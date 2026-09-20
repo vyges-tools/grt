@@ -66,13 +66,13 @@ impl EstimateGrid {
     ///
     /// ⚠️ **Half-open**: the edge leaving the last cell is not charged, because the run ends
     /// there. `x1 <= x2` is guaranteed by the segment ordering upstream.
-    fn update_h(&mut self, x1: i32, x2: i32, y: i32, amount: f64) {
+    pub(crate) fn update_h(&mut self, x1: i32, x2: i32, y: i32, amount: f64) {
         for x in x1..x2 {
             self.add_h(x as usize, y as usize, amount);
         }
     }
     /// Add demand along a vertical run, from `y1` to `y2` in column `x`.
-    fn update_v(&mut self, x: i32, y1: i32, y2: i32, amount: f64) {
+    pub(crate) fn update_v(&mut self, x: i32, y1: i32, y2: i32, amount: f64) {
         for y in y1..y2 {
             self.add_v(x as usize, y as usize, amount);
         }
@@ -135,6 +135,88 @@ pub fn estimate_all(grid: &mut EstimateGrid, nets: &[Vec<Segment>]) {
     for segments in nets {
         for seg in segments {
             estimate_one_seg(grid, seg);
+        }
+    }
+}
+
+/// The fraction of an edge's capacity below which congestion costs nothing.
+///
+/// ⛔ **`f32`, and that is load-bearing.** The reference computes the bound as
+/// `float LB = 0.9; lb = LB * capacity`, in single precision, and only then compares it against a
+/// `double` demand. `0.9f32` is `0.899999976…` while `0.9f64` is `0.900000000…`, so on a capacity
+/// of 10 the two bounds are `8.99999976` and `9.00000000`. A demand of exactly `9.0` overflows
+/// a demand landing between them overflows under one and not the other.
+///
+/// ⬜ **Kept in `f32` because that is what the reference does, NOT because a difference has been
+/// observed.** Recomputing the bound in `f64` passes every reference check on the designs scored
+/// so far — no demand lands in the gap. The threshold genuinely differs; the *behaviour*
+/// difference is unwitnessed, and saying so beats implying it was caught.
+pub const CAPACITY_LOWER_BOUND_FRACTION: f32 = 0.9;
+
+/// The congestion-free allowance for an edge of the given capacity.
+pub fn capacity_lower_bound(capacity: i32) -> f32 {
+    CAPACITY_LOWER_BOUND_FRACTION * capacity as f32
+}
+
+/// Which way a diagonal segment bends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LShape {
+    /// Up the first column, then across the far row — the reference's `xFirst == false`.
+    YFirst,
+    /// Across the near row, then up the far column — the reference's `xFirst == true`.
+    XFirst,
+}
+
+/// Congestion cost of one edge: demand above the allowance, and nothing below it.
+///
+/// ⚠️ **Demand includes the edge's blockage**, not just routing demand — the reference adds the
+/// reduction term before comparing. ⚠️ The bound is `f32` and widens here; see
+/// [`CAPACITY_LOWER_BOUND_FRACTION`].
+pub fn congestion_cost(demand: f64, blockage: u16, lower_bound: f32) -> f64 {
+    (demand + blockage as f64 - lower_bound as f64).max(0.0)
+}
+
+/// Choose which way a diagonal segment bends, by comparing the congestion on the two L paths.
+///
+/// The two candidates share their endpoints and differ in where they turn:
+///
+/// | shape | path | cost is |
+/// | --- | --- | --- |
+/// | [`LShape::YFirst`] | up column `x1`, then along row `y2` | column `x1` + row `y2` |
+/// | [`LShape::XFirst`] | along row `y1`, then up column `x2` | column `x2` + row `y1` |
+///
+/// ⛔ **A TIE picks `XFirst`.** The comparison is a strict `costL1 < costL2`, so equal costs fall
+/// to the else. Writing it as `<=` flips every tied segment, and ties are common because most
+/// edges carry no congestion at all and contribute zero to both sides.
+pub fn choose_l_shape(cost_y_first: f64, cost_x_first: f64) -> LShape {
+    if cost_y_first < cost_x_first {
+        LShape::YFirst
+    } else {
+        LShape::XFirst
+    }
+}
+
+/// Commit a bend: give the chosen path the other half of the cost and take it back from the one
+/// not taken.
+///
+/// ⚠️ The estimate pass charged **half** to each candidate. Committing adds another half to the
+/// winner and subtracts a half from the loser, which leaves the winner at full cost and the loser
+/// at zero — without either ever being recomputed from scratch.
+pub fn commit_l_shape(grid: &mut EstimateGrid, seg: &Segment, shape: LShape) {
+    let half = seg.edge_cost as f64 / 2.0;
+    let (ymin, ymax) = (seg.y1.min(seg.y2), seg.y1.max(seg.y2));
+    match shape {
+        LShape::YFirst => {
+            grid.update_v(seg.x1, ymin, ymax, half);
+            grid.update_v(seg.x2, ymin, ymax, -half);
+            grid.update_h(seg.x1, seg.x2, seg.y2, half);
+            grid.update_h(seg.x1, seg.x2, seg.y1, -half);
+        }
+        LShape::XFirst => {
+            grid.update_h(seg.x1, seg.x2, seg.y1, half);
+            grid.update_h(seg.x1, seg.x2, seg.y2, -half);
+            grid.update_v(seg.x2, ymin, ymax, half);
+            grid.update_v(seg.x1, ymin, ymax, -half);
         }
     }
 }

@@ -15,7 +15,10 @@
 //! rules live in [`guides_for_segment`], the geometry in [`global_routing_to_box`].
 
 pub mod estimate;
-pub use estimate::{estimate_all, estimate_one_seg, needs_l_route, EstimateGrid};
+pub use estimate::{
+    capacity_lower_bound, choose_l_shape, commit_l_shape, congestion_cost, estimate_all,
+    estimate_one_seg, needs_l_route, EstimateGrid, LShape, CAPACITY_LOWER_BOUND_FRACTION,
+};
 pub mod ripup;
 pub use ripup::{
     cost_and_enlarge_step, logistic_coefficient, order_by_congestion, order_for_ripup,
