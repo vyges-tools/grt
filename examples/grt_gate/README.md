@@ -315,3 +315,17 @@ The ramp past capacity contributes exactly zero at capacity, so the two pieces m
 Both `index > capacity` and `index > capacity - 1` reproduce every captured entry — the first
 because the term it skips is zero, the second because it is the same condition written
 differently. Neither is a corpus gap.
+
+## `netedgeorder.json` — the order a net's own edges are routed in
+
+1,476 nets from four designs, sorted by **routed length, longest first**, **stably**.
+
+⛔ **Stability is the specification, and the corpus proves it can be tested.** 673 of the captured
+cases have a tie group *and* required the sort to move something — only those can distinguish a
+stable sort from an unstable one. A corpus full of ties where nothing moves would say nothing
+about stability, so that count is asserted rather than assumed, and `sort_unstable_by` fails the
+gate.
+
+⚠️ The length sorted on is the **routed** length — how many steps the current path takes — not the
+distance between the endpoints. A detour therefore raises an edge's priority, and a zero-length
+route sorts last rather than being skipped.

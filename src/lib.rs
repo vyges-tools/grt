@@ -17,7 +17,9 @@
 pub mod estimate;
 pub mod lroute;
 pub mod spiral;
+pub mod maze;
 pub mod mazecost;
+pub use maze::{netedge_order_dec, OrderNetEdge};
 pub mod mazeconv;
 pub use mazecost::{cost_table, get_cost, CostParams};
 pub mod monotonic;
