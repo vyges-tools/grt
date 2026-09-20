@@ -89,6 +89,70 @@ pub fn is_routable(
     !is_supply && !is_special && !has_special_wires && !connected_by_abutment
 }
 
+/// What the liberty lookup says about one instance terminal on a net.
+///
+/// ⚠️ These are **inputs**, not something this crate derives: they come from the timing library,
+/// which is a different substrate entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ITermClockFacts {
+    /// Whether the terminal resolves to a liberty port at all.
+    pub has_liberty_port: bool,
+    /// Whether that port is a register's clock input.
+    pub is_reg_clk: bool,
+    /// Whether the cell it belongs to is a pad.
+    pub cell_is_pad: bool,
+}
+
+/// Whether a terminal counts as a clock terminal.
+///
+/// ⚠️ **A pad terminal counts even when it is not a register clock pin.** The two conditions are
+/// an OR, and both are gated on the port existing at all — a terminal with no liberty port is
+/// never a clock terminal, whatever its cell.
+pub fn is_clk_term(f: ITermClockFacts) -> bool {
+    f.has_liberty_port && (f.is_reg_clk || f.cell_is_pad)
+}
+
+/// Whether a net is a clock net **above the leaves**.
+///
+/// ⛔ **"Clock net" is not the same as "clock-typed net".** A net typed as clock that reaches any
+/// clock terminal is a LEAF and answers false; only one that reaches none of them is a non-leaf
+/// clock. Getting this backwards puts the leaf nets at the front of the routing order.
+///
+/// ⚠️ A net that is not clock-typed answers false without looking at its terminals.
+pub fn is_non_leaf_clock(sig_type_is_clock: bool, iterms: &[ITermClockFacts]) -> bool {
+    sig_type_is_clock && !iterms.iter().copied().any(is_clk_term)
+}
+
+/// A net as net discovery sees it, before ordering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredNet {
+    pub name: String,
+    pub is_non_leaf_clock: bool,
+}
+
+/// Order the nets the way the published stage hands them to the router.
+///
+/// ⛔ **Non-leaf clock nets first, then everything else, each group sorted by NAME.** Upstream
+/// does this deliberately — "to ensure stable results" — so the database's own order is *erased*
+/// before anything routes. An engine that kept database order would route in a different sequence
+/// and produce different rip-up decisions downstream.
+///
+/// ⚠️ **The partition is not implied by the sort.** On many designs the clock nets happen to sort
+/// first anyway and the two are indistinguishable; on others they do not. Sorting the whole list
+/// by name is a different function.
+///
+/// ⚠️ The comparison is plain byte order on the name, not a natural or numeric ordering, so
+/// `net10` sorts before `net9`.
+pub fn order_nets(nets: &[DiscoveredNet]) -> Vec<String> {
+    let mut clk: Vec<&str> = nets.iter().filter(|n| n.is_non_leaf_clock)
+        .map(|n| n.name.as_str()).collect();
+    let mut rest: Vec<&str> = nets.iter().filter(|n| !n.is_non_leaf_clock)
+        .map(|n| n.name.as_str()).collect();
+    clk.sort_unstable();
+    rest.sort_unstable();
+    clk.into_iter().chain(rest).map(str::to_string).collect()
+}
+
 /// A stage of the setup sequence that this engine does not implement yet.
 ///
 /// 🔑 **Named, not omitted.** A stage that simply is not called produces no diff to chase — it
@@ -115,6 +179,9 @@ pub enum AbsentStage {
     PerturbCapacities,
     /// I12 — per-layer edge capacity roll-up.
     InitEdgesCapacityPerLayer,
+    /// I13a — reading the nets off the database. The ORDER they come back in is implemented
+    /// ([`order_nets`]); what is absent is the database walk that finds them.
+    FindNetsFromDatabase,
     /// I13b — reject pins that cannot be reached on their own layer.
     CheckPinPlacement,
     /// I14 — build the router's netlist, its degrees and its pin-access resources.
@@ -159,6 +226,7 @@ pub fn init_fast_route(
             ApplyAdjustments,
             PerturbCapacities,
             InitEdgesCapacityPerLayer,
+            FindNetsFromDatabase,
             CheckPinPlacement,
             InitNetlist,
         ],

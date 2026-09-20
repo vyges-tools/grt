@@ -119,5 +119,92 @@ fn the_sequencer_REPORTS_every_stage_it_does_not_run() {
     assert_eq!(r.grid.x_grids, 35);
     assert!(r.absent.contains(&AbsentStage::SetCapacities));
     assert!(r.absent.contains(&AbsentStage::InitNetlist));
-    assert_eq!(r.absent.len(), 11, "eleven of the fourteen stages are still absent");
+    assert!(r.absent.contains(&AbsentStage::FindNetsFromDatabase));
+    assert_eq!(r.absent.len(), 12, "twelve stages are still absent; I7 and I13's RULES are done");
+}
+
+// ---- I13a: net discovery order, and the clock classification that drives it ---------------
+
+/// The order the reference handed its nets to the router, on a design where the clock-first
+/// partition is **distinguishable** from a plain name sort.
+const NET_ORDER: &str = include_str!("../examples/grt_gate/net_order.ok");
+
+fn net_order_golden() -> Vec<(bool, String)> {
+    NET_ORDER
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let mut f = l.splitn(3, ' ');
+            let clk = f.next().unwrap() == "1";
+            let _oid = f.next().unwrap();
+            (clk, f.next().unwrap().to_string())
+        })
+        .collect()
+}
+
+#[test]
+fn net_order_matches_the_REFERENCE_on_a_design_that_DISTINGUISHES_the_partition() {
+    // ⛔ The corpus was picked for what it makes different, not for being bigger: on this design
+    // the full list is NOT name-sorted, so clock-first and plain-name-sort give different answers
+    // and the test can actually fail. `gcd` has no clock nets at all and could not tell them
+    // apart; `clock_route` has two, but they happen to sort first anyway.
+    let golden = net_order_golden();
+    assert_eq!(golden.len(), 348);
+    assert_eq!(golden.iter().filter(|(c, _)| *c).count(), 2, "two non-leaf clock nets");
+
+    let names: Vec<&str> = golden.iter().map(|(_, n)| n.as_str()).collect();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_ne!(names, sorted, "this corpus must DISTINGUISH the partition or it proves nothing");
+
+    // Feed them REVERSED, to show the answer depends on the rules and not on input order.
+    let mut input: Vec<DiscoveredNet> = golden.iter()
+        .map(|(clk, name)| DiscoveredNet { name: name.clone(), is_non_leaf_clock: *clk })
+        .collect();
+    input.reverse();
+
+    assert_eq!(order_nets(&input), names.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn sorting_the_WHOLE_list_by_name_is_a_different_function() {
+    // The mutation this guards against: dropping the partition and sorting everything by name.
+    let golden = net_order_golden();
+    let mut all_by_name: Vec<String> = golden.iter().map(|(_, n)| n.clone()).collect();
+    all_by_name.sort();
+    let input: Vec<DiscoveredNet> = golden.iter()
+        .map(|(clk, name)| DiscoveredNet { name: name.clone(), is_non_leaf_clock: *clk })
+        .collect();
+    assert_ne!(order_nets(&input), all_by_name);
+}
+
+#[test]
+fn a_clock_typed_net_reaching_a_clock_terminal_is_a_LEAF_and_sorts_with_the_rest() {
+    // ⛔ "clock net" is not "clock-typed net". Reaching ANY clock terminal makes it a leaf.
+    let reg_clk = ITermClockFacts { has_liberty_port: true, is_reg_clk: true, cell_is_pad: false };
+    let plain = ITermClockFacts { has_liberty_port: true, is_reg_clk: false, cell_is_pad: false };
+
+    assert!(is_non_leaf_clock(true, &[plain, plain]), "no clock terminal -> non-leaf");
+    assert!(!is_non_leaf_clock(true, &[plain, reg_clk]), "one clock terminal is enough -> leaf");
+    assert!(!is_non_leaf_clock(false, &[plain]), "not clock-typed -> not a clock net at all");
+    assert!(is_non_leaf_clock(true, &[]), "no terminals -> vacuously non-leaf");
+}
+
+#[test]
+fn a_PAD_terminal_counts_as_a_clock_terminal_even_without_a_register() {
+    // ⚠️ The two conditions are an OR, and both are gated on the port existing.
+    let pad = ITermClockFacts { has_liberty_port: true, is_reg_clk: false, cell_is_pad: true };
+    assert!(is_clk_term(pad));
+
+    let no_port = ITermClockFacts { has_liberty_port: false, is_reg_clk: true, cell_is_pad: true };
+    assert!(!is_clk_term(no_port), "no liberty port is never a clock terminal, whatever the cell");
+}
+
+#[test]
+fn the_name_comparison_is_BYTE_order_not_numeric() {
+    // ⚠️ `net10` before `net9`. A natural-sort would reorder real designs.
+    let nets: Vec<DiscoveredNet> = ["net9", "net10", "net1"].iter()
+        .map(|n| DiscoveredNet { name: n.to_string(), is_non_leaf_clock: false })
+        .collect();
+    assert_eq!(order_nets(&nets), vec!["net1", "net10", "net9"]);
 }

@@ -66,6 +66,10 @@ called produces no diff to chase, so the gaps are visible from the outside.
 
 `is_local` classifies a net, and is checked against the reference on all 563 nets of the design.
 
+`order_nets` reproduces the order nets are handed to the router — **non-leaf clock nets first,
+then everything else, each group sorted by name**. Checked against the reference on a design where
+that is *distinguishable* from a plain name sort, because on many designs it is not.
+
 ## The rules it implements, and why they are not obvious
 
 - **A via is defined by position, not by layer.** A segment is a via when it does not move in x or
@@ -80,6 +84,9 @@ called produces no diff to chase, so the gaps are visible from the outside.
 - **A box within one tile of the grid edge snaps out to it**, under a truncating integer divide.
   The gap is closed rather than left as a sliver the detailed router cannot use.
 - **Guide order within a net is segment order**, and guide files are compared as ordered lists.
+- **A clock net is not a clock-typed net.** One that reaches any clock terminal is a *leaf* and
+  routes with the ordinary nets; only one that reaches none of them goes to the front. A pad
+  terminal counts as a clock terminal even without a register.
 - **A guide landing on one of the net's own pins is flagged**, and the *first* guide to reach that
   point claims it — the one piece of state that carries across segments.
 

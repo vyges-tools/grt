@@ -51,3 +51,14 @@ so a richer design announces that a gap has closed rather than leaving it to be 
 
 ⟹ This design is small and well behaved. A second corpus should be chosen for what it makes
 *different*, not for being bigger.
+
+## `net_order.ok` — a second corpus, chosen on exactly that criterion
+
+The order nets are handed to the router is *non-leaf clock nets first, then the rest, each group
+sorted by name*. On many designs the clock nets sort first anyway, so that is indistinguishable
+from sorting the whole list — `gcd` has no clock nets at all, and `clock_route`'s two are named
+`clk` and `clknet_0_clk`, which sort first regardless.
+
+`net_order.ok` is 348 nets from a design where the full list is **not** name-sorted, so the two
+rules give different answers and the test can fail. The nets are fed to `order_nets` **reversed**,
+to show the answer depends on the rules rather than on input order.

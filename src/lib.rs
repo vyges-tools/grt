@@ -15,7 +15,10 @@
 //! rules live in [`guides_for_segment`], the geometry in [`global_routing_to_box`].
 
 pub mod init;
-pub use init::{init_fast_route, init_grid, is_local, is_routable, AbsentStage, CoreGrid, SetupReport};
+pub use init::{
+    init_fast_route, init_grid, is_clk_term, is_local, is_non_leaf_clock, is_routable, order_nets,
+    AbsentStage, CoreGrid, DiscoveredNet, ITermClockFacts, SetupReport,
+};
 
 #[cfg(feature = "odb")]
 pub mod apply;
