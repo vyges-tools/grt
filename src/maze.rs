@@ -4,6 +4,8 @@
 //! This module grows piece by piece alongside the reference's `maze.cpp`. The edge-cost tables
 //! it prices with live in [`crate::mazecost`], built once per congestion iteration.
 
+use crate::estimate::EstimateGrid;
+
 /// One of a net's edges, paired with the length that decides when it is routed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OrderNetEdge {
@@ -710,4 +712,95 @@ pub fn maze_edge_is_long_enough(
 ) -> Option<i32> {
     let len = (n2x - n1x).abs() + (n2y - n1y).abs();
     (len > maze_edge_threshold).then_some(len)
+}
+
+/// Run the search until it reaches the destination subtree, and report where.
+///
+/// ⛔ **The stopping test is on the cell the heap is ABOUT to pop, not on the one just popped.**
+/// The loop reads the heap's minimum, asks whether it belongs to the destination subtree, and
+/// only expands it if not — so the cell it stops on is never expanded, and is returned as the
+/// meeting point.
+///
+/// ⛔ **Four relaxations per expansion, each guarded by the region**, and the guards are not
+/// symmetric with the detour flags beside them: a step is *taken* while the neighbour is inside
+/// the region, but a detour is only *considered* while there is a further cell beyond it.
+///
+/// ⚠️ **The via flag is derived from the predecessor, not from the step.** A cell reached
+/// vertically makes a horizontal step a turn, and vice versa — which is why the horizontal pair
+/// tests the row and the vertical pair tests the column.
+///
+/// 🔑 **The source exemption here and the one inside the relaxation are MUTUALLY redundant.**
+/// This loop leaves the predecessor equal to the cell when the distance is zero, so the flag it
+/// passes is already false at a source; the relaxation then refuses the via again on the same
+/// condition. Removing **either** changes nothing — each is a mutation nothing can kill — and
+/// removing both would charge a via for turning at a source. Both are transcribed.
+///
+/// ⚠️ The cell index is decomposed with the **row stride** of the distance grid, which is the
+/// grid's allocated width rather than the design's.
+pub fn maze_search(
+    s: &mut MazeSearch,
+    dest_seeds: &[(i32, i32)],
+    (region_x1, region_x2, region_y1, region_y2): (i32, i32, i32, i32),
+    inp: &RelaxInputs<'_>,
+) -> Result<(i32, i32), String> {
+    let mut is_dest = vec![false; s.dist.len()];
+    for &(x, y) in dest_seeds {
+        is_dest[s.at(x, y)] = true;
+    }
+
+    let mut ind1 = *s.heap.first().ok_or("the source frontier is empty")?;
+    while !is_dest[ind1] {
+        let (cur_x, cur_y) = ((ind1 % s.width) as i32, (ind1 / s.width) as i32);
+
+        // Where this cell was reached from; itself when it is a source.
+        let (mut pre_x, mut pre_y) = (cur_x, cur_y);
+        if s.dist[ind1] != 0.0 {
+            if s.hv[ind1] {
+                pre_x = s.parent_x1[ind1];
+                pre_y = s.parent_y1[ind1];
+            } else {
+                pre_x = s.parent_x3[ind1];
+                pre_y = s.parent_y3[ind1];
+            }
+        }
+
+        remove_min(&mut s.heap, &s.dist);
+
+        if cur_x > region_x1 {
+            relax_adjacent(s, (cur_x, cur_y), (-1, 0), pre_y != cur_y,
+                           cur_x < region_x2 - 1, inp)?;
+        }
+        if cur_x < region_x2 {
+            relax_adjacent(s, (cur_x, cur_y), (1, 0), pre_y != cur_y,
+                           cur_x > region_x1 + 1, inp)?;
+        }
+        if cur_y > region_y1 {
+            relax_adjacent(s, (cur_x, cur_y), (0, -1), pre_x != cur_x,
+                           cur_y < region_y2 - 1, inp)?;
+        }
+        if cur_y < region_y2 {
+            relax_adjacent(s, (cur_x, cur_y), (0, 1), pre_x != cur_x,
+                           cur_y > region_y1 + 1, inp)?;
+        }
+
+        ind1 = *s.heap.first().ok_or("the search exhausted its frontier")?;
+    }
+    Ok(((ind1 % s.width) as i32, (ind1 / s.width) as i32))
+}
+
+/// Charge the demand a finished route costs — the driver's last act for an edge.
+///
+/// ⛔ **The edge is indexed at its LOWER endpoint**, stated here as `min` of the two. That is the
+/// fourth site in this engine to state the same rule, after the route walk, the rip-up undo and
+/// the relaxation.
+pub fn charge_route(grid: &mut EstimateGrid, grids: &[(i32, i32)], edge_cost: i8) {
+    let cost = f64::from(edge_cost);
+    for pair in grids.windows(2) {
+        let ((ax, ay), (bx, by)) = (pair[0], pair[1]);
+        if ax == bx {
+            grid.update_usage_v(ax, ay.min(by), cost);
+        } else {
+            grid.update_usage_h(ax.min(bx), ay, cost);
+        }
+    }
 }

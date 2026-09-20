@@ -480,3 +480,32 @@ afterwards.
 ⚠️ The two divisions step on **different cadences** — the allowance every sixth iteration, the
 shrink every seventh. Iterations 6 and 7 share an allowance step, which is what lets a test
 attribute a difference between them to the shrink alone.
+
+## `mazesearch.json` — the search loop, end to end
+
+331 complete searches from four designs, **27,672 expansions**. Each drives the heap setup's
+output, the relaxation, the heap primitives and the stopping rule together, and is checked on the
+meeting point it arrives at **and** the detour flags it leaves behind.
+
+⛔ **This is the strongest statement available about the search.** A meeting point that matches
+after a hundred expansions depends on every pop order, every parent recorded and every cost looked
+up along the way. A single relaxation matching says far less.
+
+### Why the detour flags had to be captured too
+
+The guard deciding whether a detour is even *considered* changes no distance and no meeting point
+— only which cells are marked, and those decide the backtrace later. Both mutations of that guard
+survived a meeting-point-only comparison. With the flags captured, both die.
+
+⟹ **A guard whose only effect is on state a later stage reads needs that state in the corpus**,
+not just the result the current stage returns.
+
+### Two guards that are mutually redundant
+
+The loop leaves the predecessor equal to the cell when the distance is zero, so the via flag it
+passes is already false at a source; the relaxation then refuses the via again on the same
+condition. Removing **either** is a mutation nothing can kill — removing **both** would charge a
+via for turning at a source. Both are transcribed, and neither survivor is a corpus gap.
+
+⚠️ The cell index is decomposed with the distance grid's **allocated** row stride, not the
+design's grid width — a thousand here, against a design barely thirty wide.
