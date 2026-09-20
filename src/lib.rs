@@ -17,6 +17,8 @@
 pub mod estimate;
 pub mod lroute;
 pub mod spiral;
+pub mod zroute;
+pub use zroute::{newroute_z, ZChoice, HCOST};
 pub use spiral::{
     propagate_alias_status, register_edges, reset_and_alias, spiral_route, chooses_y_first, traversal_order, EdgeReg,
     SpiralNode, MAX_CONNECTIONS,

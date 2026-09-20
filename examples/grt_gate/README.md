@@ -144,3 +144,41 @@ only a delta and disagrees with the reference from the second edge of every net 
 
 ⚠️ The degenerate-edge guard is **unreachable from the only caller** and is pinned by a
 constructed case for that reason.
+
+## `zroute.json` — the two-bend re-route
+
+285 decisions from four designs, **89 horizontal-first and 196 vertical-first**, each carrying the
+whole grid patch its cost loops read. Median patch is 33 cells and the largest 1,681, so the cost
+computation is replayed **end to end** rather than checked against a captured intermediate.
+
+⛔ **Every via term in this stage is dead.** `via_cost_` is an `int`, and it is 0 whenever the
+stage runs — both family base costs and both endpoint penalties contribute nothing. The corpus
+asserts the zero rather than relying on it, and swapping the two endpoint-status arms is a
+mutation nothing can kill.
+
+⚠️ **The unreduced-usage asymmetry is not dead**, and it is easy to assume it is. The reference
+asks for plain rather than reduced usage on exactly one branch. Blockage differs from zero on
+24,658 of 49,012 captured cells and 135 of the 285 decisions take that branch, so levelling the
+asymmetry out fails the gate.
+
+### An `else if` that can never run
+
+The dispatch ends with a branch guarded by `len > threshold` hanging off an `if` on exactly that
+condition. It is unreachable, and measuring says so: **0 hits across all 147 traceable designs**.
+
+### The horizontal tie-break is inert — provably, not just here
+
+The horizontal family breaks ties on a second cost, and that cost only ever receives two **uniform
+fills**. Nothing varies it per candidate, so it is constant across the candidates and the
+tie-break clause can never prefer one column over another. Deleting the clause is a mutation
+nothing can kill, and that is a property of the code rather than a gap in the corpus.
+
+⚠️ The tie-break *between the two families* is a different matter and does decide real cases — an
+exact tie always goes to horizontal-first.
+
+### Capturing this needed a fix first
+
+`via_cost_` is an `int`. Printing it with `%g` makes the float arguments after it read from the
+wrong registers, so the first capture reported the same denormal for one bound on every design
+while the other varied correctly — which is what gave it away. All three scalars were wrong, not
+just the one that looked wrong.

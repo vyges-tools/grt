@@ -66,13 +66,13 @@ impl EstimateGrid {
     ///
     /// ⚠️ **Half-open**: the edge leaving the last cell is not charged, because the run ends
     /// there. `x1 <= x2` is guaranteed by the segment ordering upstream.
-    pub(crate) fn update_h(&mut self, x1: i32, x2: i32, y: i32, amount: f64) {
+    pub fn update_h(&mut self, x1: i32, x2: i32, y: i32, amount: f64) {
         for x in x1..x2 {
             self.add_h(x as usize, y as usize, amount);
         }
     }
     /// Add demand along a vertical run, from `y1` to `y2` in column `x`.
-    pub(crate) fn update_v(&mut self, x: i32, y1: i32, y2: i32, amount: f64) {
+    pub fn update_v(&mut self, x: i32, y1: i32, y2: i32, amount: f64) {
         for y in y1..y2 {
             self.add_v(x as usize, y as usize, amount);
         }
