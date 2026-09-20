@@ -70,8 +70,9 @@ pub const WALK_RESET: ResetParams = ResetParams { counter_init: 0, terminal_stat
 
 /// Layer assignment's reset: counters at **infinity**, terminals marked **1**.
 ///
-/// ⚠️ The counters start at the reference's `BIG_INT` here rather than zero, because layer
-/// assignment uses them to track a minimum rather than to count.
+/// ⚠️ They are not counters in this stage. Layer assignment uses the two fields to hold the
+/// **edge id at the node's highest and lowest layer**, and the sentinel means "no edge above (or
+/// below) this node's own layer yet" — which is why it starts at infinity rather than zero.
 pub const LAYER_RESET: ResetParams =
     ResetParams { counter_init: 1_000_000_000, terminal_status: 1 };
 
@@ -354,4 +355,99 @@ pub fn spiral_route(
 /// is the only part of the L arm a corpus can check without reconstructing the demand grid.
 pub fn chooses_y_first(cost_l1: f64, cost_l2: f64) -> bool {
     cost_l1 < cost_l2
+}
+
+/// Reset a net's nodes before recording which edges reach its extreme layers.
+///
+/// ⚠️ **A partial reset, not the full one.** The aliases resolved earlier are left in place —
+/// only the per-node layer bookkeeping is cleared. Re-resolving them here would be harmless but
+/// wasteful, and the reference does not.
+pub fn reset_for_layer_extremes(
+    nodes: &mut [SpiralNode],
+    num_terminals: usize,
+    pin_layers: &[i16],
+    num_layers: i16,
+) {
+    for (d, node) in nodes.iter_mut().enumerate() {
+        node.top_layer = -1;
+        node.bot_layer = num_layers;
+        node.edges.clear();
+        node.h_id = LAYER_RESET.counter_init;
+        node.l_id = LAYER_RESET.counter_init;
+        node.status = 0;
+        node.assigned = false;
+        if d < num_terminals {
+            node.bot_layer = pin_layers[d];
+            node.top_layer = pin_layers[d];
+            node.assigned = true;
+            node.status = LAYER_RESET.terminal_status;
+        }
+    }
+}
+
+/// Which layer each end of one edge arrives on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EdgeLayers {
+    pub n1: usize,
+    pub n2: usize,
+    pub len: i32,
+    /// The layer at the edge's first grid point, which meets `n1`.
+    pub first: i16,
+    /// The layer at its last, which meets `n2`.
+    pub last: i16,
+}
+
+/// What a node ends up connected to, vertically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayerExtremes {
+    pub top_layer: i16,
+    pub bot_layer: i16,
+    /// The edge reaching this node's **highest** layer, or the sentinel if none goes above it.
+    pub h_id: i32,
+    /// The edge reaching its **lowest**, or the sentinel if none goes below.
+    pub l_id: i32,
+}
+
+/// Record, per node, which edges reach its highest and lowest layers.
+///
+/// ⛔ **Both ends of every edge are recorded, on the ALIAS nodes.** An edge contributes the layer
+/// of its first grid point to one end and of its last to the other, so a via along the way is
+/// invisible here — only where the edge *meets* each node matters.
+///
+/// ⛔ **The comparisons are strict, so the first edge to reach a layer keeps it.** A later edge
+/// arriving on the same layer does not displace it, which is what makes the result depend on edge
+/// order rather than only on the layers.
+///
+/// ⚠️ **A terminal starts at its own pin layer, not at infinity**, so an edge that stays on that
+/// layer sets neither field — and the sentinel survives, meaning "nothing above (or below) the
+/// pin". A Steiner node starts wide open and is always set by its first edge.
+pub fn record_layer_extremes(nodes: &mut [SpiralNode], edges: &[EdgeLayers]) {
+    for (edge_id, e) in edges.iter().enumerate() {
+        if e.len <= 0 {
+            continue;
+        }
+        for (node, layer) in [(e.n1, e.first), (e.n2, e.last)] {
+            let a = nodes[node].stack_alias;
+            nodes[a].edges.push(edge_id);
+            if layer > nodes[a].top_layer {
+                nodes[a].h_id = edge_id as i32;
+                nodes[a].top_layer = layer;
+            }
+            if layer < nodes[a].bot_layer {
+                nodes[a].l_id = edge_id as i32;
+                nodes[a].bot_layer = layer;
+            }
+            nodes[a].assigned = true;
+        }
+    }
+}
+
+/// Read one node's layer bookkeeping back out.
+pub fn layer_extremes(node: &SpiralNode) -> LayerExtremes {
+    LayerExtremes {
+        top_layer: node.top_layer,
+        bot_layer: node.bot_layer,
+        h_id: node.h_id,
+        l_id: node.l_id,
+    }
 }

@@ -634,3 +634,22 @@ further, the shared code stops matching one of the two goldens.
 ⚠️ A degenerate edge's alias fields are left untouched by the reference, so the captured values
 are whatever was already there. The test asserts they are *unwritten*, not that they hold a
 particular value.
+
+## `layerextremes.json` — which edges reach each node's highest and lowest layers
+
+900 nets from four designs, **4,317 nodes keeping the sentinel**.
+
+This is the pass that explains the infinity constant. The two per-node fields hold the **edge id**
+at the node's extreme layers, not a count, and the sentinel means "no edge rises above (or drops
+below) this node's own layer".
+
+⛔ **A terminal starts at its pin layer**, so an edge that stays on that layer sets neither field
+and the sentinel survives. A Steiner node starts wide open and is always set by its first edge.
+
+⛔ **The comparisons are strict, so the first edge to reach a layer keeps it.** A later edge
+arriving on the same layer is still recorded in the node's edge list but does not displace it —
+which makes the result depend on edge order, not only on layers.
+
+⚠️ Both ends of every edge are recorded, on the **alias** nodes, and each end takes the layer where
+the edge *meets it* — the first grid point for one end, the last for the other. A via partway
+along is invisible here.
