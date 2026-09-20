@@ -13,7 +13,11 @@ repository = "https://github.com/vyges-tools/grt"
 # every one of them is testable without a design database, which keeps `cargo test` a
 # second-long, dependency-free check of the part that is easy to get wrong. Turning this on
 # brings in the database and its C++ build.
-odb = ["dep:vyges-opendb"]
+#
+# ⛔ It must pull in `gen-write` too: `net_clear_guides` is a GENERATED setter and the database
+# crate keeps its whole generated write surface behind that feature. Depending on the crate
+# without it compiles the read half only, and the applier needs to clear before it writes.
+odb = ["dep:vyges-opendb", "vyges-opendb/gen-write"]
 
 [dev-dependencies]
 # Test-only: the end-to-end corpus is JSON. The library itself stays dependency-free.
