@@ -540,3 +540,36 @@ cases would say nothing about it.
 structural: a node's neighbours are distinct, so there is never more than one match. Measured
 across 11,084 captured neighbour lists, not one holds a duplicate. Transcribed as written, because
 the reference relies on that rather than enforcing it.
+
+## `e2e.json` — the per-edge call sequence, end to end
+
+360 re-routed edges from four designs, 1,582 path points, 279 on multi-pin nets. Each record
+carries the net's whole tree, every threshold and knob, and the usage patch over the search
+region — everything the sequence reads — and is checked on the path it produced.
+
+⛔ **This validates the THREADING between stages, not the stages.** Each is already gated
+separately. What it catches is a region computed correctly and handed to the wrong seeding, or a
+search whose result is backtraced against the wrong state — failures a per-stage corpus cannot see
+precisely because every stage is individually right.
+
+⚠️ The sequence reports the region it searched and the frontiers it seeded, not just the path.
+Without that, handing the seeding a region one cell too small survived the comparison: the path
+usually comes out the same anyway.
+
+### What this corpus cannot decide
+
+Three mutations survive here and die elsewhere, because every edge in it **passed both gates** and
+was routed **monotonically**:
+
+| mutation | where it dies |
+| --- | --- |
+| the region capped by the edge's span rather than its route length | the region corpus — **185** of its edges have a route longer than their span; this one has **none** |
+| the length gate skipped | beside the region, where the boundary is constructed |
+| the rip-up gate ignored | against its own captured verdicts, which include refusals |
+
+A test asserts that this corpus still has no edge routed the long way round, so the note goes stale
+loudly rather than quietly.
+
+⚠️ One more survivor is a property of the transcription, not the reference: the search grid's row
+stride. The reference's matters because it decomposes a flat cell index that crosses function
+boundaries; no flat index escapes this crate, so any sufficient width round-trips.

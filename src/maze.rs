@@ -949,3 +949,108 @@ pub fn rewire_after_type2(
         }
     }
 }
+
+/// Why one edge was not re-routed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EdgeOutcome {
+    /// Shorter than the threshold.
+    TooShort,
+    /// The rip-up gate declined to replace the existing route.
+    NotCongested,
+    /// Re-routed: the path it took, the region it searched, and the frontiers it seeded.
+    ///
+    /// ⚠️ The region and the frontiers are reported, not just the path, so that a stage handed
+    /// the wrong one is caught. A region one cell too small usually yields the same path anyway.
+    Routed {
+        path: Vec<(i32, i32)>,
+        region: (i32, i32, i32, i32),
+        src: Vec<(i32, i32)>,
+        dest: Vec<(i32, i32)>,
+    },
+    /// ⛔ The surgery could not place a contact point. The net's tree must be rebuilt and the
+    /// **whole net** reprocessed — the reference steps its net index back before breaking out.
+    RebuildNet(String),
+}
+
+/// What the sequencer needs from the stages around it.
+///
+/// ⚠️ Passed in rather than reached for, so the order below stays readable as a call sequence and
+/// nothing in it does work of its own.
+pub struct EdgeContext<'a> {
+    pub maze_edge_threshold: i32,
+    pub expand: i32,
+    pub iter: i32,
+    pub is_critical: bool,
+    pub grid_size: (i32, i32),
+    pub num_terminals: usize,
+    pub edge_cost: i8,
+    pub relax: &'a RelaxInputs<'a>,
+    /// The rip-up gate's answer for this edge, which the caller obtains from the gate stage.
+    pub rip_up_says_reroute: bool,
+}
+
+/// Re-route one edge: the reference's per-edge call sequence, and nothing else.
+///
+/// ```text
+///   recompute the length      ->  too short?      give up
+///   ask the rip-up gate       ->  not congested?  give up
+///   compute the search region
+///   seed both frontiers from the subtrees the edge separates
+///   search until the far subtree is reached
+///   walk the parents back to get the path
+/// ```
+///
+/// ⛔ **Every step here is its own function, each gated against the reference separately.** This
+/// one does no work of its own — that is what lets a divergence be attributed to a stage rather
+/// than bisected out of a loop.
+///
+/// ⚠️ The tree surgery that follows is left to the caller: which of its two shapes applies depends
+/// on where the path's ends landed, and that decision belongs with the tree, not with the search.
+///
+/// ⚠️ **`search_grid_width` is an allocation detail here, not a behavioural one.** The reference's
+/// row stride matters because it decomposes a flat cell index that crosses function boundaries;
+/// no flat index escapes this crate, so any width wide enough round-trips. Kept as a parameter so
+/// the allocation stays the caller's decision, but changing it is a mutation nothing can kill —
+/// and that is a property of this transcription, not of the reference.
+pub fn route_one_edge(
+    search_grid_width: usize,
+    nodes: &[MazeNode],
+    edges: &[MazeEdge],
+    edge_id: usize,
+    ctx: &EdgeContext<'_>,
+) -> Result<EdgeOutcome, String> {
+    let e = &edges[edge_id];
+    let (n1, n2) = (e.n1, e.n2);
+    let p1 = (nodes[n1].x, nodes[n1].y);
+    let p2 = (nodes[n2].x, nodes[n2].y);
+
+    if maze_edge_is_long_enough(p1, p2, ctx.maze_edge_threshold).is_none() {
+        return Ok(EdgeOutcome::TooShort);
+    }
+    if !ctx.rip_up_says_reroute {
+        return Ok(EdgeOutcome::NotCongested);
+    }
+
+    let region = maze_edge_region(
+        p1, p2, ctx.expand, ctx.iter, e.routelen as i32, ctx.is_critical, ctx.grid_size,
+    );
+
+    let heaps = setup_heap(ctx.num_terminals, nodes, edges, edge_id, region);
+
+    // ⚠️ The distances start at "unreached" across the region, and the seeds are what the search
+    // begins from — both of which the heap setup decided.
+    let mut state = MazeSearch::new(search_grid_width, (region.3 + 2) as usize);
+    for &(x, y) in &heaps.src {
+        let i = state.at(x, y);
+        state.dist[i] = 0.0;
+        state.heap.push(i);
+    }
+
+    let cross = maze_search(&mut state, &heaps.dest, region, ctx.relax)?;
+    Ok(EdgeOutcome::Routed {
+        path: backtrace(&state, cross),
+        region,
+        src: heaps.src,
+        dest: heaps.dest,
+    })
+}
