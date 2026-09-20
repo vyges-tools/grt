@@ -14,6 +14,11 @@
 //! stage runs, so a divergence can be pointed at one line rather than bisected. The per-segment
 //! rules live in [`guides_for_segment`], the geometry in [`global_routing_to_box`].
 
+pub mod rsmt;
+pub use rsmt::{
+    segments_from_tree, Branch, NetSegments, Segment, COEFF_V_DEFAULT, COEFF_V_NO_ADJUSTMENTS,
+    ROUTER_FLUTE_ACCURACY,
+};
 pub mod capacity;
 pub use capacity::{
     capacity_edge_order, check_adjacent_layers_direction, compute_gcell_capacity,
