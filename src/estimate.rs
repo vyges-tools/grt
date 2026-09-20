@@ -53,6 +53,19 @@ impl EstimateGrid {
         self.usage_v[y * self.x_grids + x]
     }
 
+    /// Charge one horizontal edge's committed demand — the reference's `updateUsageH`.
+    ///
+    /// ⚠️ A single edge, not a run: the walk that uses this charges each step as it takes it.
+    pub fn update_usage_h(&mut self, x: i32, y: i32, amount: f64) {
+        let i = y as usize * self.h_columns() + x as usize;
+        self.usage_h[i] += amount;
+    }
+    /// Charge one vertical edge's committed demand — the reference's `updateUsageV`.
+    pub fn update_usage_v(&mut self, x: i32, y: i32, amount: f64) {
+        let i = y as usize * self.x_grids + x as usize;
+        self.usage_v[i] += amount;
+    }
+
     /// Fold the estimate into the committed demand — the reference's `addEstUsageToUsage`.
     ///
     /// ⛔ **Adds rather than replaces, and leaves the estimate untouched.** Every edge is visited,

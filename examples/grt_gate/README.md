@@ -218,3 +218,35 @@ because moving it instead looks identical on a first fold and diverges on the se
 router folds more than once. The runaway-usage check fires **strictly above** a whole multiple of
 the capacity, and each direction is judged against its own capacity; it is constructed, because
 it is an error path no shipped design reaches.
+
+## `monotonic.json` — the cheapest pair of bends through a searched midpoint
+
+Validated in two halves, because they cost very different amounts to capture:
+
+- **the walk** — 1,429 routed edges, replayed point by point from the reference's own midpoint and
+  orientations;
+- **the search** — 130 of those also carry the usage patch over the whole box, the cost table in
+  force, and the demand the walk went on to charge, so the choice itself is replayed.
+
+The boxes are too large to carry for every edge — median 476 cells, 3.1 million in total — so the
+second set is sampled in the instrument and bucketed here. Buckets are the branches taken: the two
+orientation flags, whether the midpoint landed on an endpoint, and the direction of travel on each
+axis. Twelve are populated and the test asserts a floor in each.
+
+### The demand the walk charges is checked, not just the points it emits
+
+⛔ **A backward run charges the edge BELOW the cell it stands on.** Nothing about a point list
+shows that: swapping the index reproduces every point of every routed edge and still corrupts the
+grid that every later stage reads. Both directions survived the first mutation round for exactly
+that reason, so the after-walk demand is now captured as a sparse delta and compared directly.
+
+### `via_cost` is zero here too
+
+Third stage running. The two orientation pairs that pay for a via compete unpenalised, and the
+corpus asserts the zero rather than relying on it.
+
+### Everything float is carried as raw IEEE bits
+
+⚠️ Including the **inputs** — the cost table and the usage patches — not only the compared cost.
+A prefix sum over ~30 table lookups will show a one-unit difference in the last place long before
+anything else does.

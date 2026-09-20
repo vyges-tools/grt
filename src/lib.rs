@@ -18,6 +18,8 @@ pub mod estimate;
 pub mod lroute;
 pub mod spiral;
 pub mod mazeconv;
+pub mod monotonic;
+pub use monotonic::{monotonic_box, monotonic_cost_table, route_monotonic, walk_monotonic_route, MonotonicRoute};
 pub mod zroute;
 pub use estimate::{check_2d_edges_usage, UsageViolation};
 pub use mazeconv::{convert_to_mazeroute, MazeRoute, SymbolicRoute};
