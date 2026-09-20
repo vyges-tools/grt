@@ -659,3 +659,55 @@ pub fn update_route_type2(
     e.len = (c2x - e1x).abs() + (c2y - e1y).abs();
     Ok(())
 }
+
+/// How far the search may stray from the edge it is re-routing.
+///
+/// ⛔ **The allowance is capped by the edge's CURRENT route length**, not by its span: an edge
+/// already routed the long way round gets a wider search than a short one between the same
+/// endpoints. It also grows with the iteration, so later rounds look further afield.
+///
+/// ⚠️ **Integer division.** `iter / 6` steps every sixth round, not smoothly, and `iter / 7` in
+/// the shrink below steps on a different cadence again.
+///
+/// ⛔ **A critical net gets a NARROWER region, not a wider one.** The shrink is applied inwards on
+/// every side, so a net under timing pressure is kept close to its existing path rather than
+/// allowed to wander — and it is capped at half the allowance, so the region can never invert.
+pub fn maze_edge_region(
+    (n1x, n1y): (i32, i32),
+    (n2x, n2y): (i32, i32),
+    expand: i32,
+    iter: i32,
+    routelen: i32,
+    is_critical: bool,
+    (x_grid, y_grid): (i32, i32),
+) -> (i32, i32, i32, i32) {
+    let (xmin, xmax) = (n1x.min(n2x), n1x.max(n2x));
+    let (ymin, ymax) = (n1y.min(n2y), n1y.max(n2y));
+
+    let enlarge = expand.min((iter / 6 + 3) * routelen);
+    let decrease = if is_critical {
+        ((iter / 7) * 5).min(enlarge / 2)
+    } else {
+        0
+    };
+
+    (
+        (xmin - enlarge + decrease).max(0),
+        (xmax + enlarge - decrease).min(x_grid - 1),
+        (ymin - enlarge + decrease).max(0),
+        (ymax + enlarge - decrease).min(y_grid - 1),
+    )
+}
+
+/// Whether an edge is worth re-routing at all — the driver's first gate.
+///
+/// ⚠️ **The length is RECOMPUTED from the endpoints here**, not read from the edge. An earlier
+/// stage may have moved a node, leaving the stored length stale; the gate uses the live geometry.
+pub fn maze_edge_is_long_enough(
+    (n1x, n1y): (i32, i32),
+    (n2x, n2y): (i32, i32),
+    maze_edge_threshold: i32,
+) -> Option<i32> {
+    let len = (n2x - n1x).abs() + (n2y - n1y).abs();
+    (len > maze_edge_threshold).then_some(len)
+}

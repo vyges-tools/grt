@@ -454,3 +454,29 @@ is why the endpoints are assigned in both arms rather than once.
 ⛔ **No captured input edge is un-routed.** The single-point branch of the copy — which hands back
 the requested endpoint's own coordinates rather than the stored points — is pinned by a
 constructed case, because an empty list there would silently shorten every join below it.
+
+## `region.json` — how far the search may stray
+
+2,410 regions from four designs across **14 branch buckets**: the allowance capped by the caller's
+limit or by the edge's own route length, the net critical or not, and the region clamped at either
+grid edge or neither. Both intermediates are carried as well as the result, so a mismatch
+attributes to the allowance or to the clamping rather than to "the region".
+
+⛔ **The allowance is capped by the edge's CURRENT route length**, not by the distance between its
+endpoints — an edge already routed the long way round gets a wider search than a short one between
+the same points. Both caps bind somewhere in the corpus, which is asserted.
+
+### A branch that is reached 302 times and never does anything
+
+A critical net narrows its own region — but only from the **seventh** iteration, because the
+shrink is `(iter / 7) * 5`. Measured: critical nets appear **only at iterations 3, 4 and 5**, so
+the shrink is **zero on all 302 of them**.
+
+⟹ The branch is live and its effect never is. Those are different claims and the corpus supports
+only the first, so what it does when it bites is pinned by a constructed case: applied inwards on
+every side, capped at half the allowance so the region cannot invert, and clamped to the grid
+afterwards.
+
+⚠️ The two divisions step on **different cadences** — the allowance every sixth iteration, the
+shrink every seventh. Iterations 6 and 7 share an allowance step, which is what lets a test
+attribute a difference between them to the shrink alone.
