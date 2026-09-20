@@ -15,6 +15,10 @@
 //! rules live in [`guides_for_segment`], the geometry in [`global_routing_to_box`].
 
 pub mod estimate;
+pub mod lroute;
+pub use lroute::{
+    is_known_status, mark_h, mark_v, route_edge, via_bias, EdgeRoute, TreeEdge, TreeNode,
+};
 pub use estimate::{
     capacity_lower_bound, choose_l_shape, commit_l_shape, congestion_cost, estimate_all,
     estimate_one_seg, needs_l_route, EstimateGrid, LShape, CAPACITY_LOWER_BOUND_FRACTION,
