@@ -14,6 +14,11 @@
 //! stage runs, so a divergence can be pointed at one line rather than bisected. The per-segment
 //! rules live in [`guides_for_segment`], the geometry in [`global_routing_to_box`].
 
+pub mod ripup;
+pub use ripup::{
+    cost_and_enlarge_step, logistic_coefficient, order_by_congestion, order_for_ripup,
+    step_threshold_m, OrderTree, Schedule, DEPRIORITISE_PERCENT, SLACK_SENTINEL,
+};
 pub mod rsmt;
 pub use rsmt::{
     segments_from_tree, Branch, NetSegments, Segment, COEFF_V_DEFAULT, COEFF_V_NO_ADJUSTMENTS,

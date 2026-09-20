@@ -78,6 +78,11 @@ every pin position funnels through. Checked against the reference by the fixed-p
 1,536 pin positions and 7,540 segment endpoints are all cell centres, so snapping one must return
 it unchanged.
 
+`order_for_ripup` reproduces the order nets are ripped up and rerouted — **all 321 nets and all
+139 de-prioritisations match the reference**. ⛔ Its congestion comparison discriminates almost
+nothing: 309 of 320 adjacent pairs tie, and a single tie group of 200 nets — 62% of the design —
+is ordered entirely by the sorts being *stable*. An unstable sort is a different function here.
+
 `segments_from_tree` turns a net's Steiner tree into the segments the router consumes — the seam
 between two engines. **All 3,733 segments across 1,980 reference invocations match**, on *both*
 tree sources: the Steiner engine (the default) and the coefficient-weighted flute the router owns.
@@ -104,6 +109,8 @@ that is *distinguishable* from a plain name sort, because on many designs it is 
 - **A box within one tile of the grid edge snaps out to it**, under a truncating integer divide.
   The gap is closed rather than left as a sliver the detailed router cannot use.
 - **Guide order within a net is segment order**, and guide files are compared as ordered lists.
+- **The rip-up order is two STABLE sorts with a position-dependent step between them**, so they
+  cannot be fused: the middle step reads each net's position in the list the first sort produced.
 - **A tree's segments are ordered by X alone**, not lexicographically — so a *vertical* segment
   always comes out with its endpoints swapped, and nothing else does.
 - **Which builder produces a net's tree is chosen by its routing alpha**, and the default is 0.3:
