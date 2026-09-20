@@ -66,6 +66,11 @@ called produces no diff to chase, so the gaps are visible from the outside.
 
 `is_local` classifies a net, and is checked against the reference on all 563 nets of the design.
 
+`position_on_grid` snaps a coordinate to the centre of the cell containing it — the arithmetic
+every pin position funnels through. Checked against the reference by the fixed-point property: its
+1,536 pin positions and 7,540 segment endpoints are all cell centres, so snapping one must return
+it unchanged.
+
 `order_nets` reproduces the order nets are handed to the router — **non-leaf clock nets first,
 then everything else, each group sorted by name**. Checked against the reference on a design where
 that is *distinguishable* from a plain name sort, because on many designs it is not.

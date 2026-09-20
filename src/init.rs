@@ -59,6 +59,40 @@ pub fn init_grid(area: Rect, tile_size: i32, routing_layer_count: i32, max_layer
     }
 }
 
+impl CoreGrid {
+    /// Snap a coordinate to the centre of the grid cell that contains it.
+    ///
+    /// ⛔ **Everything about pin placement funnels through this**, so an error here moves every
+    /// pin and therefore every guide that covers one.
+    ///
+    /// ⚠️ **The cell index is a truncating divide**, matching the reference's integer division —
+    /// Rust and C++ both truncate toward zero, so a coordinate below the die origin behaves the
+    /// same in both rather than flooring.
+    ///
+    /// ⚠️ **A point in the partial cell past the last full one is pulled BACK into it.** The die
+    /// need not be a whole number of cells across (that is what `perfect_regular_*` records), so
+    /// a coordinate near the top edge can land at index `x_grids`, which is one past the end. The
+    /// decrement is the counterpart of that remainder, not an off-by-one guard.
+    ///
+    /// ⚠️ `tile_size / 2` truncates too: on an odd cell size the centre sits half a unit low.
+    pub fn position_on_grid(&self, x: i32, y: i32) -> (i32, i32) {
+        let mut gcell_id_x = (x - self.area.x_min) / self.tile_size;
+        let mut gcell_id_y = (y - self.area.y_min) / self.tile_size;
+
+        if gcell_id_x >= self.x_grids {
+            gcell_id_x -= 1;
+        }
+        if gcell_id_y >= self.y_grids {
+            gcell_id_y -= 1;
+        }
+
+        (
+            gcell_id_x * self.tile_size + self.tile_size / 2 + self.area.x_min,
+            gcell_id_y * self.tile_size + self.tile_size / 2 + self.area.y_min,
+        )
+    }
+}
+
 /// Whether a net sits entirely on one grid point.
 ///
 /// ⛔ **Position only — the LAYER is not compared.** Two pins at the same `(x, y)` on different

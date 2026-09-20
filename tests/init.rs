@@ -208,3 +208,86 @@ fn the_name_comparison_is_BYTE_order_not_numeric() {
         .collect();
     assert_eq!(order_nets(&nets), vec!["net1", "net10", "net9"]);
 }
+
+// ---- the snap every pin position funnels through ------------------------------------------
+
+fn design_grid() -> CoreGrid {
+    // The grid the reference built for the corpus design.
+    init_grid(Rect::new(0, 0, 200_260, 201_600), 5_700, 10, -1)
+}
+
+#[test]
+fn every_REFERENCE_pin_position_is_a_FIXED_POINT_of_the_snap() {
+    // 🔑 The strongest check available without re-deriving pin geometry: the reference's on-grid
+    // positions are, by construction, cell centres — so snapping one must return it unchanged.
+    // A wrong divisor, a missing origin offset or a dropped half-tile all break this on the first
+    // pin, across 1,536 real positions.
+    let g = design_grid();
+    let v: serde_json::Value = serde_json::from_str(CORPUS).unwrap();
+    let mut checked = 0;
+    for net in v["nets"].as_array().unwrap() {
+        for p in net["pins"].as_array().unwrap() {
+            let x = p["on_grid_x"].as_i64().unwrap() as i32;
+            let y = p["on_grid_y"].as_i64().unwrap() as i32;
+            assert_eq!(g.position_on_grid(x, y), (x, y),
+                "({x}, {y}) is a reference on-grid position but not a fixed point of the snap");
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 1_536, "every pin position must have been checked");
+}
+
+#[test]
+fn every_REFERENCE_segment_endpoint_is_a_FIXED_POINT_too() {
+    // Segment ends are grid points as well, so the same invariant holds over a much larger set —
+    // 3,770 segments, both ends each.
+    let g = design_grid();
+    let v: serde_json::Value = serde_json::from_str(CORPUS).unwrap();
+    let mut checked = 0;
+    for net in v["nets"].as_array().unwrap() {
+        for s in net["segments"].as_array().unwrap() {
+            for (kx, ky) in [("init_x", "init_y"), ("final_x", "final_y")] {
+                let x = s[kx].as_i64().unwrap() as i32;
+                let y = s[ky].as_i64().unwrap() as i32;
+                assert_eq!(g.position_on_grid(x, y), (x, y), "segment endpoint ({x}, {y})");
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, 7_540, "3,770 segments, both ends");
+}
+
+#[test]
+fn the_snap_lands_on_the_CENTRE_of_the_containing_cell() {
+    // tile 100 over 0..1000: cell 0 spans [0,100) and its centre is 50.
+    let g = init_grid(Rect::new(0, 0, 1_000, 1_000), 100, 10, -1);
+    assert_eq!(g.position_on_grid(0, 0), (50, 50));
+    assert_eq!(g.position_on_grid(99, 99), (50, 50));
+    assert_eq!(g.position_on_grid(100, 100), (150, 150));
+}
+
+#[test]
+fn the_die_ORIGIN_is_subtracted_before_dividing_and_added_back_after() {
+    // ⚠️ A non-zero origin is where a missing offset shows up; with origin 0 the bug is invisible.
+    let g = init_grid(Rect::new(1_000, 2_000, 2_000, 3_000), 100, 10, -1);
+    assert_eq!(g.position_on_grid(1_000, 2_000), (1_050, 2_050));
+    assert_eq!(g.position_on_grid(1_150, 2_150), (1_150, 2_150), "a centre maps to itself");
+}
+
+#[test]
+fn a_point_in_the_PARTIAL_last_cell_is_pulled_back_into_the_last_full_one() {
+    // ⛔ 1,050 wide on 100-unit cells: 10 full cells and a 50-unit remainder. A point at 1,020
+    // divides to index 10, which is one past the end, so it is clamped to cell 9 — centre 950.
+    let g = init_grid(Rect::new(0, 0, 1_050, 1_000), 100, 10, -1);
+    assert_eq!(g.x_grids, 10);
+    assert!(!g.perfect_regular_x);
+    assert_eq!(g.position_on_grid(1_020, 500).0, 950);
+}
+
+#[test]
+fn an_ODD_cell_size_puts_the_centre_half_a_unit_LOW() {
+    // ⚠️ `tile_size / 2` truncates. Worth pinning: rounding it the other way moves every
+    // position by one unit on an odd-sized grid.
+    let g = init_grid(Rect::new(0, 0, 900, 900), 101, 10, -1);
+    assert_eq!(g.position_on_grid(0, 0), (50, 50), "101/2 == 50, not 51");
+}
