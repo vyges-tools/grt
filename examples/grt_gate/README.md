@@ -593,3 +593,28 @@ too, so a recapture that ever reaches it fails loudly instead of quietly invalid
 ⚠️ The reference steps its net index **back** before breaking out of the edge loop, so the loop's
 own increment returns to the same net. Writing that as "move on to the next net" is the natural
 mistake, and nothing in any corpus would catch it.
+
+## `removeloops.json` — cutting loops out of routed paths
+
+750 edges kept from 17,542 scanned. A maze route can revisit a cell — the search is over a grid,
+not a tree — so this stage finds a repeated point, removes everything between the two visits,
+gives back exactly the demand that stretch was charged, and **restarts the scan**.
+
+⛔ **No captured path contains a loop.** Swept across **all 148 traceable designs: 79,813 edges
+scanned, zero loops.** The corpus therefore decides only that the scan leaves a loop-free path
+untouched and charges nothing back — worth having, and not the same as validating the removal.
+
+The removal, the give-back and the restart are pinned by constructed cases, and the absence is
+asserted so a recapture that finds a loop fails loudly.
+
+### Why the restart is not merely conservative
+
+Removing a stretch shifts everything after it **down**, so a duplicate pair that sat beyond the
+index can land entirely before it — where a continuing scan would never look again. The case
+showing this had to be built deliberately: the obvious two-loop path is cleaned correctly either
+way, because its second loop happens to stay above the index.
+
+🔑 **And because it restarts, at most one earlier point can ever match.** When the scan reaches an
+index, no two earlier points are equal — if they were it would have stopped at the second of them.
+So taking the last match rather than the first is a mutation nothing can kill: a property of the
+algorithm, not a gap in the corpus.

@@ -1101,3 +1101,73 @@ where
     }
     visited
 }
+
+/// Cut any loop out of a routed path, giving back the demand it charged.
+///
+/// A maze route can revisit a cell — the search is over a grid, not a tree, and nothing in it
+/// forbids a path that doubles back. This finds the **first** repeated point, removes everything
+/// between the two visits, and gives back exactly the demand that stretch was charged.
+///
+/// ⛔ **The scan restarts from the beginning after every removal.** The reference resets both
+/// indices and lets the loops' own increments carry it back to the start. That is not a
+/// conservative choice: removing a stretch shifts everything after it **down**, so a duplicate
+/// pair that sat beyond the index can land entirely before it, where a continuing scan would
+/// never look again.
+///
+/// 🔑 **Because it restarts, at most one earlier point can ever match.** When the scan reaches an
+/// index, no two earlier points are equal — if they were it would have stopped at the second of
+/// them. So taking the last match rather than the first is a mutation nothing can kill, and that
+/// is a property of the algorithm rather than a gap in the corpus.
+///
+/// ⚠️ **A zero-length step charges nothing and gives nothing back.** The vertical arm guards
+/// against the two points being identical; the horizontal arm needs no guard, because it is only
+/// reached when the columns differ.
+///
+/// ⚠️ The points beyond the loop are copied **down** over it and the length reduced — the buffer
+/// keeps its size, so anything past the new length is stale and must not be read.
+pub fn remove_loops(
+    grid: &mut EstimateGrid,
+    grids: &mut [(i32, i32)],
+    routelen: &mut usize,
+    edge_cost: i8,
+) -> usize {
+    let cost = f64::from(edge_cost);
+    let mut removed = 0usize;
+    let mut i = 1usize;
+
+    while i <= *routelen {
+        let mut found = None;
+        for j in 0..i {
+            if grids[i] == grids[j] {
+                found = Some(j);
+                break;
+            }
+        }
+        let Some(j) = found else {
+            i += 1;
+            continue;
+        };
+
+        for k in j..i {
+            let ((ax, ay), (bx, by)) = (grids[k], grids[k + 1]);
+            if ax == bx {
+                if ay != by {
+                    grid.update_usage_v(ax, ay.min(by), -cost);
+                }
+            } else {
+                grid.update_usage_h(ax.min(bx), ay, -cost);
+            }
+        }
+
+        let mut cnt = 1usize;
+        for k in i + 1..=*routelen {
+            grids[j + cnt] = grids[k];
+            cnt += 1;
+        }
+        *routelen -= i - j;
+        removed += 1;
+        // ⛔ Back to the start, not on from here.
+        i = 1;
+    }
+    removed
+}
