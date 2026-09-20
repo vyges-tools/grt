@@ -329,3 +329,31 @@ gate.
 ⚠️ The length sorted on is the **routed** length — how many steps the current path takes — not the
 distance between the endpoints. A detour therefore raises an edge's priority, and a zero-length
 route sorts last rather than being skipped.
+
+## `setupheap.json` — seeding both search frontiers
+
+1,059 setups from four designs, each carrying the net's whole tree — every node with its
+neighbours and the edge reaching each, and every edge with its current route — plus the search
+region and both frontiers **in push order**.
+
+The edge being re-routed splits its net's tree in two. Everything already routed on one side
+becomes a source, everything on the other a destination, which is what makes the search that
+follows multi-source and multi-destination rather than point to point.
+
+⛔ **Push order is the behaviour under test.** Every seed is given a distance of zero, so the heap
+is entirely ties and pop order is decided by insertion alone. Comparing the frontiers as sets
+would pass an implementation that searches in a different order.
+
+⚠️ **309 of the setups have part of the subtree outside the search region**, so the region test is
+decided by the corpus rather than assumed — and that count is asserted, because a corpus whose
+regions always contain the whole subtree would say nothing about it.
+
+### Two mutations that cannot be killed, both for structural reasons
+
+| mutation | why nothing can kill it |
+| --- | --- |
+| a two-pin net runs the full traversal | every two-pin net has **exactly two nodes and one edge**, so the traversal has nowhere to go. The shortcut is an optimisation, not a different rule. |
+| `visited` marked on enqueue rather than dequeue | every captured net satisfies `edges == nodes - 1` — a proper tree — so each node has one parent and nothing is enqueued twice. |
+
+Both are transcribed as the reference writes them. The second is worth keeping as written: the
+reference **relies** on that invariant rather than enforcing it.
