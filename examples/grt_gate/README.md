@@ -34,23 +34,27 @@ compared against.
 `is_connected_to_term` flag that the guide file does not record. 1,414 of the 3,848 guides are
 marked.
 
-## ⬜ What this corpus cannot discriminate
+## `cases/` — four more designs, each for a path the main one does not walk
 
-Three rules can each be replaced by a plausible wrong one and this design produces **identical
-output**. Mutation testing found all three; the passing gate found none of them.
-
-| rule | a wrong version that also passes | why it passes here |
+| case | nets | why it is here |
 | --- | --- | --- |
-| the **first** guide to reach a pin's route point claims it | mark every guide that touches one | no net touches one of its own pin points twice |
-| locality compares **position only** | compare the layer as well | no net has two pins at one point on different layers |
-| a net with **no pins** is local | say it is not | no net has zero pins |
+| ⭐ `pin_access1` | 15 | **closes two coverage gaps** the 563-net design could not: a pin route point touched twice, and a net with two pins at one point on different layers. Also the access-point path in pin derivation, on every pin |
+| `pin_track_not_aligned` | 1 (2 pins) | the **only** case found that reaches the instance-edge path, and it also reaches the pad/macro fallback |
+| `macro_obs_not_aligned` | 1 | pad/macro fallback |
+| `modeling_instance_obs` | 2 | pad/macro fallback |
 
-Synthetic cases in `tests/guides.rs` and `tests/init.rs` cover all three, and
-`the_corpus_CANNOT_DISCRIMINATE_these_three_rules_and_says_so` asserts the three counts are zero —
-so a richer design announces that a gap has closed rather than leaving it to be rediscovered.
+Each carries its own `corpus.json`, `guideok` and `connected.ok`, all captured from the same run
+and each verified identical to the golden that ships with the reference's own suite.
 
-⟹ This design is small and well behaved. A second corpus should be chosen for what it makes
-*different*, not for being bigger.
+🔑 **19 nets against the main design's 563, and they are what made two undecidable rules
+decidable.** Coverage is not size — `overlapping_edges` evaluates 24,328 pins and adds nothing.
+
+## ⬜ The one gap that remains
+
+A net with **no pins** is local. No design here has one, so replacing that rule with "a pinless
+net is not local" still produces identical output everywhere; only a synthetic case covers it.
+`ONE_gap_remains_of_the_three_and_the_suite_says_which` asserts the count, so adding such a design
+makes the suite say so.
 
 ## `net_order.ok` — a second corpus, chosen on exactly that criterion
 

@@ -15,8 +15,37 @@ fn pin(layer: i32, x: i32, y: i32) -> Pin {
     Pin { connection_layer: layer, on_grid_x: x, on_grid_y: y }
 }
 
+/// The extra designs, each added for a path the main one does not walk.
+///
+/// ⚠️ **`pin_access1` is why this list exists here too.** The end-to-end gate takes `is_local`
+/// from the corpus as an INPUT, so mutating the rule cannot move it — only this test exercises
+/// the rule, and on the main design alone it could not tell "compare position" from "compare
+/// position and layer". `pin_access1` has a net with two pins at one point on different layers,
+/// so here it can.
+const EXTRA_CORPORA: &[(&str, &str)] = &[
+    ("pin_access1", include_str!("../examples/grt_gate/cases/pin_access1.corpus.json")),
+    ("pin_track_not_aligned", include_str!("../examples/grt_gate/cases/pin_track_not_aligned.corpus.json")),
+    ("macro_obs_not_aligned", include_str!("../examples/grt_gate/cases/macro_obs_not_aligned.corpus.json")),
+    ("modeling_instance_obs", include_str!("../examples/grt_gate/cases/modeling_instance_obs.corpus.json")),
+];
+
 #[test]
-fn is_local_matches_the_REFERENCE_on_every_net_of_a_whole_design() {
+fn is_local_matches_the_REFERENCE_on_FIVE_designs() {
+    // The extra designs first: one of them is the only reason this test can distinguish the rule
+    // from a plausible wrong one.
+    for (name, corpus) in EXTRA_CORPORA {
+        let v: serde_json::Value = serde_json::from_str(corpus).unwrap();
+        for net in v["nets"].as_array().unwrap() {
+            let pins: Vec<Pin> = net["pins"].as_array().unwrap().iter().map(|p| Pin {
+                connection_layer: p["connection_layer"].as_i64().unwrap() as i32,
+                on_grid_x: p["on_grid_x"].as_i64().unwrap() as i32,
+                on_grid_y: p["on_grid_y"].as_i64().unwrap() as i32,
+            }).collect();
+            assert_eq!(is_local(&pins), net["is_local"].as_bool().unwrap(),
+                "{name}, net {}: is_local", net["name"].as_str().unwrap());
+        }
+    }
+
     let v: serde_json::Value = serde_json::from_str(CORPUS).unwrap();
     let mut checked = 0;
     let mut local = 0;
@@ -290,4 +319,28 @@ fn an_ODD_cell_size_puts_the_centre_half_a_unit_LOW() {
     // position by one unit on an odd-sized grid.
     let g = init_grid(Rect::new(0, 0, 900, 900), 101, 10, -1);
     assert_eq!(g.position_on_grid(0, 0), (50, 50), "101/2 == 50, not 51");
+}
+
+
+#[test]
+fn the_EXTRA_corpora_close_the_layer_blindness_gap() {
+    // ⭐ Asserted, so the coverage cannot quietly regress if a corpus is regenerated. On the main
+    // design this count is 0 and the rule is undecidable; here it is not.
+    let mut with_two_layers_at_one_point = 0;
+    for (_, corpus) in EXTRA_CORPORA {
+        let v: serde_json::Value = serde_json::from_str(corpus).unwrap();
+        for net in v["nets"].as_array().unwrap() {
+            let mut by_xy: std::collections::BTreeMap<(i64, i64), std::collections::BTreeSet<i64>>
+                = std::collections::BTreeMap::new();
+            for p in net["pins"].as_array().unwrap() {
+                by_xy.entry((p["on_grid_x"].as_i64().unwrap(), p["on_grid_y"].as_i64().unwrap()))
+                    .or_default()
+                    .insert(p["connection_layer"].as_i64().unwrap());
+            }
+            if by_xy.values().any(|l| l.len() > 1) { with_two_layers_at_one_point += 1; }
+        }
+    }
+    assert_eq!(with_two_layers_at_one_point, 1,
+        "exactly one net across the extra designs pins two layers at one point; it is what makes \
+         `is_local` decidable");
 }

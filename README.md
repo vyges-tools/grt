@@ -13,8 +13,11 @@ guide records.
 not. The crate is useful today as the guide-geometry half of a routing flow, and as a reference
 for exactly how guide rectangles are derived from grid coordinates.
 
-✅ **Validated end to end.** Over a whole design — 563 nets, 3,770 segments — every one of the
-3,848 guides matches the output of a published global router, per net and in order. The golden was
+✅ **Validated end to end, over five designs.** On the main one — 563 nets, 3,770 segments —
+every one of the 3,848 guides matches the output of a published global router, per net and in
+order. Four smaller designs add 19 nets and 329 guides, each chosen for a path the first does not
+walk; **two rules that were previously undecidable became decidable** because of one 15-net
+addition. The golden was
 verified byte-identical to the one shipping with that router's own test suite before it was
 committed. See `examples/grt_gate/`.
 
@@ -25,11 +28,13 @@ The gate is control-verified: widening the guide box, removing the two-guide via
 guide order within a net, swapping which guide a via's two ends mark, and sharing the pin-claim
 set between nets each make it fail, with the diagnostic naming which.
 
-⬜ **Three rules it cannot see**, and the crate says so rather than implying otherwise — the
-pin-claim tie-break, locality ignoring the layer, and a pinless net being local. Each can be
-replaced by a plausible wrong rule and this design produces identical output. Synthetic cases
-cover all three, and a test asserts the corpus counts so a richer design announces when a gap
-closes. Mutation testing found all three; the passing gate found none of them.
+⬜ **One rule the suite still cannot see**: a pinless net is local. No design here has such a
+net, so a wrong version of that rule produces identical output everywhere; a synthetic case covers
+it and a test asserts the count, so adding such a design says so.
+
+Two sibling gaps — the pin-claim tie-break and locality ignoring the layer — were in the same
+state and are now **closed**, each verified by the mutation that previously slipped through.
+Mutation testing found all three; the passing gate found none of them.
 
 ## What it does
 

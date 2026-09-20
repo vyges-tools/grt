@@ -34,6 +34,34 @@ use std::collections::BTreeMap;
 use vyges_grt::*;
 
 const CORPUS: &str = include_str!("../examples/grt_gate/corpus.json");
+
+/// ⭐ Four more designs, each chosen because it walks a path the first one does not.
+///
+/// `pin_access1` is the one that pays: **15 nets**, and it closes two coverage gaps that 563
+/// nets could not — a net whose pin route point is touched twice, and a net with two pins at one
+/// point on different layers. `pin_track_not_aligned` is a **single net, two pins**, and is the
+/// only case found that reaches the instance-edge path in pin derivation.
+const CASES: &[(&str, &str, &str)] = &[
+    ("pin_access1",
+     include_str!("../examples/grt_gate/cases/pin_access1.corpus.json"),
+     include_str!("../examples/grt_gate/cases/pin_access1.guideok")),
+    ("pin_track_not_aligned",
+     include_str!("../examples/grt_gate/cases/pin_track_not_aligned.corpus.json"),
+     include_str!("../examples/grt_gate/cases/pin_track_not_aligned.guideok")),
+    ("macro_obs_not_aligned",
+     include_str!("../examples/grt_gate/cases/macro_obs_not_aligned.corpus.json"),
+     include_str!("../examples/grt_gate/cases/macro_obs_not_aligned.guideok")),
+    ("modeling_instance_obs",
+     include_str!("../examples/grt_gate/cases/modeling_instance_obs.corpus.json"),
+     include_str!("../examples/grt_gate/cases/modeling_instance_obs.guideok")),
+];
+
+const CASE_CONNECTED: &[(&str, &str)] = &[
+    ("pin_access1", include_str!("../examples/grt_gate/cases/pin_access1.connected.ok")),
+    ("pin_track_not_aligned", include_str!("../examples/grt_gate/cases/pin_track_not_aligned.connected.ok")),
+    ("macro_obs_not_aligned", include_str!("../examples/grt_gate/cases/macro_obs_not_aligned.connected.ok")),
+    ("modeling_instance_obs", include_str!("../examples/grt_gate/cases/modeling_instance_obs.connected.ok")),
+];
 const GOLDEN: &str = include_str!("../examples/grt_gate/grt_gate.ok");
 /// ⛔ A SECOND golden, because the guide file does not record `is_connected_to_term`. One line
 /// per net: the net's name and one character per guide, in guide-file order.
@@ -79,7 +107,11 @@ struct Corpus {
 }
 
 fn parse_corpus() -> Corpus {
-    let v: serde_json::Value = serde_json::from_str(CORPUS).expect("corpus parses");
+    parse_corpus_text(CORPUS)
+}
+
+fn parse_corpus_text(text: &str) -> Corpus {
+    let v: serde_json::Value = serde_json::from_str(text).expect("corpus parses");
     let g = &v["grid"];
     let a = g["area"].as_array().unwrap();
     let n = |x: &serde_json::Value| x.as_i64().unwrap() as i32;
@@ -200,62 +232,34 @@ fn the_connected_to_term_flag_matches_the_REFERENCE_on_every_guide() {
 }
 
 #[test]
-fn the_corpus_CANNOT_DISCRIMINATE_these_three_rules_and_says_so() {
-    // ⬜ **Three measured gaps, kept as one test so they cannot quietly become false assurance.**
+fn ONE_gap_remains_of_the_three_and_the_suite_says_which() {
+    // 🔑 Three rules could once each be replaced by a plausible wrong one with identical output.
+    // Mutation testing found all three; the passing gate found none. Two are now CLOSED by adding
+    // `pin_access1` — 15 nets, where the main design's 563 could not decide either:
     //
-    // Each of these rules can be replaced by a plausible wrong one and this design produces
-    // IDENTICAL output. Mutation testing found all three; the passing gate found none of them.
-    //
-    // | rule | wrong version that also passes | why it passes here |
+    // | rule | closed by | verified |
     // | --- | --- | --- |
-    // | first guide to reach a pin point claims it | mark every guide that touches one | no net touches one of its own pin points twice |
-    // | `is_local` compares position only | compare the layer too | no net has two pins at one point on different layers |
-    // | a net with no pins is local | say it is not | no net has zero pins |
+    // | first guide to reach a pin point claims it | `pin_access1` (1 repeated point) | the mutation now fails `the_connected_flag_matches_..._FOUR_MORE_DESIGNS` |
+    // | `is_local` compares position only | `pin_access1` (1 net, 2 layers at a point) | the mutation now fails `is_local_matches_the_REFERENCE_on_FIVE_designs` |
+    // | ⬜ **a net with no pins is local** | **nothing yet** | only a synthetic case covers it |
     //
-    // Synthetic cases in `tests/guides.rs` and `tests/init.rs` cover all three. ⚠️ The counts are
-    // asserted rather than described, so a richer corpus ANNOUNCES that a gap has closed instead
-    // of leaving it to be rediscovered.
-    let c = parse_corpus();
-
-    let mut repeated_pin_points = 0;
-    let mut same_point_other_layer = 0;
+    // ⚠️ This asserts the REMAINING gap, so adding a design with a pinless net will make it fail
+    // and the last gap gets closed rather than forgotten.
     let mut pinless = 0;
-    for net in &c.nets {
-        if net.pins.is_empty() {
-            pinless += 1;
-        }
-        let mut by_xy: BTreeMap<(i32, i32), std::collections::BTreeSet<i32>> = BTreeMap::new();
-        for p in &net.pins {
-            by_xy.entry((p.on_grid_x, p.on_grid_y)).or_default().insert(p.connection_layer);
-        }
-        if by_xy.values().any(|layers| layers.len() > 1) {
-            same_point_other_layer += 1;
-        }
-
-        let pin_pts: std::collections::BTreeSet<RoutePt> = net.pins.iter()
-            .map(|p| RoutePt { x: p.on_grid_x, y: p.on_grid_y, layer: p.connection_layer })
-            .collect();
-        let mut hits: BTreeMap<RoutePt, usize> = BTreeMap::new();
-        for sg in &net.segments {
-            for pt in [RoutePt { x: sg.init_x, y: sg.init_y, layer: sg.init_layer },
-                       RoutePt { x: sg.final_x, y: sg.final_y, layer: sg.final_layer }] {
-                if pin_pts.contains(&pt) {
-                    *hits.entry(pt).or_default() += 1;
-                }
-            }
-        }
-        repeated_pin_points += hits.values().filter(|n| **n > 1).count();
+    let mut corpora = 1;
+    for net in &parse_corpus().nets {
+        if net.pins.is_empty() { pinless += 1; }
     }
-
-    assert_eq!(repeated_pin_points, 0,
-        "a pin route point is now touched more than once ({repeated_pin_points}x): the \
-         first-claim tie-break is witnessed end to end at last — update this test and the README");
-    assert_eq!(same_point_other_layer, 0,
-        "{same_point_other_layer} net(s) now have two pins at one point on different layers: \
-         is_local's layer-blindness is witnessed — update this test and the README");
+    for (_, corpus, _) in CASES {
+        corpora += 1;
+        for net in &parse_corpus_text(corpus).nets {
+            if net.pins.is_empty() { pinless += 1; }
+        }
+    }
+    assert_eq!(corpora, 5, "five designs are scored");
     assert_eq!(pinless, 0,
-        "{pinless} net(s) now have no pins: the empty-net locality rule is witnessed — \
-         update this test and the README");
+        "a design here now has a pinless net ({pinless}): the empty-net locality rule is \
+         witnessed at last — close the gap and update this test");
 }
 
 #[test]
@@ -267,4 +271,105 @@ fn the_corpus_actually_REACHES_the_two_guide_via_form() {
     assert!(local > 0, "no local nets: the two-guide via form is unexercised");
     let with_pins = c.nets.iter().filter(|n| !n.pins.is_empty()).count();
     assert!(with_pins > 0, "no pins: the covering-pin test is unexercised");
+}
+
+
+/// Compare one design's guides, per net and in order. Returns (nets, guides) checked.
+fn check_design(name: &str, corpus: &str, golden_text: &str) -> (usize, usize) {
+    let c = parse_corpus_text(corpus);
+    let golden = parse_golden(golden_text);
+    let produced = save_guides(&c.nets, &c.grid, &c.opts)
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+
+    let (mut nets, mut guides) = (0, 0);
+    for net in &produced {
+        let want = golden.get(&net.net)
+            .unwrap_or_else(|| panic!("{name}: net {} is in the corpus but not the golden", net.net));
+        let got: Vec<GuideLine> = net.guides.iter().map(|g| (
+            g.box_.x_min, g.box_.y_min, g.box_.x_max, g.box_.y_max,
+            c.layers.get(&g.layer).expect("a routing level with no layer name").clone(),
+        )).collect();
+        assert_eq!(got.len(), want.len(),
+            "{name}, net {}: produced {} guides, the reference produced {}", net.net, got.len(), want.len());
+        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert_eq!(g, w, "{name}, net {}, guide {i}", net.net);
+        }
+        nets += 1;
+        guides += got.len();
+    }
+    assert_eq!(nets, golden.len(), "{name}: every net in the golden must have been checked");
+    (nets, guides)
+}
+
+#[test]
+fn every_guide_of_FOUR_MORE_DESIGNS_matches_the_reference() {
+    // ⭐ Each of these was picked for a path it walks that the main design does not. Together
+    // they are 19 nets against that design's 563 — coverage is not size.
+    let mut total_nets = 0;
+    let mut total_guides = 0;
+    for (name, corpus, golden) in CASES {
+        let (n, g) = check_design(name, corpus, golden);
+        assert!(n > 0, "{name}: produced no nets");
+        total_nets += n;
+        total_guides += g;
+    }
+    assert_eq!(total_nets, 19, "four designs, nineteen nets between them");
+    assert_eq!(total_guides, 329, "and this many guides");
+}
+
+#[test]
+fn the_connected_flag_matches_the_reference_on_FOUR_MORE_DESIGNS() {
+    let mut total = 0;
+    let mut marked = 0;
+    for (name, conn_text) in CASE_CONNECTED {
+        let corpus = CASES.iter().find(|(n, _, _)| n == name).unwrap().1;
+        let c = parse_corpus_text(corpus);
+        let produced = save_guides(&c.nets, &c.grid, &c.opts).expect("routes");
+        let want: BTreeMap<&str, &str> = conn_text.lines().filter(|l| !l.trim().is_empty())
+            .map(|l| l.rsplit_once(' ').expect("`<net> <bits>`")).collect();
+        for net in &produced {
+            let bits = want.get(net.net.as_str())
+                .unwrap_or_else(|| panic!("{name}: net {} has no flag golden", net.net));
+            let got: String = net.guides.iter()
+                .map(|g| if g.is_connected_to_term { '1' } else { '0' }).collect();
+            assert_eq!(&got, bits, "{name}, net {}: connected-to-term flags", net.net);
+            total += got.len();
+            marked += got.chars().filter(|ch| *ch == '1').count();
+        }
+    }
+    assert_eq!(total, 329);
+    assert_eq!(marked, 83, "neither all nor none");
+}
+
+#[test]
+fn pin_access1_CLOSES_two_of_the_three_gaps_the_main_design_left_open() {
+    // 🔑 The point of adding it. 15 nets close what 563 could not:
+    //   * a net whose pin route point is touched TWICE -> the first-claim tie-break is witnessed
+    //   * a net with two pins at one point on DIFFERENT LAYERS -> is_local's layer-blindness is
+    //
+    // ⬜ The third gap, a net with no pins at all, is still open on every design here.
+    let c = parse_corpus_text(CASES.iter().find(|(n, _, _)| *n == "pin_access1").unwrap().1);
+
+    let mut repeated = 0;
+    let mut same_point_other_layer = 0;
+    for net in &c.nets {
+        let mut by_xy: BTreeMap<(i32, i32), std::collections::BTreeSet<i32>> = BTreeMap::new();
+        for p in &net.pins {
+            by_xy.entry((p.on_grid_x, p.on_grid_y)).or_default().insert(p.connection_layer);
+        }
+        if by_xy.values().any(|l| l.len() > 1) { same_point_other_layer += 1; }
+
+        let pts: std::collections::BTreeSet<RoutePt> = net.pins.iter()
+            .map(|p| RoutePt { x: p.on_grid_x, y: p.on_grid_y, layer: p.connection_layer }).collect();
+        let mut hits: BTreeMap<RoutePt, usize> = BTreeMap::new();
+        for sg in &net.segments {
+            for pt in [RoutePt { x: sg.init_x, y: sg.init_y, layer: sg.init_layer },
+                       RoutePt { x: sg.final_x, y: sg.final_y, layer: sg.final_layer }] {
+                if pts.contains(&pt) { *hits.entry(pt).or_default() += 1; }
+            }
+        }
+        repeated += hits.values().filter(|n| **n > 1).count();
+    }
+    assert_eq!(repeated, 1, "the first-claim tie-break is witnessed here");
+    assert_eq!(same_point_other_layer, 1, "is_local's layer-blindness is witnessed here");
 }
