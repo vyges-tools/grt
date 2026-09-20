@@ -182,3 +182,39 @@ exact tie always goes to horizontal-first.
 wrong registers, so the first capture reported the same denormal for one bound on every design
 while the other varied correctly — which is what gave it away. All three scalars were wrong, not
 just the one that looked wrong.
+
+## `mazeconv.json` — symbolic routes walked out into grid points
+
+3,903 records from four designs, checked **point by point** rather than by length. Every one of
+the eight (shape, turn, y-ordering) combinations is present and the test asserts each has at
+least fifty records — every shape branches on the y-ordering, so a corpus missing one arm would
+validate it against nothing.
+
+⚠️ Capped at 800 records per bucket to keep the fixture small, **but never at the cost of an
+unusual record**: anything with a buffer/point mismatch, a length out of step with its geometry, a
+non-positive entry length or reversed x is kept regardless of the cap. A flat cap would silently
+drop exactly the records worth having.
+
+### The sizing invariant, asserted rather than assumed
+
+The reference sizes the point buffer from the length the edge carried **on entry** and then fills
+it from the geometry. Those are different quantities. Every shape writes exactly `manhattan + 1`
+points, so they agree only while the stored length is already the Manhattan distance — which is
+what makes the `resize` safe. The corpus asserts it holds on all 3,903 records.
+
+Two consequences, both confirmed as mutations nothing can kill:
+
+- the explicit zero-length write for a degenerate edge is **redundant** — all 301 such records
+  have coincident endpoints, so the recomputed distance is already zero;
+- `routelen` taken from the entry length is **indistinguishable** from the recomputed length.
+
+Both are kept, because they are what the reference does and what would hold if an earlier stage
+ever left the stored length out of step.
+
+### The two calls that follow
+
+Folding the estimate into the committed demand **adds** and leaves the estimate in place — pinned
+because moving it instead looks identical on a first fold and diverges on the second, and the
+router folds more than once. The runaway-usage check fires **strictly above** a whole multiple of
+the capacity, and each direction is judged against its own capacity; it is constructed, because
+it is an error path no shipped design reaches.

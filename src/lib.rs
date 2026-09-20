@@ -17,7 +17,10 @@
 pub mod estimate;
 pub mod lroute;
 pub mod spiral;
+pub mod mazeconv;
 pub mod zroute;
+pub use estimate::{check_2d_edges_usage, UsageViolation};
+pub use mazeconv::{convert_to_mazeroute, MazeRoute, SymbolicRoute};
 pub use zroute::{newroute_z, ZChoice, HCOST};
 pub use spiral::{
     propagate_alias_status, register_edges, reset_and_alias, spiral_route, chooses_y_first, traversal_order, EdgeReg,

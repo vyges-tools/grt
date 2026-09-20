@@ -23,6 +23,13 @@ pub struct EstimateGrid {
     pub y_grids: usize,
     h: Vec<f64>,
     v: Vec<f64>,
+    /// Committed demand, as distinct from the estimate above.
+    ///
+    /// ⚠️ The two are separate all the way through the estimating stages; the estimate is folded
+    /// into this one only when the router switches to maze routing, and it is **added**, not
+    /// moved — the estimate is left in place.
+    usage_h: Vec<f64>,
+    usage_v: Vec<f64>,
 }
 
 impl EstimateGrid {
@@ -32,6 +39,30 @@ impl EstimateGrid {
             y_grids,
             h: vec![0.0; x_grids.saturating_sub(1) * y_grids],
             v: vec![0.0; x_grids * y_grids.saturating_sub(1)],
+            usage_h: vec![0.0; x_grids.saturating_sub(1) * y_grids],
+            usage_v: vec![0.0; x_grids * y_grids.saturating_sub(1)],
+        }
+    }
+
+    /// Committed horizontal demand on the edge leaving cell `(x, y)`.
+    pub fn usage_h(&self, x: usize, y: usize) -> f64 {
+        self.usage_h[y * self.h_columns() + x]
+    }
+    /// Committed vertical demand on the edge leaving cell `(x, y)`.
+    pub fn usage_v(&self, x: usize, y: usize) -> f64 {
+        self.usage_v[y * self.x_grids + x]
+    }
+
+    /// Fold the estimate into the committed demand — the reference's `addEstUsageToUsage`.
+    ///
+    /// ⛔ **Adds rather than replaces, and leaves the estimate untouched.** Every edge is visited,
+    /// including ones no net ever reached.
+    pub fn add_est_usage_to_usage(&mut self) {
+        for (u, e) in self.usage_h.iter_mut().zip(self.h.iter()) {
+            *u += *e;
+        }
+        for (u, e) in self.usage_v.iter_mut().zip(self.v.iter()) {
+            *u += *e;
         }
     }
     /// Number of horizontal edges across: one fewer than the cell columns.
@@ -219,4 +250,51 @@ pub fn commit_l_shape(grid: &mut EstimateGrid, seg: &Segment, shape: LShape) {
             grid.update_v(seg.x1, ymin, ymax, -half);
         }
     }
+}
+
+/// One edge whose committed demand has run past what the check allows.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UsageViolation {
+    pub x: usize,
+    pub y: usize,
+    pub horizontal: bool,
+    pub usage: f64,
+    pub limit: i32,
+}
+
+/// How many times a layer's capacity an edge may carry before the check fires.
+const MAX_USAGE_MULTIPLIER: i32 = 100;
+
+/// Check no edge's committed demand has run away — the reference's `check2DEdgesUsage`.
+///
+/// ⚠️ **Strictly greater than the limit**, and the limit is a whole multiple of the capacity, so
+/// an edge sitting exactly on it passes.
+///
+/// The reference raises an error per offending edge (GRT-228 horizontal, GRT-229 vertical) and
+/// stops. Violations are returned here instead, so a caller can report them all and so the rule
+/// is testable without a design that triggers it — no shipped design does.
+pub fn check_2d_edges_usage(
+    grid: &EstimateGrid,
+    h_capacity: i32,
+    v_capacity: i32,
+) -> Vec<UsageViolation> {
+    let mut out = Vec::new();
+    let (h_limit, v_limit) = (MAX_USAGE_MULTIPLIER * h_capacity, MAX_USAGE_MULTIPLIER * v_capacity);
+    for y in 0..grid.y_grids {
+        for x in 0..grid.h_columns() {
+            let usage = grid.usage_h(x, y);
+            if usage > f64::from(h_limit) {
+                out.push(UsageViolation { x, y, horizontal: true, usage, limit: h_limit });
+            }
+        }
+    }
+    for y in 0..grid.v_rows() {
+        for x in 0..grid.x_grids {
+            let usage = grid.usage_v(x, y);
+            if usage > f64::from(v_limit) {
+                out.push(UsageViolation { x, y, horizontal: false, usage, limit: v_limit });
+            }
+        }
+    }
+    out
 }
