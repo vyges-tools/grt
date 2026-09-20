@@ -41,6 +41,8 @@ pub struct MazeNode {
     pub y: i32,
     /// Adjacent nodes and the tree edge reaching each, in the reference's stored order.
     pub neighbours: Vec<(usize, usize)>,
+    /// The node whose connection state this one shares — see the outward walk's aliasing.
+    pub stack_alias: usize,
 }
 
 /// One tree edge's current route.
@@ -490,6 +492,9 @@ pub fn backtrace(s: &MazeSearch, cross: (i32, i32)) -> Vec<(i32, i32)> {
 pub struct SurgeryEdge {
     pub n1: usize,
     pub n2: usize,
+    /// The endpoints' alias nodes, carried alongside the endpoints themselves.
+    pub n1a: usize,
+    pub n2a: usize,
     pub routelen: usize,
     pub grids: Vec<(i32, i32)>,
     /// `false` for a degenerate edge that was never routed.
@@ -801,6 +806,146 @@ pub fn charge_route(grid: &mut EstimateGrid, grids: &[(i32, i32)], edge_cost: i8
             grid.update_usage_v(ax, ay.min(by), cost);
         } else {
             grid.update_usage_h(ax.min(bx), ay, cost);
+        }
+    }
+}
+
+/// Give a pin a stand-in that can move in its place — the reference's `splitEdge`.
+///
+/// A pin cannot be relocated, so when the search wants its position to change, a **duplicate node
+/// is created at the same coordinates** and joined to the pin by a **zero-length edge**. The
+/// duplicate takes over the pin's connections and moves instead; the pin stays where it is.
+///
+/// ⛔ **The duplicate inherits the pin's alias**, not its own identity, so the two share
+/// connection state exactly as coincident nodes do elsewhere.
+///
+/// ⚠️ **The pin's neighbour list shrinks.** The far node is rebuilt onto the duplicate and the
+/// caller's node is dropped entirely, so the pin ends with one fewer neighbour than it began.
+///
+/// Returns the new node's index — which the caller uses in place of the pin from then on.
+pub fn split_edge(
+    nodes: &mut Vec<MazeNode>,
+    edges: &mut Vec<SurgeryEdge>,
+    n1: usize,
+    n2: usize,
+    edge_n1n2: usize,
+) -> usize {
+    let (n2x, n2y) = (nodes[n2].x, nodes[n2].y);
+    let new_node_id = nodes.len();
+    let new_edge_id = edges.len();
+    let alias = nodes[n2].stack_alias;
+
+    // ⚠️ The neighbour handed over is the first one that is not the caller — taken by position,
+    // so which one it is depends on the stored order.
+    let (nbr, edge_n2_nbr) = if nodes[n2].neighbours[0].0 == n1 {
+        nodes[n2].neighbours[1]
+    } else {
+        nodes[n2].neighbours[0]
+    };
+
+    // Rebuild the pin's list: the caller is dropped, and the handed-over neighbour is replaced by
+    // the duplicate.
+    let rebuilt: Vec<(usize, usize)> = nodes[n2]
+        .neighbours
+        .iter()
+        .filter(|(v, _)| *v != n1)
+        .map(|&(v, e)| if v == nbr { (new_node_id, new_edge_id) } else { (v, e) })
+        .collect();
+    nodes[n2].neighbours = rebuilt;
+
+    // Both edges that met at the pin now meet at the duplicate.
+    for eid in [edge_n2_nbr, edge_n1n2] {
+        if edges[eid].n1 == n2 {
+            edges[eid].n1 = new_node_id;
+            edges[eid].n1a = alias;
+        } else {
+            edges[eid].n2 = new_node_id;
+            edges[eid].n2a = alias;
+        }
+    }
+
+    // ⚠️ Only the neighbour ITSELF is re-pointed on these two, not the edge beside it — the edge
+    // is unchanged, only which node sits at its far end.
+    for node in [nbr, n1] {
+        for entry in nodes[node].neighbours.iter_mut() {
+            if entry.0 == n2 {
+                entry.0 = new_node_id;
+            }
+        }
+    }
+
+    edges.push(SurgeryEdge {
+        n1: new_node_id,
+        n2,
+        n1a: alias,
+        n2a: nodes[n2].stack_alias,
+        routelen: 0,
+        grids: vec![(n2x, n2y)],
+        is_maze_route: true,
+        len: 0,
+    });
+    nodes.push(MazeNode {
+        x: n2x,
+        y: n2y,
+        // ⛔ Three neighbours in this order: the handed-over one, the pin, then the caller.
+        neighbours: vec![(nbr, edge_n2_nbr), (n2, new_edge_id), (n1, edge_n1n2)],
+        stack_alias: alias,
+    });
+    new_node_id
+}
+
+/// Re-point the tree after a node has moved onto a different edge.
+///
+/// The grids were rewritten by the surgery; this is the other half — the endpoints of the three
+/// recycled edges, and the adjacency of the **five** nodes involved.
+///
+/// ⛔ **The moved node's list is rebuilt wholesale**, not patched: it keeps its link to the far
+/// endpoint of the edge being re-routed and takes the two ends of the edge it landed on. Its
+/// former neighbours are joined to each other instead.
+#[allow(clippy::too_many_arguments)]
+pub fn rewire_after_type2(
+    nodes: &mut [MazeNode],
+    edges: &mut [SurgeryEdge],
+    n1: usize,
+    n2: usize,
+    a1: usize,
+    a2: usize,
+    c1: usize,
+    c2: usize,
+    edge_n1n2: usize,
+    edge_n1a1: usize,
+    edge_n1a2: usize,
+    edge_c1c2: usize,
+) {
+    let (edge_n1c1, edge_n1c2, edge_a1a2) = (edge_n1a1, edge_n1a2, edge_c1c2);
+
+    edges[edge_n1c1].n1 = c1;
+    edges[edge_n1c1].n2 = n1;
+    edges[edge_n1c2].n1 = n1;
+    edges[edge_n1c2].n2 = c2;
+    edges[edge_a1a2].n1 = a1;
+    edges[edge_a1a2].n2 = a2;
+
+    nodes[n1].neighbours = vec![(n2, edge_n1n2), (c1, edge_n1c1), (c2, edge_n1c2)];
+
+    // ⚠️ Each of the other four keeps its own list and replaces exactly one entry — the first
+    // match, which is what the reference's `break` means.
+    //
+    // 🔑 Replacing every match instead is a mutation nothing can kill, and the reason is
+    // structural: a node's neighbours are distinct, so there is never more than one match.
+    // Measured across 11,084 captured neighbour lists, not one holds a duplicate. Transcribed as
+    // the reference writes it, because the reference relies on that rather than enforcing it.
+    //
+    // ⛔ The ORDER of these four does matter, and is not structural: 301 of the captured
+    // rewirings have two of them touching the same node, where whichever runs first wins.
+    for (node, from, to, edge) in [
+        (a1, n1, a2, edge_a1a2),
+        (a2, n1, a1, edge_a1a2),
+        (c1, c2, n1, edge_n1c1),
+        (c2, c1, n1, edge_n1c2),
+    ] {
+        if let Some(entry) = nodes[node].neighbours.iter_mut().find(|e| e.0 == from) {
+            *entry = (to, edge);
         }
     }
 }

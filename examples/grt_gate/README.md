@@ -509,3 +509,34 @@ via for turning at a source. Both are transcribed, and neither survivor is a cor
 
 ⚠️ The cell index is decomposed with the distance grid's **allocated** row stride, not the
 design's grid width — a thousand here, against a design barely thirty wide.
+
+## `splitedge.json` and `rewire.json` — rebuilding the tree around a moved node
+
+**100 splits** and **509 rewirings** from four designs. Both compare the **whole tree** before and
+after — every node's neighbours and every edge's endpoints — not just the part that changed. A
+rebuild that re-points four of five nodes still leaves a tree, and still a wrong one.
+
+### The pin stand-in
+
+A pin cannot be relocated, so a duplicate node is created at the same coordinates and joined to it
+by a **zero-length edge**; the duplicate takes over the pin's connections and moves instead.
+
+⛔ The stand-in **inherits the pin's alias** rather than taking its own, so the two share
+connection state exactly as coincident nodes do elsewhere in this engine.
+
+⚠️ The pin's neighbour list **shrinks** — the caller is dropped outright and another entry is
+rebuilt onto the stand-in. All four shapes are present: the pin holding two or three neighbours,
+with the caller first in its list or not.
+
+### The rewiring, and where order matters
+
+⛔ **301 of the 509 rewirings have the four surrounding nodes NOT all distinct** — a neighbour of
+the moved node is also an endpoint of the edge it landed on. Each patch replaces the **first**
+matching entry, so where two of them touch the same node, the order they run in decides the
+answer. Reordering them fails the gate; that count is asserted, because a corpus of only distinct
+cases would say nothing about it.
+
+🔑 Replacing **every** match rather than the first is a mutation nothing can kill, and that one is
+structural: a node's neighbours are distinct, so there is never more than one match. Measured
+across 11,084 captured neighbour lists, not one holds a duplicate. Transcribed as written, because
+the reference relies on that rather than enforcing it.
