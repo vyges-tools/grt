@@ -13,6 +13,14 @@ guide records.
 not. The crate is useful today as the guide-geometry half of a routing flow, and as a reference
 for exactly how guide rectangles are derived from grid coordinates.
 
+✅ **Validated end to end.** Over a whole design — 563 nets, 3,770 segments — every one of the
+3,848 guides matches the output of a published global router, per net and in order. The golden was
+verified byte-identical to the one shipping with that router's own test suite before it was
+committed. See `examples/grt_gate/`.
+
+The gate is control-verified: widening the guide box, removing the two-guide via form, or
+reversing guide order within a net each make it fail, with the diagnostic naming which.
+
 ## What it does
 
 ```rust

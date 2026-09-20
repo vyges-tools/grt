@@ -14,6 +14,11 @@
 //! stage runs, so a divergence can be pointed at one line rather than bisected. The per-segment
 //! rules live in [`guides_for_segment`], the geometry in [`global_routing_to_box`].
 
+#[cfg(feature = "odb")]
+pub mod apply;
+#[cfg(feature = "odb")]
+pub use apply::apply_guides;
+
 /// An inclusive rectangle in database units.
 ///
 /// ⚠️ Normalised on construction — `(x1, x2)` is stored as `(min, max)` — because the database
