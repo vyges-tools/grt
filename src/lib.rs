@@ -17,7 +17,9 @@
 pub mod estimate;
 pub mod lroute;
 pub mod spiral;
+pub mod mazecost;
 pub mod mazeconv;
+pub use mazecost::{cost_table, get_cost, CostParams};
 pub mod monotonic;
 pub use monotonic::{monotonic_box, monotonic_cost_table, route_monotonic, walk_monotonic_route, MonotonicRoute};
 pub mod zroute;

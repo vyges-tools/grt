@@ -288,3 +288,30 @@ walked gate only sees routes already expanded into points. It is pinned by the p
 matters: **routing a Z and then ripping it up returns the grid exactly to its previous state.**
 The charge and the undo are written in different modules from different reference functions, so
 they agree only if both are right.
+
+## `mazecost.json` — the maze router's edge-cost tables
+
+18 distinct builds from three designs, spanning every slope, capacity pair and curve shape the
+congestion loop produced, with **every entry** as raw IEEE bits.
+
+⛔ **Carrying every entry rather than a sample was the point.** The curve is a logistic, and `exp`
+is the one place two correct implementations may legitimately differ in the last place. Across
+all 167,960 entries originally captured, this crate reproduces the reference **bit for bit** — so
+these curves need no tolerance anywhere in the pipeline.
+
+### Two tables, not one
+
+⚠️ Each direction is priced against **its own** capacity. The monotonic stage earlier in the
+pipeline prices vertical edges from the *horizontal* table; this stage does not, and the obvious
+mistake is to carry that over. The corpus makes it visible because the two capacities differ on
+every captured design.
+
+⚠️ The span is **forty** times capacity, where the monotonic table spans ten and the runaway-usage
+check allows a hundred — three different multiples in three places, none derived from the others.
+
+### A boundary with nothing to catch
+
+The ramp past capacity contributes exactly zero at capacity, so the two pieces meet continuously.
+Both `index > capacity` and `index > capacity - 1` reproduce every captured entry — the first
+because the term it skips is zero, the second because it is the same condition written
+differently. Neither is a corpus gap.
