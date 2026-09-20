@@ -357,3 +357,46 @@ regions always contain the whole subtree would say nothing about it.
 
 Both are transcribed as the reference writes them. The second is worth keeping as written: the
 reference **relies** on that invariant rather than enforcing it.
+
+## `relax.json` — one step of the search
+
+6,752 relaxations from three designs across **69 branch buckets**: both flags, all four
+directions, first arrival against improvement against refusal, and with and without carried-over
+usage.
+
+Everything the step writes is compared — the new distance, **both** parent pairs, the flag saying
+which pair holds the parent, and the two hyper flags. A step that computes the right distance and
+records the wrong parent routes correctly and then backtraces wrongly.
+
+### Three inputs that had to be captured, not guessed
+
+Each was found by a failing test, and each is a value the step reads that nothing else records:
+
+| value | why it cannot be inferred |
+| --- | --- |
+| the distance of the cell **behind** the current one | the detour test reads a third distance, distinct from the current and the adjacent |
+| the cost parameters in force | they change every congestion iteration |
+| the hyper flags **before** the step | the first capture read them after the block that sets them, so the trace showed zero transitions |
+
+⟹ The last is the same mistake this corpus already has a rule about: capture the before-state
+**before** the mutation, not merely before the write you happen to be looking at.
+
+### The via guard is redundant, and only the call sequence shows it
+
+Read alone, the step says a turn is free at a source. Read from its caller, that case never
+arrives: the caller derives the flag as `pre != cur` and initialises `pre` **to `cur`** exactly
+when the distance is zero. Measured: of 1,855 relaxations starting from a source, **none**
+requests a via, and removing the guard is a mutation nothing can kill.
+
+### Other findings
+
+- ⛔ **The detour test truncates to an integer** before comparing against a double, so it is
+  coarser than it looks. Un-truncating it fails the gate.
+- ⛔ **The usage blends two rounds**: this one's plus `L` times the previous one's. The
+  carried-over component is non-zero on about a tenth of the calls, so both the blend and its
+  weight are decided by the corpus.
+- ⚠️ **An equal-cost path is refused, not accepted.** Only one captured case offers an exactly
+  equal cost and the distance is unchanged either way — what differs is the parent. Pinned by a
+  constructed case.
+- ⚠️ `removeMin` is **not** the idiomatic swap-pop-sift: the tail is copied to the root and the
+  heap repaired while the stale element is still present, so it takes part in comparisons.

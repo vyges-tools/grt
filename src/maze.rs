@@ -159,3 +159,257 @@ pub fn setup_heap(
     walk(n2, n1, &mut h.dest, &mut h.corr_edge, &mut visited);
     h
 }
+
+/// The reference's `BIG_INT`, used as "not reached yet".
+pub const BIG_INT: f64 = i32::MAX as f64;
+
+fn parent_index(i: usize) -> usize {
+    (i - 1) / 2
+}
+fn left_index(i: usize) -> usize {
+    2 * i + 1
+}
+fn right_index(i: usize) -> usize {
+    2 * i + 2
+}
+
+/// Sift the element at `i` up until its parent is no larger — the reference's `updateHeap`.
+///
+/// ⚠️ Compares the **live** distance each cell currently holds, which is why the heap has to be
+/// repaired by position when a cell's distance improves rather than simply re-pushed.
+pub fn update_heap(heap: &mut [usize], mut i: usize, dist: &[f64]) {
+    let tmp = heap[i];
+    while i > 0 && dist[heap[parent_index(i)]] > dist[tmp] {
+        let parent = parent_index(i);
+        heap[i] = heap[parent];
+        i = parent;
+    }
+    heap[i] = tmp;
+}
+
+/// Sift the root down — the reference's `heapify`.
+///
+/// ⚠️ Written as a hole being pushed down, comparing children against the value held aside
+/// rather than against whatever currently sits in the hole.
+pub fn heapify(heap: &mut [usize], dist: &[f64]) {
+    if heap.is_empty() {
+        return;
+    }
+    let heap_size = heap.len();
+    let mut i = 0usize;
+    let tmp = heap[i];
+    loop {
+        let (l, r) = (left_index(i), right_index(i));
+        let smallest = if l < heap_size && dist[heap[l]] < dist[tmp] {
+            if r < heap_size && dist[heap[r]] < dist[heap[l]] {
+                r
+            } else {
+                l
+            }
+        } else if r < heap_size && dist[heap[r]] < dist[tmp] {
+            r
+        } else {
+            i
+        };
+        if smallest != i {
+            heap[i] = heap[smallest];
+            i = smallest;
+        } else {
+            heap[i] = tmp;
+            return;
+        }
+    }
+}
+
+/// Remove the smallest element — the reference's `removeMin`.
+///
+/// ⛔ **This is NOT the idiomatic swap-pop-sift, and the difference is observable.** The last
+/// element is copied to the root and the heap is repaired **while that element is still present
+/// at the end**, so it takes part in comparisons as a child; only then is the tail dropped.
+///
+/// ⟹ If the sift path reaches the stale slot, the ordering differs from repairing a heap that had
+/// already been shortened. Writing the idiomatic version would give a different pop order, and
+/// therefore a different route. Transcribed exactly.
+pub fn remove_min(heap: &mut Vec<usize>, dist: &[f64]) {
+    if heap.is_empty() {
+        return;
+    }
+    heap[0] = heap[heap.len() - 1];
+    heapify(heap, dist);
+    heap.pop();
+}
+
+/// The search state one edge's re-route works over.
+///
+/// ⚠️ **Two separate parent grids, chosen by the direction of the move that reached a cell**, with
+/// `hv` recording which of them holds that cell's parent. A single parent grid would lose the
+/// distinction the backtrace later depends on.
+#[derive(Debug, Clone)]
+pub struct MazeSearch {
+    pub width: usize,
+    pub dist: Vec<f64>,
+    /// Parent of a cell reached by a **vertical** move.
+    pub parent_x1: Vec<i32>,
+    pub parent_y1: Vec<i32>,
+    /// Parent of a cell reached by a **horizontal** move.
+    pub parent_x3: Vec<i32>,
+    pub parent_y3: Vec<i32>,
+    /// `true` when the cell was reached vertically, i.e. its parent is in the first pair.
+    pub hv: Vec<bool>,
+    pub hyper_h: Vec<bool>,
+    pub hyper_v: Vec<bool>,
+    pub heap: Vec<usize>,
+}
+
+impl MazeSearch {
+    pub fn new(width: usize, height: usize) -> Self {
+        let n = width * height;
+        MazeSearch {
+            width,
+            dist: vec![BIG_INT; n],
+            parent_x1: vec![-1; n],
+            parent_y1: vec![-1; n],
+            parent_x3: vec![-1; n],
+            parent_y3: vec![-1; n],
+            hv: vec![false; n],
+            hyper_h: vec![false; n],
+            hyper_v: vec![false; n],
+            heap: Vec::new(),
+        }
+    }
+
+    pub fn at(&self, x: i32, y: i32) -> usize {
+        y as usize * self.width + x as usize
+    }
+
+    /// Lower the cost of one adjacent cell, if this path reaches it more cheaply — the
+    /// reference's `updateAdjacent`.
+    ///
+    /// ⛔ **The heap is repaired two different ways.** A cell never reached before is pushed and
+    /// sifted up from the end; a cell already in the heap is **found by scanning** and sifted from
+    /// where it sits. Re-pushing instead would leave a stale entry behind.
+    ///
+    /// ⚠️ The reference distinguishes those two cases by testing the cell's **previous** distance
+    /// against `BIG_INT`. Its second test, that the previous distance exceeds the new one, is
+    /// already guaranteed by the early return above it.
+    pub fn update_adjacent(
+        &mut self,
+        (cur_x, cur_y): (i32, i32),
+        (adj_x, adj_y): (i32, i32),
+        cost: f64,
+    ) -> Result<(), String> {
+        let adj = self.at(adj_x, adj_y);
+        let adj_cost = self.dist[adj];
+        if adj_cost <= cost {
+            return Ok(());
+        }
+        self.dist[adj] = cost;
+
+        if cur_x != adj_x {
+            self.parent_x3[adj] = cur_x;
+            self.parent_y3[adj] = cur_y;
+            self.hv[adj] = false;
+        } else {
+            self.parent_x1[adj] = cur_x;
+            self.parent_y1[adj] = cur_y;
+            self.hv[adj] = true;
+        }
+
+        if adj_cost >= BIG_INT {
+            self.heap.push(adj);
+            let last = self.heap.len() - 1;
+            update_heap(&mut self.heap, last, &self.dist);
+        } else {
+            match self.heap.iter().position(|&c| c == adj) {
+                Some(pos) => update_heap(&mut self.heap, pos, &self.dist),
+                // The reference raises an error here and names the net; a cell with a finite
+                // distance that is absent from the heap means the two have gone out of step.
+                None => return Err(format!("cell ({adj_x},{adj_y}) is not in the heap")),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What one relaxation step needs from the grids it prices against.
+pub struct RelaxInputs<'a> {
+    /// `L` — how heavily the previous round's usage is blended into this one's.
+    pub l: i32,
+    /// The via penalty for turning.
+    pub via: f64,
+    pub h_capacity: i32,
+    pub v_capacity: i32,
+    pub params: &'a crate::mazecost::CostParams,
+    pub used_h: &'a dyn Fn(i32, i32) -> i32,
+    pub used_v: &'a dyn Fn(i32, i32) -> i32,
+    pub last_h: &'a dyn Fn(i32, i32) -> i32,
+    pub last_v: &'a dyn Fn(i32, i32) -> i32,
+}
+
+/// Relax one step from `cur` in direction `(d_x, d_y)` — the reference's `relaxAdjacent`.
+///
+/// ⛔ **The edge crossed is indexed at its LOWER endpoint**, so a step in the negative direction
+/// prices the edge *behind* the cell, not the one at it. That is the same rule the route walk and
+/// the rip-up undo use, stated a third way here as `cur - (d == -1)`.
+///
+/// ⛔ **The usage looked up blends this round with the previous one**: `usage + L * last_usage`.
+/// This is where the carried-over demand the per-round reset clears is actually consumed.
+///
+/// ⛔ **The via guard here is redundant, and only the CALL SEQUENCE shows it.** Read alone this
+/// says "a turn is free at a source". Read from the caller, that case never arrives: the caller
+/// derives the flag as `pre != cur`, and initialises `pre` **to `cur`** exactly when the distance
+/// is zero — so the flag is already false there. Measured: of 1,855 relaxations starting from a
+/// source, **none** requests a via, and removing this guard is a mutation nothing can kill.
+///
+/// Transcribed anyway, because it is what the reference writes and a future caller could reach it.
+///
+/// ⛔ **The hyper test truncates to an integer.** The reference stores the competing cost in an
+/// `int` before comparing it against a `double`, so any fractional part is discarded and the
+/// comparison is coarser than it looks. Transcribed, not corrected.
+#[allow(clippy::too_many_arguments)]
+pub fn relax_adjacent(
+    s: &mut MazeSearch,
+    (cur_x, cur_y): (i32, i32),
+    (d_x, d_y): (i32, i32),
+    add_via: bool,
+    maybe_hyper: bool,
+    inp: &RelaxInputs<'_>,
+) -> Result<(), String> {
+    let is_horizontal = d_x != 0;
+    let capacity = if is_horizontal { inp.h_capacity } else { inp.v_capacity };
+
+    // p1 is the edge this step crosses; p2 is the one on the far side of `cur`.
+    let p1_x = cur_x - i32::from(d_x == -1);
+    let p1_y = cur_y - i32::from(d_y == -1);
+    let p2_x = cur_x - i32::from(d_x == 1);
+    let p2_y = cur_y - i32::from(d_y == 1);
+
+    let usage = |x: i32, y: i32| {
+        if is_horizontal {
+            (inp.used_h)(x, y) + inp.l * (inp.last_h)(x, y)
+        } else {
+            (inp.used_v)(x, y) + inp.l * (inp.last_v)(x, y)
+        }
+    };
+
+    let cur = s.at(cur_x, cur_y);
+    let cost1 = crate::mazecost::get_cost(usage(p1_x, p1_y), capacity, inp.params);
+    let mut tmp = s.dist[cur] + cost1;
+
+    if add_via && s.dist[cur] != 0.0 {
+        tmp += inp.via;
+
+        if maybe_hyper {
+            let cost2 = crate::mazecost::get_cost(usage(p2_x, p2_y), capacity, inp.params);
+            let back = s.at(cur_x - d_x, cur_y - d_y);
+            // ⛔ Truncated to an integer by the reference before the comparison.
+            let tmp_cost = (s.dist[back] + cost2) as i32;
+            if f64::from(tmp_cost) < s.dist[cur] + inp.via {
+                let hyper = if is_horizontal { &mut s.hyper_h } else { &mut s.hyper_v };
+                hyper[cur] = true;
+            }
+        }
+    }
+
+    s.update_adjacent((cur_x, cur_y), (cur_x + d_x, cur_y + d_y), tmp)
+}
