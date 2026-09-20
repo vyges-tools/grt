@@ -1,0 +1,15 @@
+[package]
+name = "vyges-grt"
+version = "0.1.0"
+edition = "2021"
+description = "Global routing over a placed design: route guides and the congestion grid, written to the OpenDB design database."
+license = "Apache-2.0"
+authors = ["Vyges <https://vyges.com/contact>"]
+homepage = "https://vyges.com"
+repository = "https://github.com/vyges-tools/grt"
+
+[dependencies]
+
+[lib]
+name = "vyges_grt"
+path = "src/lib.rs"

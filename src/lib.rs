@@ -1,0 +1,326 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Global routing: the guide writer.
+//!
+//! A global router decides, per net, which grid cells the detailed router may use. That answer is
+//! emitted as **route guides** — one rectangle per segment, on a layer — and guides are what the
+//! next stage consumes. This crate turns a routed net's segments into those guide records.
+//!
+//! Reimplemented from behaviour published by the OpenROAD project's global router, not
+//! transliterated from it. Where the two disagree the presumption is that this engine is wrong.
+//!
+//! # Shape
+//!
+//! [`save_guides`] is a thin sequencer and nothing else: it reads in the same order the published
+//! stage runs, so a divergence can be pointed at one line rather than bisected. The per-segment
+//! rules live in [`guides_for_segment`], the geometry in [`global_routing_to_box`].
+
+/// An inclusive rectangle in database units.
+///
+/// ⚠️ Normalised on construction — `(x1, x2)` is stored as `(min, max)` — because the database
+/// rectangle this becomes normalises too, so corner order must not be able to change a result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rect {
+    pub x_min: i32,
+    pub y_min: i32,
+    pub x_max: i32,
+    pub y_max: i32,
+}
+
+impl Rect {
+    pub fn new(x1: i32, y1: i32, x2: i32, y2: i32) -> Self {
+        Rect {
+            x_min: x1.min(x2),
+            y_min: y1.min(y2),
+            x_max: x1.max(x2),
+            y_max: y1.max(y2),
+        }
+    }
+    /// Translate by a delta — the grid origin offset every guide carries.
+    pub fn move_delta(self, dx: i32, dy: i32) -> Self {
+        Rect {
+            x_min: self.x_min + dx,
+            y_min: self.y_min + dy,
+            x_max: self.x_max + dx,
+            y_max: self.y_max + dy,
+        }
+    }
+}
+
+/// One routed segment: a straight run on a layer, or a via between two layers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GSegment {
+    pub init_x: i32,
+    pub init_y: i32,
+    pub init_layer: i32,
+    pub final_x: i32,
+    pub final_y: i32,
+    pub final_layer: i32,
+    pub is_jumper: bool,
+}
+
+impl GSegment {
+    /// ⛔ **A via is defined by POSITION, not by layer.** A segment is a via when it does not move
+    /// in x or y — `init_x == final_x && init_y == final_y`.
+    ///
+    /// The obvious reading, "the layers differ", is a different predicate and a wrong one: it
+    /// would classify nothing extra here but would silently diverge on any segment that both
+    /// moves and changes layer, and it is not what the published rule says.
+    pub fn is_via(&self) -> bool {
+        self.init_x == self.final_x && self.init_y == self.final_y
+    }
+    pub fn is_jumper(&self) -> bool {
+        self.is_jumper
+    }
+}
+
+/// The routing grid, as much of it as guide geometry needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Grid {
+    /// Edge length of one grid cell, in database units.
+    pub tile_size: i32,
+    /// The grid's extent. Only the upper corner is read: a guide that lands within one tile of
+    /// the boundary is snapped out to it.
+    pub area: Rect,
+}
+
+/// A pin, reduced to what the covering-pin test reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pin {
+    pub connection_layer: i32,
+    pub on_grid_x: i32,
+    pub on_grid_y: i32,
+}
+
+/// One net's routing, and the facts about it the guide rules consult.
+#[derive(Debug, Clone)]
+pub struct NetRoute {
+    pub name: String,
+    pub segments: Vec<GSegment>,
+    pub pins: Vec<Pin>,
+    /// A net entirely inside one grid cell. Local nets take the two-guide via form.
+    pub is_local: bool,
+}
+
+/// A guide record: one rectangle, on a layer, with the layer a via rises to.
+///
+/// ⚠️ `via_layer` is **not** optional. A wire guide names its own layer twice; only a via guide
+/// names two different layers, and that is the only way a reader tells the two apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Guide {
+    pub layer: i32,
+    pub via_layer: i32,
+    pub box_: Rect,
+    pub is_congested: bool,
+    pub is_jumper: bool,
+}
+
+/// What the run as a whole contributes to every guide it writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SaveOptions {
+    /// ⚠️ Computed **once per run**, not per net, and stamped on every guide. A design that is
+    /// congested anywhere marks all of them.
+    pub guide_is_congested: bool,
+    /// The grid origin, added to every guide box.
+    pub origin_x: i32,
+    pub origin_y: i32,
+    /// Below this layer a diagonal wire segment is an error.
+    pub min_routing_layer: i32,
+}
+
+/// What went wrong, named after the condition rather than the call site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuideError {
+    /// A via between layers that are not adjacent.
+    NonAdjacentLayers { net: String, from: i32, to: i32 },
+    /// A diagonal wire segment below the minimum routing layer.
+    BlockedMetal { net: String, layer: i32 },
+}
+
+impl std::fmt::Display for GuideError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GuideError::NonAdjacentLayers { net, from, to } => write!(
+                f,
+                "connection between non-adjacent layers {from} and {to} in net {net}"
+            ),
+            GuideError::BlockedMetal { net, layer } => {
+                write!(f, "routing with guides in blocked metal (layer {layer}) for net {net}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for GuideError {}
+
+/// The guide rectangle for one segment, before the grid origin is applied.
+///
+/// The segment's endpoints are grid-cell centres; a guide covers the cells it spans, so the box
+/// grows by half a tile in each direction.
+///
+/// ⚠️ **The endpoints are min/max'd first.** A segment may be stored in either direction, and the
+/// half-tile is added to the *lower* corner and *upper* corner rather than to init and final.
+///
+/// ⚠️ **The snap is a truncating integer division, and that is the rule.** A guide whose upper
+/// edge is less than one whole tile from the grid's upper edge is extended to it —
+/// `(area_max - ur) / tile_size < 1` — so the gap is closed rather than left as a sliver the
+/// detailed router cannot use. Written with a float divide it would snap on a different set of
+/// boxes.
+pub fn global_routing_to_box(seg: &GSegment, grid: &Grid) -> Rect {
+    let (init_x, final_x) = (seg.init_x.min(seg.final_x), seg.init_x.max(seg.final_x));
+    let (init_y, final_y) = (seg.init_y.min(seg.final_y), seg.init_y.max(seg.final_y));
+
+    let half = grid.tile_size / 2;
+    let ll_x = init_x - half;
+    let ll_y = init_y - half;
+    let mut ur_x = final_x + half;
+    let mut ur_y = final_y + half;
+
+    if (grid.area.x_max - ur_x) / grid.tile_size < 1 {
+        ur_x = grid.area.x_max;
+    }
+    if (grid.area.y_max - ur_y) / grid.tile_size < 1 {
+        ur_y = grid.area.y_max;
+    }
+
+    Rect::new(ll_x, ll_y, ur_x, ur_y)
+}
+
+/// Whether a via segment lands exactly on one of the net's pins.
+///
+/// ⚠️ Compares against the segment's **final** point and its **top** layer, not its init point.
+pub fn is_covering_pin(pins: &[Pin], seg: &GSegment) -> bool {
+    let seg_top_layer = seg.init_layer.max(seg.final_layer);
+    pins.iter().any(|p| {
+        p.connection_layer == seg_top_layer
+            && p.on_grid_x == seg.final_x
+            && p.on_grid_y == seg.final_y
+    })
+}
+
+/// The guides one segment produces — **zero, one, or two of them**.
+///
+/// The three-way split is the substance of the stage:
+///
+/// | segment | guides |
+/// | --- | --- |
+/// | via on a local net, or covering a pin | **two**, `(l1,l2)` and `(l2,l1)`, over the same box |
+/// | any other via | **one**, `layer = min`, `via_layer = max` |
+/// | wire (`init_layer == final_layer`) | **one**, `(layer, layer)` |
+///
+/// ⚠️ A segment that is neither a via nor same-layer produces **nothing**. That is the published
+/// behaviour — the `else if` chain has no final `else` — and it is deliberate here rather than an
+/// oversight: such a segment is a diagonal layer change, which the router does not emit.
+pub fn guides_for_segment(
+    net: &NetRoute,
+    seg: &GSegment,
+    grid: &Grid,
+    opts: &SaveOptions,
+) -> Result<Vec<Guide>, GuideError> {
+    let box_ = global_routing_to_box(seg, grid).move_delta(opts.origin_x, opts.origin_y);
+
+    if seg.is_via() {
+        if (seg.final_layer - seg.init_layer).abs() > 1 {
+            return Err(GuideError::NonAdjacentLayers {
+                net: net.name.clone(),
+                from: seg.init_layer,
+                to: seg.final_layer,
+            });
+        }
+
+        if net.is_local || is_covering_pin(&net.pins, seg) {
+            // Both directions of the layer pair, over the same box.
+            return Ok(vec![
+                Guide {
+                    layer: seg.init_layer,
+                    via_layer: seg.final_layer,
+                    box_,
+                    is_congested: opts.guide_is_congested,
+                    is_jumper: false,
+                },
+                Guide {
+                    layer: seg.final_layer,
+                    via_layer: seg.init_layer,
+                    box_,
+                    is_congested: opts.guide_is_congested,
+                    is_jumper: false,
+                },
+            ]);
+        }
+
+        return Ok(vec![Guide {
+            layer: seg.init_layer.min(seg.final_layer),
+            via_layer: seg.init_layer.max(seg.final_layer),
+            box_,
+            is_congested: opts.guide_is_congested,
+            is_jumper: false,
+        }]);
+    }
+
+    if seg.init_layer == seg.final_layer {
+        if seg.init_layer < opts.min_routing_layer
+            && seg.init_x != seg.final_x
+            && seg.init_y != seg.final_y
+        {
+            return Err(GuideError::BlockedMetal {
+                net: net.name.clone(),
+                layer: seg.init_layer,
+            });
+        }
+        return Ok(vec![Guide {
+            layer: seg.init_layer,
+            via_layer: seg.init_layer,
+            box_,
+            is_congested: opts.guide_is_congested,
+            is_jumper: seg.is_jumper(),
+        }]);
+    }
+
+    Ok(Vec::new())
+}
+
+/// One net's guides, in segment order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NetGuides {
+    pub net: String,
+    pub guides: Vec<Guide>,
+    /// How many of them are jumpers — reported per run, not per guide.
+    pub jumper_count: usize,
+}
+
+/// The stage: every net's guides, in the order the nets were given.
+///
+/// ⛔ **A net with no segments contributes nothing and must not clear anything.** The published
+/// stage skips it before touching the database, so a net whose route is empty keeps whatever
+/// guides it already had.
+///
+/// ⚠️ **Guide order within a net is segment order**, and it is load-bearing: the guide file is
+/// compared as an ordered list. A database whose guide set prepends must be reversed after
+/// writing to get back to this order.
+pub fn save_guides(
+    nets: &[NetRoute],
+    grid: &Grid,
+    opts: &SaveOptions,
+) -> Result<Vec<NetGuides>, GuideError> {
+    let mut out = Vec::with_capacity(nets.len());
+    for net in nets {
+        if net.segments.is_empty() {
+            continue;
+        }
+        let mut guides = Vec::new();
+        let mut jumper_count = 0;
+        for seg in &net.segments {
+            for guide in guides_for_segment(net, seg, grid, opts)? {
+                if guide.is_jumper {
+                    jumper_count += 1;
+                }
+                guides.push(guide);
+            }
+        }
+        out.push(NetGuides {
+            net: net.name.clone(),
+            guides,
+            jumper_count,
+        });
+    }
+    Ok(out)
+}
