@@ -112,3 +112,35 @@ Both were read out of the reference and then found to survive a deliberate mutat
 ⚠️ The second is **not** an equivalence — the constructed tree gives `e0 e1 e2 e3` breadth-first
 against `e0 e1 e3 e2` in node order. The one mutation that does survive on purpose is testing the
 opposite endpoint when expanding, which is provably the same function; the argument is at the site.
+
+## `spiralroute.json` — the per-edge routing the walk drives
+
+16,229 distinct calls from four designs; 3,487 take the bent arm and **1,619 of those are exact
+ties**, so the tie-break is nearly half the decisions rather than a rare corner.
+
+The body is the earlier L re-route's, and the diff against it is three things: marks land on the
+**alias** as well as the node, `hID`/`lID` are incremented on the **alias** nodes and crossed
+against the shape, and the via bias has no `viaGuided` guard.
+
+⛔ **That third difference is unobservable.** The stage has exactly one call site, between the
+assignment that zeroes `via_cost_` and the one that raises it in the 3D phase. All 16,229 captured
+calls carry `via_cost_ = 0`, which the test asserts rather than assumes — so the bias contributes
+nothing and making it conditional is a mutation nothing can kill. It is transcribed anyway and
+recorded as unwitnessed.
+
+### How the bent arm is replayed
+
+Reproducing the captured costs would mean rebuilding the whole demand grid at that instant.
+Instead the two halves are checked separately and neither re-implements the other:
+
+- the **comparison** is replayed against the costs the reference actually computed, as raw IEEE
+  bits;
+- the **state transition** is driven through the real function with the blockage rigged so the
+  captured arm is the one taken.
+
+⚠️ `hID` and `lID` are **cumulative over a net's edges** — reset once in the stage's first pass,
+not per call — so the replay seeds them from captured before-values. Starting them at zero checks
+only a delta and disagrees with the reference from the second edge of every net onward.
+
+⚠️ The degenerate-edge guard is **unreachable from the only caller** and is pinned by a
+constructed case for that reason.

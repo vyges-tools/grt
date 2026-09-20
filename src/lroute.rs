@@ -12,16 +12,19 @@ use crate::estimate::{congestion_cost, EstimateGrid, LShape};
 
 /// A node of a net's Steiner tree, with the connection state the via bias reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// ⛔ The widths are the reference's: `TreeNode` holds `x`, `y` and `status` as `int16_t`.
+/// Holding them wider lets a value survive that the reference would truncate. No corpus witnesses
+/// a difference — the grid never approaches the range — but the rule is to transcribe the type.
 pub struct TreeNode {
-    pub x: i32,
-    pub y: i32,
+    pub x: i16,
+    pub y: i16,
     /// A two-bit set held as a small integer: bit 0 = connected vertically, bit 1 = connected
     /// horizontally. 0 is unconnected, 3 is both.
     ///
     /// ⚠️ **The range is an empirical fact, not an enforced invariant.** Measured over a whole
     /// design: `n1` takes 0, 2, 3 and `n2` takes 0, 1, 2, 3 — never more. The reference does not
     /// trust it either, warning (GRT-179) on anything outside `0..=3` before carrying on.
-    pub status: i32,
+    pub status: i16,
 }
 
 /// An edge of a net's Steiner tree.
@@ -37,9 +40,11 @@ pub struct TreeEdge {
 ///
 /// ⚠️ Arithmetic, not a bit operation: `if status % 2 == 0 { status += 1 }`. For bit 0 the parity
 /// test *is* the bit test, so this coincides with `status |= 1` at every value.
-pub fn mark_v(node: &mut TreeNode) {
-    if node.status % 2 == 0 {
-        node.status += 1;
+/// Takes the status alone rather than a node, because two stages mark the same way over
+/// different node types and the rule must not be written down twice.
+pub fn mark_v(status: &mut i16) {
+    if *status % 2 == 0 {
+        *status += 1;
     }
 }
 
@@ -50,9 +55,9 @@ pub fn mark_v(node: &mut TreeNode) {
 /// Measured over a whole design, no status ever exceeds 3, so the two agree everywhere observed —
 /// but the arithmetic is transcribed rather than "simplified", because it is what the reference
 /// does and the range is not enforced.
-pub fn mark_h(node: &mut TreeNode) {
-    if node.status < 2 {
-        node.status += 2;
+pub fn mark_h(status: &mut i16) {
+    if *status < 2 {
+        *status += 2;
     }
 }
 
@@ -69,7 +74,7 @@ pub fn mark_h(node: &mut TreeNode) {
 /// ⚠️ The reference assigns for `n1` (`costL1 = via_cost`) and accumulates for `n2` (`costL2 +=`).
 /// That is equivalent only because both costs are zero when the block runs, and it is transcribed
 /// as accumulation here rather than silently "corrected".
-pub fn via_bias(n1_status: i32, n2_status: i32, via_cost: f64) -> (f64, f64) {
+pub fn via_bias(n1_status: i16, n2_status: i16, via_cost: f64) -> (f64, f64) {
     let (mut l1, mut l2) = (0.0, 0.0);
     match n1_status {
         2 => l1 += via_cost,
@@ -88,7 +93,7 @@ pub fn via_bias(n1_status: i32, n2_status: i32, via_cost: f64) -> (f64, f64) {
 ///
 /// ⚠️ The reference warns (GRT-179) on anything outside `0..=3` and then carries on. Reported
 /// here rather than warned, because a caller that produced such a status has a bug worth seeing.
-pub fn is_known_status(status: i32) -> bool {
+pub fn is_known_status(status: i16) -> bool {
     (0..=3).contains(&status)
 }
 
@@ -125,21 +130,23 @@ pub fn route_edge(
     if edge.len <= 0 {
         return EdgeRoute::None;
     }
-    let (x1, y1) = (nodes[edge.n1].x, nodes[edge.n1].y);
-    let (x2, y2) = (nodes[edge.n2].x, nodes[edge.n2].y);
+    // ⚠️ Widened here because the reference widens here: the fields are `int16_t`, but
+    // `const int x1 = treenodes[n1].x;` makes every coordinate computation below `int`.
+    let (x1, y1) = (i32::from(nodes[edge.n1].x), i32::from(nodes[edge.n1].y));
+    let (x2, y2) = (i32::from(nodes[edge.n2].x), i32::from(nodes[edge.n2].y));
     let (ymin, ymax) = (y1.min(y2), y1.max(y2));
     let cost = edge_cost as f64;
 
     if x1 == x2 {
         grid.update_v(x1, ymin, ymax, cost);
-        mark_v(&mut nodes[edge.n1]);
-        mark_v(&mut nodes[edge.n2]);
+        mark_v(&mut nodes[edge.n1].status);
+        mark_v(&mut nodes[edge.n2].status);
         return EdgeRoute::Vertical;
     }
     if y1 == y2 {
         grid.update_h(x1, x2, y1, cost);
-        mark_h(&mut nodes[edge.n1]);
-        mark_h(&mut nodes[edge.n2]);
+        mark_h(&mut nodes[edge.n1].status);
+        mark_h(&mut nodes[edge.n2].status);
         return EdgeRoute::Horizontal;
     }
 
@@ -162,14 +169,14 @@ pub fn route_edge(
     if cost_l1 < cost_l2 {
         // ⚠️ The marks are crossed to match the shape: L1 leaves n1 vertically, reaches n2
         // horizontally.
-        mark_v(&mut nodes[edge.n1]);
-        mark_h(&mut nodes[edge.n2]);
+        mark_v(&mut nodes[edge.n1].status);
+        mark_h(&mut nodes[edge.n2].status);
         grid.update_v(x1, ymin, ymax, cost);
         grid.update_h(x1, x2, y2, cost);
         EdgeRoute::L(LShape::YFirst)
     } else {
-        mark_v(&mut nodes[edge.n2]);
-        mark_h(&mut nodes[edge.n1]);
+        mark_v(&mut nodes[edge.n2].status);
+        mark_h(&mut nodes[edge.n1].status);
         grid.update_h(x1, x2, y1, cost);
         grid.update_v(x2, ymin, ymax, cost);
         EdgeRoute::L(LShape::XFirst)

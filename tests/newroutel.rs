@@ -13,32 +13,32 @@ use vyges_grt::*;
 const GOLDEN: &str = include_str!("../examples/grt_gate/newroutel.json");
 
 struct Row {
-    n1: i32,
-    n2: i32,
+    n1: i16,
+    n2: i16,
     bias_l1: f64,
     bias_l2: f64,
     via_cost: f64,
     l1: f64,
     l2: f64,
     x_first: bool,
-    n1_after: i32,
-    n2_after: i32,
+    n1_after: i16,
+    n2_after: i16,
 }
 
 fn rows() -> Vec<Row> {
     let v: serde_json::Value = serde_json::from_str(GOLDEN).expect("golden parses");
     let bits = |x: &serde_json::Value| f64::from_bits(x.as_str().unwrap().parse().unwrap());
     v.as_array().unwrap().iter().map(|r| Row {
-        n1: r["n1"].as_i64().unwrap() as i32,
-        n2: r["n2"].as_i64().unwrap() as i32,
+        n1: r["n1"].as_i64().unwrap() as i16,
+        n2: r["n2"].as_i64().unwrap() as i16,
         bias_l1: bits(&r["bias_l1_bits"]),
         bias_l2: bits(&r["bias_l2_bits"]),
         via_cost: bits(&r["via_cost_bits"]),
         l1: bits(&r["l1_bits"]),
         l2: bits(&r["l2_bits"]),
         x_first: r["x_first"].as_bool().unwrap(),
-        n1_after: r["n1_after"].as_i64().unwrap() as i32,
-        n2_after: r["n2_after"].as_i64().unwrap() as i32,
+        n1_after: r["n1_after"].as_i64().unwrap() as i16,
+        n2_after: r["n2_after"].as_i64().unwrap() as i16,
     }).collect()
 }
 
@@ -107,11 +107,11 @@ fn the_marks_the_reference_recorded_follow_from_the_shape_it_chose() {
         let mut n1 = TreeNode { x: 0, y: 0, status: r.n1 };
         let mut n2 = TreeNode { x: 0, y: 0, status: r.n2 };
         if r.x_first {
-            mark_v(&mut n2);
-            mark_h(&mut n1);
+            mark_v(&mut n2.status);
+            mark_h(&mut n1.status);
         } else {
-            mark_v(&mut n1);
-            mark_h(&mut n2);
+            mark_v(&mut n1.status);
+            mark_h(&mut n2.status);
         }
         assert_eq!((n1.status, n2.status), (r.n1_after, r.n2_after), "decision {i}");
     }

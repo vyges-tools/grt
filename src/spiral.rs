@@ -16,6 +16,9 @@
 //! reused with a different meaning from this point on. Carrying it forward would change the
 //! traversal.
 
+use crate::estimate::{congestion_cost, EstimateGrid, LShape};
+use crate::lroute::{mark_h, mark_v, via_bias, EdgeRoute};
+
 /// How many edges one node can carry.
 ///
 /// ⚠️ The reference stores `eID` as a fixed `int[10]` and appends with `eID[conCNT++]`, with no
@@ -39,6 +42,11 @@ pub struct SpiralNode {
     /// node's coordinate aliases to it; everything else aliases to itself.
     pub stack_alias: usize,
     pub status: i16,
+    /// Counts of edges leaving this node horizontally and "lower" (the reference's `hID` and
+    /// `lID`). ⚠️ Declared `-1` in the reference's struct but reset to 0 by this stage, and
+    /// incremented only on the **alias** node, never the node itself.
+    pub h_id: i32,
+    pub l_id: i32,
     /// Edges registered on this node, in registration order.
     pub edges: Vec<usize>,
 }
@@ -71,6 +79,8 @@ pub fn reset_and_alias(
             assigned: false,
             stack_alias: d,
             status: 0,
+            h_id: 0,
+            l_id: 0,
             edges: Vec::new(),
         };
         if d < num_terminals {
@@ -161,7 +171,7 @@ pub fn traversal_order(
     let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
     let mut order = Vec::new();
 
-    let mut enqueue_node_edges = |node_alias: usize,
+    let enqueue_node_edges = |node_alias: usize,
                                   nodes: &[SpiralNode],
                                   assigned: &mut Vec<bool>,
                                   queue: &mut std::collections::VecDeque<usize>| {
@@ -202,4 +212,121 @@ pub fn propagate_alias_status(nodes: &mut [SpiralNode]) {
     for (node, status) in nodes.iter_mut().zip(statuses) {
         node.status = status;
     }
+}
+
+/// Mark a node **and its alias** as connected vertically.
+///
+/// ⛔ The alias is marked too, which is what separates this stage from the earlier L re-route:
+/// coincident nodes share a location, so a segment arriving at one arrives at all of them.
+fn mark_vertical(nodes: &mut [SpiralNode], n: usize, na: usize) {
+    mark_v(&mut nodes[n].status);
+    mark_v(&mut nodes[na].status);
+}
+
+/// Mark a node **and its alias** as connected horizontally.
+fn mark_horizontal(nodes: &mut [SpiralNode], n: usize, na: usize) {
+    mark_h(&mut nodes[n].status);
+    mark_h(&mut nodes[na].status);
+}
+
+/// Route one tree edge as the outward walk reaches it.
+///
+/// The body is the earlier L re-route's, with three differences that are the whole point of the
+/// stage:
+///
+/// - ⛔ **the via bias is unconditional.** The earlier pass wraps it in `viaGuided`; here there is
+///   no guard. ⚠️ **But it is dead in the shipped flow**: `spiralRouteAll` has exactly one call
+///   site, and the router sets `via_cost_ = 0` before it and only raises it to 1 much later, in
+///   the 3D phase. Measured: all 16,568 captured calls across four designs carry `via_cost_ = 0`,
+///   so the bias contributes nothing and the difference from the earlier pass cannot be observed.
+///   Transcribed anyway, and marked as unwitnessed rather than claimed as validated.
+/// - ⛔ **every mark also lands on the alias**, so coincident nodes share connection state.
+/// - ⛔ **`hID` and `lID` are incremented on the ALIAS nodes**, and crossed: the shape that leaves
+///   `n1` vertically counts a horizontal arrival at `n2a` and a "lower" departure at `n1a`.
+///
+/// ⚠️ **The degenerate arm is not a no-op**: a zero-length edge is explicitly set to "no route",
+/// not left at whatever the previous iteration wrote.
+#[allow(clippy::too_many_arguments)]
+pub fn spiral_route(
+    grid: &mut EstimateGrid,
+    nodes: &mut [SpiralNode],
+    edge: (usize, usize, i32),
+    edge_cost: i8,
+    via_cost: f64,
+    v_lb: f32,
+    h_lb: f32,
+    red_v: &dyn Fn(usize, usize) -> u16,
+    red_h: &dyn Fn(usize, usize) -> u16,
+) -> EdgeRoute {
+    let (n1, n2, len) = edge;
+    if len <= 0 {
+        return EdgeRoute::None;
+    }
+
+    // ⚠️ Widened here because the reference widens here — the fields are `int16_t`, the locals
+    // `int`.
+    let (x1, y1) = (i32::from(nodes[n1].x), i32::from(nodes[n1].y));
+    let (x2, y2) = (i32::from(nodes[n2].x), i32::from(nodes[n2].y));
+    let n1a = nodes[n1].stack_alias;
+    let n2a = nodes[n2].stack_alias;
+    let (ymin, ymax) = (y1.min(y2), y1.max(y2));
+    let cost = f64::from(edge_cost);
+
+    if x1 == x2 {
+        grid.update_v(x1, ymin, ymax, cost);
+        mark_vertical(nodes, n1, n1a);
+        mark_vertical(nodes, n2, n2a);
+        return EdgeRoute::Vertical;
+    }
+    if y1 == y2 {
+        grid.update_h(x1, x2, y1, cost);
+        mark_horizontal(nodes, n1, n1a);
+        mark_horizontal(nodes, n2, n2a);
+        return EdgeRoute::Horizontal;
+    }
+
+    // ⛔ No `viaGuided` guard here, unlike the earlier pass.
+    let (mut cost_l1, mut cost_l2) = via_bias(nodes[n1].status, nodes[n2].status, via_cost);
+
+    for j in ymin..ymax {
+        cost_l1 += congestion_cost(grid.v(x1 as usize, j as usize), red_v(x1 as usize, j as usize), v_lb);
+        cost_l2 += congestion_cost(grid.v(x2 as usize, j as usize), red_v(x2 as usize, j as usize), v_lb);
+    }
+    // ⚠️ Not `min..max` — the reference writes `for (int j = x1; j < x2; j++)` with no ordering,
+    // so this loop contributes nothing at all when `x1 > x2`. The vertical loop above DOES order
+    // its bounds. The asymmetry is the reference's.
+    for j in x1..x2 {
+        cost_l1 += congestion_cost(grid.h(j as usize, y2 as usize), red_h(j as usize, y2 as usize), h_lb);
+        cost_l2 += congestion_cost(grid.h(j as usize, y1 as usize), red_h(j as usize, y1 as usize), h_lb);
+    }
+
+    if chooses_y_first(cost_l1, cost_l2) {
+        mark_vertical(nodes, n1, n1a);
+        mark_horizontal(nodes, n2, n2a);
+        nodes[n2a].h_id += 1;
+        nodes[n1a].l_id += 1;
+        grid.update_v(x1, ymin, ymax, cost);
+        grid.update_h(x1, x2, y2, cost);
+        EdgeRoute::L(LShape::YFirst)
+    } else {
+        mark_vertical(nodes, n2, n2a);
+        mark_horizontal(nodes, n1, n1a);
+        nodes[n1a].h_id += 1;
+        nodes[n2a].l_id += 1;
+        grid.update_h(x1, x2, y1, cost);
+        grid.update_v(x2, ymin, ymax, cost);
+        EdgeRoute::L(LShape::XFirst)
+    }
+}
+
+/// Which way the bend goes, given the two candidate costs.
+///
+/// ⛔ **A tie goes to X-first**, as everywhere else in this router: the reference tests
+/// `costL1 < costL2` and takes the else branch on equality. Ties are not rare — with
+/// `via_cost_` at zero and an uncongested region both costs are exactly `0.0`.
+///
+/// Split out so the comparison can be replayed against costs captured from the reference, which
+/// is the only part of the L arm a corpus can check without reconstructing the demand grid.
+pub fn chooses_y_first(cost_l1: f64, cost_l2: f64) -> bool {
+    cost_l1 < cost_l2
 }
