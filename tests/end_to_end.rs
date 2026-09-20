@@ -232,19 +232,18 @@ fn the_connected_to_term_flag_matches_the_REFERENCE_on_every_guide() {
 }
 
 #[test]
-fn ONE_gap_remains_of_the_three_and_the_suite_says_which() {
+fn the_three_gaps_are_CLOSED_or_CHARACTERISED_and_this_says_which() {
     // 🔑 Three rules could once each be replaced by a plausible wrong one with identical output.
-    // Mutation testing found all three; the passing gate found none. Two are now CLOSED by adding
-    // `pin_access1` — 15 nets, where the main design's 563 could not decide either:
+    // Mutation testing found all three; the passing gate found none.
     //
-    // | rule | closed by | verified |
+    // | rule | state | how |
     // | --- | --- | --- |
-    // | first guide to reach a pin point claims it | `pin_access1` (1 repeated point) | the mutation now fails `the_connected_flag_matches_..._FOUR_MORE_DESIGNS` |
-    // | `is_local` compares position only | `pin_access1` (1 net, 2 layers at a point) | the mutation now fails `is_local_matches_the_REFERENCE_on_FIVE_designs` |
-    // | ⬜ **a net with no pins is local** | **nothing yet** | only a synthetic case covers it |
+    // | first guide to reach a pin point claims it | ✅ **closed** | `pin_access1` has a repeated point; the mutation now fails the flag gate |
+    // | `is_local` compares position only | ✅ **closed** | `pin_access1` has a net with two layers at one point; the mutation now fails the unit gate |
+    // | a net with no pins is local | ⬜ **characterised, not open** | see `tests/init.rs` — on every path this crate implements, a pinless net is filtered out BEFORE locality is asked. No corpus can show it; the branch is load-bearing only on the incremental path |
     //
-    // ⚠️ This asserts the REMAINING gap, so adding a design with a pinless net will make it fail
-    // and the last gap gets closed rather than forgotten.
+    // ⚠️ The count is still asserted, because if a pinless net ever DOES reach a corpus the
+    // reasoning above has changed and this should say so.
     let mut pinless = 0;
     let mut corpora = 1;
     for net in &parse_corpus().nets {
@@ -258,8 +257,8 @@ fn ONE_gap_remains_of_the_three_and_the_suite_says_which() {
     }
     assert_eq!(corpora, 5, "five designs are scored");
     assert_eq!(pinless, 0,
-        "a design here now has a pinless net ({pinless}): the empty-net locality rule is \
-         witnessed at last — close the gap and update this test");
+        "a corpus now has a pinless net ({pinless}) — the call-site reasoning in tests/init.rs \
+         needs revisiting, because something reached locality without a pin filter");
 }
 
 #[test]

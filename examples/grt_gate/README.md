@@ -49,12 +49,27 @@ and each verified identical to the golden that ships with the reference's own su
 🔑 **19 nets against the main design's 563, and they are what made two undecidable rules
 decidable.** Coverage is not size — `overlapping_edges` evaluates 24,328 pins and adds nothing.
 
-## ⬜ The one gap that remains
+## ⬜ The third gap is CHARACTERISED, not open
 
-A net with **no pins** is local. No design here has one, so replacing that rule with "a pinless
-net is not local" still produces identical output everywhere; only a synthetic case covers it.
-`ONE_gap_remains_of_the_three_and_the_suite_says_which` asserts the count, so adding such a design
-makes the suite say so.
+A net with **no pins** is local. No design here has such a net — checked in the DEFs as well as
+the corpora, and the count is zero in both — so no corpus can distinguish that rule from its
+opposite.
+
+Adding designs would not have helped, and the reference's own call sites say why. Locality is
+asked in three places:
+
+| call site | guard | reachable with zero pins |
+| --- | --- | --- |
+| the guide writer's via fork | only nets that have a route, and a net is routed only when it has more than one pin | no |
+| building the router's netlist | the same "more than one pin" gate | no |
+| ⭐ the incremental route collection | walks every net with **no pin guard** | **yes** |
+
+⟹ On every path this crate implements, a pinless net is filtered out *before* locality is asked.
+The branch is not dead — on the incremental path the test is `route.empty() && !isLocal()`, and a
+pinless net answering **true** is exactly what keeps it out of the incremental set; answering
+false would insert an empty route for a net with nothing to route.
+
+**So the gap closes when the incremental path is implemented, not when a bigger design is found.**
 
 ## `net_order.ok` — a second corpus, chosen on exactly that criterion
 

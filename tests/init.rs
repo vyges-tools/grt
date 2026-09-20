@@ -70,11 +70,32 @@ fn is_local_matches_the_REFERENCE_on_FIVE_designs() {
 }
 
 #[test]
-fn a_net_with_NO_pins_is_local() {
+fn a_net_with_NO_pins_is_local_and_the_SOURCE_says_why_no_corpus_shows_it() {
     // ⚠️ The empty case returns true, not false. It falls out of "every pin is at the first pin's
     // position" only if that is written as an all-match over the tail; an implementation that
     // demanded at least one pin would answer the opposite.
     assert!(is_local(&[]));
+
+    // ⬜ **Why no design in the suite witnesses this, established from the reference's call
+    // sites rather than by hunting for a corpus.** There are three, and they do not agree:
+    //
+    // | call site | guard | reachable with zero pins |
+    // | --- | --- | --- |
+    // | the guide writer's via fork | only nets that HAVE a route, and a net is only routed when it has more than one pin | no |
+    // | building the router's netlist | same "more than one pin" gate | no |
+    // | ⭐ the INCREMENTAL route collection | walks every net in the map with **no pin guard** | **yes** |
+    //
+    // ⟹ On every path this crate implements, a pinless net is filtered out *before* locality is
+    // ever asked — which is why no corpus can distinguish the rule, and why adding designs would
+    // not have helped. The branch is not dead: it is load-bearing on the incremental path, where
+    // the test is `route.empty() && !isLocal()` and a pinless net answering `true` is what keeps
+    // it OUT of the incremental set. Answering `false` there would insert an empty route for a
+    // net that has nothing to route.
+    //
+    // ⚠️ So the rule is implemented and pinned here, and the gap is **characterised rather than
+    // open**: it closes when the incremental path is implemented, not when a bigger design is
+    // found.
+    assert!(is_local(&[]), "and it must stay true for the incremental filter to work");
 }
 
 #[test]

@@ -28,9 +28,11 @@ The gate is control-verified: widening the guide box, removing the two-guide via
 guide order within a net, swapping which guide a via's two ends mark, and sharing the pin-claim
 set between nets each make it fail, with the diagnostic naming which.
 
-⬜ **One rule the suite still cannot see**: a pinless net is local. No design here has such a
-net, so a wrong version of that rule produces identical output everywhere; a synthetic case covers
-it and a test asserts the count, so adding such a design says so.
+⬜ **One rule no corpus can show**, and the reference's call sites say why rather than leaving it
+a mystery: a pinless net is local. Locality is asked in three places, and on the two this crate
+implements a pinless net is filtered out *before* the question is put — only the incremental path
+asks without a pin guard. So the gap closes when that path is implemented, not when a bigger
+design is found. The rule is pinned by a synthetic case either way.
 
 Two sibling gaps — the pin-claim tie-break and locality ignoring the layer — were in the same
 state and are now **closed**, each verified by the mutation that previously slipped through.
