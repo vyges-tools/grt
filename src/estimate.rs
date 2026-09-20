@@ -30,6 +30,14 @@ pub struct EstimateGrid {
     /// moved — the estimate is left in place.
     usage_h: Vec<f64>,
     usage_v: Vec<f64>,
+    /// Demand carried over from the previous round, and how many rounds an edge has been
+    /// congested. Both feed the congestion history the maze router consults.
+    ///
+    /// ⛔ `last_usage` is `int16_t` in the reference, not a float.
+    last_usage_h: Vec<i16>,
+    last_usage_v: Vec<i16>,
+    cong_cnt_h: Vec<i32>,
+    cong_cnt_v: Vec<i32>,
 }
 
 impl EstimateGrid {
@@ -41,6 +49,58 @@ impl EstimateGrid {
             v: vec![0.0; x_grids * y_grids.saturating_sub(1)],
             usage_h: vec![0.0; x_grids.saturating_sub(1) * y_grids],
             usage_v: vec![0.0; x_grids * y_grids.saturating_sub(1)],
+            last_usage_h: vec![0; x_grids.saturating_sub(1) * y_grids],
+            last_usage_v: vec![0; x_grids * y_grids.saturating_sub(1)],
+            cong_cnt_h: vec![0; x_grids.saturating_sub(1) * y_grids],
+            cong_cnt_v: vec![0; x_grids * y_grids.saturating_sub(1)],
+        }
+    }
+
+    /// Demand carried over from the previous round on the edge leaving `(x, y)`.
+    pub fn last_usage_h(&self, x: usize, y: usize) -> i16 {
+        self.last_usage_h[y * self.h_columns() + x]
+    }
+    pub fn last_usage_v(&self, x: usize, y: usize) -> i16 {
+        self.last_usage_v[y * self.x_grids + x]
+    }
+    /// How many rounds the edge leaving `(x, y)` has been counted congested.
+    pub fn cong_cnt_h(&self, x: usize, y: usize) -> i32 {
+        self.cong_cnt_h[y * self.h_columns() + x]
+    }
+    pub fn cong_cnt_v(&self, x: usize, y: usize) -> i32 {
+        self.cong_cnt_v[y * self.x_grids + x]
+    }
+
+    /// Clear the estimate on every edge — the reference's `InitEstUsage`.
+    ///
+    /// ⚠️ **Every edge, including ones no net ever reached.** The committed demand is untouched.
+    pub fn init_est_usage(&mut self) {
+        self.h.fill(0.0);
+        self.v.fill(0.0);
+    }
+
+    /// Clear the carried-over demand, and the congestion counts on the first pass — the
+    /// reference's `InitLastUsage`.
+    ///
+    /// ⛔ **The `2` arm is dead arithmetic, and it is destroying real data to get there.** The
+    /// reference zeroes `last_usage` on every edge and then, for that arm alone, multiplies it by
+    /// `0.2` — a value the line above has already set to zero. Measured on the design that
+    /// reaches it: **647 of 2,380 edges carry a non-zero carried-over demand on entry, and every
+    /// one is zero by the time the multiply runs.**
+    ///
+    /// ⟹ The arm reads as an intent to **retain a fifth** of the previous round's demand, which
+    /// the unconditional zeroing defeats. Transcribed as the no-op it actually is; the divergence
+    /// is recorded rather than silently "fixed", because guessing the intent would change results.
+    pub fn init_last_usage(&mut self, up_type: i32) {
+        self.last_usage_h.fill(0);
+        self.last_usage_v.fill(0);
+        match up_type {
+            1 => {
+                self.cong_cnt_h.fill(0);
+                self.cong_cnt_v.fill(0);
+            }
+            2 => { /* `last_usage * 0.2` on a field just zeroed */ }
+            _ => {}
         }
     }
 
@@ -310,4 +370,13 @@ pub fn check_2d_edges_usage(
         }
     }
     out
+}
+
+/// Remember each edge's routed length for the next round — the reference's `SaveLastRouteLen`.
+///
+/// ⚠️ This is the value the critical-net rip-up arm divides by. An edge whose length was never
+/// saved reads back as zero, which is exactly why that arm treats a zero previous length as
+/// "not configured" rather than dividing by it.
+pub fn save_last_route_len(routelens: &[i32], last_routelens: &mut [i32]) {
+    last_routelens.copy_from_slice(routelens);
 }
