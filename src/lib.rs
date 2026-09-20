@@ -36,6 +36,8 @@ pub use estimate::{
     estimate_one_seg, needs_l_route, EstimateGrid, LShape, CAPACITY_LOWER_BOUND_FRACTION,
 };
 pub mod ripup;
+pub mod ripup_route;
+pub use ripup_route::{new_ripup, new_ripup_check, new_ripup_congested_l, new_ripup_net, CriticalCheck, RipupReason, RoutedShape};
 pub use ripup::{
     cost_and_enlarge_step, logistic_coefficient, order_by_congestion, order_for_ripup,
     step_threshold_m, OrderTree, Schedule, DEPRIORITISE_PERCENT, SLACK_SENTINEL,

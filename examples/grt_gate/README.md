@@ -250,3 +250,41 @@ corpus asserts the zero rather than relying on it.
 ⚠️ Including the **inputs** — the cost table and the usage patches — not only the compared cost.
 A prefix sum over ~30 table lookups will show a one-unit difference in the last place long before
 anything else does.
+
+## `ripup_gates.json` — the two gates that decide whether a route is replaced
+
+583 one-bend decisions and 742 walked-route decisions from five designs. Each carries what the
+gate read, its verdict, **and the state afterwards** — a gate that says yes also gives back demand
+and, in the one-bend case, undoes node marks.
+
+⛔ **The two gates read different grids and compare differently.** The one-bend gate reads the
+**estimate** and asks `usage > capacity`, against a per-edge capacity summed over the net's layer
+range. The walked gate reads **committed** demand and asks `usage >= capacity - threshold`.
+Feeding either rule to the other passes nothing.
+
+⚠️ **The horizontal mark is given back only to a Steiner node**, while the vertical mark is given
+back unconditionally — so a terminal keeps a mark set by a route that has since gone.
+
+### The critical-net arm is live, and entirely unwitnessed in its details
+
+142 of the captured decisions are torn up for a **detour** rather than for congestion, so the arm
+itself is exercised. But every one of its four conditions survived a deliberate mutation, and
+measuring says why — the corpus has **zero** cases that could separate any of them:
+
+| condition | distinguishing cases in the corpus |
+| --- | --- |
+| the detour ratio is ≥ 2, not ≥ 1 | 0 |
+| the sentinel slack is excluded | 0 — no net carries it |
+| a zero previous length disables the check | 0 |
+| congestion is decided before the detour | 0 |
+
+All four are pinned by constructed cases. ⚠️ A one-step route can never be a detour however short
+its predecessor, which is what made the first attempt at those cases fail.
+
+### The Z undo has no witness either
+
+Neither gate reaches it — the one-bend gate refuses anything that is not a single bend, and the
+walked gate only sees routes already expanded into points. It is pinned by the property that
+matters: **routing a Z and then ripping it up returns the grid exactly to its previous state.**
+The charge and the undo are written in different modules from different reference functions, so
+they agree only if both are right.
