@@ -16,6 +16,11 @@
 
 pub mod estimate;
 pub mod lroute;
+pub mod spiral;
+pub use spiral::{
+    propagate_alias_status, register_edges, reset_and_alias, traversal_order, EdgeReg,
+    SpiralNode, MAX_CONNECTIONS,
+};
 pub use lroute::{
     is_known_status, mark_h, mark_v, route_edge, via_bias, EdgeRoute, TreeEdge, TreeNode,
 };

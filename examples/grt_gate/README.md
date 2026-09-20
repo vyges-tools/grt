@@ -81,3 +81,34 @@ from sorting the whole list — `gcd` has no clock nets at all, and `clock_route
 `net_order.ok` is 348 nets from a design where the full list is **not** name-sorted, so the two
 rules give different answers and the test can fail. The nets are fed to `order_nets` **reversed**,
 to show the answer depends on the rules rather than on input order.
+
+## `spiral.json` — the traversal that feeds layer assignment
+
+7,088 net states from five designs, each carrying the inputs (coordinates, pin layers, edge list)
+and every output the stage produces (aliases, statuses, per-node edge registration, per-edge alias
+fields, and the order edges are routed in).
+
+**Five designs, because most of them cannot reach the alias branch.** Swept across all 147
+traceable cases: only `gcd_flute` (266 aliased nodes) and `overlapping_edges` (43) ever collapse a
+coincident Steiner node at any scale. Every design whose trees come from the PD builder gives 0 or
+1. A corpus without a FLUTE case validates the alias resolution against nothing.
+
+**Each net appears many times.** The stage runs once per rip-up iteration and the tree differs
+each time, so the repeats are real coverage and are kept as separate cases; only states identical
+in every field are dropped. A first extractor attached every iteration's visit order to the
+*first* record for each net id, which produced a corpus where most cases had nothing to check and
+still passed.
+
+### Two rules no design witnesses
+
+Both were read out of the reference and then found to survive a deliberate mutation across all
+7,088 states, so each is pinned by a constructed case instead:
+
+| rule | why no design reaches it |
+| --- | --- |
+| a Steiner node aliases to the **first** recorded node at its coordinate | first and last differ only where one coordinate holds **two or more terminals**, since a matched Steiner node is never itself recorded. Zero such coordinates in the corpus. |
+| the traversal is seeded from the **terminals only** | seeding from every node gives the same answer everywhere here, because these designs index Steiner nodes in discovery order. Separating it needs a Steiner node indexed *below* another on its only path to a terminal. |
+
+⚠️ The second is **not** an equivalence — the constructed tree gives `e0 e1 e2 e3` breadth-first
+against `e0 e1 e3 e2` in node order. The one mutation that does survive on purpose is testing the
+opposite endpoint when expanding, which is provably the same function; the argument is at the site.
