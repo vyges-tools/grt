@@ -200,20 +200,38 @@ fn the_connected_to_term_flag_matches_the_REFERENCE_on_every_guide() {
 }
 
 #[test]
-fn the_corpus_does_NOT_witness_the_first_claim_tie_break_and_says_so() {
-    // ⬜ **A measured gap, kept as a test so it cannot quietly become a false assurance.**
+fn the_corpus_CANNOT_DISCRIMINATE_these_three_rules_and_says_so() {
+    // ⬜ **Three measured gaps, kept as one test so they cannot quietly become false assurance.**
     //
-    // `mark_connected_to_terms` claims a route point for the FIRST guide that reaches it and
-    // leaves every later one unmarked. Replacing that rule with "mark every guide that touches a
-    // pin point" produces IDENTICAL output on this corpus — because no net here touches any of
-    // its own pin points twice. The whole-design gate therefore cannot tell the two apart, and
-    // only the synthetic case in `tests/guides.rs` does.
+    // Each of these rules can be replaced by a plausible wrong one and this design produces
+    // IDENTICAL output. Mutation testing found all three; the passing gate found none of them.
     //
-    // ⚠️ If a future corpus does exercise it, this test fires and the gap is closed — which is
-    // the point of asserting the count rather than writing a comment nobody re-checks.
+    // | rule | wrong version that also passes | why it passes here |
+    // | --- | --- | --- |
+    // | first guide to reach a pin point claims it | mark every guide that touches one | no net touches one of its own pin points twice |
+    // | `is_local` compares position only | compare the layer too | no net has two pins at one point on different layers |
+    // | a net with no pins is local | say it is not | no net has zero pins |
+    //
+    // Synthetic cases in `tests/guides.rs` and `tests/init.rs` cover all three. ⚠️ The counts are
+    // asserted rather than described, so a richer corpus ANNOUNCES that a gap has closed instead
+    // of leaving it to be rediscovered.
     let c = parse_corpus();
-    let mut repeated = 0;
+
+    let mut repeated_pin_points = 0;
+    let mut same_point_other_layer = 0;
+    let mut pinless = 0;
     for net in &c.nets {
+        if net.pins.is_empty() {
+            pinless += 1;
+        }
+        let mut by_xy: BTreeMap<(i32, i32), std::collections::BTreeSet<i32>> = BTreeMap::new();
+        for p in &net.pins {
+            by_xy.entry((p.on_grid_x, p.on_grid_y)).or_default().insert(p.connection_layer);
+        }
+        if by_xy.values().any(|layers| layers.len() > 1) {
+            same_point_other_layer += 1;
+        }
+
         let pin_pts: std::collections::BTreeSet<RoutePt> = net.pins.iter()
             .map(|p| RoutePt { x: p.on_grid_x, y: p.on_grid_y, layer: p.connection_layer })
             .collect();
@@ -226,13 +244,18 @@ fn the_corpus_does_NOT_witness_the_first_claim_tie_break_and_says_so() {
                 }
             }
         }
-        repeated += hits.values().filter(|n| **n > 1).count();
+        repeated_pin_points += hits.values().filter(|n| **n > 1).count();
     }
-    assert_eq!(
-        repeated, 0,
-        "this corpus now DOES touch a pin route point more than once ({repeated} times), so the \
-         first-claim tie-break is finally witnessed end to end — update this test and the README"
-    );
+
+    assert_eq!(repeated_pin_points, 0,
+        "a pin route point is now touched more than once ({repeated_pin_points}x): the \
+         first-claim tie-break is witnessed end to end at last — update this test and the README");
+    assert_eq!(same_point_other_layer, 0,
+        "{same_point_other_layer} net(s) now have two pins at one point on different layers: \
+         is_local's layer-blindness is witnessed — update this test and the README");
+    assert_eq!(pinless, 0,
+        "{pinless} net(s) now have no pins: the empty-net locality rule is witnessed — \
+         update this test and the README");
 }
 
 #[test]

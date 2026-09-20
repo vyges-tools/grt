@@ -34,18 +34,20 @@ compared against.
 `is_connected_to_term` flag that the guide file does not record. 1,414 of the 3,848 guides are
 marked.
 
-## ⬜ What this corpus does NOT reach
+## ⬜ What this corpus cannot discriminate
 
-The flag is claimed by the **first** guide to reach a route point where a pin sits; later guides
-over the same point are left unmarked. **No net in this design touches one of its own pin points
-twice**, so replacing that rule with "mark every guide that touches a pin point" produces
-identical output here. The whole-design gate cannot tell the two apart — only the synthetic case
-in `tests/guides.rs` does.
+Three rules can each be replaced by a plausible wrong one and this design produces **identical
+output**. Mutation testing found all three; the passing gate found none of them.
 
-`the_corpus_does_NOT_witness_the_first_claim_tie_break_and_says_so` asserts that count is zero, so
-a richer corpus will announce that the gap has closed rather than leaving it to be rediscovered.
+| rule | a wrong version that also passes | why it passes here |
+| --- | --- | --- |
+| the **first** guide to reach a pin's route point claims it | mark every guide that touches one | no net touches one of its own pin points twice |
+| locality compares **position only** | compare the layer as well | no net has two pins at one point on different layers |
+| a net with **no pins** is local | say it is not | no net has zero pins |
 
-## Regenerating
+Synthetic cases in `tests/guides.rs` and `tests/init.rs` cover all three, and
+`the_corpus_CANNOT_DISCRIMINATE_these_three_rules_and_says_so` asserts the three counts are zero —
+so a richer design announces that a gap has closed rather than leaving it to be rediscovered.
 
-The corpus and the golden must be captured from the **same run**, or they describe different
-designs. `tests/end_to_end.rs` reads both and compares every guide, per net and in order.
+⟹ This design is small and well behaved. A second corpus should be chosen for what it makes
+*different*, not for being bigger.

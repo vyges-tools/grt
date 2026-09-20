@@ -25,9 +25,11 @@ The gate is control-verified: widening the guide box, removing the two-guide via
 guide order within a net, swapping which guide a via's two ends mark, and sharing the pin-claim
 set between nets each make it fail, with the diagnostic naming which.
 
-⬜ **One rule it cannot see**, and the crate says so rather than implying otherwise: the pin-claim
-tie-break, because no net in this design touches one of its own pin points twice. A synthetic case
-covers it, and a test asserts the corpus count so a richer design announces when the gap closes.
+⬜ **Three rules it cannot see**, and the crate says so rather than implying otherwise — the
+pin-claim tie-break, locality ignoring the layer, and a pinless net being local. Each can be
+replaced by a plausible wrong rule and this design produces identical output. Synthetic cases
+cover all three, and a test asserts the corpus counts so a richer design announces when a gap
+closes. Mutation testing found all three; the passing gate found none of them.
 
 ## What it does
 
@@ -55,6 +57,14 @@ let net = NetRoute {
 let guides = save_guides(&[net], &grid, &opts).unwrap();
 assert_eq!(guides[0].guides[0].box_, Rect::new(250, 250, 550, 350));
 ```
+
+## Setting up a run
+
+`init_fast_route` derives the routing grid from the die area and the cell size, and reports by
+name every stage of the published setup order it does not yet run — a stage that is simply not
+called produces no diff to chase, so the gaps are visible from the outside.
+
+`is_local` classifies a net, and is checked against the reference on all 563 nets of the design.
 
 ## The rules it implements, and why they are not obvious
 

@@ -14,6 +14,9 @@
 //! stage runs, so a divergence can be pointed at one line rather than bisected. The per-segment
 //! rules live in [`guides_for_segment`], the geometry in [`global_routing_to_box`].
 
+pub mod init;
+pub use init::{init_fast_route, init_grid, is_local, is_routable, AbsentStage, CoreGrid, SetupReport};
+
 #[cfg(feature = "odb")]
 pub mod apply;
 #[cfg(feature = "odb")]
