@@ -78,6 +78,10 @@ every pin position funnels through. Checked against the reference by the fixed-p
 1,536 pin positions and 7,540 segment endpoints are all cell centres, so snapping one must return
 it unchanged.
 
+`compute_gcell_capacity` counts the routing tracks crossing one grid cell — the per-edge capacity
+the router works from. **Every one of 1,076,274 reference calls was replayed and matched**, cell
+rectangles and capacities both; a stratified 810-row sample ships as the committed gate.
+
 `order_nets` reproduces the order nets are handed to the router — **non-leaf clock nets first,
 then everything else, each group sorted by name**. Checked against the reference on a design where
 that is *distinguishable* from a plain name sort, because on many designs it is not.
@@ -96,6 +100,13 @@ that is *distinguishable* from a plain name sort, because on many designs it is 
 - **A box within one tile of the grid edge snaps out to it**, under a truncating integer divide.
   The gap is closed rather than left as a sliver the detailed router cannot use.
 - **Guide order within a net is segment order**, and guide files are compared as ordered lists.
+- **Capacity's two bounds are not symmetric.** The lower is a ceiling; the upper floors over
+  `max_bound - track_init - 1`, so a track sitting exactly on a cell's upper edge belongs to the
+  *next* cell. Dropping that `- 1` over-counts on every boundary a track lands on.
+- **Adjacent routing layers must prefer different directions** — but the check is half-open, so
+  the topmost pair is never examined, and a backside layer beside a frontside one is skipped.
+- **Routing layers are indexed by a running counter**, not by their routing level; layers at
+  level 0 are skipped and do not consume an index.
 - **A clock net is not a clock-typed net.** One that reaches any clock terminal is a *leaf* and
   routes with the ordinary nets; only one that reaches none of them goes to the front. A pad
   terminal counts as a clock terminal even without a register.

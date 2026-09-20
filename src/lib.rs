@@ -14,6 +14,11 @@
 //! stage runs, so a divergence can be pointed at one line rather than bisected. The per-segment
 //! rules live in [`guides_for_segment`], the geometry in [`global_routing_to_box`].
 
+pub mod capacity;
+pub use capacity::{
+    capacity_edge_order, check_adjacent_layers_direction, compute_gcell_capacity,
+    init_routing_layers, Direction, LayerError, RoutingLayer, INFINITE_CAPACITY,
+};
 pub mod init;
 pub use init::{
     init_fast_route, init_grid, is_clk_term, is_local, is_non_leaf_clock, is_routable, order_nets,
