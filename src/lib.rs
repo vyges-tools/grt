@@ -14,6 +14,8 @@
 //! stage runs, so a divergence can be pointed at one line rather than bisected. The per-segment
 //! rules live in [`guides_for_segment`], the geometry in [`global_routing_to_box`].
 
+pub mod estimate;
+pub use estimate::{estimate_all, estimate_one_seg, needs_l_route, EstimateGrid};
 pub mod ripup;
 pub use ripup::{
     cost_and_enlarge_step, logistic_coefficient, order_by_congestion, order_for_ripup,

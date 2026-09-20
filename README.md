@@ -78,6 +78,10 @@ every pin position funnels through. Checked against the reference by the fixed-p
 1,536 pin positions and 7,540 segment endpoints are all cell centres, so snapping one must return
 it unchanged.
 
+`estimate_one_seg` lays down the first demand estimate, before anything is routed — **every one of
+985 non-zero grid cells matches the reference**. A diagonal segment charges *half* its cost to
+four runs, because which way it will bend is not yet known.
+
 `order_for_ripup` reproduces the order nets are ripped up and rerouted — **all 321 nets and all
 139 de-prioritisations match the reference**. ⛔ Its congestion comparison discriminates almost
 nothing: 309 of 320 adjacent pairs tie, and a single tie group of 200 nets — 62% of the design —
@@ -109,6 +113,11 @@ that is *distinguishable* from a plain name sort, because on many designs it is 
 - **A box within one tile of the grid edge snaps out to it**, under a truncating integer divide.
   The gap is closed rather than left as a sliver the detailed router cannot use.
 - **Guide order within a net is segment order**, and guide files are compared as ordered lists.
+- **Demand is estimated for every segment before any is routed** — two separate passes, so the
+  first net routes against the complete picture rather than a half-filled grid.
+- **The edge arrays are not the cell grid**: `(x-1) × y` horizontal edges and `x × (y-1)`
+  vertical. The reference's accessors do not bounds-check, so reading the missing column returns
+  whatever is in memory.
 - **The rip-up order is two STABLE sorts with a position-dependent step between them**, so they
   cannot be fused: the middle step reads each net's position in the list the first sort produced.
 - **A tree's segments are ordered by X alone**, not lexicographically — so a *vertical* segment
