@@ -429,3 +429,28 @@ described a step that moved with no flag set — impossible — and the replay d
 ⚠️ The first-step guard **is** a real gap — not one of the 1,760 walks has a jump flag set at its
 meeting point, so the corpus cannot tell the guard from its absence. Pinned by a constructed case,
 which matters because the previous position it guards is uninitialised on that first pass.
+
+## `surgery.json` — splicing the new path back into the tree
+
+1,500 surgeries from four designs, in two shapes: the node landed on one of **its own** edges, or
+on a **different** one.
+
+⛔ **In the second shape the three edge slots are recycled, not created.** The node's two edges
+become the single edge joining its former neighbours, and the edge it landed on becomes the node's
+two new edges — all in the same three slots, roles swapped. The merged edge is written into the
+slot of the edge about to be split, so the split only works because every point list is copied out
+first. Reordering those two steps fails the gate.
+
+⚠️ **The second shape assigns no endpoints**, unlike the first: the caller rewrites all three
+edges' endpoints and the adjacency of five nodes afterwards. The test compares endpoints only
+where the function itself sets them.
+
+### What the corpus decides, and what it cannot
+
+All four of the first shape's orientation combinations are present and asserted — each rewritten
+edge is stored with the smaller column first, the same convention the segment emission uses, which
+is why the endpoints are assigned in both arms rather than once.
+
+⛔ **No captured input edge is un-routed.** The single-point branch of the copy — which hands back
+the requested endpoint's own coordinates rather than the stored points — is pinned by a
+constructed case, because an empty list there would silently shorten every join below it.

@@ -482,3 +482,180 @@ pub fn backtrace(s: &MazeSearch, cross: (i32, i32)) -> Vec<(i32, i32)> {
     grids.push(cross);
     grids
 }
+
+/// An edge as the tree surgery reads and rewrites it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurgeryEdge {
+    pub n1: usize,
+    pub n2: usize,
+    pub routelen: usize,
+    pub grids: Vec<(i32, i32)>,
+    /// `false` for a degenerate edge that was never routed.
+    pub is_maze_route: bool,
+    pub len: i32,
+}
+
+/// Read one edge's points out in the direction starting at `from` — the reference's `copyGrids`.
+///
+/// ⚠️ An edge stores its points in one fixed order; this hands them back starting from whichever
+/// endpoint is asked for, reversing when that is the stored second node.
+///
+/// ⚠️ **A never-routed edge yields a single point — the coordinates of `from`** — rather than an
+/// empty list, so the joins below always have something to start from.
+pub fn copy_grids(
+    nodes: &[MazeNode],
+    from: usize,
+    edges: &[SurgeryEdge],
+    edge_id: usize,
+) -> Vec<(i32, i32)> {
+    let e = &edges[edge_id];
+    if !e.is_maze_route {
+        return vec![(nodes[from].x, nodes[from].y)];
+    }
+    let taken = &e.grids[..=e.routelen];
+    if e.n1 == from {
+        taken.to_vec()
+    } else {
+        taken.iter().rev().copied().collect()
+    }
+}
+
+/// The node moved onto one of its own edges: re-cut that edge at the new position.
+///
+/// `n1` is moving to `(e1x, e1y)`, which lies on the edge joining it to `a1`. That edge is
+/// shortened to end at the new position, and the edge to `a2` takes over everything beyond it —
+/// so the node keeps two edges and neither is created or destroyed.
+///
+/// ⛔ **Each rewritten edge is oriented by X**: the endpoint with the smaller column is stored
+/// first, and `n1`/`n2` are set to match. This is the same convention the segment emission uses,
+/// and it is why the endpoints are assigned in both arms rather than once.
+///
+/// ⚠️ The join skips the first point of the second list, which is the node itself and already
+/// present as the last point of the first.
+#[allow(clippy::too_many_arguments)]
+pub fn update_route_type1(
+    nodes: &[MazeNode],
+    n1: usize,
+    a1: usize,
+    a2: usize,
+    (e1x, e1y): (i32, i32),
+    edges: &mut [SurgeryEdge],
+    edge_n1a1: usize,
+    edge_n1a2: usize,
+) -> Result<(), String> {
+    let (a1x, a1y) = (nodes[a1].x, nodes[a1].y);
+    let (a2x, a2y) = (nodes[a2].x, nodes[a2].y);
+
+    // Both copies are taken before anything is written, because the edges being read are the
+    // edges about to be overwritten.
+    let from_a1 = copy_grids(nodes, a1, edges, edge_n1a1);
+    let from_n1 = copy_grids(nodes, n1, edges, edge_n1a2);
+
+    let e1_pos = from_a1
+        .iter()
+        .position(|&p| p == (e1x, e1y))
+        .ok_or_else(|| format!("({e1x},{e1y}) is not on the edge it is supposed to lie on"))?;
+
+    // The near half: a1 as far as the new position.
+    let head: Vec<(i32, i32)> = from_a1[..=e1_pos].to_vec();
+    let e = &mut edges[edge_n1a1];
+    if a1x <= e1x {
+        e.grids = head;
+        e.n1 = a1;
+        e.n2 = n1;
+    } else {
+        e.grids = head.into_iter().rev().collect();
+        e.n1 = n1;
+        e.n2 = a1;
+    }
+    e.is_maze_route = true;
+    e.routelen = e1_pos;
+    e.len = (a1x - e1x).abs() + (a1y - e1y).abs();
+
+    // The far half: everything beyond the new position, plus the whole of the other edge.
+    let mut tail: Vec<(i32, i32)> = from_a1[e1_pos..].to_vec();
+    tail.extend_from_slice(&from_n1[1..]);
+    let e = &mut edges[edge_n1a2];
+    e.routelen = tail.len() - 1;
+    if e1x <= a2x {
+        e.grids = tail;
+        e.n1 = n1;
+        e.n2 = a2;
+    } else {
+        e.grids = tail.into_iter().rev().collect();
+        e.n1 = a2;
+        e.n2 = n1;
+    }
+    e.is_maze_route = true;
+    e.len = (a2x - e1x).abs() + (a2y - e1y).abs();
+    Ok(())
+}
+
+/// The node moved onto a **different** edge: merge its own two edges, and split the one it landed
+/// on.
+///
+/// ⛔ **Three edge slots are recycled, not created.** The node's two edges become the single edge
+/// joining its former neighbours, and the edge it landed on becomes the node's two new edges —
+/// all in the same three slots, with their roles swapped.
+///
+/// ⛔ **The merged edge is written into the slot of the edge about to be split**, so the split
+/// only works because every list was copied out first. Writing before copying would destroy the
+/// points the split needs.
+///
+/// ⚠️ **No endpoint is assigned here**, unlike the other variant: the caller rewrites all three
+/// edges' endpoints and the adjacency of five nodes afterwards. Assigning them here would make
+/// the two halves disagree about which had done it.
+#[allow(clippy::too_many_arguments)]
+pub fn update_route_type2(
+    nodes: &[MazeNode],
+    n1: usize,
+    a1: usize,
+    a2: usize,
+    c1: usize,
+    c2: usize,
+    (e1x, e1y): (i32, i32),
+    edges: &mut [SurgeryEdge],
+    edge_n1a1: usize,
+    edge_n1a2: usize,
+    edge_c1c2: usize,
+) -> Result<(), String> {
+    let (a1x, a1y) = (nodes[a1].x, nodes[a1].y);
+    let (a2x, a2y) = (nodes[a2].x, nodes[a2].y);
+    let (c1x, c1y) = (nodes[c1].x, nodes[c1].y);
+    let (c2x, c2y) = (nodes[c2].x, nodes[c2].y);
+
+    let from_a1 = copy_grids(nodes, a1, edges, edge_n1a1);
+    let from_n1 = copy_grids(nodes, n1, edges, edge_n1a2);
+    let from_c1 = copy_grids(nodes, c1, edges, edge_c1c2);
+
+    // The two edges at the node become one, joining its former neighbours through where it was.
+    let mut merged: Vec<(i32, i32)> = from_a1.clone();
+    merged.extend_from_slice(&from_n1[1..]);
+    let e = &mut edges[edge_c1c2];
+    e.routelen = merged.len() - 1;
+    e.grids = merged;
+    e.is_maze_route = true;
+    e.len = (a1x - a2x).abs() + (a1y - a2y).abs();
+
+    // ⚠️ Looked up AFTER the merge has overwritten this edge's slot — which is safe only because
+    // its points were copied above.
+    let e1_pos = from_c1
+        .iter()
+        .position(|&p| p == (e1x, e1y))
+        .ok_or_else(|| format!("({e1x},{e1y}) is not on the edge it was routed onto"))?;
+
+    let head: Vec<(i32, i32)> = from_c1[..=e1_pos].to_vec();
+    let e = &mut edges[edge_n1a1];
+    e.routelen = head.len() - 1;
+    e.grids = head;
+    e.is_maze_route = true;
+    e.len = (c1x - e1x).abs() + (c1y - e1y).abs();
+
+    let tail: Vec<(i32, i32)> = from_c1[e1_pos..].to_vec();
+    let e = &mut edges[edge_n1a2];
+    e.routelen = tail.len() - 1;
+    e.grids = tail;
+    e.is_maze_route = true;
+    e.len = (c2x - e1x).abs() + (c2y - e1y).abs();
+    Ok(())
+}
