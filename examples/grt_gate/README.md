@@ -400,3 +400,32 @@ requests a via, and removing the guard is a mutation nothing can kill.
   constructed case.
 - ⚠️ `removeMin` is **not** the idiomatic swap-pop-sift: the tail is copied to the root and the
   heap repaired while the stale element is still present, so it takes part in comparisons.
+
+## `backtrace.json` — walking the parents back from the meeting point
+
+1,760 walks from four designs, 22,348 steps, **744 of them jumps**.
+
+The search stops the moment it pops a cell that already belongs to the destination subtree, so the
+meeting point is already on that subtree and a single walk back to a source cell is the whole new
+route. There is no second traversal.
+
+### The capture had to be placed at the read, not near it
+
+Each step records the horizontal jump flag **at the cell entered**, the vertical jump flag at the
+cell as it stood **after** the horizontal test, and the column where that second read happened.
+
+⛔ The first capture read the vertical flag *after* the whole test block, so whenever a vertical
+jump fired it sampled the flag at the post-jump cell rather than the one tested. The trace then
+described a step that moved with no flag set — impossible — and the replay diverged on 66 walks.
+**Sample a value where it is read, not merely before the next write.**
+
+### Two mutations that cannot be killed, and why they differ
+
+| mutation | verdict |
+| --- | --- |
+| the two jump tests swapped in order | ⭐ **structural equivalence** — after a parent step the cell differs from the previous one in exactly one axis, after a jump in none, so at most one test can fire. 0 of 744 captured jumps move both axes. |
+| the jump shortened so the position does not advance | **not a survivor at all** — it spins. The reflection is what makes the walk terminate; there is no bound on the loop. |
+
+⚠️ The first-step guard **is** a real gap — not one of the 1,760 walks has a jump flag set at its
+meeting point, so the corpus cannot tell the guard from its absence. Pinned by a constructed case,
+which matters because the previous position it guards is uninitialised on that first pass.

@@ -413,3 +413,72 @@ pub fn relax_adjacent(
 
     s.update_adjacent((cur_x, cur_y), (cur_x + d_x, cur_y + d_y), tmp)
 }
+
+/// Walk the recorded parents back from the meeting point to the source subtree.
+///
+/// The search stops the moment it pops a cell that already belongs to the destination subtree, so
+/// the meeting point is **already on** that subtree and a single walk back to a source cell is
+/// the whole new route. There is no second traversal.
+///
+/// ⛔ **Only one coordinate changes per step.** Every move the search made was axis-aligned, so
+/// the parent differs from its child in exactly one axis — and the reference updates only that
+/// one, taking the other from where it already is. Copying both from the parent grid would read
+/// a coordinate that grid never wrote.
+///
+/// ⛔ **A "hyper" cell jumps one more step in the direction just travelled** rather than
+/// consulting its parent: `cur = 2 * cur - previous` reflects the last step forward again. The
+/// parent step is skipped entirely when a jump happens — a jumped cell has no parent to consult.
+///
+/// ⚠️ **The reflection is what makes the walk terminate.** Shortening the jump so the position
+/// does not advance — `cur = previous`, say — leaves the loop spinning rather than producing a
+/// wrong path: the guard here is the arithmetic, not a bound on the loop.
+///
+/// ⚠️ **The two jump tests are sequentially dependent** — the vertical one reads the hyper grid at
+/// a column the horizontal one may have just changed.
+///
+/// 🔑 **But they can never both fire in the same step, and that is structural.** After a parent
+/// step the cell differs from the previous one in exactly one axis; after a jump it differs in
+/// none. So at most one of the two movement tests can be true. Measured: **0 of 744** captured
+/// jumps move both axes. Swapping the two tests is therefore a mutation nothing can kill — an
+/// equivalence, not a gap.
+///
+/// ⚠️ The path is built backwards and reversed, then the meeting point is appended — so the
+/// meeting point appears exactly once, at the end, and is never pushed by the loop.
+pub fn backtrace(s: &MazeSearch, cross: (i32, i32)) -> Vec<(i32, i32)> {
+    let (mut cur_x, mut cur_y) = cross;
+    // ⚠️ The reference leaves these uninitialised and relies on the first iteration not reading
+    // them. Named here so that reliance is visible rather than accidental.
+    let (mut prev_x, mut prev_y) = (i32::MIN, i32::MIN);
+    let mut reversed: Vec<(i32, i32)> = Vec::new();
+    let mut first = true;
+
+    while s.dist[s.at(cur_x, cur_y)] != 0.0 {
+        let mut jumped = false;
+        if !first {
+            if cur_x != prev_x && s.hyper_h[s.at(cur_x, cur_y)] {
+                cur_x = 2 * cur_x - prev_x;
+                jumped = true;
+            }
+            if cur_y != prev_y && s.hyper_v[s.at(cur_x, cur_y)] {
+                cur_y = 2 * cur_y - prev_y;
+                jumped = true;
+            }
+        }
+        prev_x = cur_x;
+        prev_y = cur_y;
+        if !jumped {
+            let here = s.at(prev_x, prev_y);
+            if s.hv[here] {
+                cur_y = s.parent_y1[here];
+            } else {
+                cur_x = s.parent_x3[here];
+            }
+        }
+        reversed.push((cur_x, cur_y));
+        first = false;
+    }
+
+    let mut grids: Vec<(i32, i32)> = reversed.into_iter().rev().collect();
+    grids.push(cross);
+    grids
+}
