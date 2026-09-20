@@ -573,3 +573,23 @@ loudly rather than quietly.
 ⚠️ One more survivor is a property of the transcription, not the reference: the search grid's row
 stride. The reference's matters because it decomposes a flat cell index that crosses function
 boundaries; no flat index escapes this crate, so any sufficient width round-trips.
+
+## `netloop.json` — the per-net loop and its retry
+
+40 passes from four designs, **19,800 net visits**, each carrying the nets entered **in order** —
+so a retry shows as a repeat at the same index. A count of visits could not tell "processed every
+net once" from "skipped one and retried another".
+
+### The recovery is unreachable on every shipped design
+
+A surgery that cannot place a contact point clears the net's tree, rebuilds it from the pins, and
+reprocesses the **same** net. Swept across **all 148 traceable designs: 713,915 net visits, zero
+retries.**
+
+⛔ It is transcribed anyway and pinned by constructed cases — that the failing net is entered again
+**in place** rather than skipped, and that nothing bounds the repetition. The absence is asserted
+too, so a recapture that ever reaches it fails loudly instead of quietly invalidating these notes.
+
+⚠️ The reference steps its net index **back** before breaking out of the edge loop, so the loop's
+own increment returns to the same net. Writing that as "move on to the next net" is the natural
+mistake, and nothing in any corpus would catch it.

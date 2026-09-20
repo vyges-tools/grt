@@ -19,7 +19,7 @@ pub mod lroute;
 pub mod spiral;
 pub mod maze;
 pub mod mazecost;
-pub use maze::{backtrace, charge_route, route_one_edge, EdgeContext, EdgeOutcome, rewire_after_type2, split_edge, copy_grids, maze_search, maze_edge_is_long_enough, maze_edge_region, heapify, update_route_type1, update_route_type2, SurgeryEdge, netedge_order_dec, relax_adjacent, remove_min, setup_heap, update_heap, Heaps, MazeEdge, MazeNode, MazeSearch, OrderNetEdge, RelaxInputs, BIG_INT};
+pub use maze::{backtrace, charge_route, maze_route_pass, AfterEdge, route_one_edge, EdgeContext, EdgeOutcome, rewire_after_type2, split_edge, copy_grids, maze_search, maze_edge_is_long_enough, maze_edge_region, heapify, update_route_type1, update_route_type2, SurgeryEdge, netedge_order_dec, relax_adjacent, remove_min, setup_heap, update_heap, Heaps, MazeEdge, MazeNode, MazeSearch, OrderNetEdge, RelaxInputs, BIG_INT};
 pub mod mazeconv;
 pub use mazecost::{cost_table, get_cost, CostParams};
 pub mod monotonic;

@@ -1054,3 +1054,50 @@ pub fn route_one_edge(
         dest: heaps.dest,
     })
 }
+
+/// What the per-net loop decides to do after one edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfterEdge {
+    /// Carry on to the next edge of this net.
+    Continue,
+    /// ⛔ Abandon the rest of this net, rebuild its tree from the pins, and process the **same**
+    /// net again from the start.
+    RebuildAndRetry,
+}
+
+/// One pass of the maze router over every net — the reference's per-net call sequence.
+///
+/// ⛔ **The net order is the congestion order when ordering is on, and the router's own net order
+/// otherwise.** Those are different lists, not the same list in a different order.
+///
+/// ⛔ **A failed surgery does not skip the edge — it abandons the net.** The reference steps its
+/// net index *back* before breaking out, so the loop's own increment returns it to the same net.
+/// And the rebuild is not a retry of the routing: it clears the net's nodes and edges entirely
+/// and builds a fresh Steiner tree from the pins, discarding everything routed so far.
+///
+/// ⚠️ **Nothing bounds the retry.** A net that fails the same way every time is reprocessed
+/// forever; the reference relies on the rebuilt tree differing from the one that failed.
+///
+/// ⚠️ **The edge count is read once**, before the edge loop — so an edge added part-way through
+/// by a pin stand-in is not visited in that pass. The ordering is likewise computed once per
+/// entry to the net, which means a retry recomputes it against the rebuilt tree.
+pub fn maze_route_pass<F>(
+    net_order: &[usize],
+    mut route_net: F,
+) -> Vec<usize>
+where
+    F: FnMut(usize) -> AfterEdge,
+{
+    let mut visited = Vec::new();
+    let mut i = 0usize;
+    while i < net_order.len() {
+        let net_id = net_order[i];
+        visited.push(net_id);
+        match route_net(net_id) {
+            AfterEdge::Continue => i += 1,
+            // ⚠️ The reference's `nidRPC--` followed by the loop's `++`: the index does not move.
+            AfterEdge::RebuildAndRetry => {}
+        }
+    }
+    visited
+}
