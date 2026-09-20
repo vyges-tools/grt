@@ -19,7 +19,7 @@
 //! the captured pass-1 statuses, not a captured pass-4 value.
 
 use serde_json::Value;
-use vyges_grt::{propagate_alias_status, register_edges, reset_and_alias, traversal_order};
+use vyges_grt::{propagate_alias_status, register_edges, reset_and_alias, traversal_order, WALK_RESET};
 
 /// `num_layers` only ever lands on a node that is never given a pin layer, and the trace records
 /// what the reference used.
@@ -132,7 +132,7 @@ type Run = (
 );
 
 fn run(c: &Case) -> Run {
-    let mut nodes = reset_and_alias(&c.coords, c.num_terminals, &c.pin_layers, NUM_LAYERS);
+    let mut nodes = reset_and_alias(&c.coords, c.num_terminals, &c.pin_layers, NUM_LAYERS, WALK_RESET);
     let alias: Vec<usize> = nodes.iter().map(|n| n.stack_alias).collect();
     let status: Vec<i16> = nodes.iter().map(|n| n.status).collect();
     let edges = register_edges(&mut nodes, &c.edges);
@@ -233,7 +233,7 @@ fn every_positive_length_edge_is_visited_exactly_once() {
 fn pass_four_copies_status_from_the_alias() {
     let mut inherited = 0usize;
     for c in &cases() {
-        let mut nodes = reset_and_alias(&c.coords, c.num_terminals, &c.pin_layers, NUM_LAYERS);
+        let mut nodes = reset_and_alias(&c.coords, c.num_terminals, &c.pin_layers, NUM_LAYERS, WALK_RESET);
         propagate_alias_status(&mut nodes);
         for (d, node) in nodes.iter().enumerate() {
             let na = c.expect_alias[d];
@@ -268,7 +268,7 @@ fn pass_four_copies_status_from_the_alias() {
 fn alias_resolves_to_the_first_recorded_node() {
     // Two terminals stacked on one coordinate, then a Steiner node on the same spot.
     let coords = vec![(4, 7), (4, 7), (4, 7), (9, 9)];
-    let nodes = reset_and_alias(&coords, 2, &[1, 2], NUM_LAYERS);
+    let nodes = reset_and_alias(&coords, 2, &[1, 2], NUM_LAYERS, WALK_RESET);
 
     assert_eq!(nodes[0].stack_alias, 0, "a terminal is always its own alias");
     assert_eq!(nodes[1].stack_alias, 1, "a terminal never aliases, even onto another terminal");
@@ -301,7 +301,7 @@ fn traversal_is_seeded_from_terminals_not_every_node() {
     let coords = vec![(0, 0), (10, 0), (5, 5), (1, 1), (3, 3)];
     let edges = vec![(0usize, 3usize, 4i32), (1, 3, 4), (3, 4, 4), (4, 2, 4)];
 
-    let mut nodes = reset_and_alias(&coords, 2, &[0, 0], NUM_LAYERS);
+    let mut nodes = reset_and_alias(&coords, 2, &[0, 0], NUM_LAYERS, WALK_RESET);
     let regs = register_edges(&mut nodes, &edges);
     let order = traversal_order(&mut nodes, &regs, 2);
 
@@ -316,7 +316,7 @@ fn zero_length_edges_are_never_visited() {
     // e1 is degenerate: node 2 sits exactly on terminal 0.
     let edges = vec![(0usize, 1usize, 6i32), (0, 2, 0i32)];
 
-    let mut nodes = reset_and_alias(&coords, 2, &[0, 0], NUM_LAYERS);
+    let mut nodes = reset_and_alias(&coords, 2, &[0, 0], NUM_LAYERS, WALK_RESET);
     let regs = register_edges(&mut nodes, &edges);
 
     assert_eq!(regs[1].alias, None, "the reference leaves a degenerate edge's aliases unwritten");

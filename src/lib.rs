@@ -29,7 +29,7 @@ pub use estimate::{check_2d_edges_usage, save_last_route_len, UsageViolation};
 pub use mazeconv::{convert_to_mazeroute, MazeRoute, SymbolicRoute};
 pub use zroute::{newroute_z, ZChoice, HCOST};
 pub use spiral::{
-    propagate_alias_status, register_edges, reset_and_alias, spiral_route, chooses_y_first, traversal_order, EdgeReg,
+    propagate_alias_status, register_edges, reset_and_alias, spiral_route, chooses_y_first, traversal_order, EdgeReg, ResetParams, LAYER_RESET, WALK_RESET,
     SpiralNode, MAX_CONNECTIONS,
 };
 pub use lroute::{

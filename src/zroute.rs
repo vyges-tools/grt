@@ -44,8 +44,12 @@ pub struct ZChoice {
     pub z_point: i32,
 }
 
-/// The reference's `BIG_INT`, used as the starting "no candidate yet" cost.
-const BIG_INT: f64 = i32::MAX as f64;
+/// The reference's `BIG_INT` — **1e9**, declared as an `int` and used as infinity.
+///
+/// ⛔ Not `i32::MAX`, which is roughly twice as large and the plausible-looking guess. Costs here
+/// never approach either, so no captured case distinguishes them — which is exactly why the
+/// constant has to be read rather than assumed.
+const BIG_INT: f64 = 1e9;
 
 /// Accumulate one edge's congestion into a running cost and its tie-break partner.
 ///

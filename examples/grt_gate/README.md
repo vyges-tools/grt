@@ -618,3 +618,19 @@ way, because its second loop happens to stay above the index.
 index, no two earlier points are equal — if they were it would have stopped at the second of them.
 So taking the last match rather than the first is a mutation nothing can kill: a property of the
 algorithm, not a gap in the corpus.
+
+## `layerassign.json` — layer assignment's reset and edge registration
+
+1,324 nets from four designs, 424 of which alias a node (699 aliased nodes in all).
+
+⛔ **These two passes are the outward walk's, bar two values.** A literal diff of the two reference
+functions shows every other line identical: layer assignment starts the per-node counters at the
+reference's infinity rather than zero, and marks a terminal **1** rather than **2**.
+
+They share one implementation here, parameterised on those two values, rather than a copy that can
+drift. **This corpus is what holds that claim** — if either reference function ever diverges
+further, the shared code stops matching one of the two goldens.
+
+⚠️ A degenerate edge's alias fields are left untouched by the reference, so the captured values
+are whatever was already there. The test asserts they are *unwritten*, not that they hold a
+particular value.

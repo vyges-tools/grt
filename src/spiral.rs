@@ -51,6 +51,30 @@ pub struct SpiralNode {
     pub edges: Vec<usize>,
 }
 
+/// How the reset differs between the two stages that perform it.
+///
+/// ⛔ **Two stages reset a net's nodes in exactly the same way bar two values**: the outward walk
+/// before per-edge routing, and layer assignment before the 3D pass. A literal diff of the two
+/// reference functions shows every other line identical, so they share one implementation here
+/// rather than a copy that can drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResetParams {
+    /// What the two per-node connection counters start at.
+    pub counter_init: i32,
+    /// The status a terminal is given.
+    pub terminal_status: i16,
+}
+
+/// The outward walk's reset: counters at zero, terminals marked **2**.
+pub const WALK_RESET: ResetParams = ResetParams { counter_init: 0, terminal_status: 2 };
+
+/// Layer assignment's reset: counters at **infinity**, terminals marked **1**.
+///
+/// ⚠️ The counters start at the reference's `BIG_INT` here rather than zero, because layer
+/// assignment uses them to track a minimum rather than to count.
+pub const LAYER_RESET: ResetParams =
+    ResetParams { counter_init: 1_000_000_000, terminal_status: 1 };
+
 /// Reset the nodes and resolve the aliases — pass 1.
 ///
 /// ⚠️ **Terminals come first and always get their own entry**, because nodes are ordered
@@ -65,6 +89,7 @@ pub fn reset_and_alias(
     num_terminals: usize,
     pin_layers: &[i16],
     num_layers: i16,
+    params: ResetParams,
 ) -> Vec<SpiralNode> {
     let mut nodes: Vec<SpiralNode> = Vec::with_capacity(coords.len());
     // the points recorded so far, as (x, y, node index)
@@ -79,8 +104,8 @@ pub fn reset_and_alias(
             assigned: false,
             stack_alias: d,
             status: 0,
-            h_id: 0,
-            l_id: 0,
+            h_id: params.counter_init,
+            l_id: params.counter_init,
             edges: Vec::new(),
         };
         if d < num_terminals {
@@ -88,9 +113,9 @@ pub fn reset_and_alias(
             node.bot_layer = layer;
             node.top_layer = layer;
             node.assigned = true;
-            // ⚠️ 2, not 0 — and unrelated to the horizontal-connection meaning the same field
-            // carries during L-routing.
-            node.status = 2;
+            // ⚠️ Not 0, and unrelated to the horizontal-connection meaning the same field
+            // carries during L-routing. The value differs between the two stages that do this.
+            node.status = params.terminal_status;
             points.push((x, y, d));
         } else if let Some(&(_, _, first)) = points.iter().find(|&&(px, py, _)| px == x && py == y)
         {
