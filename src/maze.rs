@@ -746,6 +746,12 @@ pub fn maze_edge_is_long_enough(
 ///
 /// ⚠️ The cell index is decomposed with the **row stride** of the distance grid, which is the
 /// grid's allocated width rather than the design's.
+///
+/// 🔑 **The reference keeps a second distance grid for the destination subtree, and never reads
+/// it.** It is filled with the infinity sentinel, then zeroed at each destination seed — but only
+/// its *addresses* are used, to index the flags that say which cells belong to that subtree. Its
+/// values are inert. Destinations are therefore held here as coordinates and a flag, which is
+/// exactly equivalent and one grid lighter.
 pub fn maze_search(
     s: &mut MazeSearch,
     dest_seeds: &[(i32, i32)],
