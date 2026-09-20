@@ -117,6 +117,11 @@ pub struct Guide {
     pub box_: Rect,
     pub is_congested: bool,
     pub is_jumper: bool,
+    /// Set on the first guide that touches a route point where one of the net's pins sits.
+    ///
+    /// ⚠️ Downstream antenna checking reads this to bind guides to pins. It is **not** recorded in
+    /// the guide file, so a comparison of guide geometry cannot see it either way.
+    pub is_connected_to_term: bool,
 }
 
 /// What the run as a whole contributes to every guide it writes.
@@ -241,6 +246,7 @@ pub fn guides_for_segment(
                     box_,
                     is_congested: opts.guide_is_congested,
                     is_jumper: false,
+                    is_connected_to_term: false,
                 },
                 Guide {
                     layer: seg.final_layer,
@@ -248,6 +254,7 @@ pub fn guides_for_segment(
                     box_,
                     is_congested: opts.guide_is_congested,
                     is_jumper: false,
+                    is_connected_to_term: false,
                 },
             ]);
         }
@@ -258,6 +265,7 @@ pub fn guides_for_segment(
             box_,
             is_congested: opts.guide_is_congested,
             is_jumper: false,
+            is_connected_to_term: false,
         }]);
     }
 
@@ -277,10 +285,57 @@ pub fn guides_for_segment(
             box_,
             is_congested: opts.guide_is_congested,
             is_jumper: seg.is_jumper(),
+            is_connected_to_term: false,
         }]);
     }
 
     Ok(Vec::new())
+}
+
+/// A point on the routing grid, on a layer — the key pins and segment ends are matched by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RoutePt {
+    pub x: i32,
+    pub y: i32,
+    pub layer: i32,
+}
+
+/// Mark the guides of one segment that land on a pin of this net.
+///
+/// ⛔ **First guide to touch a route point wins, and the state persists across segments.** Once a
+/// point is claimed it is never claimed again, so this cannot be computed per segment in
+/// isolation — it depends on the order segments are walked, which is why the claim set is
+/// threaded through the whole net rather than rebuilt.
+///
+/// ⚠️ **Which guide gets which end matters.** The segment's init point marks the FIRST guide and
+/// its final point the SECOND. For the two-guide via form those are different guides; for every
+/// other form the same guide is offered both ends, so either end can claim it.
+pub fn mark_connected_to_terms(
+    claimed: &mut std::collections::BTreeMap<RoutePt, bool>,
+    seg: &GSegment,
+    guides: &mut [Guide],
+) {
+    if guides.is_empty() {
+        return;
+    }
+    let init_pt = RoutePt { x: seg.init_x, y: seg.init_y, layer: seg.init_layer };
+    let final_pt = RoutePt { x: seg.final_x, y: seg.final_y, layer: seg.final_layer };
+    // index 1 only exists for the two-guide via form; otherwise the same guide is offered twice.
+    let final_idx = if guides.len() > 1 { 1 } else { 0 };
+
+    for (pt, idx) in [(init_pt, 0usize), (final_pt, final_idx)] {
+        if claimed.get(&pt) == Some(&false) {
+            claimed.insert(pt, true);
+            guides[idx].is_connected_to_term = true;
+        }
+    }
+}
+
+/// The route points this net's pins sit on, none of them claimed yet.
+pub fn find_route_pt_pins(pins: &[Pin]) -> std::collections::BTreeMap<RoutePt, bool> {
+    pins.iter()
+        .map(|p| (RoutePt { x: p.on_grid_x, y: p.on_grid_y, layer: p.connection_layer }, false))
+        .collect()
 }
 
 /// One net's guides, in segment order.
@@ -313,8 +368,12 @@ pub fn save_guides(
         }
         let mut guides = Vec::new();
         let mut jumper_count = 0;
+        // ⛔ Per NET, and mutated as the segments are walked: see `mark_connected_to_terms`.
+        let mut claimed = find_route_pt_pins(&net.pins);
         for seg in &net.segments {
-            for guide in guides_for_segment(net, seg, grid, opts)? {
+            let mut seg_guides = guides_for_segment(net, seg, grid, opts)?;
+            mark_connected_to_terms(&mut claimed, seg, &mut seg_guides);
+            for guide in seg_guides {
                 if guide.is_jumper {
                     jumper_count += 1;
                 }

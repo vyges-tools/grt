@@ -30,6 +30,21 @@ replay without them cannot tell a missing rule from a missing input.
 The design is `gcd` on a 45nm open cell library, both of which ship with the router this is
 compared against.
 
+`connected.ok` is a **second golden**, one line per net with one character per guide, carrying the
+`is_connected_to_term` flag that the guide file does not record. 1,414 of the 3,848 guides are
+marked.
+
+## ⬜ What this corpus does NOT reach
+
+The flag is claimed by the **first** guide to reach a route point where a pin sits; later guides
+over the same point are left unmarked. **No net in this design touches one of its own pin points
+twice**, so replacing that rule with "mark every guide that touches a pin point" produces
+identical output here. The whole-design gate cannot tell the two apart — only the synthetic case
+in `tests/guides.rs` does.
+
+`the_corpus_does_NOT_witness_the_first_claim_tie_break_and_says_so` asserts that count is zero, so
+a richer corpus will announce that the gap has closed rather than leaving it to be rediscovered.
+
 ## Regenerating
 
 The corpus and the golden must be captured from the **same run**, or they describe different

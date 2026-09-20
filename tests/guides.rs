@@ -185,3 +185,68 @@ fn guides_come_out_in_segment_order() {
 fn a_rect_normalises_so_corner_order_cannot_change_a_result() {
     assert_eq!(Rect::new(10, 20, 3, 4), Rect::new(3, 4, 10, 20));
 }
+
+// ---- S10: marking the guides that land on a pin ------------------------------------------
+
+fn pin(layer: i32, x: i32, y: i32) -> Pin {
+    Pin { connection_layer: layer, on_grid_x: x, on_grid_y: y }
+}
+
+#[test]
+fn a_guide_landing_on_a_pin_is_marked_connected_to_term() {
+    let mut n = net(vec![wire(300, 300, 500, 300, 2)]);
+    n.pins = vec![pin(2, 300, 300)];
+    let out = save_guides(&[n], &grid(), &opts()).unwrap();
+    assert!(out[0].guides[0].is_connected_to_term);
+}
+
+#[test]
+fn a_guide_that_lands_on_no_pin_is_NOT_marked() {
+    let mut n = net(vec![wire(300, 300, 500, 300, 2)]);
+    n.pins = vec![pin(2, 900, 900)];          // right layer, elsewhere
+    let out = save_guides(&[n], &grid(), &opts()).unwrap();
+    assert!(!out[0].guides[0].is_connected_to_term);
+
+    let mut n2 = net(vec![wire(300, 300, 500, 300, 2)]);
+    n2.pins = vec![pin(5, 300, 300)];         // right place, wrong layer
+    let out2 = save_guides(&[n2], &grid(), &opts()).unwrap();
+    assert!(!out2[0].guides[0].is_connected_to_term);
+}
+
+#[test]
+fn only_the_FIRST_guide_to_reach_a_route_point_claims_it() {
+    // ⛔ The rule that makes this stateful. A point is claimed once; every later guide over the
+    // same point is left unmarked. Two segments that both start at the pin: the first claims it.
+    let mut n = net(vec![wire(300, 300, 500, 300, 2), wire(300, 300, 300, 500, 2)]);
+    n.pins = vec![pin(2, 300, 300)];
+    let out = save_guides(&[n], &grid(), &opts()).unwrap();
+    assert!(out[0].guides[0].is_connected_to_term, "the first segment claims the point");
+    assert!(!out[0].guides[1].is_connected_to_term, "the second finds it already claimed");
+}
+
+#[test]
+fn the_claim_set_is_PER_NET_not_shared_across_nets() {
+    // Two nets whose pins sit on the same route point must each get their own mark; a shared
+    // claim set would silently drop the second one's.
+    let mut a = net(vec![wire(300, 300, 500, 300, 2)]);
+    a.name = "a".into();
+    a.pins = vec![pin(2, 300, 300)];
+    let mut b = a.clone();
+    b.name = "b".into();
+    let out = save_guides(&[a, b], &grid(), &opts()).unwrap();
+    assert!(out[0].guides[0].is_connected_to_term);
+    assert!(out[1].guides[0].is_connected_to_term, "the second net has its own claim set");
+}
+
+#[test]
+fn a_segments_BOTH_ENDS_can_claim_and_they_map_to_different_guides_on_a_via() {
+    // ⚠️ init marks the FIRST guide, final marks the SECOND. On the two-guide via form those are
+    // different guides; anywhere else the same guide is offered both ends.
+    let mut n = net(vec![via(300, 300, 2, 3)]);
+    n.is_local = true;                            // force the two-guide form
+    n.pins = vec![pin(3, 300, 300)];              // matches the FINAL end (layer 3)
+    let out = save_guides(&[n], &grid(), &opts()).unwrap();
+    assert_eq!(out[0].guides.len(), 2);
+    assert!(!out[0].guides[0].is_connected_to_term, "init end is layer 2, no pin there");
+    assert!(out[0].guides[1].is_connected_to_term, "final end is layer 3, where the pin is");
+}

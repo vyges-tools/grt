@@ -18,8 +18,16 @@ for exactly how guide rectangles are derived from grid coordinates.
 verified byte-identical to the one shipping with that router's own test suite before it was
 committed. See `examples/grt_gate/`.
 
-The gate is control-verified: widening the guide box, removing the two-guide via form, or
-reversing guide order within a net each make it fail, with the diagnostic naming which.
+A second golden carries the `is_connected_to_term` flag, which the guide file does not record —
+**all 1,414 marked guides of the 3,848 match**.
+
+The gate is control-verified: widening the guide box, removing the two-guide via form, reversing
+guide order within a net, swapping which guide a via's two ends mark, and sharing the pin-claim
+set between nets each make it fail, with the diagnostic naming which.
+
+⬜ **One rule it cannot see**, and the crate says so rather than implying otherwise: the pin-claim
+tie-break, because no net in this design touches one of its own pin points twice. A synthetic case
+covers it, and a test asserts the corpus count so a richer design announces when the gap closes.
 
 ## What it does
 
@@ -62,6 +70,8 @@ assert_eq!(guides[0].guides[0].box_, Rect::new(250, 250, 550, 350));
 - **A box within one tile of the grid edge snaps out to it**, under a truncating integer divide.
   The gap is closed rather than left as a sliver the detailed router cannot use.
 - **Guide order within a net is segment order**, and guide files are compared as ordered lists.
+- **A guide landing on one of the net's own pins is flagged**, and the *first* guide to reach that
+  point claims it — the one piece of state that carries across segments.
 
 Each of these is pinned by a test that states the rule.
 

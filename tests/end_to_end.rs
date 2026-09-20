@@ -24,6 +24,7 @@
 //! | 563 nets, 3,770 segments, 1,536 pins | a whole design, not a hand-picked case |
 //! | **68 local nets** | the two-guide via form, which changes the guide COUNT |
 //! | 3,848 guides (5,537 golden file lines) | every box, layer and ordering decision |
+//! | 1,414 of them connected-to-term | the stateful first-claim rule, from a SECOND golden |
 
 // ⚠️ Test names carry the rule; the capitalised word is what must not be missed when the gate
 // goes red and the failure line is the first thing read.
@@ -34,6 +35,9 @@ use vyges_grt::*;
 
 const CORPUS: &str = include_str!("../examples/grt_gate/corpus.json");
 const GOLDEN: &str = include_str!("../examples/grt_gate/grt_gate.ok");
+/// ⛔ A SECOND golden, because the guide file does not record `is_connected_to_term`. One line
+/// per net: the net's name and one character per guide, in guide-file order.
+const CONNECTED: &str = include_str!("../examples/grt_gate/connected.ok");
 
 /// One guide as the golden spells it: a box and a layer NAME.
 type GuideLine = (i32, i32, i32, i32, String);
@@ -153,6 +157,82 @@ fn every_guide_of_a_whole_design_matches_the_REFERENCES_OWN_output() {
     // satisfied and proves nothing. 3,848 guides across 563 nets is this design; the golden FILE
     // has 5,537 lines, the difference being each net's name and its two brackets.
     assert!(checked_guides > 3_000, "expected a whole design, got {checked_guides}");
+}
+
+#[test]
+fn the_connected_to_term_flag_matches_the_REFERENCE_on_every_guide() {
+    // ⛔ This flag appears in NO output file, so the guide comparison above is blind to it — an
+    // engine that never set it at all would pass that test completely. It needed its own golden,
+    // captured from the reference at the same moment as the guides.
+    //
+    // 🔑 It is also the only stateful rule in the stage: the FIRST guide to reach a route point
+    // where a pin sits claims it, and every later guide over that point is left unmarked. A
+    // per-segment implementation cannot express that, so getting it wrong is easy and invisible.
+    let c = parse_corpus();
+    let produced = save_guides(&c.nets, &c.grid, &c.opts).expect("routes");
+
+    let want: BTreeMap<&str, &str> = CONNECTED
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let (net, bits) = l.rsplit_once(' ').expect("`<net> <bits>` per line");
+            (net, bits)
+        })
+        .collect();
+
+    let mut checked = 0usize;
+    let mut connected = 0usize;
+    for net in &produced {
+        let bits = want.get(net.net.as_str())
+            .unwrap_or_else(|| panic!("net {} has no connected-flag golden", net.net));
+        let got: String = net.guides.iter()
+            .map(|g| if g.is_connected_to_term { '1' } else { '0' })
+            .collect();
+        assert_eq!(&got, bits, "net {}: connected-to-term flags", net.net);
+        checked += got.len();
+        connected += got.chars().filter(|c| *c == '1').count();
+    }
+
+    // ⚠️ Vacuity guards in both directions: all-zero would pass a string compare against an
+    // all-zero golden, and an empty run would pass everything.
+    assert_eq!(checked, 3_848, "every guide must have had its flag compared");
+    assert_eq!(connected, 1_414, "the reference marks this many; neither all nor none");
+}
+
+#[test]
+fn the_corpus_does_NOT_witness_the_first_claim_tie_break_and_says_so() {
+    // ⬜ **A measured gap, kept as a test so it cannot quietly become a false assurance.**
+    //
+    // `mark_connected_to_terms` claims a route point for the FIRST guide that reaches it and
+    // leaves every later one unmarked. Replacing that rule with "mark every guide that touches a
+    // pin point" produces IDENTICAL output on this corpus — because no net here touches any of
+    // its own pin points twice. The whole-design gate therefore cannot tell the two apart, and
+    // only the synthetic case in `tests/guides.rs` does.
+    //
+    // ⚠️ If a future corpus does exercise it, this test fires and the gap is closed — which is
+    // the point of asserting the count rather than writing a comment nobody re-checks.
+    let c = parse_corpus();
+    let mut repeated = 0;
+    for net in &c.nets {
+        let pin_pts: std::collections::BTreeSet<RoutePt> = net.pins.iter()
+            .map(|p| RoutePt { x: p.on_grid_x, y: p.on_grid_y, layer: p.connection_layer })
+            .collect();
+        let mut hits: BTreeMap<RoutePt, usize> = BTreeMap::new();
+        for sg in &net.segments {
+            for pt in [RoutePt { x: sg.init_x, y: sg.init_y, layer: sg.init_layer },
+                       RoutePt { x: sg.final_x, y: sg.final_y, layer: sg.final_layer }] {
+                if pin_pts.contains(&pt) {
+                    *hits.entry(pt).or_default() += 1;
+                }
+            }
+        }
+        repeated += hits.values().filter(|n| **n > 1).count();
+    }
+    assert_eq!(
+        repeated, 0,
+        "this corpus now DOES touch a pin route point more than once ({repeated} times), so the \
+         first-claim tie-break is finally witnessed end to end — update this test and the README"
+    );
 }
 
 #[test]
