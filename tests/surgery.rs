@@ -41,6 +41,8 @@ fn edge_from(v: &Value) -> SurgeryEdge {
     SurgeryEdge {
         n1: v["n1"].as_u64().expect("n1") as usize,
         n2: v["n2"].as_u64().expect("n2") as usize,
+        n1a: 0,
+        n2a: 0,
         routelen: v["routelen"].as_i64().expect("rl").max(0) as usize,
         len: v["len"].as_i64().expect("len") as i32,
         is_maze_route: v["is_maze_route"].as_bool().expect("type"),
@@ -59,7 +61,7 @@ fn surgeries() -> Vec<Surgery> {
         let node_map = s["nodes"].as_object().expect("nodes");
         let max_node = node_map.keys().map(|k| k.parse::<usize>().expect("id")).max().unwrap_or(0);
         let mut nodes: Vec<MazeNode> = (0..=max_node)
-            .map(|_| MazeNode { x: 0, y: 0, neighbours: Vec::new() })
+            .map(|_| MazeNode { x: 0, y: 0, neighbours: Vec::new(), stack_alias: 0 })
             .collect();
         for (k, p) in node_map {
             let i = k.parse::<usize>().expect("id");
@@ -94,7 +96,7 @@ fn run(s: &Surgery) -> Vec<Option<SurgeryEdge>> {
     let n = s.before.len().max(s.after.len());
     let mut edges: Vec<SurgeryEdge> = (0..n)
         .map(|i| s.before.get(i).and_then(|e| e.clone()).unwrap_or(SurgeryEdge {
-            n1: 0, n2: 0, routelen: 0, len: 0, is_maze_route: false, grids: vec![(0, 0)],
+            n1: 0, n2: 0, n1a: 0, n2a: 0, routelen: 0, len: 0, is_maze_route: false, grids: vec![(0, 0)],
         }))
         .collect();
 
@@ -183,11 +185,11 @@ fn the_recycled_slot_is_copied_before_it_is_overwritten() {
 #[test]
 fn an_unrouted_edge_yields_one_point() {
     let nodes = vec![
-        MazeNode { x: 4, y: 9, neighbours: Vec::new() },
-        MazeNode { x: 7, y: 9, neighbours: Vec::new() },
+        MazeNode { x: 4, y: 9, neighbours: Vec::new(), stack_alias: 0 },
+        MazeNode { x: 7, y: 9, neighbours: Vec::new(), stack_alias: 0 },
     ];
     let edges = vec![SurgeryEdge {
-        n1: 0, n2: 1, routelen: 0, len: 0, is_maze_route: false, grids: vec![(99, 99)],
+        n1: 0, n2: 1, n1a: 0, n2a: 1, routelen: 0, len: 0, is_maze_route: false, grids: vec![(99, 99)],
     }];
     // Asked from either end, the answer is that end's own coordinates — not the stored point.
     assert_eq!(copy_grids(&nodes, 0, &edges, 0), vec![(4, 9)]);
@@ -198,11 +200,11 @@ fn an_unrouted_edge_yields_one_point() {
 #[test]
 fn copying_reverses_when_asked_from_the_far_end() {
     let nodes = vec![
-        MazeNode { x: 1, y: 1, neighbours: Vec::new() },
-        MazeNode { x: 3, y: 1, neighbours: Vec::new() },
+        MazeNode { x: 1, y: 1, neighbours: Vec::new(), stack_alias: 0 },
+        MazeNode { x: 3, y: 1, neighbours: Vec::new(), stack_alias: 0 },
     ];
     let edges = vec![SurgeryEdge {
-        n1: 0, n2: 1, routelen: 2, len: 2, is_maze_route: true,
+        n1: 0, n2: 1, n1a: 0, n2a: 1, routelen: 2, len: 2, is_maze_route: true,
         grids: vec![(1, 1), (2, 1), (3, 1)],
     }];
     assert_eq!(copy_grids(&nodes, 0, &edges, 0), vec![(1, 1), (2, 1), (3, 1)]);
@@ -210,7 +212,7 @@ fn copying_reverses_when_asked_from_the_far_end() {
 
     // ⚠️ Only the routed prefix is taken: a buffer longer than the route is not copied whole.
     let long = vec![SurgeryEdge {
-        n1: 0, n2: 1, routelen: 1, len: 1, is_maze_route: true,
+        n1: 0, n2: 1, n1a: 0, n2a: 1, routelen: 1, len: 1, is_maze_route: true,
         grids: vec![(1, 1), (2, 1), (9, 9)],
     }];
     assert_eq!(copy_grids(&nodes, 0, &long, 0), vec![(1, 1), (2, 1)]);

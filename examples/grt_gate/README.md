@@ -653,3 +653,36 @@ which makes the result depend on edge order, not only on layers.
 ⚠️ Both ends of every edge are recorded, on the **alias** nodes, and each end takes the layer where
 the edge *meets it* — the first grid point for one end, the last for the other. A via partway
 along is invisible here.
+
+## `assignedge.json` — the layer-assignment dynamic program
+
+1,001 edge assignments from **35 designs, captured in two cost modes**, 468 of which change layer
+somewhere. Both directions: 750 forward, 251 backward.
+
+⛔ **The second mode is the point.** The reference's wire and via cost functions return zero
+outright unless the router runs resistance-aware, which is off by default. A corpus taken from
+default runs multiplies every cost weight in the program by zero, and a reimplementation that
+drops the wire cost entirely scores exactly the same on it. A `global_route -resistance_aware`
+sweep contributed 716 of these cases — 594 with a live wire cost, 237 with a live via cost — and
+killed that mutation outright. ⚠️ **More designs would not have found it; a second mode did.**
+
+⛔ **Three cost tiers, and the ordering between them is the policy.** A usable step costs one plus
+the layer's wire cost. A layer whose orientation does not match the step, or which lies outside
+the net's permitted range, costs *twice* the infinity constant; anything else short of resources
+costs it once. So when nothing is usable the program still picks a layer, preferring one that
+merely lacks resources over one that cannot carry the step at all.
+
+⚠️ **The availability table is captured rather than the 3D usage it is derived from.** That splits
+the stage: this golden decides the program, and the table's own derivation is a separate piece
+with its own inputs.
+
+⛔ **The last column of that table is never written by the reference** — all 6,943 captured cells
+are zero — yet the backward direction reads its orientation from exactly there on the first step.
+Recorded as finding 5 in the programme's upstream notes and pinned by a test here.
+
+⚠️ Five deliberate mutations survive this corpus, all measured rather than assumed: three cost
+weights that shift costs without moving any `argmin`, the narrowing of the running minimum to an
+`int` (the worst cost reached is within **7%** of overflowing), and the "still unset" tie-break
+clause (reached 19 times, changes the selected layer 3 times, changes no assignment — the
+read-back follows the same link either way). Each has a test stating the measurement, so a corpus
+that later does reach one fails the gate instead of silently invalidating the note.

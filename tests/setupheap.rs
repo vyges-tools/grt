@@ -50,6 +50,7 @@ fn setups() -> Vec<Setup> {
                     .map(|p| (p[0].as_u64().expect("nbr") as usize,
                               p[1].as_u64().expect("edge") as usize))
                     .collect(),
+                stack_alias: 0,
             }).collect(),
             edges: s["edges"].as_array().expect("edges").iter().map(|e| MazeEdge {
                 n1: e["n1"].as_u64().expect("n1") as usize,
