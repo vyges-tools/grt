@@ -742,3 +742,28 @@ four run-wide worst-case values, which is state this pass does not own.
 because no net's total length reaches 2²⁴, where a `float` stops being exact (asserted as a
 threshold); and the sort's stability cannot matter because the net index is the last key, so no
 two records ever compare equal (asserted as the precondition).
+
+## `full3d.json` — expanding a routed edge into a full three-dimensional path
+
+836 edges from 69 designs: **633 that gain points, 143 converted without changing, and 60 the pass
+skips**, captured on both sides so a skipped edge can be shown to come out byte-identical.
+
+⛔ **The inserted points take the NEXT point's coordinates.** A step that changes layer becomes a
+move in the plane and then a stack of vias at the destination — never a stack at the origin
+followed by a move. Both directions start at the *current* layer and stop before the next one, so
+the first inserted point repeats the origin's layer at the destination's position.
+
+⚠️ **`routelen` is the authority, not the number of points.** The walk reads that many steps plus
+one final point; anything beyond is dropped.
+
+⛔ **Three behaviours no design witnesses**, each pinned by a constructed case with the limitation
+asserted so a later capture that reaches one fails loudly:
+
+| unwitnessed | why the corpus cannot decide it |
+|---|---|
+| the route-type stamp | every captured edge already enters as a maze route |
+| the length gate's boundary | all 60 skipped edges hold one point and no steps, so converting them would be a no-op either way |
+| points past the step count | no captured edge carries any |
+
+13 of 13 mutations die — including every loop bound, both coordinate choices, the final push, the
+step-count recomputation and the stamp.
