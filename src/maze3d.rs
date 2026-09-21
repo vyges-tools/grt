@@ -1355,3 +1355,62 @@ pub fn tree_surgery_3d(
     }
     Ok(out)
 }
+
+// ─── R18h — `recoverEdge` ───────────────────────────────────────────────────────────────────
+
+/// "Trying to recover a 0-length edge" — the reference aborts (GRT-206).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoverZeroLength;
+
+/// Put back an edge the search could not re-route — `recoverEdge`, the inverse of
+/// [`new_ripup_3d_type3`].
+///
+/// Re-registers the edge at both ALIAS ends (its first layer at `n1a`, its last at `n2a`, strict
+/// extremes, `assigned` set) and re-requests usage for every PLANAR step, at the lower endpoint:
+/// (horizontal?, layer, x, y), each +edge cost in 2D (NDR-aware in the reference) and +layer edge
+/// cost in 3D. The route itself is untouched — the rip-up never changed it.
+///
+/// ⚠️ Two differences from its inverse: a step that moves in both x and y is SKIPPED here, where the
+/// rip-up aborts on it; and a zero-length edge is fatal here, where the rip-up merely declines it.
+///
+/// Reached from two places in the driver: the search running dry (counted for GRT-183, never
+/// captured) and a zero-distance crossing (NOT counted — 2 of 73,179 searches, both on
+/// `overlapping_edges`).
+pub fn recover_edge(tree: &mut Tree3D, edge_id: usize) -> Result<Vec<(bool, i16, i16, i16)>, RecoverZeroLength> {
+    let e = &tree.edges[edge_id];
+    if e.len == 0 {
+        return Err(RecoverZeroLength);
+    }
+    let (n1a, n2a) = (e.n1a, e.n2a);
+    let (first, last) = (e.grids[0].layer, e.grids[e.routelen as usize].layer);
+    for (node, layer) in [(n1a, first), (n2a, last)] {
+        let c = &mut tree.nodes[node].conn;
+        let at = c.con_cnt as usize;
+        c.heights[at] = layer;
+        c.e_id[at] = edge_id as i32;
+        c.con_cnt += 1;
+        if layer > c.top_layer {
+            c.h_id = edge_id as i32;
+            c.top_layer = layer;
+        }
+        if layer < c.bot_layer {
+            c.l_id = edge_id as i32;
+            c.bot_layer = layer;
+        }
+        tree.nodes[node].assigned = true;
+    }
+    let g = &tree.edges[edge_id].grids;
+    let mut usage = Vec::new();
+    for i in 0..tree.edges[edge_id].routelen.max(0) as usize {
+        let (a, b) = (g[i], g[i + 1]);
+        if a.layer != b.layer {
+            continue;
+        }
+        if a.x == b.x {
+            usage.push((false, a.layer, a.x, a.y.min(b.y)));
+        } else if a.y == b.y {
+            usage.push((true, a.layer, a.x.min(b.x), a.y));
+        }
+    }
+    Ok(usage)
+}
