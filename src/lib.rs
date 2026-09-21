@@ -29,7 +29,7 @@ pub use layerdp::{assign_edge_layers, selection_column_witness, LayerDpInputs, L
 pub use layertable::{build_layer_grid, LayerDir, LayerRange, TableInputs, BARRED};
 pub use netpinorder::{netpin_order_inc, NetForOrder, OrderNetPin, MIN_X_INITIAL};
 pub use full3d::{convert_edge_to_full_3d, convert_to_full_3d_type2, Edge3D, Point3D, RouteType};
-pub use softndr::{apply_soft_ndr, congested_ndr_nets, disable_ndr_for_congested_nets, set_soft_ndr, update_net_3d_usage, update_planar_net_usage, CongestionView, NdrEdge, NdrNet, UsageGrid};
+pub use softndr::{apply_soft_ndr, compute_congested_ndr_nets, congested_ndr_nets, congested_ndr_nets_by_fraction, sort_congested_ndr_nets, CongestedNdr, Overflow2D, disable_ndr_for_congested_nets, set_soft_ndr, update_net_3d_usage, update_planar_net_usage, CongestionView, NdrEdge, NdrNet, UsageGrid};
 pub use slacks::{res_aware_score, update_slacks, NetSlackInput, NetSlackOutput, SlackParams, SlackUpdate, WorstMetrics, SHORT_NET_THRESHOLD};
 pub use maze::{backtrace, charge_route, remove_loops, maze_route_pass, AfterEdge, route_one_edge, EdgeContext, EdgeOutcome, rewire_after_type2, split_edge, copy_grids, maze_search, maze_edge_is_long_enough, maze_edge_region, heapify, update_route_type1, update_route_type2, SurgeryEdge, netedge_order_dec, relax_adjacent, remove_min, setup_heap, update_heap, Heaps, MazeEdge, MazeNode, MazeSearch, OrderNetEdge, RelaxInputs, BIG_INT};
 pub mod mazeconv;

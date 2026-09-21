@@ -24,6 +24,11 @@ use crate::full3d::Point3D;
 /// One edge of a net, reduced to what these passes read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NdrEdge {
+    /// The Manhattan distance between the edge's end nodes.
+    ///
+    /// ⚠️ Read only by [`compute_congested_ndr_nets`], whose edge gate is `len > 0 || routelen >
+    /// 0`. R17's own scan ignores it and gates on the step count alone.
+    pub len: i32,
     pub routelen: i32,
     pub grids: Vec<Point3D>,
 }
@@ -221,4 +226,91 @@ pub fn disable_ndr_for_congested_nets(
         }
     }
     congested
+}
+
+// ─── The congestion loop's own NDR selection ────────────────────────────────────────────────
+//
+// ⛔ **A THIRD congestion scan, with different rules again.** R17's scan (above) skips a step
+// that changes layer, tests three-dimensional availability as well as two-dimensional overflow,
+// and stops at the first congested step. This one does none of those: it tests every step, reads
+// only the planar overflow, and counts all of them. It also gates edges differently — on the
+// edge's length OR its step count, where R17's gates on the step count alone.
+//
+// Neither is written in terms of the other, and the counts they would produce differ.
+
+/// One congested NDR net and how many of its steps are congested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CongestedNdr {
+    pub net_id: usize,
+    /// ⚠️ A `uint16_t` in the reference. Transcribed, so a net with more than 65,535 congested
+    /// steps wraps rather than saturating.
+    pub num_edges: u16,
+}
+
+/// The planar overflow this scan reads. ⚠️ It never asks about layers.
+pub trait Overflow2D {
+    fn overflow_v(&self, x: i16, y: i16) -> i32;
+    fn overflow_h(&self, x: i16, y: i16) -> i32;
+}
+
+/// Count each NDR net's congested steps.
+///
+/// ⛔ **Every step is tested, including one that changes layer** — unlike [`congested_ndr_nets`],
+/// which skips those as vias. And the scan does not stop early: it counts every congested step of
+/// every edge.
+pub fn compute_congested_ndr_nets(
+    nets: &[NdrNet],
+    view: &dyn Overflow2D,
+) -> Vec<CongestedNdr> {
+    let mut out = Vec::new();
+    for net in nets {
+        if !net.has_ndr || net.is_soft_ndr {
+            continue;
+        }
+        let mut num_edges: u16 = 0;
+        for edge in &net.edges {
+            // ⛔ The edge's LENGTH or its step count — either admits the edge. R17's scan asks
+            // only about the step count, so it skips edges this one walks.
+            if !(edge.len > 0 || edge.routelen > 0) {
+                continue;
+            }
+            for i in 0..edge.routelen.max(0) as usize {
+                let (a, b) = (edge.grids[i], edge.grids[i + 1]);
+                let congested = if a.x == b.x {
+                    view.overflow_v(a.x, a.y.min(b.y)) > 0
+                } else {
+                    view.overflow_h(a.x.min(b.x), a.y) > 0
+                };
+                if congested {
+                    // ⚠️ Wrapping, because the reference's counter is 16 bits wide.
+                    num_edges = num_edges.wrapping_add(1);
+                }
+            }
+        }
+        if num_edges > 0 {
+            out.push(CongestedNdr { net_id: net.net_id, num_edges });
+        }
+    }
+    out
+}
+
+/// Order the congested nets, most congested first.
+///
+/// ⛔ **An UNSTABLE sort over a comparator with ONE key and no tie-break** — the only ordering in
+/// this engine that is not stable. Two nets with the same count therefore have unspecified order.
+/// Transcribed as written; recorded as finding 9, and a test asserts the captured corpus has no
+/// ties so the difference cannot bite here.
+pub fn sort_congested_ndr_nets(nets: &mut [CongestedNdr]) {
+    nets.sort_unstable_by(|a, b| b.num_edges.cmp(&a.num_edges));
+}
+
+/// Take the given fraction of the most congested nets.
+///
+/// ⚠️ The fraction is **clamped** to `0.0..=1.0` first, then the count is rounded **up** and
+/// capped at the list length. So any fraction above zero takes at least one net, and the only
+/// value the router ever passes — `1.0` — takes all of them.
+pub fn congested_ndr_nets_by_fraction(nets: &[CongestedNdr], fraction: f64) -> Vec<usize> {
+    let clamped = fraction.clamp(0.0, 1.0);
+    let count = ((nets.len() as f64 * clamped).ceil() as usize).min(nets.len());
+    nets.iter().take(count).map(|n| n.net_id).collect()
 }

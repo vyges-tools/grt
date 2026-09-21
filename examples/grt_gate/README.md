@@ -816,3 +816,30 @@ starts from the same edge cost (9), no net is demoted twice, and **the layered b
 exercised** — the caller that fires does not use it. The recorder panics if our code writes
 layered usage on this path, so reaching further than the reference does is a failure, not a pass.
 R17's congestion scan and layered bracket stay pinned by constructed cases; see finding 8.
+
+## `congestedndr.json` — the congestion loop's NDR selection
+
+2 calls, 12 nets, **257 steps read**, from the two designs whose escalation path fires.
+
+⛔ **This is the THIRD congestion scan in the engine, and its rules differ from R17's in four
+ways.** It tests every step *including one that changes layer*, reads only the planar overflow,
+never stops early, and gates an edge on its length **or** its step count rather than the step
+count alone. Neither scan is written in terms of the other. Two tests put them side by side on the
+same input and assert they disagree.
+
+⚠️ **The overflow values are captured per step as the reference read them**, and the test's grid
+**panics on a lookup the reference never made** — so a scan that visits a step the reference
+skipped fails loudly instead of reading a plausible default.
+
+⚠️ **The fraction selector is probed at 0.0 / 0.25 / 0.5 / 0.75 / 1.0 although the router only ever
+passes 1.0.** It is pure and side-effect-free, so asking it directly costs nothing and is the only
+way to learn what its clamp-and-round-up does at values the flow never reaches. With two nets:
+0.25 and 0.50 take one, 0.75 and 1.00 take both, 0.00 takes none.
+
+Three mutations survive, each measured and stated in a test rather than left open:
+
+| survivor | why |
+|---|---|
+| dropping the gate's `len > 0` term | **equivalent everywhere**, not just here — that term can only admit an edge with no steps to walk |
+| dropping the fraction's clamp | **equivalent in Rust**, where a float-to-int cast saturates. ⛔ In the reference it is undefined behaviour for a negative value, so the clamp is transcribed for *that* reason |
+| widening the 16-bit counter | unobservable by four orders of magnitude — the largest captured count is **25** against a wrap at 65,535 |

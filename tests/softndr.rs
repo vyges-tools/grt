@@ -70,6 +70,7 @@ fn net(id: usize, has_ndr: bool, soft: bool, cost: i8) -> NdrNet {
         edge_cost: cost,
         layer_edge_cost: Some(vec![1, 1, 4, 4]),
         edges: vec![NdrEdge {
+            len: 10,
             routelen: 3,
             grids: vec![p(0, 0, 2), p(1, 0, 2), p(2, 0, 2), p(3, 0, 2)],
         }],
@@ -133,6 +134,7 @@ fn a_layer_change_is_not_tested_for_congestion() {
         edge_cost: 4,
         layer_edge_cost: Some(vec![1, 1, 4, 4]),
         edges: vec![NdrEdge {
+            len: 10,
             routelen: 1,
             grids: vec![p(0, 0, 2), p(1, 0, 3)],
         }],
@@ -155,8 +157,8 @@ fn an_empty_edge_is_skipped() {
         edge_cost: 4,
         layer_edge_cost: None,
         edges: vec![
-            NdrEdge { routelen: 0, grids: vec![p(0, 0, 2)] },
-            NdrEdge { routelen: 2, grids: Vec::new() },
+            NdrEdge { len: 10, routelen: 0, grids: vec![p(0, 0, 2)] },
+            NdrEdge { len: 10, routelen: 2, grids: Vec::new() },
         ],
     };
     assert!(congested_ndr_nets(&[n], &g).is_empty(), "neither edge may be walked");
@@ -247,6 +249,7 @@ fn the_two_updates_skip_different_steps() {
         edge_cost: 1,
         layer_edge_cost: None,
         edges: vec![NdrEdge {
+            len: 10,
             routelen: 2,
             // A pure via, then a step that both moves and changes layer.
             grids: vec![p(0, 0, 2), p(0, 0, 3), p(4, 0, 4)],
@@ -282,6 +285,7 @@ fn the_vertical_branch_has_its_own_strict_thresholds() {
         edge_cost: 4,
         layer_edge_cost: Some(vec![1, 1, 4, 4]),
         edges: vec![NdrEdge {
+            len: 10,
             routelen: 2,
             grids: vec![p(5, 0, 2), p(5, 1, 2), p(5, 2, 2)],
         }],
@@ -323,7 +327,7 @@ fn a_negative_step_count_is_skipped() {
         is_soft_ndr: false,
         edge_cost: 4,
         layer_edge_cost: None,
-        edges: vec![NdrEdge { routelen: -1, grids: vec![p(0, 0, 2), p(1, 0, 2)] }],
+        edges: vec![NdrEdge { len: 10, routelen: -1, grids: vec![p(0, 0, 2), p(1, 0, 2)] }],
     };
     assert!(congested_ndr_nets(&[n.clone()], &g).is_empty(), "the scan must skip it");
 

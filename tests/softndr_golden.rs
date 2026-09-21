@@ -64,6 +64,7 @@ fn cases() -> Vec<Case> {
         layer_cost: c["layer_cost"].as_array().expect("lc").iter()
             .map(|x| x.as_i64().expect("int") as i8).collect(),
         edges: c["edges"].as_array().expect("edges").iter().map(|e| NdrEdge {
+            len: e["len"].as_i64().expect("len") as i32,
             routelen: e["routelen"].as_i64().expect("rl") as i32,
             grids: e["grids"].as_array().expect("g").iter().map(|p| {
                 let a = p.as_array().expect("triple");
