@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! R18e — the 3D maze search.
+//! R18e — the 3D maze search, and R18f — its backtrace.
 //!
 //! Golden `search3d.json`, both cost modes: sampled searches with their inputs (region, per-layer
 //! direction, move prices, admission bits, layer range, original length, mode, detour penalty,
@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use serde_json::Value;
-use vyges_grt::{maze_search_3d, Cell3, Dir3, Search3DInputs};
+use vyges_grt::{backtrace_3d, maze_search_3d, Cell3, CellState, Dir3, Point3D, Recovery, Search3DInputs};
 
 fn read(path: &str) -> Value {
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"));
@@ -96,6 +96,26 @@ fn replay(g: &Value) -> (usize, usize) {
                 );
             }
         }
+        // R18f: the backtrace, run on THIS engine's search state, against the reference's outcome.
+        let states: HashMap<Cell3, CellState> = got.reached.iter().copied().collect();
+        let bt = &r["bt"];
+        match (backtrace_3d(got.crossing, &|c| states[&c]), bt["kind"].as_str().expect("kind")) {
+            (Ok(b), "path") => {
+                let want: Vec<Point3D> = bt["grids"].as_array().expect("grids").iter().map(|p| Point3D {
+                    x: int(&p[0]) as i16,
+                    y: int(&p[1]) as i16,
+                    layer: int(&p[2]) as i16,
+                }).collect();
+                assert_eq!(b.grids, want, "{who}: backtrace path");
+                assert_eq!(
+                    (b.head_room as i64, i64::from(b.orig_layer), i64::from(b.last_layer)),
+                    (int(&bt["headroom"]), int(&bt["origL"]), int(&bt["lastL"])),
+                    "{who}: head room / layers"
+                );
+            }
+            (Err(Recovery::ZeroDistance), "zero") | (Err(Recovery::Underflow), "underflow") => {}
+            (got_bt, want) => panic!("{who}: backtrace {got_bt:?}, reference {want}"),
+        }
         pops_total += got.pops.len();
     }
     (records.len(), pops_total)
@@ -116,11 +136,14 @@ fn search_3d_matches_the_reference_exhaustively() {
     eprintln!("exhaustive: {:?} (searches, pops)", replay(&read(&path)));
 }
 
-/// ⚠️ No captured search ran dry (0 of 73,179): the recovery path is R18h's, constructed there.
+/// ⚠️ No captured search ran dry (0 of 73,179) — but TWO took the zero-distance recovery (both on
+/// `overlapping_edges`), which the reference does not count for GRT-183. Neither is in the sample;
+/// R18h captures them. A tripwire: a change in either count means the golden needs a look.
 #[test]
-fn no_captured_search_underflows() {
+fn recoveries_are_as_measured() {
     let g = golden();
     assert_eq!(int(&g["underflow"]), 0);
+    assert_eq!(int(&g["zero_recover"]), 2);
     assert!(int(&g["searches"]) >= 70_000);
 }
 
@@ -243,4 +266,48 @@ fn the_detour_penalty_needs_resistance_aware_and_a_longer_path() {
         // Step 1: length 1, not past the original 1 → no penalty. Step 2: length 2 → +7 when ra.
         assert_eq!((d[&(0, 0, 1)], d[&(0, 0, 2)]), want, "ra={ra}");
     }
+}
+
+// ─── R18f constructed cases ─────────────────────────────────────────────────────────────────
+
+fn st(dist: i32, parent: Option<Cell3>, dir: Dir3) -> CellState {
+    CellState { dist, path_len: 0, parent, dir }
+}
+
+/// The walk follows parents until a ZERO distance, reverses, and appends the crossing; `head_room`
+/// is the index of the last point at the start position (a via stack there raises it).
+#[test]
+fn the_backtrace_walks_to_zero_and_counts_the_start_stack() {
+    // seed (0,0,0) -> via up (1,0,0) -> via up (2,0,0) -> planar (2,0,1) = crossing.
+    let cells: HashMap<Cell3, CellState> = [
+        ((0, 0, 0), st(0, None, Dir3::Origin)),
+        ((1, 0, 0), st(1, Some((0, 0, 0)), Dir3::Up)),
+        ((2, 0, 0), st(2, Some((1, 0, 0)), Dir3::Up)),
+        ((2, 0, 1), st(3, Some((2, 0, 0)), Dir3::East)),
+    ].into_iter().collect();
+    let b = backtrace_3d(Some((2, 0, 1)), &|c| cells[&c]).expect("a path");
+    let p = |x, y, layer| Point3D { x, y, layer };
+    assert_eq!(b.grids, vec![p(0, 0, 0), p(0, 0, 1), p(0, 0, 2), p(1, 0, 2)]);
+    assert_eq!((b.head_room, b.orig_layer, b.last_layer), (2, 0, 2));
+}
+
+/// ⛔ A crossing at distance 0 is a recovery, not a one-point path; no crossing is the other one.
+#[test]
+fn a_zero_distance_crossing_and_underflow_both_recover() {
+    let cells: HashMap<Cell3, CellState> = [((0, 0, 0), st(0, None, Dir3::Origin))].into_iter().collect();
+    assert_eq!(backtrace_3d(Some((0, 0, 0)), &|c| cells[&c]), Err(Recovery::ZeroDistance));
+    assert_eq!(backtrace_3d(None, &|c| cells[&c]), Err(Recovery::Underflow));
+}
+
+/// ⛔ The walk stops at DISTANCE 0, not at a seed: a relaxed cell holding 0 (a price below 1,
+/// truncated) ends the path early. Never captured — every price is at least 1.
+#[test]
+fn the_walk_stops_at_the_first_zero_distance() {
+    let cells: HashMap<Cell3, CellState> = [
+        ((0, 0, 0), st(0, None, Dir3::Origin)),
+        ((0, 0, 1), st(0, Some((0, 0, 0)), Dir3::East)), // relaxed, but truncated to 0
+        ((0, 0, 2), st(1, Some((0, 0, 1)), Dir3::East)),
+    ].into_iter().collect();
+    let b = backtrace_3d(Some((0, 0, 2)), &|c| cells[&c]).expect("a path");
+    assert_eq!(b.grids.len(), 2, "stopped at (0,0,1), not at the seed");
 }

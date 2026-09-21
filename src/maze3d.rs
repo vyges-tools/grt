@@ -664,3 +664,69 @@ pub fn maze_search_3d(
         .collect();
     Ok(Search3D { pops, crossing, reached })
 }
+
+// ─── R18f — the backtrace ───────────────────────────────────────────────────────────────────
+
+/// What the backtrace leaves for the tree surgery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Backtrace3D {
+    /// From the subtree-1 end to the crossing: every parent walked, reversed, then the crossing.
+    pub grids: Vec<Point3D>,
+    /// The index of the LAST point still at the path's start position — the top of the via
+    /// stack there. ⚠️ Counted as "points at the start position" minus one, so a path whose
+    /// first step is planar has `head_room == 0`.
+    pub head_room: usize,
+    /// The first point's layer, and the layer at `head_room`.
+    pub orig_layer: i16,
+    pub last_layer: i16,
+}
+
+/// Why no path came back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recovery {
+    /// The search ran dry. The reference recovers the edge AND counts the net for GRT-183.
+    Underflow,
+    /// The crossing's own distance is 0 — a destination cell that is also a seed. ⚠️ The
+    /// reference recovers the edge but does NOT count the net for GRT-183.
+    ZeroDistance,
+}
+
+/// Walk back from the crossing — the backtrace in `mazeRouteMSMDOrder3D`.
+///
+/// Differences from the 2D [`crate::backtrace`], found by diffing the two reference routines: ONE
+/// parent grid carrying the layer, where 2D keeps two chosen by the arrival direction; no
+/// hyper-edge reflections; and a `head_room` scan the 2D code has no counterpart for.
+///
+/// ⛔ The walk stops at the first cell whose DISTANCE is 0 — not at the first seed. They agree only
+/// because every move costs at least 1, so a cell a relaxation reached never stores 0.
+pub fn backtrace_3d(
+    crossing: Option<Cell3>,
+    state: &dyn Fn(Cell3) -> CellState,
+) -> Result<Backtrace3D, Recovery> {
+    let cross = crossing.ok_or(Recovery::Underflow)?;
+    if state(cross).dist == 0 {
+        return Err(Recovery::ZeroDistance);
+    }
+    let mut cur = cross;
+    let mut walked: Vec<Point3D> = Vec::new();
+    while state(cur).dist != 0 {
+        cur = state(cur).parent.expect("a cell with a non-zero distance was relaxed, so has a parent");
+        walked.push(Point3D { x: cur.2, y: cur.1, layer: cur.0 });
+    }
+    let mut grids: Vec<Point3D> = walked.into_iter().rev().collect();
+    grids.push(Point3D { x: cross.2, y: cross.1, layer: cross.0 });
+
+    let (e1x, e1y) = (grids[0].x, grids[0].y);
+    let mut head_room = 0;
+    while head_room < grids.len() && grids[head_room].x == e1x && grids[head_room].y == e1y {
+        head_room += 1;
+    }
+    // Always at least one point at the start, so this never underflows.
+    head_room -= 1;
+    Ok(Backtrace3D {
+        orig_layer: grids[0].layer,
+        last_layer: grids[head_room].layer,
+        grids,
+        head_room,
+    })
+}
