@@ -995,3 +995,363 @@ pub fn update_route_type2_3d(
     split(&mut edges[edge_n1a2], &g3[pos2..], dist(c2, e1x, e1y));
     Ok(())
 }
+
+// ─── R18g3 — the surgery's wiring ───────────────────────────────────────────────────────────
+
+/// A tree node carrying every field the 3D tree surgery reads or writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Node3D {
+    pub x: i16,
+    pub y: i16,
+    pub stack_alias: usize,
+    pub assigned: bool,
+    pub status: i16,
+    /// `eID` / `heights` / `conCNT` and the layer range and extreme edges.
+    pub conn: NodeConnections,
+    /// `(nbr, edge)` pairs, `nbr_count` of them (at most 3).
+    pub nbr: Vec<(usize, usize)>,
+}
+
+/// A tree edge carrying every field the 3D tree surgery reads or writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Edge3D {
+    pub n1: usize,
+    pub n2: usize,
+    pub n1a: usize,
+    pub n2a: usize,
+    pub len: i32,
+    pub route_type: RouteType,
+    pub routelen: i32,
+    pub grids: Vec<Point3D>,
+}
+
+/// One net's tree, as the surgery sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tree3D {
+    pub num_terminals: usize,
+    pub num_layers: i16,
+    /// Each terminal's pin layer (`getPinL()[node_to_pin_idx[t]]`).
+    pub pin_layers: Vec<i16>,
+    pub nodes: Vec<Node3D>,
+    pub edges: Vec<Edge3D>,
+}
+
+/// Split the edge next to a moved PIN — the reference's `splitEdge`, the same C++ function the 2D
+/// pass calls ([`crate::split_edge`] is its 2D-typed transcription), here on the 3D tree.
+///
+/// `n2` is the pin that moved, `n1` the edge's other end. A new node takes `n2`'s place on the
+/// edge (same position, `n2`'s alias), and a new zero-length edge joins it to `n2`.
+///
+/// ⚠️ The new edge's single grid point is `{n2x, n2y}` — its LAYER is the struct default, 0.
+/// ⚠️ The new node's other fields are the struct defaults (`botL = topL = -1`, `hID = lID = -1`);
+/// the caller's `setTreeNodesVariables` overwrites them straight after.
+pub fn split_edge_3d(tree: &mut Tree3D, n1: usize, n2: usize, edge_n1n2: usize) -> usize {
+    let (n2x, n2y) = (tree.nodes[n2].x, tree.nodes[n2].y);
+    let new_node = tree.nodes.len();
+    let new_edge = tree.edges.len();
+    let alias = tree.nodes[n2].stack_alias;
+    let (nbr, edge_n2_nbr) = if tree.nodes[n2].nbr[0].0 == n1 { tree.nodes[n2].nbr[1] } else { tree.nodes[n2].nbr[0] };
+
+    let old = tree.nodes[n2].nbr.clone();
+    tree.nodes[n2].nbr = old
+        .iter()
+        .filter(|&&(v, _)| v != n1)
+        .map(|&(v, e)| if v == nbr { (new_node, new_edge) } else { (v, e) })
+        .collect();
+
+    for e in [edge_n2_nbr, edge_n1n2] {
+        let edge = &mut tree.edges[e];
+        if edge.n1 == n2 {
+            edge.n1 = new_node;
+            edge.n1a = alias;
+        } else {
+            edge.n2 = new_node;
+            edge.n2a = alias;
+        }
+    }
+    for who in [nbr, n1] {
+        for slot in tree.nodes[who].nbr.iter_mut() {
+            if slot.0 == n2 {
+                slot.0 = new_node;
+            }
+        }
+    }
+    tree.edges.push(Edge3D {
+        n1: new_node,
+        n1a: alias,
+        n2,
+        n2a: tree.nodes[n2].stack_alias,
+        len: 0,
+        route_type: RouteType::MazeRoute,
+        routelen: 0,
+        grids: vec![Point3D { x: n2x, y: n2y, layer: 0 }],
+    });
+    tree.nodes.push(Node3D {
+        x: n2x,
+        y: n2y,
+        stack_alias: alias,
+        assigned: false,
+        status: 0,
+        conn: NodeConnections {
+            e_id: [0; MAX_CONNECTIONS],
+            heights: [0; MAX_CONNECTIONS],
+            con_cnt: 0,
+            bot_layer: -1,
+            top_layer: -1,
+            l_id: -1,
+            h_id: -1,
+        },
+        nbr: vec![(nbr, edge_n2_nbr), (n2, new_edge), (n1, edge_n1n2)],
+    });
+    new_node
+}
+
+/// Recompute every node's layer bookkeeping — the reference's `setTreeNodesVariables`.
+///
+/// Reset (terminals to their pin layer, status 1; everything else open), alias each non-terminal
+/// that sits on an earlier node's position to the FIRST node inserted there, then register every
+/// POSITIVE-length edge at both alias ends by its first / last layer with strict extremes.
+///
+/// ⚠️ `eID` / `heights` past the new count keep their old values — the reference never clears them.
+pub fn set_tree_nodes_variables(tree: &mut Tree3D) {
+    let mut first_at: std::collections::HashMap<(i16, i16), usize> = std::collections::HashMap::new();
+    for d in 0..tree.nodes.len() {
+        let n = &mut tree.nodes[d];
+        n.conn.top_layer = -1;
+        n.conn.bot_layer = tree.num_layers;
+        n.assigned = false;
+        n.stack_alias = d;
+        n.conn.con_cnt = 0;
+        n.conn.h_id = BIG_INT;
+        n.conn.l_id = BIG_INT;
+        n.status = 0;
+        let key = (n.x, n.y);
+        if d < tree.num_terminals {
+            n.conn.bot_layer = tree.pin_layers[d];
+            n.conn.top_layer = tree.pin_layers[d];
+            n.assigned = true;
+            n.status = 1;
+            first_at.entry(key).or_insert(d);
+        } else if let Some(&first) = first_at.get(&key) {
+            n.stack_alias = first;
+        } else {
+            first_at.insert(key, d);
+        }
+    }
+    for k in 0..tree.edges.len() {
+        if tree.edges[k].len <= 0 {
+            continue;
+        }
+        let (n1a, n2a) = (tree.nodes[tree.edges[k].n1].stack_alias, tree.nodes[tree.edges[k].n2].stack_alias);
+        let e = &mut tree.edges[k];
+        e.n1a = n1a;
+        e.n2a = n2a;
+        let (l1, l2) = (e.grids[0].layer, e.grids[e.routelen as usize].layer);
+        for (node, layer) in [(n1a, l1), (n2a, l2)] {
+            let c = &mut tree.nodes[node].conn;
+            let at = c.con_cnt as usize;
+            c.heights[at] = layer;
+            c.e_id[at] = k as i32;
+            c.con_cnt += 1;
+            if layer > c.top_layer {
+                c.h_id = k as i32;
+                c.top_layer = layer;
+            }
+            if layer < c.bot_layer {
+                c.l_id = k as i32;
+                c.bot_layer = layer;
+            }
+            tree.nodes[node].assigned = true;
+        }
+    }
+}
+
+/// Register the re-routed edge at an end that did not shift — `newUpdateNodeLayers`.
+///
+/// ⚠️ Top is tested before bottom, both strict, on the node as it stands.
+pub fn new_update_node_layers(node: &mut NodeConnections, edge_id: usize, last_layer: i16) {
+    let at = node.con_cnt as usize;
+    node.heights[at] = last_layer;
+    node.e_id[at] = edge_id as i32;
+    node.con_cnt += 1;
+    if node.top_layer < last_layer {
+        node.top_layer = last_layer;
+        node.h_id = edge_id as i32;
+    }
+    if node.bot_layer > last_layer {
+        node.bot_layer = last_layer;
+        node.l_id = edge_id as i32;
+    }
+}
+
+/// What one edge's surgery reports back to the driver.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SurgeryOutcome {
+    pub n1_shift: bool,
+    pub n2_shift: bool,
+    /// Edges whose points a node shift overwrote, in the order they were queued.
+    pub retry: Vec<usize>,
+    /// Every usage request, in order: (horizontal?, layer, x, y). Each is +edge cost on the 2D
+    /// grid (NDR-aware in the reference) and +layer edge cost on the 3D grid.
+    pub usage: Vec<(bool, i16, i16, i16)>,
+}
+
+/// Apply a node shift through the g1/g2 helpers on this tree's own types.
+fn with_surgery_view<R>(tree: &mut Tree3D, f: impl FnOnce(&mut [SurgeryNode3D], &mut [SurgeryEdge3D]) -> R) -> R {
+    let mut sn: Vec<SurgeryNode3D> = tree.nodes.iter().map(|n| SurgeryNode3D { x: n.x, y: n.y, bot_layer: n.conn.bot_layer }).collect();
+    let mut se: Vec<SurgeryEdge3D> = tree.edges.iter().map(|e| SurgeryEdge3D {
+        n1: e.n1, n2: e.n2, route_type: e.route_type, routelen: e.routelen, len: e.len, grids: e.grids.clone(),
+    }).collect();
+    let r = f(&mut sn, &mut se);
+    for (n, s) in tree.nodes.iter_mut().zip(&sn) {
+        (n.x, n.y) = (s.x, s.y);
+    }
+    for (e, s) in tree.edges.iter_mut().zip(se) {
+        (e.n1, e.n2, e.route_type, e.routelen, e.len, e.grids) = (s.n1, s.n2, s.route_type, s.routelen, s.len, s.grids);
+    }
+    r
+}
+
+/// The two neighbours of `n` other than `other`, with their edges — the reference's A1/A2 (B1/B2)
+/// choice: skip whichever of the first two slots holds `other`, else take the first two.
+fn the_other_two(node: &Node3D, other: usize) -> ((usize, usize), (usize, usize)) {
+    if node.nbr[0].0 == other {
+        (node.nbr[1], node.nbr[2])
+    } else if node.nbr[1].0 == other {
+        (node.nbr[0], node.nbr[2])
+    } else {
+        (node.nbr[0], node.nbr[1])
+    }
+}
+
+/// One end's half of the surgery: split at a moved pin, then shift a moved Steiner node (type 1 or
+/// type 2, with type 2's five-node rewiring), or register the edge at an end that stayed put.
+#[allow(clippy::too_many_arguments)]
+fn surgery_end(
+    tree: &mut Tree3D,
+    me: &mut usize,
+    other: usize,
+    alias: usize,
+    orig_pos: (i16, i16),
+    e: (i16, i16),
+    corr: usize,
+    edge_n1n2: usize,
+    last_layer: i16,
+    out: &mut SurgeryOutcome,
+) -> Result<bool, ShiftError> {
+    let moved = e != orig_pos;
+    if *me < tree.num_terminals && moved {
+        *me = split_edge_3d(tree, other, *me, edge_n1n2);
+        set_tree_nodes_variables(tree);
+    }
+    if !(*me >= tree.num_terminals && moved) {
+        new_update_node_layers(&mut tree.nodes[alias].conn, edge_n1n2, last_layer);
+        return Ok(false);
+    }
+    let n = *me;
+    let (endpt1, endpt2) = (tree.edges[corr].n1, tree.edges[corr].n2);
+    let ((mut a1, mut e_a1), (mut a2, mut e_a2)) = the_other_two(&tree.nodes[n], other);
+    if endpt1 == n || endpt2 == n {
+        if endpt1 == a2 || endpt2 == a2 {
+            std::mem::swap(&mut a1, &mut a2);
+            std::mem::swap(&mut e_a1, &mut e_a2);
+        }
+        with_surgery_view(tree, |sn, se| update_route_type1_3d(sn, n, a1, a2, e, se, e_a1, e_a2))?;
+        out.retry.extend([e_a1, e_a2]);
+        tree.nodes[n].assigned = true;
+    } else {
+        let (c1, c2, e_c1c2) = (endpt1, endpt2, corr);
+        with_surgery_view(tree, |sn, se| update_route_type2_3d(sn, n, (a1, a2), (c1, c2), e, se, (e_a1, e_a2, e_c1c2)))?;
+        out.retry.extend([e_a1, e_a2, e_c1c2]);
+        tree.nodes[n].x = e.0;
+        tree.nodes[n].y = e.1;
+        tree.nodes[n].assigned = true;
+        let (e_nc1, e_nc2, e_a1a2) = (e_a1, e_a2, e_c1c2);
+        (tree.edges[e_nc1].n1, tree.edges[e_nc1].n2) = (c1, n);
+        (tree.edges[e_nc2].n1, tree.edges[e_nc2].n2) = (n, c2);
+        (tree.edges[e_a1a2].n1, tree.edges[e_a1a2].n2) = (a1, a2);
+        tree.nodes[n].nbr[0] = (other, edge_n1n2);
+        tree.nodes[n].nbr[1] = (c1, e_nc1);
+        tree.nodes[n].nbr[2] = (c2, e_nc2);
+        // Each of the four neighbours swaps ONE entry — the first that matches.
+        for (who, was, now, edge) in [(a1, n, a2, e_a1a2), (a2, n, a1, e_a1a2), (c1, c2, n, e_nc1), (c2, c1, n, e_nc2)] {
+            if let Some(slot) = tree.nodes[who].nbr.iter_mut().take(3).find(|s| s.0 == was) {
+                *slot = (now, edge);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// The tree surgery after one edge's re-route — the driver's section from the backtrace to the end
+/// of the edge's iteration.
+///
+/// ⛔ The reference's ORDER, which decides results: end 1 (split, shift or register) → the tail
+/// room → end 2 (which reads end 1's possibly-new node id) → the route written from `head_room` to
+/// `tail_room` → usage for every PLANAR step in that span → `setTreeNodesVariables` only if either
+/// end shifted.
+///
+/// `corr(layer, x, y)` is the `corr_edge_3D` value the search's seeding left at a cell; the ends'
+/// original positions are the ones read before the rip-up.
+#[allow(clippy::too_many_arguments)]
+pub fn tree_surgery_3d(
+    tree: &mut Tree3D,
+    edge_id: usize,
+    bt: &Backtrace3D,
+    orig_positions: ((i16, i16), (i16, i16)),
+    aliases: (usize, usize),
+    corr: &dyn Fn(i16, i16, i16) -> usize,
+) -> Result<SurgeryOutcome, ShiftError> {
+    let g = &bt.grids;
+    let cnt = g.len();
+    let e1 = (g[0].x, g[0].y);
+    let e2 = (g[cnt - 1].x, g[cnt - 1].y);
+    let (mut n1, mut n2) = (tree.edges[edge_id].n1, tree.edges[edge_id].n2);
+    let mut out = SurgeryOutcome::default();
+
+    let lazy1 = corr(bt.orig_layer, e1.1, e1.0);
+    out.n1_shift = surgery_end(tree, &mut n1, n2, aliases.0, orig_positions.0, e1, lazy1, edge_id, bt.last_layer, &mut out)?;
+
+    // The tail room: the FIRST point of the via stack at the path's end.
+    let orig_layer2 = g[cnt - 1].layer;
+    let mut tail = cnt - 1;
+    while tail > 0 && g[tail].x == e2.0 && g[tail].y == e2.1 {
+        tail -= 1;
+    }
+    if tail < cnt - 1 {
+        tail += 1;
+    }
+    let last_layer2 = g[tail].layer;
+    let lazy2 = corr(orig_layer2, e2.1, e2.0);
+    out.n2_shift = surgery_end(tree, &mut n2, n1, aliases.1, orig_positions.1, e2, lazy2, edge_id, last_layer2, &mut out)?;
+
+    // The re-routed edge itself, trimmed to [head_room, tail].
+    let newcnt = tail as i32 - bt.head_room as i32 + 1;
+    let e = &mut tree.edges[edge_id];
+    if e.route_type == RouteType::MazeRoute {
+        e.grids.clear();
+    }
+    if newcnt > 0 {
+        e.grids.resize(newcnt as usize, Point3D { x: 0, y: 0, layer: 0 });
+    }
+    e.route_type = RouteType::MazeRoute;
+    e.routelen = newcnt - 1;
+    e.len = i32::from((e1.0 - e2.0).abs() + (e1.1 - e2.1).abs());
+    for i in 0..newcnt.max(0) as usize {
+        e.grids[i] = g[bt.head_room + i];
+    }
+    // ⚠️ Anything planar that is not vertical is charged as HORIZONTAL — no diagonal test here.
+    for i in bt.head_room..tail {
+        if g[i].layer == g[i + 1].layer {
+            if g[i].x == g[i + 1].x {
+                out.usage.push((false, g[i].layer, g[i].x, g[i].y.min(g[i + 1].y)));
+            } else {
+                out.usage.push((true, g[i].layer, g[i].x.min(g[i + 1].x), g[i].y));
+            }
+        }
+    }
+    if out.n1_shift || out.n2_shift {
+        set_tree_nodes_variables(tree);
+    }
+    Ok(out)
+}
