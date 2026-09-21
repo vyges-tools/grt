@@ -29,7 +29,7 @@ pub mod fillvia;
 pub mod routes;
 pub mod overflow2d;
 pub mod maze3d;
-pub use maze3d::{edge_in_window, end_index, max_reroute_iter, maze_route_msmd_order_3d, prelude, skips_for_slack, EdgeResult, Maze3DCall, Maze3DEdgeWork, Maze3DEvent, OrderedNet, Prelude, FINAL_RES_AWARE_NETS_PERCENTAGE, HIGH_DETOUR_PENALTY, LOW_DETOUR_PENALTY};
+pub use maze3d::{new_ripup_3d_type3, remove_edge_from_node, MazeRipupWrong, NodeConnections, edge_in_window, end_index, max_reroute_iter, maze_route_msmd_order_3d, prelude, skips_for_slack, EdgeResult, Maze3DCall, Maze3DEdgeWork, Maze3DEvent, OrderedNet, Prelude, FINAL_RES_AWARE_NETS_PERCENTAGE, HIGH_DETOUR_PENALTY, LOW_DETOUR_PENALTY};
 pub use overflow2d::{get_overflow_2d, get_overflow_2d_maze, history_threshold, Overflow2DScan, UsedCell};
 pub use routes::{get_net_route, get_routes, grid_to_dbu, report_run_metrics, GridOrigin, NetForRoutes, RouteEdge, RunReport};
 pub use fillvia::{fill_via, get_via_stack_range, EdgeFill, EndClaim, NoPreviousRouting, ViaCounts, ViaEdge, ViaNet, ViaNode, ViaPin, NO_EDGE};

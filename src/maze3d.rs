@@ -6,8 +6,8 @@
 //! and the pass changes the routes of thousands of nets — it decides the final routes on most
 //! designs.
 //!
-//! This module is built in pieces, each against its own capture. **R18a — this file so far — is
-//! the driver's control sequence**: which nets are walked, which are skipped, which edges fall in
+//! This module is built in pieces, each against its own capture. **R18a is the driver's control
+//! sequence** and **R18b the 3D rip-up** (below it): which nets are walked, which are skipped, which edges fall in
 //! the window, and how the retry passes repeat. The per-edge work is handed to a
 //! [`Maze3DEdgeWork`], so the sequence is testable now and each later piece slots in behind it:
 //!
@@ -184,4 +184,139 @@ pub fn maze_route_msmd_order_3d(
         }
     }
     (events, recovered_nets)
+}
+
+// ─── R18b — `newRipup3DType3` ───────────────────────────────────────────────────────────────
+
+use crate::full3d::Point3D;
+use crate::softndr::UsageGrid;
+use crate::spiral::MAX_CONNECTIONS;
+
+/// The reference's `BIG_INT`, the "no edge" id and the Steiner node's starting bottom layer.
+const BIG_INT: i32 = 1_000_000_000;
+
+/// A tree node's connection bookkeeping, as the 3D rip-up reads and rewrites it.
+///
+/// ⛔ Fixed arrays with a count, as the reference holds them (`eID[10]`, `heights[10]`,
+/// `conCNT`), not a growable list: removing shifts later entries down and decrements the count,
+/// leaving a stale copy in the slot past it — and if the edge is not found at all, the count still
+/// drops, discarding whatever sat in the last slot. A `Vec` would express neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeConnections {
+    pub e_id: [i32; MAX_CONNECTIONS],
+    pub heights: [i16; MAX_CONNECTIONS],
+    pub con_cnt: i16,
+    pub bot_layer: i16,
+    pub top_layer: i16,
+    pub l_id: i32,
+    pub h_id: i32,
+}
+
+/// Remove one edge from a node and recompute its layer range and extreme edges — the reference's
+/// `removeEdgeFromNode` lambda.
+///
+/// ⛔ A PIN starts from its pin layer with no edge ids; a STEINER node starts from `[BIG_INT, 0]`.
+/// The comparisons are strict, so:
+/// - an edge exactly at a pin's layer never claims `l_id` / `h_id` (1,496 captured);
+/// - a Steiner node whose remaining edges are all on layer 0 keeps `h_id = BIG_INT` (53 captured);
+/// - on a tie the FIRST remaining edge in list order keeps the id (~8,600 captured each way).
+///
+/// ⚠️ A Steiner node left with nothing becomes `bot = -1, top = 0` — NOT the `(num_layers, -1)`
+/// "no layers" pair other stages test for. Never captured: Steiner nodes are never emptied.
+pub fn remove_edge_from_node(node: &mut NodeConnections, edge_id: i32, pin_layer: Option<i32>) {
+    let (mut bl, mut hl) = match pin_layer {
+        Some(l) => (l, l),
+        None => (BIG_INT, 0),
+    };
+    let (mut bid, mut hid) = (BIG_INT, BIG_INT);
+    let n = node.con_cnt as usize;
+    let mut consider = |h: i16, id: i32| {
+        let h = i32::from(h);
+        if bl > h {
+            bl = h;
+            bid = id;
+        }
+        if hl < h {
+            hl = h;
+            hid = id;
+        }
+    };
+    for i in 0..n {
+        if node.e_id[i] == edge_id {
+            // Shift the rest down, considering each as it moves.
+            for k in i + 1..n {
+                node.e_id[k - 1] = node.e_id[k];
+                node.heights[k - 1] = node.heights[k];
+                consider(node.heights[k], node.e_id[k]);
+            }
+            break;
+        }
+        consider(node.heights[i], node.e_id[i]);
+    }
+    node.con_cnt -= 1;
+    // ⚠️ The reference clamps the sentinel to its struct default so it does not truncate into 16
+    // bits; the top is narrowed as is.
+    node.bot_layer = if bl == BIG_INT { -1 } else { bl as i16 };
+    node.l_id = bid;
+    node.top_layer = hl as i16;
+    node.h_id = hid;
+}
+
+/// "Maze ripup wrong" — a planar step that moves in both x and y. The reference aborts (GRT-122).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MazeRipupWrong {
+    pub step: usize,
+}
+
+/// Rip one edge up in three dimensions — `newRipup3DType3`.
+///
+/// Returns `Ok(false)` without touching anything for a zero-length edge (the reference's "not
+/// ripup for degraded edge"). ⚠️ Unreachable from R18's driver: its window already excludes
+/// `len <= 0` — 0 refusals in 73,179 calls.
+///
+/// Otherwise removes the edge from both ALIAS endpoints, then gives back every PLANAR step's
+/// usage (a step that changes layer is a via and gives back nothing):
+/// - 2D committed usage by the net's edge cost — through the grid, which in the reference is
+///   NDR-aware; measured inert: every applied delta equals the edge cost, NDR nets included;
+/// - 3D usage on the step's layer by that layer's edge cost (3, 5 and 7 all captured).
+///
+/// Both are indexed at the step's LOWER endpoint.
+#[allow(clippy::too_many_arguments)]
+pub fn new_ripup_3d_type3(
+    edge_id: usize,
+    len: i32,
+    (n1a, n2a): (usize, usize),
+    grids: &[Point3D],
+    routelen: i32,
+    nodes: &mut [NodeConnections],
+    pin_layer: &dyn Fn(usize) -> Option<i32>,
+    edge_cost: i8,
+    layer_edge_cost: &dyn Fn(i16) -> i8,
+    grid: &mut dyn UsageGrid,
+) -> Result<bool, MazeRipupWrong> {
+    if len == 0 {
+        return Ok(false);
+    }
+    remove_edge_from_node(&mut nodes[n1a], edge_id as i32, pin_layer(n1a));
+    remove_edge_from_node(&mut nodes[n2a], edge_id as i32, pin_layer(n2a));
+
+    for i in 0..routelen.max(0) as usize {
+        let (a, b) = (grids[i], grids[i + 1]);
+        if a.layer != b.layer {
+            continue;
+        }
+        let lc = i32::from(layer_edge_cost(a.layer));
+        if a.x == b.x {
+            let ymin = a.y.min(b.y);
+            grid.add_usage_v_2d(a.x, ymin, -i32::from(edge_cost));
+            grid.add_usage_v_3d(a.layer, a.x, ymin, -lc);
+        } else if a.y == b.y {
+            let xmin = a.x.min(b.x);
+            grid.add_usage_h_2d(xmin, a.y, -i32::from(edge_cost));
+            grid.add_usage_h_3d(a.layer, xmin, a.y, -lc);
+        } else {
+            return Err(MazeRipupWrong { step: i });
+        }
+    }
+    Ok(true)
 }
