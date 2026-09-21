@@ -711,3 +711,34 @@ against that *layer's* edge cost; the reach-outside scan compares the best found
 ⚠️ The per-step resource is captured rather than the 3D capacity and usage arrays behind it: that
 read is a database walk indexed by the step's position, not a rule. Splitting there keeps this
 golden about the rules.
+
+## `netpinorder.json` — the net ordering layer assignment walks in
+
+115 calls, **33,359 nets**, from 71 designs in **both cost modes** — 48 default, 67
+resistance-aware.
+
+⛔ **Two of the six sort keys are identically zero without resistance-aware.** The clock key is `0`
+outright in a default run, and the score key is `0` for every net that is not flagged — which is
+all of them. A default-only corpus therefore decides four keys out of six. Same trap as
+`assignedge.json`, and the reason both sweeps now run by default.
+
+⛔ **Not the congestion ordering, despite the family resemblance.** That one accumulates per-edge
+overflow into a field called `xmin`, then mutates slack and re-sorts; this one takes a real
+minimum x, sorts once, and mutates nothing. Diffing the two reference functions was what
+established they share nothing — the name was the only similarity.
+
+⚠️ **The minimum runs in a narrow type and is stored in a wide one.** `int16_t` for the reduction,
+`int` in the record, so a net with no edges keeps **32,767** rather than the larger type's maximum.
+No captured net is edgeless, so that value is pinned by a constructed case with the absence
+asserted.
+
+⚠️ **The minimum is over each edge's FIRST node only** — the second endpoint never enters it, so
+this is not the net's leftmost point.
+
+⚠️ The per-net score is captured rather than derived: the reference divides four net properties by
+four run-wide worst-case values, which is state this pass does not own.
+
+11 of 13 mutations die. The two survivors are measured: the division's precision is unobservable
+because no net's total length reaches 2²⁴, where a `float` stops being exact (asserted as a
+threshold); and the sort's stability cannot matter because the net index is the last key, so no
+two records ever compare equal (asserted as the precondition).
