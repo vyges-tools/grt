@@ -475,8 +475,8 @@ pub enum Dir3 {
 /// What one search reads, besides its seeds.
 ///
 /// ⚠️ The move PRICES are inputs. In plain mode a wire is `1.0` and a via is `via_cost_` (1); in
-/// resistance-aware mode both come from the technology's resistance tables — a separate function
-/// (`getWireCost` / `getViaCost`), priced per layer and per layer pair, not a rule of the search.
+/// resistance-aware mode both come from the technology's resistance tables — `getMazeRouteCost3D`
+/// ([`crate::get_maze_route_cost_3d`]), priced per layer and per layer pair, not a rule of the search.
 pub struct Search3DInputs<'a> {
     pub num_layers: i16,
     /// `(x1, x2, y1, y2)`, inclusive.
