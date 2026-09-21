@@ -843,3 +843,33 @@ Three mutations survive, each measured and stated in a test rather than left ope
 | dropping the gate's `len > 0` term | **equivalent everywhere**, not just here — that term can only admit an edge with no steps to walk |
 | dropping the fraction's clamp | **equivalent in Rust**, where a float-to-int cast saturates. ⛔ In the reference it is undefined behaviour for a negative value, so the clamp is transcribed for *that* reason |
 | widening the 16-bit counter | unobservable by four orders of magnitude — the largest captured count is **25** against a wrap at 65,535 |
+
+## R19 — `threedvia.json`, `overflow3d.json`, `checkroute.json`, `pincoverage.json`
+
+Four passes captured from one sweep over 71 designs: 6 via-count runs, **10 grids of which 7
+actually overflow**, 600 checked nets, and 600 nets covering **2,240 pins**.
+
+⛔ **Three of the four gate edges differently, and no two agree.** The via count asks `len > 0`,
+the checker asks `len == 0` (so it examines an edge with a *negative* length, which the via count
+skips), and the pin-coverage pass asks `len > 0 || routelen > 0`. Tests drive an edge through all
+three and assert they disagree.
+
+⚠️ **`getOverflow3D` returns the total USAGE and sets the total OVERFLOW as a side effect** — two
+different numbers, and reading the returned one as congestion is the obvious mistake. Both are
+gated.
+
+⛔ **The checker finds nothing and the pin-coverage pass adds nothing, on every captured design.**
+Both absences are asserted with the margin measured: **0 of 2,240 pins** would need a via stack,
+and no pin's position is even missed by its net's routing — layer assignment already covers them.
+So each condition is *also* driven by a constructed case, because a checker that has only ever
+returned nothing is a checker whose conditions are untested.
+
+⚠️ The overflow cell rows are `[direction, layer, x, y, usage, capacity]`. ⛔ The first version of
+the test read usage at index 3 and picked up the **y coordinate**, scoring every grid as massively
+overflowing — the aggregate captured alongside the cells is what caught it. **Capture the
+reference's own totals next to the raw rows; they cross-check the parser.**
+
+16 of 17 mutations die. The survivor — relaxing the overflow test from "above capacity" to "at or
+above" — is arithmetically equivalent, since a cell exactly at capacity contributes zero to both
+the sum and the maximum. ⛔ Not equivalent in the reference, where that branch also prints a
+per-cell congestion report; we do not model the logger.
