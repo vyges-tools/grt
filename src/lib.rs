@@ -25,6 +25,8 @@ pub mod full3d;
 pub mod slacks;
 pub mod softndr;
 pub mod checks3d;
+pub mod fillvia;
+pub use fillvia::{fill_via, get_via_stack_range, EdgeFill, EndClaim, NoPreviousRouting, ViaCounts, ViaEdge, ViaNet, ViaNode, ViaPin, NO_EDGE};
 pub mod mazecost;
 pub use layerdp::{assign_edge_layers, selection_column_witness, LayerDpInputs, LayerEnd};
 pub use layertable::{build_layer_grid, LayerDir, LayerRange, TableInputs, BARRED};
