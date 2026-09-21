@@ -145,3 +145,61 @@ fn a_two_pin_net_seeds_only_its_endpoints() {
     }
     assert!(checked >= 100, "too few two-pin nets: {checked}");
 }
+
+// ─── R18c: the same heap over the 3D search's integer distances ─────────────────────────────
+
+/// ⭐ The 3D heap (`heapify3D` / `updateHeap3D` / `removeMin3D`) is the 2D heap over `int`
+/// distances — textually identical in the reference. These pin the integer instance's two
+/// behaviours that the 3D search depends on: equal keys keep their relative arrangement exactly as
+/// the hole-pushing sift leaves them, and the tail element takes part in the repair before it is
+/// dropped.
+#[test]
+fn the_heap_orders_integer_distances_like_the_reference() {
+    use vyges_grt::{heapify, remove_min, update_heap};
+    // Pop order over integer keys with ties: repeatedly remove the minimum.
+    let dist: Vec<i32> = vec![5, 3, 3, 1, 9, 3, 1];
+    let mut heap: Vec<usize> = Vec::new();
+    for i in 0..dist.len() {
+        heap.push(i);
+        let last = heap.len() - 1;
+        update_heap(&mut heap, last, &dist);
+    }
+    let mut popped = Vec::new();
+    while !heap.is_empty() {
+        popped.push(heap[0]);
+        remove_min(&mut heap, &dist);
+    }
+    // Minimums first; among the tied 3s the order is the sift's — 5, 1, 2 — not insertion order.
+    // ⚠️ Expected order computed from an independent transcription of the C++, not from this code.
+    assert_eq!(popped.iter().map(|&i| dist[i]).collect::<Vec<_>>(), vec![1, 1, 3, 3, 3, 5, 9]);
+    assert_eq!(popped, vec![3, 6, 5, 1, 2, 0, 4]);
+
+    // The same keys as doubles give the same order — one algorithm, two key types.
+    let dist_f: Vec<f64> = dist.iter().map(|&d| f64::from(d)).collect();
+    let mut heap: Vec<usize> = Vec::new();
+    for i in 0..dist_f.len() {
+        heap.push(i);
+        let last = heap.len() - 1;
+        update_heap(&mut heap, last, &dist_f);
+    }
+    let mut popped_f = Vec::new();
+    while !heap.is_empty() {
+        popped_f.push(heap[0]);
+        remove_min(&mut heap, &dist_f);
+    }
+    assert_eq!(popped_f, popped);
+
+    // ⛔ The sift compares children against the value held ASIDE, not the hole's occupant: here
+    // the root (10) must travel two levels, past a child (2) smaller than the grandchild (4) it
+    // still has to pass. Expected result computed from an independent transcription of the C++.
+    let dist2: Vec<i32> = vec![10, 2, 5, 4, 7];
+    let mut deep = vec![0usize, 1, 2, 3, 4];
+    heapify(&mut deep, &dist2);
+    assert_eq!(deep, vec![1, 3, 2, 0, 4]);
+
+    // heapify on a one-element heap is a no-op; on an empty one it does not panic.
+    let mut one = vec![0usize];
+    heapify(&mut one, &dist);
+    assert_eq!(one, vec![0]);
+    heapify(&mut Vec::<usize>::new(), &dist);
+}

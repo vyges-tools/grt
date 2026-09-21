@@ -171,6 +171,17 @@ pub fn setup_heap(
 /// constant has to be read rather than assumed.
 pub const BIG_INT: f64 = 1e9;
 
+// ─── The heap — shared by the 2D search (R14, `double` distances) and the 3D search (R18c,
+// `int` distances) ───────────────────────────────────────────────────────────────────────────
+//
+// ⭐ **One implementation, two reference copies.** `maze.cpp`'s `heapify` / `updateHeap` /
+// `removeMin` and `maze3D.cpp`'s `heapify3D` / `updateHeap3D` / `removeMin3D` are TEXTUALLY
+// IDENTICAL once the element type (`double*` vs `int*`) and the `3D` suffix are normalised — a
+// literal diff leaves two comments. The only real difference is the key type, so the functions are
+// generic over it rather than copied: a copy is a place for the two to drift. The 2D instance is
+// validated against R14's goldens; the 3D instance is the same code over `i32`, and R18e's search
+// capture exercises it end to end.
+
 fn parent_index(i: usize) -> usize {
     (i - 1) / 2
 }
@@ -185,7 +196,7 @@ fn right_index(i: usize) -> usize {
 ///
 /// ⚠️ Compares the **live** distance each cell currently holds, which is why the heap has to be
 /// repaired by position when a cell's distance improves rather than simply re-pushed.
-pub fn update_heap(heap: &mut [usize], mut i: usize, dist: &[f64]) {
+pub fn update_heap<K: PartialOrd + Copy>(heap: &mut [usize], mut i: usize, dist: &[K]) {
     let tmp = heap[i];
     while i > 0 && dist[heap[parent_index(i)]] > dist[tmp] {
         let parent = parent_index(i);
@@ -199,7 +210,7 @@ pub fn update_heap(heap: &mut [usize], mut i: usize, dist: &[f64]) {
 ///
 /// ⚠️ Written as a hole being pushed down, comparing children against the value held aside
 /// rather than against whatever currently sits in the hole.
-pub fn heapify(heap: &mut [usize], dist: &[f64]) {
+pub fn heapify<K: PartialOrd + Copy>(heap: &mut [usize], dist: &[K]) {
     if heap.is_empty() {
         return;
     }
@@ -231,14 +242,16 @@ pub fn heapify(heap: &mut [usize], dist: &[f64]) {
 
 /// Remove the smallest element — the reference's `removeMin`.
 ///
-/// ⛔ **This is NOT the idiomatic swap-pop-sift, and the difference is observable.** The last
-/// element is copied to the root and the heap is repaired **while that element is still present
-/// at the end**, so it takes part in comparisons as a child; only then is the tail dropped.
+/// The last element is copied to the root and the heap is repaired **while that element is still
+/// present at the end**; only then is the tail dropped.
 ///
-/// ⟹ If the sift path reaches the stale slot, the ordering differs from repairing a heap that had
-/// already been shortened. Writing the idiomatic version would give a different pop order, and
-/// therefore a different route. Transcribed exactly.
-pub fn remove_min(heap: &mut Vec<usize>, dist: &[f64]) {
+/// ⚠️ **CORRECTED 2026-09-21 — this is EQUIVALENT to the idiomatic swap-pop-sift.** An earlier
+/// version of this comment said the difference was observable; a mutation proved otherwise, and
+/// the reason is a property of the code: the value held aside IS the tail element, so the stale
+/// copy is only ever compared against itself or against a child already smaller than it, and
+/// under strict `<` it is never selected. The hole therefore never enters the last slot, and the
+/// `pop` removes exactly the stale copy. Transcribed as the reference writes it anyway.
+pub fn remove_min<K: PartialOrd + Copy>(heap: &mut Vec<usize>, dist: &[K]) {
     if heap.is_empty() {
         return;
     }
