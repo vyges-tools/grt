@@ -767,3 +767,30 @@ asserted so a later capture that reaches one fails loudly:
 
 13 of 13 mutations die — including every loop bound, both coordinate choices, the final push, the
 step-count recomputation and the stamp.
+
+## `updateslacks.json` — choosing which nets are treated as resistance-aware
+
+87 calls, **11,564 nets, 993 surviving the filters**, from 41 designs.
+
+⛔ **There is no default-mode half of this corpus, because there is nothing to capture.** The pass
+returns before touching anything unless the router is resistance-aware *and* a liberty library is
+loaded — so in a default run no net's slack, length or resistance is written at all.
+
+⛔ **The score divides by worst-case values that are still being accumulated.** Each net is scored
+inside the same loop that updates the worst metrics, so it divides by the worst seen *so far*,
+including itself — not by the final values. The golden captures the worst metrics **as they stood
+at each net**, so hoisting the accumulation into its own pass is caught per net rather than only
+if it happens to move the marked set. 100+ of the 993 scores differ from what the final metrics
+would give, and the test asserts that, so the gate cannot go vacuous.
+
+⚠️ **Slack and length are written for EVERY net, including the ones the pass then skips.** Only
+resistance, the worst metrics and candidacy are confined to the survivors.
+
+⛔ **Two boundaries no design reaches**, both measured and pinned by constructed cases:
+
+| unwitnessed | measurement |
+|---|---|
+| the incremental exemption from the positive-slack filter | 48 incremental nets reach the condition; **all 48** are already short or unconstrained, so it never decides |
+| slack of exactly zero | **0 of 11,564** nets have it, so `> 0` and `>= 0` cannot be told apart |
+
+15 of 15 mutations die.
