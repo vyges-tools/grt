@@ -26,6 +26,8 @@ pub mod slacks;
 pub mod softndr;
 pub mod checks3d;
 pub mod fillvia;
+pub mod routes;
+pub use routes::{get_net_route, get_routes, grid_to_dbu, report_run_metrics, GridOrigin, NetForRoutes, RouteEdge, RunReport};
 pub use fillvia::{fill_via, get_via_stack_range, EdgeFill, EndClaim, NoPreviousRouting, ViaCounts, ViaEdge, ViaNet, ViaNode, ViaPin, NO_EDGE};
 pub mod mazecost;
 pub use layerdp::{assign_edge_layers, selection_column_witness, LayerDpInputs, LayerEnd};
@@ -116,7 +118,11 @@ impl Rect {
 }
 
 /// One routed segment: a straight run on a layer, or a via between two layers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// ⛔ **Equality and hashing cover the six coordinates and NOT `is_jumper`** — the reference's
+/// `operator==` and `GSegmentHash` both leave the flag out, and `getRoutes`' dedup set is built on
+/// them. A derived `PartialEq` would compare the flag too.
+#[derive(Debug, Clone, Copy)]
 pub struct GSegment {
     pub init_x: i32,
     pub init_y: i32,
@@ -127,7 +133,44 @@ pub struct GSegment {
     pub is_jumper: bool,
 }
 
+impl PartialEq for GSegment {
+    fn eq(&self, o: &Self) -> bool {
+        self.init_layer == o.init_layer
+            && self.final_layer == o.final_layer
+            && self.init_x == o.init_x
+            && self.init_y == o.init_y
+            && self.final_x == o.final_x
+            && self.final_y == o.final_y
+    }
+}
+
+impl Eq for GSegment {}
+
+impl std::hash::Hash for GSegment {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        (self.init_x, self.init_y, self.init_layer, self.final_x, self.final_y, self.final_layer)
+            .hash(h);
+    }
+}
+
 impl GSegment {
+    /// The reference's constructor.
+    ///
+    /// ⛔ x and y are each sorted on their own; the layers are NOT. A step from (5, 1) to (2, 3)
+    /// becomes (2, 1)–(5, 3): neither endpoint of the original. So a planar step walked backwards
+    /// equals the forward one, while a via walked downwards differs from the same via upwards.
+    pub fn new(x0: i32, y0: i32, l0: i32, x1: i32, y1: i32, l1: i32) -> GSegment {
+        GSegment {
+            init_x: x0.min(x1),
+            init_y: y0.min(y1),
+            init_layer: l0,
+            final_x: x0.max(x1),
+            final_y: y0.max(y1),
+            final_layer: l1,
+            is_jumper: false,
+        }
+    }
+
     /// ⛔ **A via is defined by POSITION, not by layer.** A segment is a via when it does not move
     /// in x or y — `init_x == final_x && init_y == final_y`.
     ///
