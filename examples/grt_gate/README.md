@@ -794,3 +794,25 @@ resistance, the worst metrics and candidacy are confined to the survivors.
 | slack of exactly zero | **0 of 11,564** nets have it, so `> 0` and `>= 0` cannot be told apart |
 
 15 of 15 mutations die.
+
+## `softndr.json` — the soft-NDR demotion, captured where it actually runs
+
+8 demotions and **328 planar writes** from 2 designs.
+
+⛔ **Captured through a different caller than the one it belongs to.** R17's own gate never fires
+(finding 8), so `applySoftNDR` and the planar usage update were first transcribed from the source
+and pinned by constructed cases only. They are **also** called from the congestion loop's
+escalation path, which does fire — so running the same probe there gives the reference's own
+answer for the shared helpers. ⚠️ It caught nothing, which is the result worth having: the
+constructed cases were right, and now that is measured rather than assumed.
+
+⚠️ **The write ORDER is the gate, not the totals.** The reference refunds the entire route at the
+old edge cost and only then charges it at the new one, so the sequence is `n` negative writes
+followed by `n` positive ones over the same positions. Summing the deltas would score a single
+signed pass as correct.
+
+⛔ **What this corpus cannot decide**, asserted rather than implied: every captured demotion
+starts from the same edge cost (9), no net is demoted twice, and **the layered bracket is never
+exercised** — the caller that fires does not use it. The recorder panics if our code writes
+layered usage on this path, so reaching further than the reference does is a failure, not a pass.
+R17's congestion scan and layered bracket stay pinned by constructed cases; see finding 8.
