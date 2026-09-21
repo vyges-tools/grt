@@ -457,3 +457,210 @@ fn add_neighbor_points(
         }
     }
 }
+
+// ─── R18e — the search ──────────────────────────────────────────────────────────────────────
+
+/// How a cell was reached — the reference's `Direction`, in its declared order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dir3 {
+    North,
+    East,
+    South,
+    West,
+    Origin,
+    Up,
+    Down,
+}
+
+/// What one search reads, besides its seeds.
+///
+/// ⚠️ The move PRICES are inputs. In plain mode a wire is `1.0` and a via is `via_cost_` (1); in
+/// resistance-aware mode both come from the technology's resistance tables — a separate function
+/// (`getWireCost` / `getViaCost`), priced per layer and per layer pair, not a rule of the search.
+pub struct Search3DInputs<'a> {
+    pub num_layers: i16,
+    /// `(x1, x2, y1, y2)`, inclusive.
+    pub region: (i32, i32, i32, i32),
+    /// Per layer: is its preferred direction horizontal?
+    pub horizontal: &'a [bool],
+    pub min_layer: i32,
+    pub max_layer: i32,
+    /// Does the planar 3D edge leaving `(x, y)` on `layer` — toward +x on a horizontal layer, +y
+    /// on a vertical one — admit the net (`usage + layer_edge_cost <= cap`)?
+    pub admits: &'a dyn Fn(i16, i32, i32) -> bool,
+    pub wire_cost: &'a dyn Fn(i16) -> f32,
+    pub via_cost: &'a dyn Fn(i16, i16) -> f32,
+    pub original_len: i32,
+    pub resistance_aware: bool,
+    pub detour_penalty: i32,
+}
+
+/// One reached cell's final state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellState {
+    pub dist: i32,
+    pub path_len: i32,
+    /// `None` for a seed — the reference never writes a seed's parent.
+    pub parent: Option<Cell3>,
+    pub dir: Dir3,
+}
+
+/// A search's outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Search3D {
+    /// Every popped cell, in order.
+    pub pops: Vec<Cell3>,
+    /// The destination cell the search stopped on, or `None` when the heap ran dry (the reference
+    /// then recovers the original route — 0 of 73,179 captured searches).
+    pub crossing: Option<Cell3>,
+    /// Every reached cell (distance below `BIG_INT`) with its final state.
+    pub reached: Vec<(Cell3, CellState)>,
+}
+
+/// "Unable to update: position not found in 3D heap" — a relaxation improved a cell that had
+/// already left the heap. The reference aborts (GRT-601..606).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotInHeap {
+    pub cell: Cell3,
+}
+
+/// The 3D search — the `while` loop of `mazeRouteMSMDOrder3D`.
+///
+/// ⛔ **One-directional.** Only the source heap is searched; destination cells are merely MARKED,
+/// and the search stops when the next cell to pop is one of them.
+///
+/// ⛔ Per pop, in this order: the two in-plane moves of the layer's PREFERRED direction only
+/// (left then right on a horizontal layer, bottom then top on a vertical one), then down, then up.
+/// A move is never taken back along the direction the cell was reached from.
+///
+/// ⛔ **The arithmetic is the reference's, not an idealisation**: the candidate distance is
+/// `float` — `d + cost + penalty` — compared as `float` against the stored `int`, and stored
+/// TRUNCATED. Resistance-aware wire prices reach ~8e8, beyond `float`'s exact-integer range, so
+/// the conversion itself rounds.
+pub fn maze_search_3d(
+    inp: &Search3DInputs,
+    src: &[Cell3],
+    dest: &[Cell3],
+) -> Result<Search3D, NotInHeap> {
+    let (x1, x2, y1, y2) = inp.region;
+    let (w, h) = ((x2 - x1 + 1) as usize, (y2 - y1 + 1) as usize);
+    let idx = |(l, y, x): Cell3| (l as usize * h + (i32::from(y) - y1) as usize) * w + (i32::from(x) - x1) as usize;
+    let cell = |i: usize| -> Cell3 {
+        let (l, r) = (i / (w * h), i % (w * h));
+        (l as i16, (r / w) as i32 as i16 + y1 as i16, (r % w) as i16 + x1 as i16)
+    };
+    let n = inp.num_layers as usize * w * h;
+    let mut dist = vec![BIG_INT; n];
+    let mut path_len = vec![BIG_INT; n];
+    let mut parent: Vec<Option<Cell3>> = vec![None; n];
+    let mut dir = vec![Dir3::Origin; n];
+    let mut is_dest = vec![false; n];
+
+    let mut heap: Vec<usize> = Vec::with_capacity(src.len());
+    for &c in src {
+        let i = idx(c);
+        dist[i] = 0;
+        path_len[i] = 0;
+        dir[i] = Dir3::Origin;
+        heap.push(i);
+    }
+    for &c in dest {
+        is_dest[idx(c)] = true;
+    }
+
+    let mut pops = Vec::new();
+    let mut crossing = None;
+    let mut cur = heap[0];
+    loop {
+        if is_dest[cur] {
+            crossing = Some(cell(cur));
+            break;
+        }
+        pops.push(cell(cur));
+        crate::maze::remove_min(&mut heap, &dist);
+        let (l, y, x) = cell(cur);
+        let (xi, yi) = (i32::from(x), i32::from(y));
+
+        let planar = |to: Cell3, edge_x: i32, edge_y: i32, d: Dir3| -> Option<(Cell3, f32, i32, Dir3)> {
+            let new_len = path_len[cur] + 1;
+            let penalty = if new_len > inp.original_len && inp.resistance_aware {
+                inp.detour_penalty as f32
+            } else {
+                0.0
+            };
+            let tmp = dist[cur] as f32 + (inp.wire_cost)(l) + penalty;
+            let open = (inp.admits)(l, edge_x, edge_y)
+                && inp.min_layer <= i32::from(l)
+                && i32::from(l) <= inp.max_layer;
+            open.then_some((to, tmp, new_len, d))
+        };
+
+        let from = dir[cur];
+        let mut moves: Vec<(Cell3, f32, i32, Dir3)> = Vec::new();
+        if inp.horizontal[l as usize] {
+            if xi > x1 && from != Dir3::East {
+                moves.extend(planar((l, y, x - 1), xi - 1, yi, Dir3::West));
+            }
+            if xi < x2 && from != Dir3::West {
+                moves.extend(planar((l, y, x + 1), xi, yi, Dir3::East));
+            }
+        } else {
+            if yi > y1 && from != Dir3::South {
+                moves.extend(planar((l, y - 1, x), xi, yi - 1, Dir3::North));
+            }
+            if yi < y2 && from != Dir3::North {
+                moves.extend(planar((l, y + 1, x), xi, yi, Dir3::South));
+            }
+        }
+        // ⚠️ Vias: no admission test, no layer-range test, no detour penalty, and the path length
+        // does not grow.
+        if l > 0 && from != Dir3::Up {
+            moves.push(((l - 1, y, x), dist[cur] as f32 + (inp.via_cost)(l, l - 1), path_len[cur], Dir3::Down));
+        }
+        if l < inp.num_layers - 1 && from != Dir3::Down {
+            moves.push(((l + 1, y, x), dist[cur] as f32 + (inp.via_cost)(l, l + 1), path_len[cur], Dir3::Up));
+        }
+        // The relaxation, shared by all six moves: the candidate is compared, then stored.
+        //
+        // 🔑 All of a pop's moves are priced BEFORE any is relaxed. Equivalent to the reference's
+        // interleaving: a relaxation writes only the NEIGHBOUR, never the popped cell whose
+        // distance, length and direction the prices read.
+        let mut relax = |nb: Cell3, tmp: f32, new_len: i32, d: Dir3,
+                         heap: &mut Vec<usize>, dist: &mut Vec<i32>|
+         -> Result<(), NotInHeap> {
+            let j = idx(nb);
+            let fresh = dist[j] >= BIG_INT;
+            if fresh || (dist[j] as f32) > tmp {
+                dist[j] = tmp as i32;
+                path_len[j] = new_len;
+                parent[j] = Some((l, y, x));
+                dir[j] = d;
+                if fresh {
+                    heap.push(j);
+                    let last = heap.len() - 1;
+                    crate::maze::update_heap(heap, last, dist);
+                } else {
+                    // ⚠️ The FIRST occurrence — a seed can sit in the heap twice.
+                    let pos = heap.iter().position(|&e| e == j).ok_or(NotInHeap { cell: nb })?;
+                    crate::maze::update_heap(heap, pos, dist);
+                }
+            }
+            Ok(())
+        };
+
+        for (nb, tmp, new_len, d) in moves {
+            relax(nb, tmp, new_len, d, &mut heap, &mut dist)?;
+        }
+
+        if heap.is_empty() {
+            break;
+        }
+        cur = heap[0];
+    }
+
+    let reached = (0..n)
+        .filter(|&i| dist[i] < BIG_INT)
+        .map(|i| (cell(i), CellState { dist: dist[i], path_len: path_len[i], parent: parent[i], dir: dir[i] }))
+        .collect();
+    Ok(Search3D { pops, crossing, reached })
+}
