@@ -730,3 +730,268 @@ pub fn backtrace_3d(
         head_room,
     })
 }
+
+// ─── R18g1 — `copyGrids3D` + `updateRouteType13D` ───────────────────────────────────────────
+
+use crate::full3d::RouteType;
+
+/// A tree edge as the 3D tree surgery reads and rewrites it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurgeryEdge3D {
+    pub n1: usize,
+    pub n2: usize,
+    pub route_type: RouteType,
+    pub routelen: i32,
+    pub len: i32,
+    pub grids: Vec<Point3D>,
+}
+
+/// A tree node as the 3D tree surgery reads it — and, for the moved node, writes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SurgeryNode3D {
+    pub x: i16,
+    pub y: i16,
+    pub bot_layer: i16,
+}
+
+/// One edge's points, read out starting from `from` — the reference's `copyGrids3D`.
+///
+/// ⛔ A STEPLESS edge (`routelen <= 0`, whatever its type) yields one point: `from`'s own cell at
+/// `from`'s BOTTOM layer. (The 2D `copyGrids` gates on the route type instead, and has no layer.)
+pub fn copy_grids_3d(
+    nodes: &[SurgeryNode3D],
+    from: usize,
+    edges: &[SurgeryEdge3D],
+    edge_id: usize,
+) -> Vec<Point3D> {
+    let e = &edges[edge_id];
+    if e.routelen <= 0 {
+        let n = nodes[from];
+        return vec![Point3D { x: n.x, y: n.y, layer: n.bot_layer }];
+    }
+    let taken = &e.grids[..=e.routelen as usize];
+    if e.n1 == from {
+        taken.to_vec()
+    } else {
+        taken.iter().rev().copied().collect()
+    }
+}
+
+/// Why a type-1 shift aborts the run in the reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShiftError {
+    /// GRT-187: the edge the node moves along has only one point.
+    SinglePointEdge,
+    /// GRT-171 / GRT-172: the new position is not on that edge.
+    NotOnEdge,
+    /// The type-2 merge would write past the end of the vector it sized — undefined behaviour in
+    /// the reference (see [`update_route_type2_3d`]). Never captured.
+    WriteBeyondEnd,
+}
+
+/// The node moved onto one of its own edges — `updateRouteType13D`.
+///
+/// Differences from the 2D [`crate::update_route_type1`], found by diffing the two:
+/// - ⛔ the near half ends at the FIRST point at the new position, the far half starts at the LAST
+///   — in 3D a via stack repeats the same x, y;
+/// - ⛔ where the two lists join, a stack of VIAS fills the gap between the first list's last layer
+///   and the second list's first layer;
+/// - the node is moved HERE, not by the caller;
+/// - a one-point first list is fatal.
+///
+/// Each rewritten edge is oriented by x, as in 2D: the endpoint with the smaller column first.
+#[allow(clippy::too_many_arguments)]
+pub fn update_route_type1_3d(
+    nodes: &mut [SurgeryNode3D],
+    n1: usize,
+    a1: usize,
+    a2: usize,
+    (e1x, e1y): (i16, i16),
+    edges: &mut [SurgeryEdge3D],
+    edge_n1a1: usize,
+    edge_n1a2: usize,
+) -> Result<(), ShiftError> {
+    // Both copies are taken before anything is written: the edges read are the edges rewritten.
+    let g1 = copy_grids_3d(nodes, a1, edges, edge_n1a1);
+    let g2 = copy_grids_3d(nodes, n1, edges, edge_n1a2);
+    if g1.len() == 1 {
+        return Err(ShiftError::SinglePointEdge);
+    }
+    let at_e1 = |p: &Point3D| p.x == e1x && p.y == e1y;
+    let pos1 = g1.iter().position(at_e1).ok_or(ShiftError::NotOnEdge)?;
+    let pos2 = g1.iter().rposition(at_e1).unwrap_or(0);
+
+    let (a1x, a1y) = (nodes[a1].x, nodes[a1].y);
+    let (a2x, a2y) = (nodes[a2].x, nodes[a2].y);
+
+    // The near half: A1 as far as the FIRST point at E1.
+    let head = &g1[..=pos1];
+    let e = &mut edges[edge_n1a1];
+    if a1x <= e1x {
+        e.grids = head.to_vec();
+        (e.n1, e.n2) = (a1, n1);
+    } else {
+        e.grids = head.iter().rev().copied().collect();
+        (e.n1, e.n2) = (n1, a1);
+    }
+    e.len = i32::from((a1x - e1x).abs() + (a1y - e1y).abs());
+    e.route_type = RouteType::MazeRoute;
+    e.routelen = pos1 as i32;
+
+    // The far half: from the LAST point at E1, a via fill, then the other edge past its first point.
+    let last1 = g1[g1.len() - 1].layer;
+    let (fx, fy, first2) = (g2[0].x, g2[0].y, g2[0].layer);
+    let mut out: Vec<Point3D> = Vec::new();
+    if e1x <= a2x {
+        out.extend_from_slice(&g1[pos2..]);
+        if g2.len() > 1 {
+            if last1 > first2 {
+                let mut l = last1 - 1;
+                while l >= first2 {
+                    out.push(Point3D { x: fx, y: fy, layer: l });
+                    l -= 1;
+                }
+            } else if last1 < first2 {
+                for l in last1 + 1..=first2 {
+                    out.push(Point3D { x: fx, y: fy, layer: l });
+                }
+            }
+        }
+        out.extend_from_slice(&g2[1..]);
+        (edges[edge_n1a2].n1, edges[edge_n1a2].n2) = (n1, a2);
+    } else {
+        out.extend(g2[1..].iter().rev().copied());
+        if g2.len() > 1 {
+            if last1 > first2 {
+                for l in first2..last1 {
+                    out.push(Point3D { x: fx, y: fy, layer: l });
+                }
+            } else if last1 < first2 {
+                let mut l = first2;
+                while l > last1 {
+                    out.push(Point3D { x: fx, y: fy, layer: l });
+                    l -= 1;
+                }
+            }
+        }
+        out.extend(g1[pos2..].iter().rev().copied());
+        (edges[edge_n1a2].n1, edges[edge_n1a2].n2) = (a2, n1);
+    }
+    let e = &mut edges[edge_n1a2];
+    e.route_type = RouteType::MazeRoute;
+    e.routelen = out.len() as i32 - 1;
+    e.grids = out;
+    e.len = i32::from((a2x - e1x).abs() + (a2y - e1y).abs());
+
+    nodes[n1].x = e1x;
+    nodes[n1].y = e1y;
+    Ok(())
+}
+
+// ─── R18g2 — `updateRouteType23D` ───────────────────────────────────────────────────────────
+
+/// The node moved onto a DIFFERENT edge — `updateRouteType23D`.
+///
+/// Its own two edges merge into the landed-on edge's slot as the new (A1, A2); the landed-on edge
+/// (C1, C2) splits at the new position into the node's two slots — near half to the FIRST point at
+/// E1, far half from the LAST.
+///
+/// ⚠️ Unlike type 1: no orientation by x, no endpoint writes (the caller rewires five nodes), and
+/// NO route type is set on any of the three slots.
+///
+/// ⛔ Faithful to the reference's VECTOR handling, because the slot's size is observable:
+/// - a slot's old points are cleared only if it held a maze route (and, for the split halves, only
+///   with steps); otherwise `resize` keeps them;
+/// - a merge of a single point sets `routelen = 0` and resizes NOTHING.
+///
+/// ⛔ **Possible upstream defect, never captured (0 of 1,879 calls)**: the merge's descending via
+/// fill is SIZED from the second list's first layer but LOOPS down to its SECOND point's layer.
+/// When they differ, fewer points are written (the tail keeps `resize`'s defaults) or more (the
+/// reference writes past the end — undefined). Reproduced for the first; an error for the second.
+#[allow(clippy::too_many_arguments)]
+pub fn update_route_type2_3d(
+    nodes: &[SurgeryNode3D],
+    n1: usize,
+    (a1, a2): (usize, usize),
+    (c1, c2): (usize, usize),
+    (e1x, e1y): (i16, i16),
+    edges: &mut [SurgeryEdge3D],
+    (edge_n1a1, edge_n1a2, edge_c1c2): (usize, usize, usize),
+) -> Result<(), ShiftError> {
+    let g1 = copy_grids_3d(nodes, a1, edges, edge_n1a1);
+    let g2 = copy_grids_3d(nodes, n1, edges, edge_n1a2);
+    let g3 = copy_grids_3d(nodes, c1, edges, edge_c1c2);
+    let dist = |a: usize, x: i16, y: i16| i32::from((nodes[a].x - x).abs() + (nodes[a].y - y).abs());
+    let blank = Point3D { x: 0, y: 0, layer: 0 };
+
+    // (A1, n1) + (n1, A2) -> the new (A1, A2), in the landed-on edge's slot.
+    let slot = &mut edges[edge_c1c2];
+    if slot.route_type == RouteType::MazeRoute {
+        slot.grids.clear();
+    }
+    let mut len = g1.len() + g2.len() - 1;
+    let a1a2 = dist(a1, nodes[a2].x, nodes[a2].y);
+    if len == 1 {
+        slot.routelen = 0;
+        slot.len = a1a2;
+    } else {
+        let mut extra = 0;
+        if g1.len() > 1 && g2.len() > 1 {
+            extra = (g1[g1.len() - 1].layer - g2[0].layer).unsigned_abs() as usize;
+            len += extra;
+        }
+        slot.grids.resize(len, blank);
+        slot.routelen = len as i32 - 1;
+        slot.len = a1a2;
+        let mut cnt = 0usize;
+        let mut write = |slot: &mut SurgeryEdge3D, p: Point3D| -> Result<(), ShiftError> {
+            let at = slot.grids.get_mut(cnt).ok_or(ShiftError::WriteBeyondEnd)?;
+            *at = p;
+            cnt += 1;
+            Ok(())
+        };
+        let mut start = 0;
+        if g1.len() > 1 {
+            start = 1;
+            for &p in &g1 {
+                write(slot, p)?;
+            }
+        }
+        if extra > 0 {
+            let last1 = g1[g1.len() - 1].layer;
+            let (fx, fy) = (g2[0].x, g2[0].y);
+            if last1 < g2[0].layer {
+                for l in last1 + 1..=g2[0].layer {
+                    write(slot, Point3D { x: fx, y: fy, layer: l })?;
+                }
+            } else {
+                // ⛔ The reference's bound: the SECOND point's layer, not the first's.
+                let mut l = last1 - 1;
+                while l >= g2[1].layer {
+                    write(slot, Point3D { x: fx, y: fy, layer: l })?;
+                    l -= 1;
+                }
+            }
+        }
+        for &p in &g2[start..] {
+            write(slot, p)?;
+        }
+    }
+
+    // (C1, C2) -> (C1, n1) and (n1, C2), in the node's two slots.
+    let at_e1 = |p: &Point3D| p.x == e1x && p.y == e1y;
+    let pos2 = g3.iter().rposition(at_e1).ok_or(ShiftError::NotOnEdge)?;
+    let pos1 = g3.iter().position(at_e1).expect("a last match implies a first");
+    let split = |slot: &mut SurgeryEdge3D, part: &[Point3D], len: i32| {
+        if slot.route_type == RouteType::MazeRoute && slot.routelen > 0 {
+            slot.grids.clear();
+        }
+        slot.grids.resize(part.len(), blank);
+        slot.grids.copy_from_slice(part);
+        slot.routelen = part.len() as i32 - 1;
+        slot.len = len;
+    };
+    split(&mut edges[edge_n1a1], &g3[..=pos1], dist(c1, e1x, e1y));
+    split(&mut edges[edge_n1a2], &g3[pos2..], dist(c2, e1x, e1y));
+    Ok(())
+}

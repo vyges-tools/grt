@@ -29,7 +29,7 @@ pub mod fillvia;
 pub mod routes;
 pub mod overflow2d;
 pub mod maze3d;
-pub use maze3d::{backtrace_3d, Backtrace3D, Recovery, maze_search_3d, CellState, Dir3, NotInHeap, Search3D, Search3DInputs, setup_heap_3d, Cell3, Heaps3D, SeedEdge, SeedNode, new_ripup_3d_type3, remove_edge_from_node, MazeRipupWrong, NodeConnections, edge_in_window, end_index, max_reroute_iter, maze_route_msmd_order_3d, prelude, skips_for_slack, EdgeResult, Maze3DCall, Maze3DEdgeWork, Maze3DEvent, OrderedNet, Prelude, FINAL_RES_AWARE_NETS_PERCENTAGE, HIGH_DETOUR_PENALTY, LOW_DETOUR_PENALTY};
+pub use maze3d::{copy_grids_3d, update_route_type1_3d, update_route_type2_3d, ShiftError, SurgeryEdge3D, SurgeryNode3D, backtrace_3d, Backtrace3D, Recovery, maze_search_3d, CellState, Dir3, NotInHeap, Search3D, Search3DInputs, setup_heap_3d, Cell3, Heaps3D, SeedEdge, SeedNode, new_ripup_3d_type3, remove_edge_from_node, MazeRipupWrong, NodeConnections, edge_in_window, end_index, max_reroute_iter, maze_route_msmd_order_3d, prelude, skips_for_slack, EdgeResult, Maze3DCall, Maze3DEdgeWork, Maze3DEvent, OrderedNet, Prelude, FINAL_RES_AWARE_NETS_PERCENTAGE, HIGH_DETOUR_PENALTY, LOW_DETOUR_PENALTY};
 pub use overflow2d::{get_overflow_2d, get_overflow_2d_maze, history_threshold, Overflow2DScan, UsedCell};
 pub use routes::{get_net_route, get_routes, grid_to_dbu, report_run_metrics, GridOrigin, NetForRoutes, RouteEdge, RunReport};
 pub use fillvia::{fill_via, get_via_stack_range, EdgeFill, EndClaim, NoPreviousRouting, ViaCounts, ViaEdge, ViaNet, ViaNode, ViaPin, NO_EDGE};
