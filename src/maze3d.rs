@@ -320,3 +320,140 @@ pub fn new_ripup_3d_type3(
     }
     Ok(true)
 }
+
+// ─── R18d — `setupHeap3D` + `addNeighborPoints` ─────────────────────────────────────────────
+
+/// A tree node as the 3D heap setup reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedNode {
+    pub x: i16,
+    pub y: i16,
+    /// Adjacent nodes and the tree edge reaching each, in the reference's stored order.
+    pub neighbours: Vec<(usize, usize)>,
+    pub stack_alias: usize,
+    /// The layer range — read on the node's ALIAS, and read as the rip-up just left it.
+    pub bot_layer: i16,
+    pub top_layer: i16,
+}
+
+/// A tree edge as the 3D heap setup reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedEdge {
+    pub n1: usize,
+    pub n2: usize,
+    pub routelen: i32,
+    pub maze_route: bool,
+    pub grids: Vec<Point3D>,
+}
+
+/// A seeded cell: layer, x, y.
+pub type Cell3 = (i16, i16, i16);
+
+/// The two frontiers in push order, and every `corr_edge` write in order.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Heaps3D {
+    pub src: Vec<Cell3>,
+    pub dest: Vec<Cell3>,
+    /// ⚠️ A cell written twice keeps the LAST write. The start node's own cells are never
+    /// written — whatever an earlier edge left there stays.
+    pub corr_edge: Vec<(Cell3, usize)>,
+}
+
+/// Seed both 3D frontiers — the reference's `setupHeap3D`.
+///
+/// ⛔ **Every seed has distance 0, so push ORDER is the whole tie-break** of the search that
+/// follows. A cell can be pushed twice (a node that is also an interior route point); it is.
+///
+/// Differences from the 2D [`crate::setup_heap`], found by diffing the two reference functions:
+///
+/// | | 2D | 3D |
+/// | --- | --- | --- |
+/// | two-pin seeds | the pin's cell | ⛔ the pin's ACCESS LAYER only |
+/// | a node | one cell | ⛔ every layer of its ALIAS's range, ascending |
+/// | route interior | the cell | the cell at its own layer |
+/// | a counted edge that is not a maze route | fatal | ⛔ its interior is skipped, silently |
+///
+/// Two further differences are inert by construction: the 2D walks share one visited set and the
+/// 3D walks each start fresh (the subtrees are disjoint), and 2D marks the region for a two-pin net
+/// too (which never reads it).
+pub fn setup_heap_3d(
+    num_terminals: usize,
+    nodes: &[SeedNode],
+    edges: &[SeedEdge],
+    edge_id: usize,
+    access_layers: (i16, i16),
+    (region_x1, region_x2, region_y1, region_y2): (i32, i32, i32, i32),
+) -> Heaps3D {
+    let mut h = Heaps3D::default();
+    let (n1, n2) = (edges[edge_id].n1, edges[edge_id].n2);
+    if num_terminals == 2 {
+        // ⚠️ The pin's access layer, looked up through the ALIAS node's pin — not the node's
+        // layer range, and without any region test. On the corpus the two coincide: after the
+        // rip-up a two-pin net's leaf pin has no edges left, so its range is exactly
+        // `[access, access]` (16,374 of 16,374) — only a constructed case separates them.
+        h.src.push((access_layers.0, nodes[n1].y, nodes[n1].x));
+        h.dest.push((access_layers.1, nodes[n2].y, nodes[n2].x));
+        return h;
+    }
+    let in_region = |x: i16, y: i16| {
+        let (x, y) = (i32::from(x), i32::from(y));
+        x >= region_x1 && x <= region_x2 && y >= region_y1 && y <= region_y2
+    };
+    add_neighbor_points(nodes, edges, n1, n2, &in_region, &mut h.src, &mut h.corr_edge);
+    add_neighbor_points(nodes, edges, n2, n1, &in_region, &mut h.dest, &mut h.corr_edge);
+    h
+}
+
+/// One subtree's seeds — the reference's `addNeighborPoints`.
+///
+/// ⛔ The START node is seeded at every layer of its alias's range with NO region test and no
+/// `corr_edge` write. (A region test there would be equivalent: the driver's region always
+/// contains both endpoints of the edge.) ⛔ The walk marks a node visited when it is DEQUEUED, never crosses
+/// `stop_at`, and counts an edge by `routelen > 0` — not by its length.
+fn add_neighbor_points(
+    nodes: &[SeedNode],
+    edges: &[SeedEdge],
+    start: usize,
+    stop_at: usize,
+    in_region: &dyn Fn(i16, i16) -> bool,
+    seeds: &mut Vec<Cell3>,
+    corr: &mut Vec<(Cell3, usize)>,
+) {
+    let mut visited = vec![false; nodes.len()];
+    let (sx, sy) = (nodes[start].x, nodes[start].y);
+    let alias = &nodes[nodes[start].stack_alias];
+    for l in alias.bot_layer..=alias.top_layer {
+        seeds.push((l, sy, sx));
+        visited[start] = true;
+    }
+    let mut queue = std::collections::VecDeque::from([start]);
+    while let Some(cur) = queue.pop_front() {
+        visited[cur] = true;
+        for &(nbr, edge) in &nodes[cur].neighbours {
+            if nbr == stop_at || visited[nbr] {
+                continue;
+            }
+            let e = &edges[edge];
+            if e.routelen > 0 {
+                let (nx, ny) = (nodes[nbr].x, nodes[nbr].y);
+                if in_region(nx, ny) {
+                    let a = &nodes[nodes[nbr].stack_alias];
+                    for l in a.bot_layer..=a.top_layer {
+                        seeds.push((l, ny, nx));
+                        corr.push(((l, ny, nx), edge));
+                    }
+                }
+                if e.maze_route {
+                    // Interior points only; the endpoints are the tree nodes themselves.
+                    for p in &e.grids[1..e.routelen as usize] {
+                        if in_region(p.x, p.y) {
+                            seeds.push((p.layer, p.y, p.x));
+                            corr.push(((p.layer, p.y, p.x), edge));
+                        }
+                    }
+                }
+            }
+            queue.push_back(nbr);
+        }
+    }
+}
