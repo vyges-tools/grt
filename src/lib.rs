@@ -27,6 +27,8 @@ pub mod softndr;
 pub mod checks3d;
 pub mod fillvia;
 pub mod routes;
+pub mod overflow2d;
+pub use overflow2d::{get_overflow_2d, get_overflow_2d_maze, history_threshold, Overflow2DScan, UsedCell};
 pub use routes::{get_net_route, get_routes, grid_to_dbu, report_run_metrics, GridOrigin, NetForRoutes, RouteEdge, RunReport};
 pub use fillvia::{fill_via, get_via_stack_range, EdgeFill, EndClaim, NoPreviousRouting, ViaCounts, ViaEdge, ViaNet, ViaNode, ViaPin, NO_EDGE};
 pub mod mazecost;
