@@ -686,3 +686,28 @@ weights that shift costs without moving any `argmin`, the narrowing of the runni
 clause (reached 19 times, changes the selected layer 3 times, changes no assignment — the
 read-back follows the same link either way). Each has a test stating the measurement, so a corpus
 that later does reach one fails the gate instead of silently invalidating the note.
+
+## `layertable.json` — the availability table's derivation
+
+1,040 edges from 69 designs: the per-step free resource on every layer, the layer directions, both
+edge-cost thresholds, the 2D-overflow flag, and the net's layer range **before and after**.
+
+⛔ **The range is captured twice because this pass can widen it.** When no layer in the net's range
+can carry a step, the reference reaches outside the range and writes the widened bound back onto
+the net — so later steps of the same edge, and the dynamic program afterwards, see the wider range.
+A golden recording the range once could not tell a pass that widens from one that does not.
+
+⛔ **That path fires on none of these 1,040 edges, and the absence is measured.** It needs no
+in-range layer to fit *and* two-dimensional routing to have left no overflow. Across 29,264 steps
+the first condition is met **494 times and the second never coincides** — every exhausted step
+belongs to a run that still had 2D overflow. The two are naturally opposed. The path's rules are
+therefore pinned by constructed cases, and a tripwire asserts the absence so the day a design does
+reach it the gate fails rather than the note going stale.
+
+⚠️ **Two different thresholds for "enough".** The in-range scan compares a layer's free resource
+against that *layer's* edge cost; the reach-outside scan compares the best found so far against the
+*net's* edge cost. Mutating either into the other is caught.
+
+⚠️ The per-step resource is captured rather than the 3D capacity and usage arrays behind it: that
+read is a database walk indexed by the step's position, not a rule. Splitting there keeps this
+golden about the rules.
