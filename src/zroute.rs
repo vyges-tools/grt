@@ -257,3 +257,122 @@ pub fn newroute_z(
 
     ZChoice { hvh, z_point: best_z }
 }
+
+/// Z-route one edge of a TWO-terminal net — the reference's `newrouteZ_edge`.
+///
+/// Reached from [`newroute_z`]'s dispatch when an edge is long enough and diagonal but the rip-up
+/// gate declines it, and the net has exactly two terminals: the edge is then ripped up and
+/// re-routed as a Z regardless. (The dispatch's second call site is dead — an `else` of
+/// `len > threshold` that requires `len > threshold`.)
+///
+/// ⚠️ Its own two early returns — a non-positive length, a straight edge — repeat checks the live
+/// caller has already made. Kept: they are what this function does when called.
+///
+/// Returns the chosen column, or `None` on an early return (nothing ripped up or written).
+#[allow(clippy::too_many_arguments)]
+pub fn newroute_z_edge(
+    grid: &mut EstimateGrid,
+    len: i32,
+    (x1, y1): (i32, i32),
+    (x2, y2): (i32, i32),
+    prior: &crate::ripup_route::RoutedShape,
+    edge_cost: i8,
+    v_lb: f32,
+    h_lb: f32,
+    red_v: &dyn Fn(usize, usize) -> u16,
+    red_h: &dyn Fn(usize, usize) -> u16,
+) -> Option<i32> {
+    if len <= 0 {
+        return None;
+    }
+    if x1 == x2 || y1 == y2 {
+        return None;
+    }
+    crate::ripup_route::new_ripup(grid, (x1, y1), (x2, y2), prior, edge_cost);
+    Some(route_z_edge_after_ripup(grid, (x1, y1), (x2, y2), edge_cost, v_lb, h_lb, red_v, red_h))
+}
+
+/// `newrouteZ_edge` from its rip-up onward: choose the HVH column and commit it.
+///
+/// ⛔ **Not `newroute_z`'s HVH arm with the VHV arm deleted.** Four differences, each load-bearing:
+///
+/// | | `newroute_z` | this |
+/// | --- | --- | --- |
+/// | candidate columns | `x1..x2` | **`x1..=x2`** — a Z whose middle is at either end |
+/// | tie-break | provably inert | **live**: the test costs are summed per column |
+/// | via terms, statuses, `hID`/`lID` | written | **none** |
+/// | `cost_tb_test` | never read | read, and ⛔ **NOT carried forward** (below) |
+///
+/// ⛔ The boundary cost is a running total — `cost_tb[i]` starts from `cost_tb[i - 1]` — but its
+/// tie-break partner is NOT: `cost_tb_test[i]` holds only column `i`'s own delta, while
+/// `cost_tb_test[0]` holds the whole top row's sum. So the tie-break compares a running total at
+/// column 0 with single deltas everywhere else.
+#[allow(clippy::too_many_arguments)]
+pub fn route_z_edge_after_ripup(
+    grid: &mut EstimateGrid,
+    (x1, y1): (i32, i32),
+    (x2, y2): (i32, i32),
+    edge_cost: i8,
+    v_lb: f32,
+    h_lb: f32,
+    red_v: &dyn Fn(usize, usize) -> u16,
+    red_h: &dyn Fn(usize, usize) -> u16,
+) -> i32 {
+    let seg_width = (x2 - x1) as usize;
+    let (ymin, ymax) = (y1.min(y2), y1.max(y2));
+    let npts = seg_width + 1;
+
+    let over_v = |grid: &EstimateGrid, x: i32, y: i32| -> f64 {
+        grid.v(x as usize, y as usize) + f64::from(red_v(x as usize, y as usize)) - f64::from(v_lb)
+    };
+    let over_h = |grid: &EstimateGrid, x: i32, y: i32| -> f64 {
+        grid.h(x as usize, y as usize) + f64::from(red_h(x as usize, y as usize)) - f64::from(h_lb)
+    };
+
+    // The vertical middle segment, per candidate column — INCLUDING column x2.
+    let (mut cost_v, mut cost_v_test) = (vec![0.0; npts], vec![0.0; npts]);
+    for i in x1..=x2 {
+        for j in ymin..ymax {
+            let k = (i - x1) as usize;
+            add_congestion(over_v(grid, i, j), &mut cost_v[k], &mut cost_v_test[k]);
+        }
+    }
+
+    // The top and bottom runs. Column 0 takes the whole of row y2; each later column carries the
+    // previous cost forward, gains a span of row y1 and gives back a span of row y2.
+    let (mut cost_tb, mut cost_tb_test) = (vec![0.0; npts], vec![0.0; npts]);
+    for j in x1..x2 {
+        add_congestion(over_h(grid, j, y2), &mut cost_tb[0], &mut cost_tb_test[0]);
+    }
+    for i in 1..=seg_width {
+        cost_tb[i] = cost_tb[i - 1];
+        // ⛔ cost_tb_test[i] is NOT seeded from cost_tb_test[i - 1].
+        let col = x1 + i as i32 - 1;
+        add_congestion(over_h(grid, col, y1), &mut cost_tb[i], &mut cost_tb_test[i]);
+        let given_back = over_h(grid, col, y2);
+        if given_back > 0.0 {
+            cost_tb[i] -= given_back;
+            cost_tb_test[i] -= HCOST;
+        } else {
+            cost_tb_test[i] -= given_back;
+        }
+    }
+
+    // ⚠️ Ties on cost go to the lower test cost; a full tie keeps the FIRST column.
+    let (mut best_cost, mut bt_test, mut best_z) = (BIG_INT, BIG_INT, 0);
+    for i in 0..npts {
+        let cost = cost_v[i] + cost_tb[i];
+        let test = cost_v_test[i] + cost_tb_test[i];
+        if cost < best_cost || (cost == best_cost && test < bt_test) {
+            best_cost = cost;
+            bt_test = test;
+            best_z = i as i32 + x1;
+        }
+    }
+
+    let cost = f64::from(edge_cost);
+    grid.update_h(x1, best_z, y1, cost);
+    grid.update_h(best_z, x2, y2, cost);
+    grid.update_v(best_z, ymin, ymax, cost);
+    best_z
+}

@@ -47,7 +47,7 @@ pub use monotonic::{monotonic_box, monotonic_cost_table, route_monotonic, walk_m
 pub mod zroute;
 pub use estimate::{check_2d_edges_usage, save_last_route_len, UsageViolation};
 pub use mazeconv::{convert_to_mazeroute, MazeRoute, SymbolicRoute};
-pub use zroute::{newroute_z, ZChoice, HCOST};
+pub use zroute::{newroute_z, newroute_z_edge, route_z_edge_after_ripup, ZChoice, HCOST};
 pub use spiral::{
     propagate_alias_status, register_edges, reset_and_alias, spiral_route, chooses_y_first, traversal_order, EdgeReg, ResetParams, LAYER_RESET, WALK_RESET, record_layer_extremes, reset_for_layer_extremes, layer_extremes, EdgeLayers, LayerExtremes,
     SpiralNode, MAX_CONNECTIONS,
