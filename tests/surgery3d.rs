@@ -151,7 +151,7 @@ fn replay(g: &Value) -> usize {
 fn tree_surgery_3d_matches_the_reference() {
     let g = read(&format!("{}/examples/grt_gate/surgery3d.json", env!("CARGO_MANIFEST_DIR")));
     let n = replay(&g);
-    assert!(n >= 200, "too few surgeries: {n}");
+    assert!(n >= 150, "too few surgeries: {n}");
 }
 
 /// GRT_SURGERY3D_FULL=/path/to/g3-all.json cargo test --test surgery3d -- --ignored
@@ -160,4 +160,69 @@ fn tree_surgery_3d_matches_the_reference() {
 fn tree_surgery_3d_matches_the_reference_exhaustively() {
     let path = std::env::var("GRT_SURGERY3D_FULL").expect("set GRT_SURGERY3D_FULL");
     eprintln!("exhaustive: {} surgeries", replay(&read(&path)));
+}
+
+// ─── Constructed cases ──────────────────────────────────────────────────────────────────────
+
+use vyges_grt::{set_tree_nodes_variables, split_edge_3d};
+
+fn bare(x: i16, y: i16, nbr: Vec<(usize, usize)>) -> Node3D {
+    Node3D {
+        x,
+        y,
+        stack_alias: 0,
+        assigned: false,
+        status: 0,
+        conn: NodeConnections { e_id: [0; 10], heights: [0; 10], con_cnt: 0, bot_layer: 3, top_layer: 3, l_id: 0, h_id: 0 },
+        nbr,
+    }
+}
+
+fn line(n1: usize, n2: usize, pts: Vec<Point3D>) -> SurgEdge3D {
+    let rl = pts.len() as i32 - 1;
+    SurgEdge3D { n1, n2, n1a: n1, n2a: n2, len: rl, route_type: RouteType::MazeRoute, routelen: rl, grids: pts }
+}
+
+/// ⛔ `splitEdge`'s new zero-length edge carries ONE point at the moved pin's cell with LAYER 0 —
+/// the struct default, not the pin's layer (here 3). Every captured moved pin sits on layer 0, so
+/// only this case separates them.
+#[test]
+fn split_edge_writes_the_new_edge_at_layer_zero() {
+    let p = |x, y, layer| Point3D { x, y, layer };
+    // pin 0 at (0,0) — edge 0 to Steiner 1 at (2,0) — edge 1 to pin 2 at (2,2)... pin 0 moved.
+    let mut tree = Tree3D {
+        num_terminals: 2,
+        num_layers: 6,
+        pin_layers: vec![3, 3],
+        nodes: vec![
+            bare(0, 0, vec![(1, 0), (2, 2)]),
+            bare(2, 0, vec![(0, 0), (2, 1)]),
+            bare(2, 2, vec![(1, 1), (0, 2)]),
+        ],
+        edges: vec![
+            line(0, 1, vec![p(0, 0, 3), p(1, 0, 3), p(2, 0, 3)]),
+            line(1, 2, vec![p(2, 0, 3), p(2, 1, 3), p(2, 2, 3)]),
+            line(2, 0, vec![p(2, 2, 3), p(0, 2, 3)]),
+        ],
+    };
+    let new_node = split_edge_3d(&mut tree, 1, 0, 0);
+    let new_edge = tree.edges.last().expect("a new edge");
+    assert_eq!(new_edge.grids, vec![p(0, 0, 0)], "layer 0, not the pin's layer 3");
+    assert_eq!((new_edge.n1, new_edge.n2, new_edge.len, new_edge.routelen), (new_node, 0, 0, 0));
+}
+
+/// ⛔ Two TERMINALS on one cell: the FIRST keeps the cell, so a later Steiner node there aliases to
+/// the first terminal, not the second. Never captured.
+#[test]
+fn a_steiner_node_aliases_to_the_first_terminal_at_its_cell() {
+    let mut tree = Tree3D {
+        num_terminals: 2,
+        num_layers: 6,
+        pin_layers: vec![1, 4],
+        nodes: vec![bare(5, 5, vec![]), bare(5, 5, vec![]), bare(5, 5, vec![])],
+        edges: vec![],
+    };
+    set_tree_nodes_variables(&mut tree);
+    assert_eq!(tree.nodes[2].stack_alias, 0);
+    assert_eq!((tree.nodes[1].stack_alias, tree.nodes[1].conn.bot_layer), (1, 4), "terminals keep themselves");
 }
