@@ -1,24 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
-//! What global routing asks of a Liberty library: per cell, whether it is a pad and which of its
-//! ports are REGISTER CLOCKS — the two facts `isClkTerm` reads to tell a leaf clock net from one
-//! above the leaves.
+//! What global routing asks of a Liberty library: per cell, whether it is a pad, which of its
+//! ports are REGISTER CLOCKS (`isClkTerm`, the leaf-clock test), and every arc's ROLE (the clock
+//! network's search passes only combinational arcs — `clk_network`).
 //!
-//! The timer marks a port a register clock (`LibertyPort::isRegClk`) when it is the FROM port of an
-//! arc whose role is register clock-to-Q or latch enable-to-Q. Those roles come from one builder
-//! rule (`makeRegLatchArcs`), applied to every `rising_edge` / `falling_edge` timing group:
+//! Each timing group's role is `LibertyBuilder::makeTimingArcs`':
 //!
-//! 1. for each port the TO pin's `function` names, find the sequential that port is an output of;
-//! 2. the first such sequential whose clock expression names the FROM port → clock-to-Q (a register)
-//!    or enable-to-Q (a latch) — a register clock either way;
-//! 3. a latch whose data names it → D-to-Q; a sequential whose clear or preset names it → set/clear —
-//!    NOT a register clock;
-//! 4. no function, or no sequential decides → inferred clock-to-Q: a register clock.
+//! 1. the preamble — a group with no `timing_type` into a pin whose function is exactly ONE
+//!    sequential output port is re-typed: `rising_edge` when the FROM port is in that sequential's
+//!    clock with a unate sense (either sense), `clear` / `preset` when it is in those;
+//! 2. combinational → latch D-to-Q when the FROM port is that latch's data, else combinational;
+//! 3. `rising_edge` / `falling_edge` → `makeRegLatchArcs`: the first sequential (among the outputs
+//!    the TO pin's function names) whose clock names the FROM port gives clock-to-Q (a register) or
+//!    enable-to-Q (a latch); a latch whose data names it gives D-to-Q; a clear or preset naming it
+//!    gives set/clear; none deciding → inferred clock-to-Q;
+//! 4. clear / preset → set/clear; the tristate types keep their roles; checks are neither.
 //!
-//! ⛔ Step 1's ports are a `std::set<LibertyPort*>` — POINTER order. When a function names outputs
+//! A port is a register clock (`isRegClk`) when it is the FROM port of a clock-to-Q or enable-to-Q
+//! arc (`makeTimingArcPortMaps`).
+//!
+//! ⛔ Step 3's ports are a `std::set<LibertyPort*>` — POINTER order. When a function names outputs
 //! of two sequentials that decide differently the reference's answer is allocation order, so that
-//! is refused rather than guessed.
+//! is refused rather than guessed. ⛔ `inferLatchRoles` is not transcribed: a cell it may rewrite
+//! is flagged, and the clock search refuses to pass through it.
 //!
-//! ⚠️ Refused, not modelled: bus and bundle pins, `ff_bank` / `latch_bank` (a sequential per bit).
+//! ⚠️ Refused, not modelled: bus and bundle pins, `ff_bank` / `latch_bank` (a sequential per bit),
+//! an unknown `timing_type`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -123,7 +129,7 @@ fn parse_body(t: &[Tok], mut i: usize, g: &mut Group) -> Result<usize, String> {
     Ok(i)
 }
 
-/// The identifiers an expression names (`"!(A & B_N)"` → `A`, `B_N`).
+/// The identifiers an expression names (`"!(A & B_N)"` → `A`, `B_N`) — `FuncExpr::hasPort`.
 fn idents(expr: &str) -> BTreeSet<String> {
     expr.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '[' || c == ']'))
         .filter(|w| !w.is_empty() && !w.chars().next().is_some_and(|c| c.is_ascii_digit()))
@@ -131,48 +137,313 @@ fn idents(expr: &str) -> BTreeSet<String> {
         .collect()
 }
 
+/// A parsed liberty function (`FuncExpr`).
+#[derive(Debug, Clone, PartialEq)]
+enum Expr {
+    Port(String),
+    Zero,
+    One,
+    Not(Box<Expr>),
+    And(Box<Expr>, Box<Expr>),
+    Or(Box<Expr>, Box<Expr>),
+    Xor(Box<Expr>, Box<Expr>),
+}
+
+/// `LibExprParse.yy`: `+ |` lowest, then `* &`, then `^`, then implicit AND of terminals, then
+/// `!` (prefix) and `'` (postfix), which apply to a TERMINAL only. All left-associative.
+fn parse_expr(text: &str) -> Result<Expr, String> {
+    let mut toks = Vec::new();
+    let b: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c.is_whitespace() {
+            i += 1;
+        } else if "+|*&^!'()".contains(c) {
+            toks.push(c.to_string());
+            i += 1;
+        } else {
+            let st = i;
+            while i < b.len() && !b[i].is_whitespace() && !"+|*&^!'()".contains(b[i]) {
+                i += 1;
+            }
+            toks.push(b[st..i].iter().collect());
+        }
+    }
+    let mut pos = 0;
+    let e = parse_binary(&toks, &mut pos, 0)?;
+    if pos != toks.len() {
+        return Err(format!("function {text:?}: trailing input"));
+    }
+    Ok(e)
+}
+
+fn parse_binary(t: &[String], pos: &mut usize, level: usize) -> Result<Expr, String> {
+    const OPS: [&[&str]; 3] = [&["+", "|"], &["*", "&"], &["^"]];
+    if level == OPS.len() {
+        return parse_implicit_and(t, pos);
+    }
+    let mut left = parse_binary(t, pos, level + 1)?;
+    while *pos < t.len() && OPS[level].contains(&t[*pos].as_str()) {
+        *pos += 1;
+        let right = parse_binary(t, pos, level + 1)?;
+        left = match level {
+            0 => Expr::Or(Box::new(left), Box::new(right)),
+            1 => Expr::And(Box::new(left), Box::new(right)),
+            _ => Expr::Xor(Box::new(left), Box::new(right)),
+        };
+    }
+    Ok(left)
+}
+
+fn starts_terminal(t: &[String], pos: usize) -> bool {
+    t.get(pos).is_some_and(|s| !["+", "|", "*", "&", "^", "'", ")"].contains(&s.as_str()))
+}
+
+fn parse_implicit_and(t: &[String], pos: &mut usize) -> Result<Expr, String> {
+    let mut left = parse_terminal_expr(t, pos)?;
+    while starts_terminal(t, *pos) {
+        let right = parse_terminal_expr(t, pos)?;
+        left = Expr::And(Box::new(left), Box::new(right));
+    }
+    Ok(left)
+}
+
+fn parse_terminal_expr(t: &[String], pos: &mut usize) -> Result<Expr, String> {
+    if t.get(*pos).map(String::as_str) == Some("!") {
+        *pos += 1;
+        return Ok(Expr::Not(Box::new(parse_terminal(t, pos)?)));
+    }
+    let e = parse_terminal(t, pos)?;
+    if t.get(*pos).map(String::as_str) == Some("'") {
+        *pos += 1;
+        return Ok(Expr::Not(Box::new(e)));
+    }
+    Ok(e)
+}
+
+fn parse_terminal(t: &[String], pos: &mut usize) -> Result<Expr, String> {
+    let tok = t.get(*pos).ok_or("function: unexpected end")?.clone();
+    *pos += 1;
+    Ok(match tok.as_str() {
+        "(" => {
+            let e = parse_binary(t, pos, 0)?;
+            if t.get(*pos).map(String::as_str) != Some(")") {
+                return Err("function: unbalanced '('".into());
+            }
+            *pos += 1;
+            e
+        }
+        "0" => Expr::Zero,
+        "1" => Expr::One,
+        _ => Expr::Port(tok),
+    })
+}
+
+/// `TimingSense`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sense {
+    Positive,
+    Negative,
+    NonUnate,
+    None,
+    Unknown,
+}
+
+/// `FuncExpr::portTimingSense` — transcribed with its asymmetric AND/OR combination.
+fn port_timing_sense(e: &Expr, port: &str) -> Sense {
+    use Sense::*;
+    match e {
+        Expr::Port(p) => {
+            if p == port {
+                Positive
+            } else {
+                None
+            }
+        }
+        Expr::Not(l) => match port_timing_sense(l, port) {
+            Positive => Negative,
+            Negative => Positive,
+            s => s,
+        },
+        Expr::And(l, r) | Expr::Or(l, r) => {
+            let (ls, rs) = (port_timing_sense(l, port), port_timing_sense(r, port));
+            if ls == rs {
+                ls
+            } else if ls == NonUnate || rs == NonUnate || (ls == Positive && rs == Negative) || (ls == Negative && rs == Positive) {
+                NonUnate
+            } else if ls == None || ls == Unknown {
+                rs
+            } else if rs == None || rs == Unknown {
+                ls
+            } else {
+                Unknown
+            }
+        }
+        Expr::Xor(l, r) => {
+            let (ls, rs) = (port_timing_sense(l, port), port_timing_sense(r, port));
+            if matches!(ls, Positive | Negative | NonUnate) || matches!(rs, Positive | Negative | NonUnate) {
+                NonUnate
+            } else {
+                Unknown
+            }
+        }
+        Expr::Zero | Expr::One => None,
+    }
+}
+
 /// One `ff` / `latch` group.
 #[derive(Debug)]
 struct Seq {
     is_register: bool,
-    clock: BTreeSet<String>,
+    clock: Option<Expr>,
     data: BTreeSet<String>,
-    clear_preset: BTreeSet<String>,
+    clear: BTreeSet<String>,
+    preset: BTreeSet<String>,
 }
 
-/// A cell's two facts.
+impl Seq {
+    fn clock_has(&self, port: &str) -> bool {
+        self.clock.as_ref().is_some_and(|c| expr_has(c, port))
+    }
+}
+
+fn expr_has(e: &Expr, port: &str) -> bool {
+    match e {
+        Expr::Port(p) => p == port,
+        Expr::Not(l) => expr_has(l, port),
+        Expr::And(l, r) | Expr::Or(l, r) | Expr::Xor(l, r) => expr_has(l, port) || expr_has(r, port),
+        Expr::Zero | Expr::One => false,
+    }
+}
+
+/// `TimingRole` of an arc set, as far as the clock network and the register clocks ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Combinational,
+    RegClkToQ,
+    LatchEnToQ,
+    LatchDtoQ,
+    RegSetClr,
+    TristateEnable,
+    TristateDisable,
+    /// A timing check, or any role neither reader distinguishes.
+    Other,
+}
+
+/// One arc set: `related_pin` → the pin, with its role.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CellArc {
+    pub from: String,
+    pub to: String,
+    pub role: Role,
+}
+
+/// A cell's facts.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CellClock {
     /// `is_pad` or `pad_cell` true.
     pub is_pad: bool,
     /// Every port, and whether it is a register clock.
     pub ports: BTreeMap<String, bool>,
+    /// Every arc set, in the library's order.
+    pub arcs: Vec<CellArc>,
+    /// ⛔ `inferLatchRoles` may rewrite a combinational arc of this cell to latch D-to-Q: the cell
+    /// has an inferred clock-to-Q arc, and a combinational arc into a pin with a clock-to-Q arc.
+    /// Not transcribed — a clock search through such a cell is refused.
+    pub latch_roles_may_be_inferred: bool,
 }
 
-/// The register-clock rule over one arc (see the module). `None` when pointer order would decide.
-fn arc_is_reg_clk(function: Option<&str>, from: &str, seq_of: &BTreeMap<String, usize>, seqs: &[Seq]) -> Option<bool> {
-    let Some(f) = function else { return Some(true) };
+/// `makeRegLatchArcs`' role (see the module). `Err` when pointer order would decide; the bool is
+/// `setHasInferedRegTimingArcs`.
+fn make_reg_latch_role(function: Option<&Expr>, from: &str, seq_of: &BTreeMap<String, usize>, seqs: &[Seq]) -> Result<(Role, bool), ()> {
     let mut verdicts = BTreeMap::new();
-    for port in idents(f) {
-        let Some(&k) = seq_of.get(&port) else { continue };
-        let s = &seqs[k];
-        let v = if s.clock.contains(from) {
-            Some(true)
-        } else if (!s.is_register && s.data.contains(from)) || s.clear_preset.contains(from) {
-            Some(false)
-        } else {
-            None
-        };
-        if let Some(v) = v {
-            verdicts.insert(k, v);
+    if let Some(f) = function {
+        let mut ports = BTreeSet::new();
+        collect_ports(f, &mut ports);
+        for port in ports {
+            let Some(&k) = seq_of.get(&port) else { continue };
+            let s = &seqs[k];
+            let v = if s.clock.as_ref().is_some_and(|c| expr_has(c, from)) {
+                Some(if s.is_register { Role::RegClkToQ } else { Role::LatchEnToQ })
+            } else if !s.is_register && s.data.contains(from) {
+                Some(Role::LatchDtoQ)
+            } else if s.clear.contains(from) || s.preset.contains(from) {
+                Some(Role::RegSetClr)
+            } else {
+                None
+            };
+            if let Some(v) = v {
+                verdicts.insert(k, v);
+            }
         }
     }
     let mut vs = verdicts.values();
     match vs.next() {
-        None => Some(true),
-        Some(&v) if vs.all(|&w| w == v) => Some(v),
-        Some(_) => None,
+        None => Ok((Role::RegClkToQ, true)),
+        Some(&v) if vs.all(|&w| w == v) => Ok((v, false)),
+        Some(_) => Err(()),
     }
+}
+
+fn collect_ports(e: &Expr, out: &mut BTreeSet<String>) {
+    match e {
+        Expr::Port(p) => {
+            out.insert(p.clone());
+        }
+        Expr::Not(l) => collect_ports(l, out),
+        Expr::And(l, r) | Expr::Or(l, r) | Expr::Xor(l, r) => {
+            collect_ports(l, out);
+            collect_ports(r, out);
+        }
+        Expr::Zero | Expr::One => {}
+    }
+}
+
+/// `LibertyBuilder::makeTimingArcs`' role for one timing group. The preamble first: a group with
+/// no `timing_type` (combinational) into a pin whose function is exactly ONE sequential port is
+/// re-typed — rising_edge when the FROM port is in that sequential's clock with a unate sense
+/// (either sense: both become rising_edge), clear or preset when it is in those.
+fn arc_role(timing_type: &str, function: Option<&Expr>, from: &str, seq_of: &BTreeMap<String, usize>, seqs: &[Seq]) -> Result<(Role, bool), String> {
+    let seq = match function {
+        Some(Expr::Port(p)) => seq_of.get(p).map(|&k| &seqs[k]),
+        _ => None,
+    };
+    let mut tt = timing_type;
+    if tt == "combinational" {
+        if let Some(s) = seq {
+            if s.clock_has(from) {
+                if matches!(port_timing_sense(s.clock.as_ref().expect("clock"), from), Sense::Positive | Sense::Negative) {
+                    tt = "rising_edge";
+                }
+            } else if s.clear.contains(from) {
+                tt = "clear";
+            } else if s.preset.contains(from) {
+                tt = "preset";
+            }
+        }
+    }
+    Ok(match tt {
+        "combinational" => {
+            if seq.is_some_and(|s| !s.is_register && s.data.contains(from)) {
+                (Role::LatchDtoQ, false)
+            } else {
+                (Role::Combinational, false)
+            }
+        }
+        "combinational_rise" | "combinational_fall" => (Role::Combinational, false),
+        "rising_edge" | "falling_edge" => make_reg_latch_role(function, from, seq_of, seqs).map_err(|()| format!("pin {from}: two sequentials decide differently (pointer order)"))?,
+        "preset" | "clear" => (Role::RegSetClr, false),
+        "three_state_enable" | "three_state_enable_rise" | "three_state_enable_fall" => (Role::TristateEnable, false),
+        "three_state_disable" | "three_state_disable_rise" | "three_state_disable_fall" => (Role::TristateDisable, false),
+        t if ["setup_", "hold_", "recovery_", "removal_", "skew_", "non_seq_", "nochange_", "min_pulse_width", "minimum_period", "max_clock_tree_path", "min_clock_tree_path"]
+            .iter()
+            .any(|k| t.starts_with(k)) =>
+        {
+            (Role::Other, false)
+        }
+        t => return Err(format!("timing_type {t:?} is not modelled")),
+    })
 }
 
 fn read_cell(cell: &Group) -> Result<CellClock, String> {
@@ -189,9 +460,8 @@ fn read_cell(cell: &Group) -> Result<CellClock, String> {
     for (kind, is_register, clk, data) in [("ff", true, "clocked_on", "next_state"), ("latch", false, "enable", "data_in")] {
         for g in cell.children(kind) {
             let set = |k: &str| g.attr(k).map(idents).unwrap_or_default();
-            let mut clear_preset = set("clear");
-            clear_preset.extend(set("preset"));
-            seqs.push(Seq { is_register, clock: set(clk), data: set(data), clear_preset });
+            let clock = g.attr(clk).map(parse_expr).transpose().map_err(|e| format!("liberty cell {name}: {e}"))?;
+            seqs.push(Seq { is_register, clock, data: set(data), clear: set("clear"), preset: set("preset") });
             for out in &g.args {
                 seq_of.insert(out.clone(), seqs.len() - 1);
             }
@@ -203,21 +473,30 @@ fn read_cell(cell: &Group) -> Result<CellClock, String> {
             ports.entry(p.clone()).or_insert(false);
         }
     }
+    let mut arcs = Vec::new();
+    let mut has_inferred = false;
     for pin in cell.children("pin") {
+        let function = pin.attr("function").map(parse_expr).transpose().map_err(|e| format!("liberty cell {name}: {e}"))?;
         for timing in pin.children("timing") {
-            if !matches!(timing.attr("timing_type"), Some("rising_edge" | "falling_edge")) {
-                continue;
-            }
+            let tt = timing.attr("timing_type").unwrap_or("combinational");
             for from in timing.attr("related_pin").unwrap_or("").split_whitespace() {
-                let v = arc_is_reg_clk(pin.attr("function"), from, &seq_of, &seqs)
-                    .ok_or_else(|| format!("liberty cell {name}: pin {from} — two sequentials decide differently (pointer order)"))?;
-                if v {
+                let (role, inferred) = arc_role(tt, function.as_ref(), from, &seq_of, &seqs).map_err(|e| format!("liberty cell {name}: {e}"))?;
+                // makeTimingArcPortMaps: the FROM port of clock-to-Q or enable-to-Q.
+                if matches!(role, Role::RegClkToQ | Role::LatchEnToQ) {
                     ports.insert(from.to_string(), true);
+                }
+                has_inferred |= inferred;
+                for to in &pin.args {
+                    arcs.push(CellArc { from: from.to_string(), to: to.clone(), role });
                 }
             }
         }
     }
-    Ok(CellClock { is_pad: truthy("is_pad") || truthy("pad_cell"), ports })
+    // inferLatchRoles runs on a cell with ANY inferred arc, over every clock-to-Q arc: a combinational
+    // arc into the same pin (unate, cond-matched — not checked here: refusing is the safe side).
+    let latch_roles_may_be_inferred =
+        has_inferred && arcs.iter().any(|a| a.role == Role::Combinational && arcs.iter().any(|q| q.role == Role::RegClkToQ && q.to == a.to));
+    Ok(CellClock { is_pad: truthy("is_pad") || truthy("pad_cell"), ports, arcs, latch_roles_may_be_inferred })
 }
 
 /// The cells of every library read, by name. ⛔ A cell in two libraries resolves to the FIRST
@@ -321,6 +600,84 @@ mod tests {
         let c = cell(r#"pin (Q) { function : "Y"; }
             test_cell () { pin (TCK) { timing () { related_pin : "TCK"; timing_type : rising_edge; } } }"#);
         assert!(!c.ports.contains_key("TCK"));
+    }
+
+    // makeTimingArcs' preamble: a timing group with no timing_type into a pin whose function is ONE
+    // sequential port, from that sequential's unate clock, becomes rising_edge → clock-to-Q.
+    #[test]
+    fn a_combinational_group_from_a_unate_clock_is_promoted_to_clock_to_q() {
+        let c = cell(r#"ff ("IQ","IQ_N") { clocked_on : "!CLK_N"; next_state : "D"; }
+            pin (CLK_N) { } pin (D) { }
+            pin (Q) { function : "IQ"; timing () { related_pin : "CLK_N"; } }"#);
+        assert!(c.ports["CLK_N"]);
+        assert_eq!(c.arcs[0].role, Role::RegClkToQ);
+    }
+
+    // A non-unate clock (XOR) is not promoted: the group stays combinational.
+    #[test]
+    fn a_non_unate_clock_stays_combinational() {
+        let c = cell(r#"ff ("IQ","IQ_N") { clocked_on : "CLK ^ EN"; next_state : "D"; }
+            pin (CLK) { } pin (EN) { }
+            pin (Q) { function : "IQ"; timing () { related_pin : "CLK"; } }"#);
+        assert!(!c.ports["CLK"]);
+        assert_eq!(c.arcs[0].role, Role::Combinational);
+    }
+
+    // The preamble needs the function to be exactly one port: "IQ & A" is not promoted.
+    #[test]
+    fn the_preamble_needs_a_single_port_function() {
+        let c = cell(r#"ff ("IQ","IQ_N") { clocked_on : "CLK"; next_state : "D"; }
+            pin (CLK) { } pin (A) { }
+            pin (Q) { function : "IQ & A"; timing () { related_pin : "CLK"; } }"#);
+        assert_eq!(c.arcs[0].role, Role::Combinational);
+    }
+
+    // Combinational from a clear pin is re-typed clear → set/clear; from a latch's data → D-to-Q.
+    #[test]
+    fn combinational_groups_from_clear_and_latch_data_take_those_roles() {
+        let c = cell(r#"ff ("IQ","IQ_N") { clocked_on : "CLK"; next_state : "D"; clear : "!R"; }
+            pin (R) { } pin (Q) { function : "IQ"; timing () { related_pin : "R"; } }"#);
+        assert_eq!(c.arcs[0].role, Role::RegSetClr);
+        let c = cell(r#"latch ("IQ","IQ_N") { enable : "G"; data_in : "D"; }
+            pin (D) { } pin (Q) { function : "IQ"; timing () { related_pin : "D"; timing_sense : positive_unate; } }"#);
+        assert_eq!(c.arcs[0].role, Role::LatchDtoQ);
+    }
+
+    // Tristate groups keep their own roles; a check is neither.
+    #[test]
+    fn tristate_and_check_roles() {
+        let c = cell(r#"pin (Z) { function : "A"; three_state : "!TE";
+              timing () { related_pin : "A"; } timing () { related_pin : "TE"; timing_type : three_state_enable; }
+              timing () { related_pin : "TE"; timing_type : three_state_disable; } }
+            pin (A) { timing () { related_pin : "CLK"; timing_type : hold_rising; } } pin (TE) { } pin (CLK) { }"#);
+        let roles: Vec<Role> = c.arcs.iter().map(|a| a.role).collect();
+        assert_eq!(roles, [Role::Combinational, Role::TristateEnable, Role::TristateDisable, Role::Other]);
+    }
+
+    // LibExprParse.yy precedence: `!` binds a terminal, then implicit AND, then ^, then * &, then + |.
+    #[test]
+    fn the_function_grammar_follows_the_reference_precedence() {
+        let p = |s: &str| parse_expr(s).expect("parse");
+        let port = |n: &str| Box::new(Expr::Port(n.into()));
+        assert_eq!(p("!A&B"), Expr::And(Box::new(Expr::Not(port("A"))), port("B")));
+        assert_eq!(p("A+B C"), Expr::Or(port("A"), Box::new(Expr::And(port("B"), port("C")))));
+        assert_eq!(p("A&B^C"), Expr::And(port("A"), Box::new(Expr::Xor(port("B"), port("C")))));
+        assert_eq!(p("A'"), Expr::Not(port("A")));
+        assert_eq!(p("(A|B)&C"), Expr::And(Box::new(Expr::Or(port("A"), port("B"))), port("C")));
+    }
+
+    // FuncExpr::portTimingSense, including its asymmetric AND/OR combination.
+    #[test]
+    fn port_timing_sense_follows_the_reference() {
+        let s = |e: &str, p: &str| port_timing_sense(&parse_expr(e).expect("parse"), p);
+        assert_eq!(s("A", "A"), Sense::Positive);
+        assert_eq!(s("!A", "A"), Sense::Negative);
+        assert_eq!(s("A & !A", "A"), Sense::NonUnate);
+        assert_eq!(s("A & B", "A"), Sense::Positive);
+        assert_eq!(s("A ^ B", "A"), Sense::NonUnate);
+        assert_eq!(s("B ^ C", "A"), Sense::Unknown);
+        assert_eq!(s("B & C", "A"), Sense::None);
+        assert_eq!(s("1", "A"), Sense::None);
     }
 
     #[test]

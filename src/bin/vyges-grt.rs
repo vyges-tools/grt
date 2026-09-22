@@ -25,7 +25,7 @@ USAGE:
 
 JOB (JSON):
   { \"lefs\": [..], \"liberty\": [..], \"def\": \"..\" | \"db\": \"..\", \"steps\": [ STEP, .. ] }
-  With liberty and no clock defined (there is no clock step), every net is unconstrained.
+  With liberty and no clock every net is unconstrained; with a clock, a pass that reads slacks is refused.
   STEP is one of
     { \"cmd\": \"set_routing_layers\", \"signal\": [lo, hi], \"clock\": [lo, hi] }
     { \"cmd\": \"layer_adjustment\", \"layers\": [lo, hi], \"value\": f }      (one layer: lo == hi)
@@ -35,6 +35,8 @@ JOB (JSON):
     { \"cmd\": \"nets_to_route\", \"patterns\": [..] }                        (Tcl globs)
     { \"cmd\": \"global_route\", \"verbose\": b, \"allow_congestion\": b, \"grid_origin\": [x, y],
       \"skip_large_fanout\": n, \"congestion_iterations\": n, \"critical_nets_percentage\": f }
+    { \"cmd\": \"create_clock\", \"ports\": [..] }                        (clock network only)
+    { \"cmd\": \"propagated_clock\" }
     { \"cmd\": \"write_guides\", \"path\": \"..\" }
 
 EXIT STATUS:
@@ -86,7 +88,7 @@ fn err<E: std::fmt::Display>(e: E) -> Fail {
 
 /// A message from the engine naming something it does not model yet.
 fn classify(msg: String) -> Fail {
-    if msg.contains("not wired") || msg.contains("not bound") {
+    if ["not wired", "not bound", "none bound", "not modelled"].iter().any(|k| msg.contains(k)) {
         Fail::Refused(msg)
     } else {
         Fail::Error(msg)
@@ -202,12 +204,21 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 for ng in &res.guides {
                     guides.insert(ng.net.clone(), ng.guides.iter().map(|g| (g.box_.x_min, g.box_.y_min, g.box_.x_max, g.box_.y_max, res.layer_names[&g.layer].clone())).collect());
                 }
-                calls.push(json!({ "nets": res.guides.len(), "total_overflow": res.total_overflow, "congested": res.guide_is_congested }));
+                calls.push(json!({ "nets": res.guides.len(), "total_overflow": res.total_overflow, "congested": res.guide_is_congested, "clock_nets": res.clock_nets }));
                 if res.total_overflow > 0 && !opts.allow_congestion {
                     // GRT-116: the reference ends the command in error after writing the guides.
                     return Err(Fail::Error("GRT-0116: Global routing finished with congestion".into()));
                 }
             }
+            // create_clock on top-level ports; the clock's period and waveform do not reach the
+            // clock network.
+            "create_clock" => {
+                for p in step["ports"].as_array().ok_or_else(|| err("ports"))? {
+                    opts.clock_sources.push(p.as_str().ok_or_else(|| err("a port name"))?.to_string());
+                }
+            }
+            // set_propagated_clock: only the slacks read it, and with a clock none are bound.
+            "propagated_clock" => {}
             "write_guides" => write_guides(step["path"].as_str().ok_or_else(|| err("path"))?, &guides)?,
             other => return Err(Fail::Refused(format!("step {other:?} is not modelled"))),
         }

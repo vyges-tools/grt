@@ -35,6 +35,8 @@ pub struct RouteOptions {
     pub verbose: bool,
     /// `read_liberty` — the libraries' pad cells and register clocks; `None` without one.
     pub liberty: Option<crate::liberty_clk::LibertyClocks>,
+    /// `create_clock … [get_ports …]` — the clocks' source ports, over every clock defined.
+    pub clock_sources: Vec<String>,
     pub critical_nets_percentage: f32,
     /// `set_global_routing_layer_adjustment *`.
     pub adjustment: f32,
@@ -65,6 +67,7 @@ impl RouteOptions {
         RouteOptions {
             verbose: false,
             liberty: None,
+            clock_sources: Vec::new(),
             critical_nets_percentage: 10.0,
             adjustment: 0.0,
             grid_origin: (0, 0),
@@ -691,6 +694,8 @@ pub struct RouteResult {
     pub guide_is_congested: bool,
     /// R20's routes as run() emitted them, by FastRoute id — before F.
     pub routes: std::collections::BTreeMap<u32, Vec<crate::GSegment>>,
+    /// The nets `initClockNets` re-typed CLOCK (`findClkNets`), by name.
+    pub clock_nets: std::collections::BTreeSet<String>,
     pub log: Vec<String>,
 }
 
@@ -706,6 +711,15 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     let mut log = t.log.clone();
     let adj = setup_adjust(db, &t, opts, &mut log)?;
     let mut e = adj.edges;
+    // initClockNets (findNets(true), at the head of net discovery): with a liberty library the
+    // timer's clock nets are re-typed CLOCK — ⛔ IN the database, so the retype persists.
+    let mut clock_nets = std::collections::BTreeSet::new();
+    if let Some(lib) = &opts.liberty {
+        clock_nets = crate::clk_network::find_clk_nets(db, lib, &opts.clock_sources)?;
+        for net in &clock_nets {
+            db.net_set_sig_type(net, "CLOCK")?;
+        }
+    }
     let nets = setup_nets(db, &t, &mut e, adj.has_macros_or_pads, opts, &mut log)?;
     let (xg, yg) = (e.x_grid as usize, e.y_grid as usize);
     // The router's grid, in run()'s layout (`[y * xg + x]` for both directions).
@@ -755,7 +769,8 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         .collect();
     let slack = vec![(0.0f32, false); nets.len()];
     // getNetSlack: with no clock defined every net is unconstrained — the timer's INF (`1E+30F`).
-    let timer_slack = opts.liberty.as_ref().map(|_| vec![1.0e30f32; nets.len()]);
+    // ⛔ With a clock the slacks are the timer's: none bound, so a partial-slack pass is refused.
+    let timer_slack = opts.liberty.as_ref().filter(|_| opts.clock_sources.is_empty()).map(|_| vec![1.0e30f32; nets.len()]);
     // makeSteinerTree(net, …): the net's alpha — the min-fanout rule when set.
     let stt_net = |id: usize| {
         let n = &nets[id];
@@ -850,5 +865,5 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     let save = crate::SaveOptions { guide_is_congested, origin_x: opts.grid_origin.0, origin_y: opts.grid_origin.1, min_routing_layer: t.min_routing_layer };
     let guides = crate::save_guides(&net_routes, &grid, &save).map_err(|e| format!("{e:?}"))?;
     let layer_names = t.tech.routing_layers.iter().map(|l| (l.routing_level, l.name.clone())).collect();
-    Ok(RouteResult { guides, layer_names, total_overflow, guide_is_congested, routes: raw_routes, log })
+    Ok(RouteResult { guides, layer_names, total_overflow, guide_is_congested, routes: raw_routes, clock_nets, log })
 }
