@@ -38,6 +38,8 @@ pub mod netlist;
 pub mod driver;
 pub mod findrouting;
 pub mod finish;
+pub mod congestion;
+pub use congestion::{boost_uniform_int, congestion_markers, update_db_congestion, utl_shuffle, CongestedCell, CongestionEdge, CongestionMarker, CrossingNet, DbCongestionLayer, Mt19937};
 pub use finish::{cell_suggestion, compute_net_wirelength, compute_suggested_adjustment, compute_wirelength, congestion_verdict, report_congestion, report_routed_nets, suggest_adjustment, CongestedGrid, CongestionLayer};
 pub use findrouting::{add_guides_for_local_net, add_remaining_guides, connect_pad_pins, connect_top_level_pins, merge_segments, GridPin, NoRouteGuides, RemainingNet};
 pub use driver::{compute_max_routing_layer, get_min_max_layer, has_routable_nets, report_resources, ResourceLayer, GRT_7};
