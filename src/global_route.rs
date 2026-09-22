@@ -741,6 +741,24 @@ pub struct RouteResult {
     /// IN ORDER — what a route-by-route comparison against the reference needs.
     pub snapshot_edges: std::collections::BTreeMap<String, Vec<SnapshotEdge>>,
     pub log: Vec<String>,
+    /// The router's state as a later command in the same session reads it.
+    pub after: AfterRoute,
+}
+
+/// What stays alive in the router after `global_route` for a later command — antenna repair's
+/// jumper pass and the `saveGuides` that follows it.
+#[derive(Debug, Clone)]
+pub struct AfterRoute {
+    /// The 3D edges at the end of the run (`h_edges_3D_` / `v_edges_3D_`). `None` when the run did
+    /// not reach R19.
+    pub final_3d: Option<Graph3d>,
+    /// `saveGuides`' input: `routes_` after F, per net in block order, with the pin facts.
+    pub net_routes: Vec<crate::NetRoute>,
+    pub jumper_grid: crate::repair_antennas::JumperGrid,
+    pub save_options: crate::SaveOptions,
+    /// `getLayerEdgeCost` per net, by 0-based layer.
+    pub layer_edge_cost: std::collections::BTreeMap<String, Vec<i8>>,
+    pub max_routing_layer: i32,
 }
 
 /// `SteinerTreeBuilder::computeHPWL`: the bounding box of every instance terminal's average pin
@@ -1008,11 +1026,17 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         overflow: i32,
         cnp: f32,
         trees: Option<Vec<Option<crate::brk_rsmt::StTree>>>,
+        /// The 3D edges at R19 — nothing after it changes them, so they are what antenna repair's
+        /// jumper pass reads (`hasAvailableResources`) and charges.
+        g3: Option<Graph3d>,
     }
     impl RunObserver for Observer {
-        fn stage(&mut self, s: Stage<'_>, _: &crate::graph2d::Graph2d, _: Option<&Graph3d>, st: &[NetState]) -> bool {
+        fn stage(&mut self, s: Stage<'_>, _: &crate::graph2d::Graph2d, g3: Option<&Graph3d>, st: &[NetState]) -> bool {
             match s {
-                Stage::B19(fin) => self.overflow = fin.overflow.total,
+                Stage::B19(fin) => {
+                    self.overflow = fin.overflow.total;
+                    self.g3 = g3.cloned();
+                }
                 Stage::Loop(crate::congestion_loop::LoopEvent::Before { params, .. }) if params.ordering && self.cnp != 0.0 && self.trees.is_none() => {
                     self.trees = Some(st.iter().map(|n| n.tree.clone()).collect());
                 }
@@ -1022,7 +1046,7 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         }
     }
     let mut state = vec![NetState::default(); nets.len()];
-    let mut ov = Observer { overflow: 0, cnp: t.config.critical_nets_percentage, trees: None };
+    let mut ov = Observer { overflow: 0, cnp: t.config.critical_nets_percentage, trees: None, g3: None };
     let routes = match fastroute_run(&inp, &mut state, &mut ov)? {
         RunEnd::Routed(r) => r,
         RunEnd::Stopped => return Err("run() stopped".into()),
@@ -1139,5 +1163,8 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     let save = crate::SaveOptions { guide_is_congested, origin_x: opts.grid_origin.0, origin_y: opts.grid_origin.1, min_routing_layer: t.min_routing_layer };
     let guides = crate::save_guides(&net_routes, &grid, &save).map_err(|e| format!("{e:?}"))?;
     let layer_names = t.tech.routing_layers.iter().map(|l| (l.routing_level, l.name.clone())).collect();
-    Ok(RouteResult { guides, layer_names, total_overflow, guide_is_congested, routes: raw_routes, clock_nets, parasitics, routed_parasitics, parasitic_pins, planar_routes, snapshot_edges, log })
+    let jumper_grid = crate::repair_antennas::JumperGrid { grid, x_grids: t.core.x_grids, y_grids: t.core.y_grids };
+    let layer_edge_cost = nets.iter().zip(&attrs).map(|(n, a)| (n.name.clone(), a.layer_edge_cost.clone())).collect();
+    let after = AfterRoute { final_3d: ov.g3, net_routes, jumper_grid, save_options: save, layer_edge_cost, max_routing_layer: t.max_routing_layer };
+    Ok(RouteResult { guides, layer_names, total_overflow, guide_is_congested, routes: raw_routes, clock_nets, parasitics, routed_parasitics, parasitic_pins, planar_routes, snapshot_edges, log, after })
 }

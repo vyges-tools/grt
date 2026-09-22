@@ -44,6 +44,11 @@ JOB (JSON):
     { \"cmd\": \"write_parasitics\", \"path\": \"..\" }       (the networks the slacks are read from)
     { \"cmd\": \"write_spef\", \"path\": \"..\", \"source\": \"partial\" | \"routed\" }
     { \"cmd\": \"write_guides\", \"path\": \"..\" }
+    { \"cmd\": \"antenna_wires\", \"path\": \"..\" }      (the wires antenna checking synthesises from the guides)
+    { \"cmd\": \"repair_antennas\", \"violations\": \"..\", \"jumper_only\": b, \"diode_only\": b, \"iterations\": n,
+      \"allow_congestion\": b, \"trace\": \"..\" }
+      violations: the reference checker's, captured (`VYGA|viol|…` lines) — an ORACLE; the
+      violation check itself is not modelled. Diode insertion is refused.
 
 EXIT STATUS:
   0  routed    every step ran; the report lists each global_route
@@ -127,6 +132,145 @@ fn write_guides(path: &str, store: &BTreeMap<String, Vec<(i32, i32, i32, i32, St
     std::fs::write(path, text).map_err(err)
 }
 
+/// The name of a routing level.
+fn db_layer_name(db: &Db, level: i32) -> String {
+    db.tech_get_layers().into_iter().find(|l| db.layer_get_type(l).is_ok_and(|t| t == "ROUTING") && db.layer_get_routing_level(l) == level).unwrap_or_default()
+}
+
+/// `dbTech`'s layer stack as the jumper graph walks it: every layer, cut layers included, with
+/// `getUpperLayer` / `getLowerLayer` resolved to positions.
+fn tech_layers(db: &Db) -> Result<vyges_grt::repair_antennas::TechLayers, Fail> {
+    let names = db.tech_get_layers();
+    let at = |n: String| names.iter().position(|m| *m == n);
+    let mut layers = Vec::with_capacity(names.len());
+    for n in &names {
+        let is_routing = db.layer_get_type(n).map_err(err)? == "ROUTING";
+        layers.push(vyges_grt::repair_antennas::TechLayer {
+            name: n.clone(),
+            routing_level: if is_routing { db.layer_get_routing_level(n) } else { 0 },
+            is_routing,
+            upper: at(db.layer_get_upper_layer(n)),
+            lower: at(db.layer_get_lower_layer(n)),
+        });
+    }
+    Ok(vyges_grt::repair_antennas::TechLayers(layers))
+}
+
+/// Captured violations: `VYGA|viol|<net>|level=<n>|excess=<r>|diodes=<n>|gates=<inst>/<pin>,…`, in
+/// blocks — one per checker call, each ended by any other line.
+fn read_violation_blocks(path: &str) -> Result<Vec<Vec<(String, i32, Vec<String>)>>, Fail> {
+    let mut blocks: Vec<Vec<(String, i32, Vec<String>)>> = Vec::new();
+    let mut open = false;
+    for line in std::fs::read_to_string(path).map_err(err)?.lines() {
+        let Some(rest) = line.strip_prefix("VYGA|viol|") else {
+            open = false;
+            continue;
+        };
+        let f: Vec<&str> = rest.split('|').collect();
+        let bad = || err(format!("{path}: bad violation line {line:?}"));
+        let level = f.get(1).and_then(|v| v.strip_prefix("level=")).and_then(|v| v.parse().ok()).ok_or_else(bad)?;
+        let gates = f.get(4).and_then(|v| v.strip_prefix("gates=")).ok_or_else(bad)?.split(',').filter(|g| !g.is_empty()).map(str::to_string).collect();
+        if !open {
+            blocks.push(Vec::new());
+            open = true;
+        }
+        blocks.last_mut().expect("a block").push((f[0].to_string(), level, gates));
+    }
+    Ok(blocks)
+}
+
+/// `repair_antennas` as `GlobalRouter::repairAntennas` runs it, with the CHECKER's answers captured.
+///
+/// One iteration: the violations of the first check → `jumperInsertion` (unless `-diode_only`) →
+/// `saveGuides` over the nets that got jumpers → the second check. Diode insertion, and a second
+/// iteration with violations left, are refused.
+fn repair_antennas(db: &Db, step: &Value, state: &mut vyges_grt::global_route::AfterRoute, total_overflow: i32, log: &mut Vec<String>) -> Result<Vec<vyges_grt::NetGuides>, Fail> {
+    use vyges_grt::repair_antennas::{jumper_insertion, AntViolation, FastRouteJumpers, GatePin, JumperInputs, NetViolations};
+    let jumper_only = step["jumper_only"].as_bool().unwrap_or(false);
+    let diode_only = step["diode_only"].as_bool().unwrap_or(false);
+    let iterations = step["iterations"].as_i64().unwrap_or(1);
+    // The Tcl sets the router's allow_congestion from THIS command's flag.
+    let allow_congestion = step["allow_congestion"].as_bool().unwrap_or(false);
+    // findDiodeMTerm: the first CORE ANTENNACELL master, in library order, with a terminal that has
+    // diffusion area. Without one the command warns (GRT-246) and does nothing at all.
+    let mut has_diode = false;
+    for (m, t) in db.masters_with_types().map_err(err)? {
+        // ⚠️ `dbMasterType::getString` spells it with a SPACE.
+        if t == "CORE ANTENNACELL" && db.master_mterms(&m).map_err(err)?.iter().any(|(term, _)| db.mterm_antenna_diff_area(&m, term) > 0.0) {
+            has_diode = true;
+            break;
+        }
+    }
+    if !has_diode {
+        log.push("GRT-0246: No diode with LEF class CORE ANTENNACELL found.".into());
+        return Ok(Vec::new());
+    }
+    let path = step["violations"].as_str().ok_or_else(|| Fail::Refused("repair_antennas without captured violations: the antenna checker is not modelled".into()))?;
+    let blocks = read_violation_blocks(path)?;
+    // antenna_violations_ is a PtrMap: by net ID, which is the block's net order.
+    let order = db.net_names();
+    let mut first = blocks.first().cloned().unwrap_or_default();
+    first.sort_by_key(|(n, ..)| order.iter().position(|m| m == n).unwrap_or(usize::MAX));
+    let tech = tech_layers(db)?;
+    let number_to_index: BTreeMap<i64, usize> = tech.0.iter().enumerate().map(|(i, l)| (i64::from(db.layer_get_number(&l.name)), i)).collect();
+    let mut by_net: Vec<NetViolations> = Vec::new();
+    for (net, level, gates) in first {
+        let mut pins = Vec::new();
+        for g in gates {
+            let (inst, pin) = g.rsplit_once('/').ok_or_else(|| err(format!("gate {g}: expected <inst>/<pin>")))?;
+            let master = db.inst_master(inst);
+            if db.master_get_type(&master).map_err(err)?.starts_with("BLOCK") {
+                return Err(Fail::Refused(format!("gate {g} is on a block: getInstRect's pin-box rule is not modelled")));
+            }
+            let b = db.inst_bbox(inst).map_err(err)?;
+            let pin_boxes = db
+                .iterm_pin_boxes(inst, pin)
+                .into_iter()
+                .map(|w| Ok((*number_to_index.get(&w.layer).ok_or_else(|| err(format!("layer number {}", w.layer)))?, vyges_grt::Rect::new(w.x0, w.y0, w.x1, w.y1))))
+                .collect::<Result<Vec<_>, Fail>>()?;
+            pins.push(GatePin { name: g.clone(), inst_rect: vyges_grt::Rect::new(b[0], b[1], b[2], b[3]), pin_boxes });
+        }
+        let v = AntViolation { routing_level: level, gates: pins };
+        match by_net.last_mut() {
+            Some(nv) if nv.net == net => nv.violations.push(v),
+            _ => by_net.push(NetViolations { net, violations: vec![v] }),
+        }
+    }
+    log.push(format!("GRT-0012: Found {} antenna violations.", by_net.len()));
+    let mut saved = Vec::new();
+    // hasNewViolations: every net is new on the first iteration.
+    if !diode_only && !by_net.is_empty() {
+        let g3 = state.final_3d.as_mut().ok_or_else(|| Fail::Refused("jumper insertion without the router's 3D edges".into()))?;
+        let mut routes: BTreeMap<String, Vec<vyges_grt::GSegment>> = state.net_routes.iter().map(|n| (n.name.clone(), n.segments.clone())).collect();
+        let inp = JumperInputs { tech: &tech, grid: state.jumper_grid, max_routing_layer: state.max_routing_layer };
+        let mut router = FastRouteJumpers { g3, grid: state.jumper_grid, layer_edge_cost: &state.layer_edge_cost };
+        let mut trace = step["trace"].as_str().map(|_| Vec::new());
+        let res = jumper_insertion(&by_net, &mut routes, &inp, &mut router, trace.as_mut()).map_err(Fail::Refused)?;
+        if let (Some(p), Some(t)) = (step["trace"].as_str(), &trace) {
+            std::fs::write(p, t.iter().map(|l| format!("VYGJ|{l}\n")).collect::<String>()).map_err(err)?;
+        }
+        log.push(format!("GRT-0302: Inserted {} jumpers for {} nets.", res.total_jumpers, res.net_with_jumpers));
+        // saveGuides(nets_with_jumpers), with the congestion mark as the command left it.
+        let mut opts = state.save_options;
+        opts.guide_is_congested = total_overflow > 0 && !allow_congestion;
+        let mut modified = Vec::new();
+        for name in &res.modified_nets {
+            let nr = state.net_routes.iter_mut().find(|n| &n.name == name).ok_or_else(|| err(format!("net {name} has no route")))?;
+            nr.segments = routes[name].clone();
+            modified.push(nr.clone());
+        }
+        saved = vyges_grt::save_guides(&modified, &state.jumper_grid.grid, &opts).map_err(|e| err(format!("{e:?}")))?;
+    }
+    let second = if diode_only { blocks.first() } else { blocks.get(1) }.cloned().unwrap_or_default();
+    if !second.is_empty() && !jumper_only {
+        return Err(Fail::Refused(format!("diode insertion is not modelled ({} nets still violate)", second.len())));
+    }
+    if !second.is_empty() && iterations > 1 {
+        return Err(Fail::Refused("a second repair iteration is not modelled".into()));
+    }
+    Ok(saved)
+}
+
 fn run(job: &Value) -> Result<Value, Fail> {
     let mut db = Db::new();
     for lef in job["lefs"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
@@ -177,6 +321,8 @@ fn run(job: &Value) -> Result<Value, Fail> {
         opts.captured_update_slacks = Some(update);
     }
     let mut guides: BTreeMap<String, Vec<(i32, i32, i32, i32, String)>> = BTreeMap::new();
+    // The same guides whole — via layer and pin flags included — for antenna checking.
+    let mut db_guides: BTreeMap<String, Vec<vyges_grt::Guide>> = BTreeMap::new();
     let mut parasitics: BTreeMap<String, vyges_grt::parasitics::Network> = BTreeMap::new();
     let mut parasitic_pins: BTreeMap<String, Vec<vyges_grt::parasitics::PinGridLocation>> = BTreeMap::new();
     let mut routed_parasitics: BTreeMap<String, vyges_grt::parasitics::Network> = BTreeMap::new();
@@ -184,6 +330,8 @@ fn run(job: &Value) -> Result<Value, Fail> {
     let mut snapshot_edges: BTreeMap<String, Vec<vyges_grt::global_route::SnapshotEdge>> = BTreeMap::new();
     let mut calls = Vec::new();
     let mut log = Vec::new();
+    // The router as a later command finds it: the last global_route's state.
+    let mut after: Option<(vyges_grt::global_route::AfterRoute, i32)> = None;
     for step in job["steps"].as_array().ok_or_else(|| err("steps"))? {
         match step["cmd"].as_str().unwrap_or("") {
             "set_routing_layers" => {
@@ -280,9 +428,11 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 planar_routes = res.planar_routes.clone();
                 snapshot_edges = res.snapshot_edges.clone();
                 for ng in &res.guides {
+                    db_guides.insert(ng.net.clone(), ng.guides.clone());
                     guides.insert(ng.net.clone(), ng.guides.iter().map(|g| (g.box_.x_min, g.box_.y_min, g.box_.x_max, g.box_.y_max, res.layer_names[&g.layer].clone())).collect());
                 }
                 calls.push(json!({ "nets": res.guides.len(), "total_overflow": res.total_overflow, "congested": res.guide_is_congested, "clock_nets": res.clock_nets }));
+                after = Some((res.after.clone(), res.total_overflow));
                 if res.total_overflow > 0 && !opts.allow_congestion {
                     // GRT-116: the reference ends the command in error after writing the guides.
                     return Err(Fail::Error("GRT-0116: Global routing finished with congestion".into()));
@@ -434,11 +584,45 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 }
                 std::fs::write(path, text).map_err(err)?;
             }
+            // ant::WireBuilder::makeNetWiresFromGuides over the block's nets, in block order —
+            // `VYGA|wire|<net>|<x1>,<y1>,<l1>|<x2>,<y2>,<l2>` per segment, in creation order.
+            "antenna_wires" => {
+                let path = step["path"].as_str().ok_or_else(|| err("path"))?;
+                let nets: Vec<vyges_grt::wire_builder::AntNet> = db
+                    .net_names()
+                    .into_iter()
+                    .map(|n| vyges_grt::wire_builder::AntNet {
+                        is_special: db.net_is_special(&n),
+                        is_connected_by_abutment: db.net_is_connected_by_abutment(&n),
+                        term_count: db.net_get_term_count(&n),
+                        is_detailed_routed: db.net_get_wire_type(&n) == "ROUTED" && db.net_has_wire(&n),
+                        guides: db_guides.get(&n).cloned().unwrap_or_default(),
+                        name: n,
+                    })
+                    .collect();
+                let mut text = String::new();
+                for w in vyges_grt::wire_builder::make_net_wires_from_guides(&nets, db.block_get_g_cell_tile_size()) {
+                    for sg in &w.route {
+                        text.push_str(&format!("VYGA|wire|{}|{},{},{}|{},{},{}\n", w.net, sg.pt1.x, sg.pt1.y, sg.pt1.layer, sg.pt2.x, sg.pt2.y, sg.pt2.layer));
+                    }
+                }
+                std::fs::write(path, text).map_err(err)?;
+            }
+            "repair_antennas" => {
+                // ⚠️ Not GRT-45: the reference also repairs from routes a database brought with it
+                // (`have_routes` after read_db). That path is not modelled.
+                let (state, total_overflow) = after.as_mut().ok_or_else(|| Fail::Refused("repair_antennas without a global_route in this session: routes read from a database are not modelled".into()))?;
+                let repaired = repair_antennas(&db, step, state, *total_overflow, &mut log)?;
+                for ng in repaired {
+                    guides.insert(ng.net.clone(), ng.guides.iter().map(|g| (g.box_.x_min, g.box_.y_min, g.box_.x_max, g.box_.y_max, db_layer_name(&db, g.layer))).collect());
+                    db_guides.insert(ng.net.clone(), ng.guides);
+                }
+            }
             "write_guides" => write_guides(step["path"].as_str().ok_or_else(|| err("path"))?, &guides)?,
             other => return Err(Fail::Refused(format!("step {other:?} is not modelled"))),
         }
     }
-    Ok(json!({ "status": "routed", "global_route": calls }))
+    Ok(json!({ "status": "routed", "global_route": calls, "log": log }))
 }
 
 fn main() -> ExitCode {
