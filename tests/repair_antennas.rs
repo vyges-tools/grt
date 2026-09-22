@@ -337,3 +337,69 @@ fn positions_on_one_segment_skip_and_stop() {
     let n = add_jumper_on_segments(&BTreeMap::from([(0, BTreeSet::from([1450, 1700]))]), &mut route, "n", &s, &mut router, None);
     assert_eq!(n, 1);
 }
+
+// ---- stage 4a: diode placement ----
+//
+// End to end, `grt-diode-score.py` replays the reference's trace on the three diode scripts: the
+// fixed set, every try, and all 16 diodes, exact, on our own violations. Every diode there landed
+// legally within a few tries; the rules below are the ones it never reaches.
+
+use vyges_grt::repair_antennas::{check_diode_loc, place_diode, row_orient, DiodeFloor, DiodeGate, DiodeRow};
+
+fn floor(rows: Vec<DiodeRow>) -> DiodeFloor {
+    DiodeFloor { rows, core: Rect::new(0, 0, 10_000, 10_000), site_width: 100, pad_left: 2, pad_right: 2, diode_width: 200, diode_height: 1000 }
+}
+
+fn row(y: i32, orient: &str) -> DiodeRow {
+    DiodeRow { bbox: Rect::new(0, y, 10_000, y + 1000), orient: orient.into() }
+}
+
+fn gate_at(x: i32, y: i32) -> DiodeGate {
+    DiodeGate { rect: Rect::new(x, y, x + 500, y + 1000), orient: "MX".into(), block_or_pad: false, is_block: false }
+}
+
+/// Beside the gate, alternating: left (flush), right (flush), left one site further, …, each
+/// taking the GATE's orientation, until the padded box touches no fixed cell.
+#[test]
+fn diode_tries_left_then_right_moving_out_a_site_each_time() {
+    let f = floor(vec![row(1000, "R0")]);
+    let fixed = [Rect::new(0, 1000, 4800, 2000), Rect::new(5500, 1000, 5900, 2000)];
+    let p = place_diode(&gate_at(5000, 1000), false, &f, &fixed);
+    let xs: Vec<i32> = p.tries.iter().map(|t| t.0).collect();
+    assert_eq!(&xs[..4], &[4800, 5500, 4700, 5600]);
+    assert!(p.tries.iter().all(|t| t.2 == "MX"));
+    assert_eq!((p.x, p.legal, p.status), (*xs.last().unwrap(), true, "FIRM"));
+}
+
+/// ⛔ A vertical violation layer tries ON the gate's row TWICE — the downward and upward
+/// sequences both start at offset 0 — then one row below, one above, … — and takes the
+/// orientation of the row under the diode's centre, not the gate's.
+#[test]
+fn vertical_diode_starts_on_the_gate_and_takes_the_row_orientation() {
+    let f = floor(vec![row(0, "R0"), row(1000, "MX"), row(2000, "R0")]);
+    let p = place_diode(&gate_at(5000, 1000), true, &f, &[Rect::new(4000, 1000, 6000, 2000)]);
+    let ys: Vec<(i32, String)> = p.tries.iter().map(|t| (t.1, t.2.clone())).collect();
+    assert_eq!(&ys[..3], &[(1000, "MX".to_string()), (1000, "MX".to_string()), (0, "R0".to_string())]);
+}
+
+/// ⛔ Golden-blind: no clear spot in 50 tries — the diode stays at the last try, marked PLACED
+/// (not FIRM) so the detailed placer may move it.
+#[test]
+fn a_diode_with_nowhere_to_go_is_left_placed_after_fifty_tries() {
+    let f = floor(vec![row(1000, "R0")]);
+    let p = place_diode(&gate_at(5000, 1000), false, &f, &[Rect::new(0, 0, 10_000, 10_000)]);
+    assert_eq!((p.tries.len(), p.legal, p.status), (50, false, "PLACED"));
+}
+
+/// The padded query is widened by BOTH paddings on each side and shrunk by one unit, and it is
+/// INCLUSIVE — a fixed cell exactly `pad` sites away still conflicts; one unit further does not.
+#[test]
+fn padded_query_is_inclusive_at_its_edge() {
+    let f = floor(vec![row(1000, "R0")]);
+    let diode = Rect::new(5000, 1000, 5200, 2000);
+    // (2 + 2) sites of 100 → 400 either side, less 1: the query reaches x = 4601 .. 5599.
+    assert!(!check_diode_loc(&diode, &f, &[Rect::new(4000, 1000, 4601, 2000)]));
+    assert!(check_diode_loc(&diode, &f, &[Rect::new(4000, 1000, 4600, 2000)]));
+    assert_eq!(row_orient(&f.rows, (5100, 1500)), "R0");
+    assert_eq!(row_orient(&f.rows, (5100, 1000)), "R0"); // on the row's edge: no row strictly contains it → default R0
+}
