@@ -18,6 +18,29 @@ use crate::overflow2d::Overflow2DScan;
 /// The reference's `BIG_INT`.
 const BIG_INT: i32 = 1_000_000_000;
 
+/// The timer's answer to `getNetSlack`, per net id, as the partial-slack pass reads it.
+#[derive(Debug, Clone, Copy)]
+pub enum TimerSlack<'a> {
+    /// No liberty library, or slacks not bound: a pass that reads them is refused.
+    None,
+    /// The same slacks at every call — no clock defined, so every net is unconstrained.
+    Every(&'a [f32]),
+    /// The timer's slacks captured at each `CalculatePartialSlack` call, in call order. ⛔ A call
+    /// beyond the captured ones is refused, never answered with a stale capture.
+    PerCall(&'a [Vec<f32>]),
+}
+
+impl<'a> TimerSlack<'a> {
+    /// The slacks for the `k`-th partial-slack call (from 0).
+    pub fn for_call(&self, k: usize) -> Option<&'a [f32]> {
+        match *self {
+            TimerSlack::None => None,
+            TimerSlack::Every(s) => Some(s),
+            TimerSlack::PerCall(v) => v.get(k).map(Vec::as_slice),
+        }
+    }
+}
+
 /// What run() carries into the loop from the pattern and monotonic phases.
 #[derive(Debug, Clone, Copy)]
 pub struct LoopStart {
@@ -102,7 +125,7 @@ pub fn congestion_loop(
     nets: &[RsmtNet<'_>],
     state: &mut [NetState],
     grid: &mut BrkGrid<'_>,
-    timer_slack: Option<&[f32]>,
+    timer_slack: TimerSlack<'_>,
     on: &mut dyn FnMut(&LoopEvent, &crate::graph2d::Graph2d, &[NetState]),
 ) -> Result<LoopEnd, String> {
     const ENLARGE: i32 = 15;
@@ -153,8 +176,14 @@ pub fn congestion_loop(
 
     // ⛔ The pass computes an `enlarge_` per edge, but into the router's MEMBER; run()'s loop uses a
     // LOCAL `int enlarge_` that shadows it, so the pass never changes the schedule's value.
+    // The partial-slack calls so far: each reads the timer afresh.
+    let partial_calls = std::cell::Cell::new(0usize);
     let pass = |grid: &mut BrkGrid<'_>, state: &mut [NetState], p: &MsmdParams| -> Result<(), String> {
-        slack_th.set(maze_route_msmd_sequential(p, net_ids, nets, state, grid, timer_slack)?.slack_th);
+        let k = partial_calls.get();
+        if p.ordering && p.critical_nets_percentage != 0.0 {
+            partial_calls.set(k + 1);
+        }
+        slack_th.set(maze_route_msmd_sequential(p, net_ids, nets, state, grid, timer_slack.for_call(k))?.slack_th);
         Ok(())
     };
 

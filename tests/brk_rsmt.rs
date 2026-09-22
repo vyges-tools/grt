@@ -652,7 +652,7 @@ fn replay_chain(who: &str, pass: usize, c5: &Value, c7: &Value, group: &[&Value]
         layer_dir: &dirs,
         resistance_aware: flag("resaware"),
         liberty: flag("liberty"),
-        timer_slack: None,
+        timer_slack: vyges_grt::congestion_loop::TimerSlack::None,
         origin,
         db_id: &db_id,
     };
@@ -1355,7 +1355,7 @@ fn the_congestion_loop_steps_enlarge_until_the_clamp() {
     assert!(scan.total_overflow > 0 && scan.total_overflow < 500);
     let start = LoopStart { pattern_max_overflow: 0, logistic_coef: 0.0, scan, overflow_iterations: 4, critical_nets_percentage: 0.0 };
     let mut expands = Vec::new();
-    let _ = congestion_loop(&start, &[0], &nets, &mut state, &mut grid, None, &mut |ev, _, _| {
+    let _ = congestion_loop(&start, &[0], &nets, &mut state, &mut grid, vyges_grt::congestion_loop::TimerSlack::None, &mut |ev, _, _| {
         if let LoopEvent::Before { params, .. } = ev {
             expands.push(params.expand);
         }

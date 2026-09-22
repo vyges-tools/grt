@@ -37,6 +37,9 @@ pub struct RouteOptions {
     pub liberty: Option<crate::liberty_clk::LibertyClocks>,
     /// `create_clock … [get_ports …]` — the clocks' source ports, over every clock defined.
     pub clock_sources: Vec<String>,
+    /// The timer's slacks captured from the reference at each partial-slack call, by net name —
+    /// the ORACLE for a run with a clock (this engine computes no timing).
+    pub captured_slacks: Option<Vec<std::collections::BTreeMap<String, f32>>>,
     pub critical_nets_percentage: f32,
     /// `set_global_routing_layer_adjustment *`.
     pub adjustment: f32,
@@ -68,6 +71,7 @@ impl RouteOptions {
             verbose: false,
             liberty: None,
             clock_sources: Vec::new(),
+            captured_slacks: None,
             critical_nets_percentage: 10.0,
             adjustment: 0.0,
             grid_origin: (0, 0),
@@ -769,8 +773,29 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         .collect();
     let slack = vec![(0.0f32, false); nets.len()];
     // getNetSlack: with no clock defined every net is unconstrained — the timer's INF (`1E+30F`).
-    // ⛔ With a clock the slacks are the timer's: none bound, so a partial-slack pass is refused.
-    let timer_slack = opts.liberty.as_ref().filter(|_| opts.clock_sources.is_empty()).map(|_| vec![1.0e30f32; nets.len()]);
+    // ⛔ With a clock the slacks are the timer's: only a capture answers them (a routed net missing
+    // from it is refused); without one a partial-slack pass is refused.
+    let unconstrained = vec![1.0e30f32; nets.len()];
+    let captured: Vec<Vec<f32>> = match (&opts.liberty, opts.clock_sources.is_empty(), &opts.captured_slacks) {
+        (Some(_), false, Some(calls)) => calls
+            .iter()
+            .map(|by_name| {
+                (0..nets.len())
+                    .map(|k| match by_name.get(&nets[k].name) {
+                        Some(&s) => Ok(s),
+                        None if nets[k].is_local => Ok(0.0), // never routed, never read
+                        None => Err(format!("net {}: no captured slack — not bound", nets[k].name)),
+                    })
+                    .collect::<Result<Vec<f32>, String>>()
+            })
+            .collect::<Result<_, _>>()?,
+        _ => Vec::new(),
+    };
+    let timer_slack = match (&opts.liberty, opts.clock_sources.is_empty(), &opts.captured_slacks) {
+        (Some(_), true, _) => crate::congestion_loop::TimerSlack::Every(&unconstrained),
+        (Some(_), false, Some(_)) => crate::congestion_loop::TimerSlack::PerCall(&captured),
+        _ => crate::congestion_loop::TimerSlack::None,
+    };
     // makeSteinerTree(net, …): the net's alpha — the min-fanout rule when set.
     let stt_net = |id: usize| {
         let n = &nets[id];
@@ -810,7 +835,7 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         layer_dir: &layer_dir,
         resistance_aware: false,
         liberty: opts.liberty.is_some(),
-        timer_slack: timer_slack.as_deref(),
+        timer_slack,
         origin: crate::routes::GridOrigin { tile_size: t.core.tile_size, x_corner: t.core.area.x_min, y_corner: t.core.area.y_min },
         db_id: &db_id,
     };

@@ -63,8 +63,8 @@ pub struct RunInputs<'a> {
     pub resistance_aware: bool,
     pub liberty: bool,
     /// The timer's slack per net id (`getNetSlack`, `sta::INF` = `1E+30F` when unconstrained), read
-    /// by the loop's partial-slack pass. `None` without a liberty library.
-    pub timer_slack: Option<&'a [f32]>,
+    /// by the loop's partial-slack pass.
+    pub timer_slack: crate::congestion_loop::TimerSlack<'a>,
     /// For R20's database units.
     pub origin: GridOrigin,
     /// Each net's database id, indexed by net id (R20's key).

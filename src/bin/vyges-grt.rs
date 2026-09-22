@@ -24,7 +24,9 @@ USAGE:
   vyges-grt --help
 
 JOB (JSON):
-  { \"lefs\": [..], \"liberty\": [..], \"def\": \"..\" | \"db\": \"..\", \"steps\": [ STEP, .. ] }
+  { \"lefs\": [..], \"liberty\": [..], \"def\": \"..\" | \"db\": \"..\", \"timer_slacks\": \"..\",
+    \"steps\": [ STEP, .. ] }
+  timer_slacks: slacks captured from a reference timer, `<call> <net> <f32 hex bits>` per line.
   With liberty and no clock every net is unconstrained; with a clock, a pass that reads slacks is refused.
   STEP is one of
     { \"cmd\": \"set_routing_layers\", \"signal\": [lo, hi], \"clock\": [lo, hi] }
@@ -137,6 +139,26 @@ fn run(job: &Value) -> Result<Value, Fail> {
         let path = lib.as_str().ok_or_else(|| err("a liberty path"))?;
         let text = std::fs::read_to_string(path).map_err(err)?;
         opts.liberty.get_or_insert_with(Default::default).read(&text).map_err(|e| Fail::Refused(format!("{path}: {e}")))?;
+    }
+    // timer_slacks — the reference timer's slacks at each partial-slack call, captured: one
+    // `<call> <net> <f32 bits in hex>` line per net per call. An ORACLE: no timing is computed here.
+    if let Some(path) = job["timer_slacks"].as_str() {
+        let mut calls: Vec<BTreeMap<String, f32>> = Vec::new();
+        for (n, line) in std::fs::read_to_string(path).map_err(err)?.lines().enumerate() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let bad = || err(format!("{path}:{}: expected `<call> <net> <bits>`", n + 1));
+            let [k, net, bits] = f[..] else { return Err(bad()) };
+            let k: usize = k.parse().map_err(|_| bad())?;
+            let v = f32::from_bits(u32::from_str_radix(bits, 16).map_err(|_| bad())?);
+            if k > calls.len() {
+                return Err(bad());
+            }
+            if k == calls.len() {
+                calls.push(BTreeMap::new());
+            }
+            calls[k].insert(net.to_string(), v);
+        }
+        opts.captured_slacks = Some(calls);
     }
     let mut guides: BTreeMap<String, Vec<(i32, i32, i32, i32, String)>> = BTreeMap::new();
     let mut calls = Vec::new();
