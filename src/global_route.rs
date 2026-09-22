@@ -545,6 +545,8 @@ pub struct RouterNet {
     pub alpha: f32,
     /// Each pin as `updateNetPins` left it, in the net's order.
     pub net_pins: Vec<NetPin>,
+    /// Per pin of [`net_pins`](Self::net_pins), whether it drives the net.
+    pub pin_is_driver: Vec<bool>,
     /// `dbNet::getTermCount()` — the Steiner builder's min-fanout test reads it.
     pub term_count: i32,
 }
@@ -682,6 +684,7 @@ pub fn setup_nets(db: &Db, t: &TechSetup, e: &mut RouterEdges, has_macros_or_pad
             // getAlpha: the net's own alpha, else the global one — FastRoute's path gate reads it.
             alpha: opts.net_alpha.get(&n.name).copied().unwrap_or(opts.alpha),
             net_pins: pins.iter().map(|(p, _)| p.clone()).collect(),
+            pin_is_driver: pins.iter().map(|(_, d)| *d).collect(),
             term_count: n.term_count,
         });
     }
@@ -728,8 +731,13 @@ pub struct RouteResult {
     /// net's RC network, built from the planar routes as they stood then. Empty when the run
     /// reached no such call.
     pub parasitics: std::collections::BTreeMap<String, crate::parasitics::Network>,
+    /// Each net's pins as the parasitics saw them — for a SPEF `*CONN` section.
+    pub parasitic_pins: std::collections::BTreeMap<String, Vec<crate::parasitics::PinGridLocation>>,
     /// The planar routes those networks were built from (`getPlanarRoutes`), by net.
     pub planar_routes: std::collections::BTreeMap<String, Vec<crate::parasitics::Segment>>,
+    /// The 2D tree those routes were read from, per net: each edge's ends, length and grid points
+    /// IN ORDER — what a route-by-route comparison against the reference needs.
+    pub snapshot_edges: std::collections::BTreeMap<String, Vec<SnapshotEdge>>,
     pub log: Vec<String>,
 }
 
@@ -762,6 +770,16 @@ fn compute_hpwl(db: &Db, net: &str) -> Result<i32, String> {
         add(x, y);
     }
     Ok((x1 - x0) + (y1 - y0))
+}
+
+/// One 2D tree edge at the snapshot: its ends, length, and the route's grid points in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotEdge {
+    pub n1: usize,
+    pub n2: usize,
+    pub len: i32,
+    pub routelen: i32,
+    pub grids: Vec<(i32, i32)>,
 }
 
 /// The Steiner tree builder as R5 calls it: pins, driver index, the net's alpha.
@@ -1009,7 +1027,9 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     };
     // est::estimateAllGlobalRouteParasitics, on the planar routes the first partial-slack call saw.
     let mut parasitics = std::collections::BTreeMap::new();
+    let mut parasitic_pins: std::collections::BTreeMap<String, Vec<crate::parasitics::PinGridLocation>> = std::collections::BTreeMap::new();
     let mut planar_routes: std::collections::BTreeMap<String, Vec<crate::parasitics::Segment>> = std::collections::BTreeMap::new();
+    let mut snapshot_edges: std::collections::BTreeMap<String, Vec<SnapshotEdge>> = std::collections::BTreeMap::new();
     if let Some(trees) = &ov.trees {
         let rc = layer_rc(db);
         let origin = crate::routes::GridOrigin { tile_size: t.core.tile_size, x_corner: t.core.area.x_min, y_corner: t.core.area.y_min };
@@ -1026,7 +1046,8 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
             let pins: Vec<crate::parasitics::PinGridLocation> = n
                 .net_pins
                 .iter()
-                .map(|p| crate::parasitics::PinGridLocation { name: p.name.clone(), pt: p.position, grid_pt: p.on_grid, conn_layer: p.connection_layer })
+                .zip(&n.pin_is_driver)
+                .map(|(p, &is_driver)| crate::parasitics::PinGridLocation { name: p.name.clone(), is_port: p.is_port, is_driver, pt: p.position, grid_pt: p.on_grid, conn_layer: p.connection_layer })
                 .collect();
             let np = crate::parasitics::NetParasitics {
                 name: &n.name,
@@ -1037,7 +1058,16 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
                 ndr_width: None,
             };
             parasitics.insert(n.name.clone(), crate::parasitics::estimate_net(&np, &rc));
+            parasitic_pins.insert(n.name.clone(), pins.clone());
             planar_routes.insert(n.name.clone(), route);
+            snapshot_edges.insert(
+                n.name.clone(),
+                tree.edges
+                    .iter()
+                    .zip(&tree.routes)
+                    .map(|(e, rt)| SnapshotEdge { n1: e.n1, n2: e.n2, len: e.len, routelen: rt.routelen, grids: rt.grids[..=(rt.routelen.max(0) as usize).min(rt.grids.len().saturating_sub(1))].to_vec() })
+                    .collect(),
+            );
         }
     }
     // F — findRouting's post-processing: remaining guides, pad pins (inert), then each merge.
@@ -1075,5 +1105,5 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     let save = crate::SaveOptions { guide_is_congested, origin_x: opts.grid_origin.0, origin_y: opts.grid_origin.1, min_routing_layer: t.min_routing_layer };
     let guides = crate::save_guides(&net_routes, &grid, &save).map_err(|e| format!("{e:?}"))?;
     let layer_names = t.tech.routing_layers.iter().map(|l| (l.routing_level, l.name.clone())).collect();
-    Ok(RouteResult { guides, layer_names, total_overflow, guide_is_congested, routes: raw_routes, clock_nets, parasitics, planar_routes, log })
+    Ok(RouteResult { guides, layer_names, total_overflow, guide_is_congested, routes: raw_routes, clock_nets, parasitics, parasitic_pins, planar_routes, snapshot_edges, log })
 }

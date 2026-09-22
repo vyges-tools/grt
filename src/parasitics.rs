@@ -28,13 +28,23 @@ pub struct Segment {
 }
 
 impl Segment {
+    /// `GSegment::GSegment(x0, y0, l0, x1, y1, l1)`.
+    ///
+    /// ⛔ The COORDINATES are sorted — `init` takes the minimum of each, `final` the maximum — so
+    /// a segment built from a route walked backwards is stored forwards. The LAYERS are not:
+    /// `init_layer` is `l0` whichever way round it is. Without this the parasitic nodes are
+    /// created in the other order and every node of the net is numbered differently.
+    pub fn new(x0: i32, y0: i32, l0: i32, x1: i32, y1: i32, l1: i32) -> Self {
+        Segment { init_x: x0.min(x1), init_y: y0.min(y1), init_layer: l0, final_x: x0.max(x1), final_y: y0.max(y1), final_layer: l1 }
+    }
     /// `GSegment::length` — the Manhattan length in dbu, zero for a via.
     pub fn length(&self) -> i32 {
         (self.init_x - self.final_x).abs() + (self.init_y - self.final_y).abs()
     }
-    /// `GSegment::isVia` — ⚠️ a zero-length segment that changes layer.
+    /// `GSegment::isVia` — ⚠️ the two ENDS coincide; the layers are not consulted, so a
+    /// zero-length segment on one layer is a via too.
     pub fn is_via(&self) -> bool {
-        self.init_layer != self.final_layer && self.length() == 0
+        self.init_x == self.final_x && self.init_y == self.final_y
     }
 }
 
@@ -43,6 +53,11 @@ impl Segment {
 pub struct PinGridLocation {
     /// The pin's own name, as the parasitic node is named after it.
     pub name: String,
+    /// Which of `PinGridLocation`'s two terminals this is — a block terminal (a port) or an
+    /// instance terminal.
+    pub is_port: bool,
+    /// Whether the pin drives the net. ⚠️ Not read here; carried for a SPEF `*CONN` direction.
+    pub is_driver: bool,
     /// `Pin::getPosition` — dbu.
     pub pt: (i32, i32),
     /// `Pin::getOnGridPosition` — dbu.
@@ -345,7 +360,7 @@ mod tests {
     fn a_pin_attaches_through_the_via_layer_when_one_is_routed() {
         let rc = rc();
         let route = [seg(0, 0, 2, 1000, 0, 2)];
-        let pins = [PinGridLocation { name: "i/A".into(), pt: (0, 500), grid_pt: (0, 0), conn_layer: 1 }];
+        let pins = [PinGridLocation { name: "i/A".into(), is_port: false, is_driver: false, pt: (0, 500), grid_pt: (0, 0), conn_layer: 1 }];
         let net = NetParasitics { name: "n", route: &route, pins: &pins, net_min_layer: 1, min_routing_layer: 1, ndr_width: None };
         let g = estimate_net(&net, &rc);
         let (r, c) = rc.layer_rc(500, 2, None);
@@ -358,7 +373,7 @@ mod tests {
     fn a_pin_attaches_on_its_own_layer_without_a_via() {
         let rc = rc();
         let route = [seg(0, 0, 1, 1000, 0, 1)];
-        let pins = [PinGridLocation { name: "i/A".into(), pt: (0, 500), grid_pt: (0, 0), conn_layer: 1 }];
+        let pins = [PinGridLocation { name: "i/A".into(), is_port: false, is_driver: false, pt: (0, 500), grid_pt: (0, 0), conn_layer: 1 }];
         let net = NetParasitics { name: "n", route: &route, pins: &pins, net_min_layer: 1, min_routing_layer: 1, ndr_width: None };
         let g = estimate_net(&net, &rc);
         let (r, _) = rc.layer_rc(500, 1, None);
@@ -370,7 +385,7 @@ mod tests {
     fn a_zero_length_attachment_is_floored() {
         let rc = rc();
         let route = [seg(0, 0, 1, 1000, 0, 1)];
-        let pins = [PinGridLocation { name: "i/A".into(), pt: (0, 0), grid_pt: (0, 0), conn_layer: 1 }];
+        let pins = [PinGridLocation { name: "i/A".into(), is_port: false, is_driver: false, pt: (0, 0), grid_pt: (0, 0), conn_layer: 1 }];
         let net = NetParasitics { name: "n", route: &route, pins: &pins, net_min_layer: 1, min_routing_layer: 1, ndr_width: None };
         let g = estimate_net(&net, &rc);
         assert_eq!(g.resistors.last(), Some(&(NodeId::Pin("i/A".into()), NodeId::Point(0), 1.0e-3)));
@@ -381,7 +396,7 @@ mod tests {
     fn a_pin_with_no_grid_node_is_warned_about() {
         let rc = rc();
         let route = [seg(0, 0, 1, 1000, 0, 1)];
-        let pins = [PinGridLocation { name: "i/A".into(), pt: (9000, 9000), grid_pt: (9000, 9000), conn_layer: 1 }];
+        let pins = [PinGridLocation { name: "i/A".into(), is_port: false, is_driver: false, pt: (9000, 9000), grid_pt: (9000, 9000), conn_layer: 1 }];
         let net = NetParasitics { name: "n", route: &route, pins: &pins, net_min_layer: 1, min_routing_layer: 1, ndr_width: None };
         let g = estimate_net(&net, &rc);
         assert!(g.warnings.iter().any(|w| w.contains("EST-0350")), "{:?}", g.warnings);

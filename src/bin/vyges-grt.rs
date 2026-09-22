@@ -42,6 +42,7 @@ JOB (JSON):
     { \"cmd\": \"set_layer_rc\", \"layer\" | \"via\": name, \"resistance\": f } (user units)
     { \"cmd\": \"propagated_clock\" }
     { \"cmd\": \"write_parasitics\", \"path\": \"..\" }       (the networks the slacks are read from)
+    { \"cmd\": \"write_spef\", \"path\": \"..\" }             (the same networks, as SPEF)
     { \"cmd\": \"write_guides\", \"path\": \"..\" }
 
 EXIT STATUS:
@@ -177,7 +178,9 @@ fn run(job: &Value) -> Result<Value, Fail> {
     }
     let mut guides: BTreeMap<String, Vec<(i32, i32, i32, i32, String)>> = BTreeMap::new();
     let mut parasitics: BTreeMap<String, vyges_grt::parasitics::Network> = BTreeMap::new();
+    let mut parasitic_pins: BTreeMap<String, Vec<vyges_grt::parasitics::PinGridLocation>> = BTreeMap::new();
     let mut planar_routes: BTreeMap<String, Vec<vyges_grt::parasitics::Segment>> = BTreeMap::new();
+    let mut snapshot_edges: BTreeMap<String, Vec<vyges_grt::global_route::SnapshotEdge>> = BTreeMap::new();
     let mut calls = Vec::new();
     let mut log = Vec::new();
     for step in job["steps"].as_array().ok_or_else(|| err("steps"))? {
@@ -271,7 +274,9 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 let res = route_design(&mut db, &opts, &stt, &flutes).map_err(|e| classify(e.to_string()))?;
                 // saveGuides replaces the guides of every net it routes; the others keep theirs.
                 parasitics = res.parasitics.clone();
+                parasitic_pins = res.parasitic_pins.clone();
                 planar_routes = res.planar_routes.clone();
+                snapshot_edges = res.snapshot_edges.clone();
                 for ng in &res.guides {
                     guides.insert(ng.net.clone(), ng.guides.iter().map(|g| (g.box_.x_min, g.box_.y_min, g.box_.x_max, g.box_.y_max, res.layer_names[&g.layer].clone())).collect());
                 }
@@ -331,6 +336,12 @@ fn run(job: &Value) -> Result<Value, Fail> {
             "write_parasitics" => {
                 let path = step["path"].as_str().ok_or_else(|| err("path"))?;
                 let mut text = String::new();
+                for (net, edges) in &snapshot_edges {
+                    for (e, ed) in edges.iter().enumerate() {
+                        let g: String = ed.grids.iter().map(|(x, y)| format!("{x},{y};")).collect();
+                        text.push_str(&format!("{net}|edge|{e}|n1={}|n2={}|len={}|rl={}|g={g}\n", ed.n1, ed.n2, ed.len, ed.routelen));
+                    }
+                }
                 for (net, route) in &planar_routes {
                     for sg in route {
                         text.push_str(&format!("{net}|seg|{}|{}|{}|{}|{}|{}\n", sg.init_x, sg.init_y, sg.init_layer, sg.final_x, sg.final_y, sg.final_layer));
@@ -349,6 +360,63 @@ fn run(job: &Value) -> Result<Value, Fail> {
                     for (n1, n2, res) in &g.resistors {
                         text.push_str(&format!("{net}|res|{}|{}|{:.8e}\n", name(n1), name(n2), res));
                     }
+                }
+                std::fs::write(path, text).map_err(err)?;
+            }
+            // The same networks as SPEF, for a timer that reads one.
+            //
+            // ⛔ Every node's ground capacitance is written, pin nodes included — OpenROAD's own
+            // writer emits `*CAP` only for nodes with no pin, so its file understates the load
+            // and no longer sums to its own `*D_NET` total (OpenROAD #11482).
+            "write_spef" => {
+                let path = step["path"].as_str().ok_or_else(|| err("path"))?;
+                let mut text = String::from(
+                    "*SPEF \"ieee 1481-1999\"\n*DESIGN \"vyges-grt\"\n*DATE \"\"\n*VENDOR \"Vyges\"\n*PROGRAM \"vyges-grt\"\n*VERSION \"1.0\"\n\
+                     *DESIGN_FLOW \"NAME_SCOPE LOCAL\" \"PIN_CAP NONE\"\n*DIVIDER /\n*DELIMITER :\n*BUS_DELIMITER []\n\
+                     *T_UNIT 1 NS\n*C_UNIT 1 PF\n*R_UNIT 1 KOHM\n*L_UNIT 1 HENRY\n\n",
+                );
+                for (net, g) in &parasitics {
+                    // A parasitic node is `<instance>:<terminal>` for a pin, `<net>:<id>` otherwise.
+                    let pin_name = |p: &str| match p.rfind('/') {
+                        Some(i) => format!("{}:{}", &p[..i], &p[i + 1..]),
+                        None => p.to_string(),
+                    };
+                    let node_name = |n: &vyges_grt::parasitics::NodeId| match n {
+                        vyges_grt::parasitics::NodeId::Pin(p) => pin_name(p),
+                        vyges_grt::parasitics::NodeId::Point(i) => format!("{net}:{}", i + 1),
+                    };
+                    // ⚠️ Only `$` is escaped; the database's names already carry their bracket escapes.
+                    let esc = |s: &str| s.replace('$', "\\$");
+                    let total: f64 = g.nodes.iter().map(|(_, c)| f64::from(*c)).sum();
+                    text.push_str(&format!("*D_NET {} {}\n*CONN\n", esc(net), total * 1e12));
+                    let pins = parasitic_pins.get(net).cloned().unwrap_or_default();
+                    for (n, _) in &g.nodes {
+                        if let vyges_grt::parasitics::NodeId::Pin(p) = n {
+                            let pin = pins.iter().find(|q| &q.name == p);
+                            let dir = if pin.is_some_and(|q| q.is_driver) { "O" } else { "I" };
+                            // A port is `*P`, an instance terminal `*I`; a port's direction is
+                            // the other way round, since a driving port feeds the net.
+                            if pin.is_some_and(|q| q.is_port) {
+                                text.push_str(&format!("*P {} {}\n", esc(p), if dir == "O" { "I" } else { "O" }));
+                            } else {
+                                text.push_str(&format!("*I {} {}\n", esc(&pin_name(p)), dir));
+                            }
+                        }
+                    }
+                    let caps: Vec<&(vyges_grt::parasitics::NodeId, f32)> = g.nodes.iter().filter(|(_, c)| *c != 0.0).collect();
+                    if !caps.is_empty() {
+                        text.push_str("*CAP\n");
+                        for (i, (n, c)) in caps.iter().enumerate() {
+                            text.push_str(&format!("{} {} {}\n", i + 1, esc(&node_name(n)), f64::from(*c) * 1e12));
+                        }
+                    }
+                    if !g.resistors.is_empty() {
+                        text.push_str("*RES\n");
+                        for (i, (a, b, v)) in g.resistors.iter().enumerate() {
+                            text.push_str(&format!("{} {} {} {}\n", i + 1, esc(&node_name(a)), esc(&node_name(b)), f64::from(*v) / 1000.0));
+                        }
+                    }
+                    text.push_str("*END\n\n");
                 }
                 std::fs::write(path, text).map_err(err)?;
             }

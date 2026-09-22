@@ -42,7 +42,7 @@ fn record_layer_and_bridge(x: i32, y: i32, new_layer: i32, seen: &mut BTreeMap<(
     if let Some(&prev) = seen.get(&(x, y)) {
         if (prev - new_layer).abs() == 1 {
             let (lo, hi) = (prev.min(new_layer), prev.max(new_layer));
-            push_unique(out, Segment { init_x: x, init_y: y, init_layer: lo + 1, final_x: x, final_y: y, final_layer: hi + 1 });
+            push_unique(out, Segment::new(x, y, lo + 1, x, y, hi + 1));
         }
     }
     seen.insert((x, y), new_layer);
@@ -80,16 +80,16 @@ pub fn planar_route(edges: &[PlanarEdge<'_>], net_min_layer: usize, layer_dir: &
             if last_x == xreal {
                 // A vertical step: change layer first if the walk was horizontal.
                 if last_l == layer_h {
-                    push_unique(&mut out, Segment { init_x: last_x, init_y: last_y, init_layer: last_l + 1, final_x: last_x, final_y: last_y, final_layer: layer_v + 1 });
+                    push_unique(&mut out, Segment::new(last_x, last_y, last_l + 1, last_x, last_y, layer_v + 1));
                 }
                 last_l = layer_v;
-                seg = Segment { init_x: last_x, init_y: last_y, init_layer: last_l + 1, final_x: xreal, final_y: yreal, final_layer: last_l + 1 };
+                seg = Segment::new(last_x, last_y, last_l + 1, xreal, yreal, last_l + 1);
             } else {
                 if last_l == layer_v {
-                    push_unique(&mut out, Segment { init_x: last_x, init_y: last_y, init_layer: last_l + 1, final_x: last_x, final_y: last_y, final_layer: layer_h + 1 });
+                    push_unique(&mut out, Segment::new(last_x, last_y, last_l + 1, last_x, last_y, layer_h + 1));
                 }
                 last_l = layer_h;
-                seg = Segment { init_x: last_x, init_y: last_y, init_layer: last_l + 1, final_x: xreal, final_y: yreal, final_layer: last_l + 1 };
+                seg = Segment::new(last_x, last_y, last_l + 1, xreal, yreal, last_l + 1);
             }
             (last_x, last_y) = (xreal, yreal);
             push_unique(&mut out, seg);
@@ -109,6 +109,19 @@ mod tests {
     fn dirs() -> Vec<LayerDir> {
         // level 0 horizontal, 1 vertical, 2 horizontal …
         vec![LayerDir::Horizontal, LayerDir::Vertical, LayerDir::Horizontal, LayerDir::Vertical]
+    }
+
+    // ⛔ A route walked backwards still stores its segments forwards: the constructor sorts the
+    // coordinates, which is what keeps the parasitic node numbering in the reference's order.
+    #[test]
+    fn a_backwards_walk_stores_its_segments_forwards() {
+        let fwd = [(0, 0), (1, 0), (2, 0)];
+        let back = [(2, 0), (1, 0), (0, 0)];
+        let a = planar_route(&[PlanarEdge { len: 2, routelen: 2, grids: &fwd }], 0, &dirs(), ORIGIN);
+        let b = planar_route(&[PlanarEdge { len: 2, routelen: 2, grids: &back }], 0, &dirs(), ORIGIN);
+        assert!(a.iter().all(|s| s.init_x <= s.final_x && s.init_y <= s.final_y));
+        assert_eq!(a.iter().map(|s| (s.init_x, s.final_x)).collect::<Vec<_>>(), [(50, 150), (150, 250)]);
+        assert_eq!(b.iter().map(|s| (s.init_x, s.final_x)).collect::<Vec<_>>(), [(150, 250), (50, 150)]);
     }
 
     // A straight horizontal edge: one segment on the horizontal pseudo-layer, no via.
