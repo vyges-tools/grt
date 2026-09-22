@@ -9,7 +9,7 @@
 //! Exit status: 0 routed (report on stdout), 1 refused (a feature this engine does not model yet —
 //! named in the report), 2 usage or read error.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::ExitCode;
 
 use serde_json::{json, Value};
@@ -468,7 +468,7 @@ fn read_violation_blocks(path: &str) -> Result<Vec<Vec<Viol>>, Fail> {
 /// `saveGuides` over the nets that got jumpers → the second check. Diode insertion, and a second
 /// iteration with violations left, are refused.
 #[allow(clippy::too_many_arguments)]
-fn repair_antennas(db: &mut Db, step: &Value, state: &mut vyges_grt::global_route::AfterRoute, total_overflow: i32, db_guides: &BTreeMap<String, Vec<vyges_grt::Guide>>, from_db: bool, padding: (i32, i32), log: &mut Vec<String>) -> Result<Vec<vyges_grt::NetGuides>, Fail> {
+fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, state: &mut vyges_grt::global_route::AfterRoute, total_overflow: i32, db_guides: &BTreeMap<String, Vec<vyges_grt::Guide>>, from_db: bool, padding: (i32, i32), log: &mut Vec<String>) -> Result<Vec<vyges_grt::NetGuides>, Fail> {
     use vyges_grt::repair_antennas::{jumper_insertion, AntViolation, FastRouteJumpers, GatePin, JumperInputs, NetViolations};
     let jumper_only = step["jumper_only"].as_bool().unwrap_or(false);
     let diode_only = step["diode_only"].as_bool().unwrap_or(false);
@@ -570,6 +570,8 @@ fn repair_antennas(db: &mut Db, step: &Value, state: &mut vyges_grt::global_rout
     second.sort_by_key(|(n, ..)| order.iter().position(|m| m == n).unwrap_or(usize::MAX));
     if !second.is_empty() && !jumper_only {
         let mut text = String::new();
+        // What the router's callbacks will see move: every instance's location and orientation.
+        let placed_before: BTreeMap<String, ((i32, i32), String)> = db.inst_names().into_iter().map(|i| (i.clone(), (db.inst_location(&i), db.inst_get_orient(&i)))).collect();
         let diodes = insert_diodes(db, &second, padding, &mut text, log)?;
         let gates: Vec<String> = second.iter().flat_map(|v| v.2.iter().map(|g| g.rsplit_once('/').map_or(g.clone(), |p| p.0.to_string()))).collect();
         let legalized = legalize_placed_cells(db, padding, &diodes, &gates, &mut text);
@@ -578,7 +580,55 @@ fn repair_antennas(db: &mut Db, step: &Value, state: &mut vyges_grt::global_rout
         }
         legalized?;
         log.push(format!("GRT-0015: Inserted {} diodes.", diodes.len()));
-        return Err(Fail::Refused(format!("the incremental re-route after diode insertion is not modelled ({} diodes placed and legalized)", diodes.len())));
+        // dirty_nets_ (a PtrSet: dbNet order) — the nets given diodes (addDirtyNet, and the diode's
+        // inDbITermPostConnect), and every net on an instance the legalization moved or flipped
+        // (inDbPostMoveInst; updateDbInstLocations writes only what changed). Special nets and
+        // nets the router does not know are never added.
+        let mut dirty: BTreeSet<String> = second.iter().filter(|v| v.3 > 0).map(|v| v.0.clone()).collect();
+        for (inst, before) in &placed_before {
+            if (db.inst_location(inst), db.inst_get_orient(inst)) != *before {
+                for (term, _) in db.master_mterms(&db.inst_get_master(inst)).map_err(err)? {
+                    let net = db.iterm_get_net(inst, &term);
+                    if !net.is_empty() && !db.net_is_special(&net) {
+                        dirty.insert(net);
+                    }
+                }
+            }
+        }
+        let known: BTreeSet<&str> = state.router_nets.iter().map(|n| n.name.as_str()).collect();
+        let nets_to_repair: Vec<String> = order.iter().filter(|n| dirty.contains(*n) && known.contains(n.as_str())).cloned().collect();
+        // IncrementalGRoute::updateRoutes → updateDirtyRoutesFastRoute, with this command's
+        // allow_congestion.
+        let mut ropts = opts.clone();
+        ropts.allow_congestion = allow_congestion;
+        let mut incr_text = String::new();
+        let mut obs = |tag: &str, a: &vyges_grt::global_route::AfterRoute| {
+            if step["incr_trace"].is_string() {
+                incr_text.push_str(&vyges_grt::global_route::router_state_text(tag, a).unwrap_or_default());
+            }
+        };
+        let rerouted = vyges_grt::global_route::update_dirty_routes_fast_route(db, &ropts, state, &nets_to_repair, &stt, &flutes, &mut obs);
+        if let Some(path) = step["incr_trace"].as_str() {
+            std::fs::write(path, &incr_text).map_err(err)?;
+        }
+        let rerouted = rerouted.map_err(|e| Fail::Refused(e.to_string()))?;
+        for n in &rerouted {
+            text.push_str(&format!("VYGD|dirty|{n}\n"));
+        }
+        for n in &rerouted {
+            let r = state.net_routes.iter().find(|r| &r.name == n).ok_or_else(|| err(format!("net {n} has no route")))?;
+            for (i, g) in r.segments.iter().enumerate() {
+                text.push_str(&format!("VYGD|route|{n}|{i}|{},{},{}|{},{},{}\n", g.init_x, g.init_y, g.init_layer, g.final_x, g.final_y, g.final_layer));
+            }
+        }
+        if let Some(path) = step["diode_trace"].as_str() {
+            std::fs::write(path, &text).map_err(err)?;
+        }
+        // saveGuides(nets_to_repair): every dirty net, re-routed or not.
+        let mut sopts = state.save_options;
+        sopts.guide_is_congested = total_overflow > 0 && !allow_congestion;
+        let modified: Vec<vyges_grt::NetRoute> = nets_to_repair.iter().filter_map(|n| state.net_routes.iter().find(|r| &r.name == n).cloned()).collect();
+        saved.extend(vyges_grt::save_guides(&modified, &state.jumper_grid.grid, &sopts).map_err(|e| err(format!("{e:?}")))?);
     }
     if !second.is_empty() && iterations > 1 {
         return Err(Fail::Refused("a second repair iteration is not modelled".into()));
@@ -1164,6 +1214,13 @@ fn run(job: &Value) -> Result<Value, Fail> {
                     }
                 }
             }
+            // FastRoute's whole state where the first run ended, in the instrumented reference's
+            // `VYGI|end|…` format (grt-incr-trace.py) — what an incremental re-route starts from.
+            "router_state" => {
+                let (state, _) = after.as_ref().ok_or_else(|| Fail::Refused("router_state without a global_route in this session".into()))?;
+                let path = step["path"].as_str().ok_or_else(|| err("path"))?;
+                std::fs::write(path, vyges_grt::global_route::router_state_text("end", state).map_err(Fail::Refused)?).map_err(err)?;
+            }
             "placement_padding" => {
                 padding = (step["left"].as_i64().unwrap_or(0) as i32, step["right"].as_i64().unwrap_or(0) as i32);
             }
@@ -1171,7 +1228,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 // ⚠️ Not GRT-45: the reference also repairs from routes a database brought with it
                 // (`have_routes` after read_db). That path is not modelled.
                 let (state, total_overflow) = after.as_mut().ok_or_else(|| Fail::Refused("repair_antennas without a global_route in this session: routes read from a database are not modelled".into()))?;
-                let repaired = repair_antennas(&mut db, step, state, *total_overflow, &db_guides, from_db, padding, &mut log)?;
+                let repaired = repair_antennas(&mut db, &opts, step, state, *total_overflow, &db_guides, from_db, padding, &mut log)?;
                 for ng in repaired {
                     guides.insert(ng.net.clone(), ng.guides.iter().map(|g| (g.box_.x_min, g.box_.y_min, g.box_.x_max, g.box_.y_max, db_layer_name(&db, g.layer))).collect());
                     db_guides.insert(ng.net.clone(), ng.guides);

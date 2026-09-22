@@ -71,6 +71,11 @@ pub struct RunInputs<'a> {
     pub origin: GridOrigin,
     /// Each net's database id, indexed by net id (R20's key).
     pub db_id: &'a [u32],
+    /// An incremental run (`is_incremental_grt_`): the 2D and 3D graphs the last run, the jumpers
+    /// and the rip-ups left. ⛔ The only incremental branch outside resistance-aware routing is
+    /// `rebuildUsedGrids`: the used sets are cleared and refilled from COMMITTED usage (`> 0`), not
+    /// left as the last run's.
+    pub resume: Option<(&'a Graph2d, &'a Graph3d)>,
 }
 
 /// One boundary of the run, as the observer sees it.
@@ -132,7 +137,10 @@ pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn 
     let (ids, nets) = (inp.net_ids, inp.nets);
     let max_layer = ids.iter().map(|&id| nets[id].max_layer).max().unwrap_or(0);
     let num_layers = inp.caps.layers.len().max(max_layer + 1);
-    let mut g2d = graph_2d(inp, num_layers);
+    let mut g2d = match inp.resume {
+        Some((g, _)) => resumed_graph_2d(g),
+        None => graph_2d(inp, num_layers),
+    };
     for &id in ids {
         state[id].seglist.clear();
         (state[id].slack, state[id].critical) = inp.slack[id];
@@ -211,7 +219,10 @@ pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn 
     let scan = g2d.get_overflow_2d_maze();
     stop_unless!(Stage::Scan { tag: "B15", scan: &scan }, None);
     // R16
-    let mut g3 = graph_3d(inp.caps, xg, yg);
+    let mut g3 = match inp.resume {
+        Some((_, g)) => g.clone(),
+        None => graph_3d(inp.caps, xg, yg),
+    };
     let ra = inp.res_aware.as_ref().map(|r| {
         std::cell::RefCell::new(crate::finalize::ResAware {
             tech: r.tech.clone(),
@@ -272,6 +283,29 @@ fn graph_2d(inp: &RunInputs<'_>, num_layers: usize) -> Graph2d {
     g.ndr = ledger;
     g.cap_h = inp.cap_h.to_vec();
     g.cap_v = inp.cap_v.to_vec();
+    g
+}
+
+/// The 2D graph an incremental run starts from: `clearUsed`, then `rebuildUsedGrids` — every
+/// horizontal edge `x < xg-1` and vertical edge `y < yg-1` with committed usage above zero.
+pub fn resumed_graph_2d(g: &Graph2d) -> Graph2d {
+    let mut g = g.clone();
+    g.clear_used();
+    let (xg, yg) = (g.est.x_grids, g.est.y_grids);
+    for x in 0..xg.saturating_sub(1) {
+        for y in 0..yg {
+            if g.est.usage_h(x, y) > 0 {
+                g.used_h.insert((x as i32, y as i32));
+            }
+        }
+    }
+    for x in 0..xg {
+        for y in 0..yg.saturating_sub(1) {
+            if g.est.usage_v(x, y) > 0 {
+                g.used_v.insert((x as i32, y as i32));
+            }
+        }
+    }
     g
 }
 

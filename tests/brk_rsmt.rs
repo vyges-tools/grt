@@ -656,6 +656,7 @@ fn replay_chain(who: &str, pass: usize, c5: &Value, c7: &Value, group: &[&Value]
         res_aware: None,
         origin,
         db_id: &db_id,
+        resume: None,
     };
     let maze_stripped = bounds.and_then(|b| b["maze_stripped"].as_bool()).unwrap_or(false);
     let mut obs = ChainCheck { at: &at, c5, c7, cn: &cn, nets: &nets, red: (&red_h, &red_v), ndr, at_b: &at_b, b15, maze_stripped, pass_pres: &pass_pres, prev_scan: None, befores: 0, resistance_aware: flag("resaware"), seen };

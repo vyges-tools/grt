@@ -752,6 +752,28 @@ pub struct AfterRoute {
     /// The 3D edges at the end of the run (`h_edges_3D_` / `v_edges_3D_`). `None` when the run did
     /// not reach R19.
     pub final_3d: Option<Graph3d>,
+    /// The 2D graph at the end of the run (usage, estimate, history, used sets).
+    pub final_2d: Option<crate::graph2d::Graph2d>,
+    /// Every net's router state at the end of the run, by FastRoute id — its final 3D tree is what a
+    /// rip-up releases.
+    pub final_state: Vec<crate::brk_rsmt::NetState>,
+    /// The 2D edge reductions and the 3D capacities the run used: an incremental run keeps them
+    /// (`initFastRoute` is not repeated).
+    pub red_h: Vec<u16>,
+    pub red_v: Vec<u16>,
+    pub caps: crate::brk_rsmt::Caps3D,
+    /// The 3D edges as the adjustments left them (`cap` reduced, `red` the reduction), per layer
+    /// `[l * x_grid * y_grid + y * x_grid + x]`.
+    pub edges_3d: (Vec<crate::adjust::EdgeState>, Vec<crate::adjust::EdgeState>),
+    /// The nets as the router received them, by FastRoute id, and the ids it routed, in order.
+    pub router_nets: Vec<RouterNet>,
+    pub net_ids: Vec<usize>,
+    /// `h_capacity_` / `v_capacity_`, each routing level's direction, and the last run's final
+    /// overflow (`totalOverflow()`).
+    pub h_capacity: i32,
+    pub v_capacity: i32,
+    pub layer_dir: Vec<crate::layertable::LayerDir>,
+    pub total_overflow: i32,
     /// `saveGuides`' input: `routes_` after F, per net in block order, with the pin facts.
     pub net_routes: Vec<crate::NetRoute>,
     pub jumper_grid: crate::repair_antennas::JumperGrid,
@@ -759,6 +781,22 @@ pub struct AfterRoute {
     /// `getLayerEdgeCost` per net, by 0-based layer.
     pub layer_edge_cost: std::collections::BTreeMap<String, Vec<i8>>,
     pub max_routing_layer: i32,
+}
+
+/// `makeSteinerTree(net, …)`'s alpha: the net's own, else — ⛔ an else-if chain — the min-HPWL rule
+/// whenever one is set (the min-fanout rule is then never consulted), else the min-fanout rule.
+/// `hpwl` is the net's [`compute_hpwl`], asked only when the min-HPWL rule decides.
+fn steiner_alpha(opts: &RouteOptions, n: &RouterNet, hpwl: Option<i32>) -> f32 {
+    if opts.net_alpha.contains_key(&n.name) {
+        n.alpha
+    } else if let Some((min, a)) = opts.min_hpwl_alpha.filter(|&(h, _)| h > 0) {
+        if hpwl.expect("computed for every net the min-HPWL rule decides") >= min { a } else { n.alpha }
+    } else {
+        match opts.min_fanout_alpha {
+            Some((min_fanout, a)) if min_fanout > 0 && n.term_count - 1 >= min_fanout => a,
+            _ => n.alpha,
+        }
+    }
 }
 
 /// `SteinerTreeBuilder::computeHPWL`: the bounding box of every instance terminal's average pin
@@ -946,20 +984,7 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
             .collect::<Result<_, _>>()?,
         None => Vec::new(),
     };
-    let stt_net = |id: usize| {
-        let n = &nets[id];
-        let alpha = if opts.net_alpha.contains_key(&n.name) {
-            n.alpha
-        } else if let Some((min, a)) = min_hpwl {
-            if hpwl[id].expect("computed above") >= min { a } else { n.alpha }
-        } else {
-            match opts.min_fanout_alpha {
-                Some((min_fanout, a)) if min_fanout > 0 && n.term_count - 1 >= min_fanout => a,
-                _ => n.alpha,
-            }
-        };
-        stt(&pins[id].0, &pins[id].1, n.root, alpha)
-    };
+    let stt_net = |id: usize| stt(&pins[id].0, &pins[id].1, nets[id].root, steiner_alpha(opts, &nets[id], hpwl.get(id).copied().flatten()));
     let layer_dir: Vec<crate::layertable::LayerDir> = (1..=num_layers as i32)
         .map(|l| match t.tech.routing_layers.iter().find(|r| r.routing_level == l).and_then(|r| r.direction) {
             Some(crate::capacity::Direction::Horizontal) => crate::layertable::LayerDir::Horizontal,
@@ -994,6 +1019,7 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         res_aware,
         origin: crate::routes::GridOrigin { tile_size: t.core.tile_size, x_corner: t.core.area.x_min, y_corner: t.core.area.y_min },
         db_id: &db_id,
+        resume: None,
     };
     // ⛔ The parasitics read the estimator's table where it has a value, and the technology's own
     // only where it has none (`MakeWireParasitics::layerRC`).
@@ -1029,13 +1055,16 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         /// The 3D edges at R19 — nothing after it changes them, so they are what antenna repair's
         /// jumper pass reads (`hasAvailableResources`) and charges.
         g3: Option<Graph3d>,
+        /// The 2D graph at R19, for the same reason: an incremental re-route starts from it.
+        g2d: Option<crate::graph2d::Graph2d>,
     }
     impl RunObserver for Observer {
-        fn stage(&mut self, s: Stage<'_>, _: &crate::graph2d::Graph2d, g3: Option<&Graph3d>, st: &[NetState]) -> bool {
+        fn stage(&mut self, s: Stage<'_>, g2d: &crate::graph2d::Graph2d, g3: Option<&Graph3d>, st: &[NetState]) -> bool {
             match s {
                 Stage::B19(fin) => {
                     self.overflow = fin.overflow.total;
                     self.g3 = g3.cloned();
+                    self.g2d = Some(g2d.clone());
                 }
                 Stage::Loop(crate::congestion_loop::LoopEvent::Before { params, .. }) if params.ordering && self.cnp != 0.0 && self.trees.is_none() => {
                     self.trees = Some(st.iter().map(|n| n.tree.clone()).collect());
@@ -1046,7 +1075,7 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         }
     }
     let mut state = vec![NetState::default(); nets.len()];
-    let mut ov = Observer { overflow: 0, cnp: t.config.critical_nets_percentage, trees: None, g3: None };
+    let mut ov = Observer { overflow: 0, cnp: t.config.critical_nets_percentage, trees: None, g3: None, g2d: None };
     let routes = match fastroute_run(&inp, &mut state, &mut ov)? {
         RunEnd::Routed(r) => r,
         RunEnd::Stopped => return Err("run() stopped".into()),
@@ -1165,6 +1194,331 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     let layer_names = t.tech.routing_layers.iter().map(|l| (l.routing_level, l.name.clone())).collect();
     let jumper_grid = crate::repair_antennas::JumperGrid { grid, x_grids: t.core.x_grids, y_grids: t.core.y_grids };
     let layer_edge_cost = nets.iter().zip(&attrs).map(|(n, a)| (n.name.clone(), a.layer_edge_cost.clone())).collect();
-    let after = AfterRoute { final_3d: ov.g3, net_routes, jumper_grid, save_options: save, layer_edge_cost, max_routing_layer: t.max_routing_layer };
+    let after = AfterRoute {
+        final_3d: ov.g3,
+        final_2d: ov.g2d,
+        final_state: state,
+        red_h,
+        red_v,
+        caps,
+        edges_3d: (e.h3.clone(), e.v3.clone()),
+        router_nets: nets.clone(),
+        net_ids,
+        h_capacity: t.capacities.h_capacity,
+        v_capacity: t.capacities.v_capacity,
+        layer_dir: layer_dir.clone(),
+        total_overflow,
+        net_routes,
+        jumper_grid,
+        save_options: save,
+        layer_edge_cost,
+        max_routing_layer: t.max_routing_layer,
+    };
     Ok(RouteResult { guides, layer_names, total_overflow, guide_is_congested, routes: raw_routes, clock_nets, parasitics, routed_parasitics, parasitic_pins, planar_routes, snapshot_edges, log, after })
+}
+
+/// `VYGI|<tag>|…` — FastRoute's whole state in the format `grt-incr-trace.py` patches into
+/// `FastRouteCore::run` (`end` at a full run's exit, `incr` / `incrend` at an incremental run's
+/// entry and exit): every 2D edge, the used-grid sets, every 3D edge, then `net_ids_` in order.
+pub fn router_state_text(tag: &str, a: &AfterRoute) -> Result<String, String> {
+    use std::fmt::Write;
+    let (g2, g3) = match (&a.final_2d, &a.final_3d) {
+        (Some(g2), Some(g3)) => (g2, g3),
+        _ => return Err("the run did not reach R19".into()),
+    };
+    let (xg, yg, nl) = (g2.est.x_grids, g2.est.y_grids, g3.num_layers);
+    let mut t = String::new();
+    let _ = writeln!(t, "VYGI|{tag}|grid|{xg}|{yg}|{nl}");
+    for x in 0..xg.saturating_sub(1) {
+        for y in 0..yg {
+            let i = y * xg + x;
+            let est = crate::antenna_check::fmt_g17(g2.est.h(x, y));
+            let _ = writeln!(t, "VYGI|{tag}|h|{x},{y}|cap={}|usage={}|red={}|est={est}|last={}|cong={}", g2.cap_h[i], g2.est.usage_h(x, y), a.red_h[i], g2.est.last_usage_h(x, y), g2.est.cong_cnt_h(x, y));
+        }
+    }
+    for x in 0..xg {
+        for y in 0..yg.saturating_sub(1) {
+            let i = y * xg + x;
+            let est = crate::antenna_check::fmt_g17(g2.est.v(x, y));
+            let _ = writeln!(t, "VYGI|{tag}|v|{x},{y}|cap={}|usage={}|red={}|est={est}|last={}|cong={}", g2.cap_v[i], g2.est.usage_v(x, y), a.red_v[i], g2.est.last_usage_v(x, y), g2.est.cong_cnt_v(x, y));
+        }
+    }
+    let used = |s: &std::collections::BTreeSet<(i32, i32)>| s.iter().map(|(x, y)| format!("{x},{y};")).collect::<String>();
+    let _ = writeln!(t, "VYGI|{tag}|usedh|{}", used(&g2.used_h));
+    let _ = writeln!(t, "VYGI|{tag}|usedv|{}", used(&g2.used_v));
+    let n = xg * yg;
+    for k in 0..nl {
+        for y in 0..yg {
+            for x in 0..xg {
+                let i = y * xg + x;
+                let (h, v) = (&a.edges_3d.0[k * n + i], &a.edges_3d.1[k * n + i]);
+                let _ = writeln!(t, "VYGI|{tag}|h3|{k}|{x},{y}|cap={}|usage={}|red={}", g3.h_cap[k][i], g3.h_usage[k][i], h.red);
+                let _ = writeln!(t, "VYGI|{tag}|v3|{k}|{x},{y}|cap={}|usage={}|red={}", g3.v_cap[k][i], g3.v_usage[k][i], v.red);
+            }
+        }
+    }
+    for &id in &a.net_ids {
+        let r = &a.router_nets[id];
+        let lc: String = match a.layer_edge_cost.get(&r.name) {
+            Some(v) => v.iter().map(|c| format!("{c},")).collect(),
+            None => (0..nl).map(|_| "1,".to_string()).collect(),
+        };
+        let pins: String = r.pins.iter().map(|(x, y, l)| format!("{x},{y},{};", l - 1)).collect();
+        let _ = writeln!(t, "VYGI|{tag}|net|{id}|{}|drv={}|min={}|max={}|cost={}|lcost={lc}|clock={}|pins={pins}", r.name, r.root, r.min_layer - 1, r.max_layer - 1, r.edge_cost, r.is_clock as i32);
+    }
+    Ok(t)
+}
+
+/// Where the incremental re-route lets an observer look: `(tag, state)` at `run()`'s entry
+/// (`incr`) and exit (`incrend`), as the reference's trace does.
+pub type IncrObserver<'a> = &'a mut dyn FnMut(&str, &AfterRoute);
+
+/// `updateDirtyRoutesFastRoute`, after a diode insertion and its legalization dirtied `dirty`
+/// (`dirty_nets_`: a `PtrSet`, so in dbNet order — the caller's). Returns the nets it re-routed.
+///
+/// The reference's call sequence and nothing else; each stage is its own function below, named
+/// after the reference's.
+///
+/// ⛔ Refused where the reference goes on: a resistance-aware net (`isResAware` skips the filter), a
+/// re-routed net that carries jumpers (`updateRouteGridsLayer` would have moved its tree's layers),
+/// and overflow after the re-route (the incremental congestion loop).
+pub fn update_dirty_routes_fast_route(db: &mut Db, opts: &RouteOptions, a: &mut AfterRoute, dirty: &[String], stt: SteinerBuilder<'_>, flutes: crate::brk_rsmt::Flutes<'_>, obs: IncrObserver<'_>) -> Res<Vec<String>> {
+    if dirty.is_empty() {
+        return Ok(Vec::new());
+    }
+    // clearNetsToRoute, then updateDirtyNets.
+    let fresh = update_net_pins(db, opts, a)?;
+    let dirty_nets = update_dirty_nets(a, &fresh, dirty)?;
+    if dirty_nets.is_empty() {
+        return Ok(Vec::new());
+    }
+    // setCriticalNetsPercentage(0); initFastRouteIncr; findRouting; mergeResults.
+    init_fast_route_incr(a, &fresh, &dirty_nets);
+    let routes = find_routing(db, opts, a, &dirty_nets, stt, flutes, obs)?;
+    merge_results(a, routes);
+    if a.total_overflow > 0 && !opts.allow_congestion {
+        return Err("the incremental re-route left overflow: its congestion loop is not modelled".into());
+    }
+    Ok(dirty_nets.iter().map(|&id| a.router_nets[id].name.clone()).collect())
+}
+
+/// `updateNetPins`, for every net: the router's nets as the database stands now (discovery, pins,
+/// layer ranges), by FastRoute id. ⚠️ Recomputed whole — the database has moved under it — and
+/// checked to keep the ids the first run gave (a diode joins an existing net; it adds none).
+fn update_net_pins(db: &mut Db, opts: &RouteOptions, a: &AfterRoute) -> Res<Vec<RouterNet>> {
+    let t = setup_tech(db, opts)?;
+    let mut log = t.log.clone();
+    let adj = setup_adjust(db, &t, opts, &mut log)?;
+    let mut e = adj.edges;
+    let nets = setup_nets(db, &t, &mut e, adj.has_macros_or_pads, opts, &mut log)?;
+    if nets.len() != a.router_nets.len() || nets.iter().zip(&a.router_nets).any(|(n, m)| n.name != m.name) {
+        return Err("the router's nets changed under the incremental re-route — new nets are not modelled".into());
+    }
+    Ok(nets)
+}
+
+/// `updateDirtyNets`: of the dirty nets, those whose pins moved — `pinPositionsChanged`, the
+/// multiset of `(on-grid x, y, connection layer)` against the positions the net was dirtied with
+/// (`saveLastPinPositions`, from the router's own stale pins: the first run's) — are released
+/// (`clearNetRoute`) and their routes cleared; the rest keep theirs. In dbNet order.
+fn update_dirty_nets(a: &mut AfterRoute, fresh: &[RouterNet], dirty: &[String]) -> Res<Vec<usize>> {
+    let mut out = Vec::new();
+    for name in dirty {
+        let Some(id) = a.router_nets.iter().position(|n| &n.name == name) else { continue }; // not in db_net_map_
+        let key = |n: &RouterNet| n.net_pins.iter().map(|p| (p.on_grid.0, p.on_grid.1, p.connection_layer)).collect::<Vec<_>>();
+        if pin_positions_changed(&key(&a.router_nets[id]), &key(&fresh[id])) {
+            if a.net_routes.iter().any(|r| &r.name == name && r.segments.iter().any(|s| s.is_jumper)) {
+                return Err(format!("net {name} carries jumpers: updateRouteGridsLayer is not modelled").into());
+            }
+            clear_net_route(a, id);
+            if let Some(r) = a.net_routes.iter_mut().find(|r| &r.name == name) {
+                r.segments.clear();
+            }
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
+/// `pinPositionsChanged`: the pins' `(on-grid x, y, connection layer)` against the last positions,
+/// as MULTISETS (`std::map<RoutePt, int>` counts up, then down) — order is ignored, multiplicity is
+/// not.
+pub fn pin_positions_changed(last: &[(i32, i32, i32)], now: &[(i32, i32, i32)]) -> bool {
+    let sorted = |v: &[(i32, i32, i32)]| {
+        let mut v = v.to_vec();
+        v.sort_unstable();
+        v
+    };
+    sorted(last) != sorted(now)
+}
+
+/// `clearNetRoute` → `releaseNetResources`: walk the net's 3D tree and take back, per unit step on
+/// one layer, `edgeCost` from the 2D edge (the NDR-aware `updateUsage`) and the layer's edge cost
+/// from the 3D edge; then drop the tree.
+fn clear_net_route(a: &mut AfterRoute, id: usize) {
+    let (Some(g2), Some(g3)) = (a.final_2d.as_mut(), a.final_3d.as_mut()) else { return };
+    let r = &a.router_nets[id];
+    let lec = a.layer_edge_cost.get(&r.name).cloned().unwrap_or_default();
+    let (min, max) = ((r.min_layer - 1) as usize, (r.max_layer - 1) as usize);
+    let net = crate::ndr_cost::NdrCostNet { id, edge_cost: r.edge_cost, min_layer: min, max_layer: max, layer_edge_cost: Some(lec.get(min..=max).map_or_else(|| vec![1; max + 1 - min], <[i8]>::to_vec)), soft_ndr: false };
+    let st = &mut a.final_state[id];
+    if let Some(t) = st.tree3d.as_ref() {
+        let xg = g3.x_grid;
+        for e in &t.edges {
+            for i in 0..e.routelen.max(0) as usize {
+                let (p, q) = (e.grids[i], e.grids[i + 1]);
+                if p.layer != q.layer {
+                    continue;
+                }
+                let k = p.layer as usize;
+                let cost = i32::from(lec.get(k).copied().unwrap_or(1));
+                let mut u = g2.for_net(&net);
+                if p.x == q.x {
+                    let y = p.y.min(q.y);
+                    crate::estimate::Usage2d::update_usage_v(&mut u, i32::from(p.x), i32::from(y), -f64::from(r.edge_cost));
+                    let c = &mut g3.v_usage[k][y as usize * xg + p.x as usize];
+                    *c = (i32::from(*c) - cost) as u16;
+                } else if p.y == q.y {
+                    let x = p.x.min(q.x);
+                    crate::estimate::Usage2d::update_usage_h(&mut u, i32::from(x), i32::from(p.y), -f64::from(r.edge_cost));
+                    let c = &mut g3.h_usage[k][p.y as usize * xg + x as usize];
+                    *c = (i32::from(*c) - cost) as u16;
+                }
+            }
+        }
+    }
+    st.tree = None;
+    st.tree3d = None;
+}
+
+/// `initFastRouteIncr` → `initNetlist(nets, true)`: `net_ids_` becomes the re-routed nets in order,
+/// each re-added (`addNet` keeps its id, resets it) with its pins as they stand — a net with fewer
+/// than two pins, or a local one, is added but not routed.
+fn init_fast_route_incr(a: &mut AfterRoute, fresh: &[RouterNet], dirty_nets: &[usize]) {
+    a.net_ids.clear();
+    for &id in dirty_nets {
+        a.router_nets[id] = fresh[id].clone();
+        a.final_state[id] = crate::brk_rsmt::NetState::default();
+        let n = &a.router_nets[id];
+        if n.net_pins.len() > 1 && !n.is_local {
+            a.net_ids.push(id);
+        }
+    }
+}
+
+/// `findRouting(dirty_nets, …)`: `run()` from the state the first run, the jumpers and the rip-ups
+/// left, then the post-processing over those nets (remaining guides, pad pins, `mergeSegments`).
+fn find_routing(db: &Db, opts: &RouteOptions, a: &mut AfterRoute, dirty_nets: &[usize], stt: SteinerBuilder<'_>, flutes: crate::brk_rsmt::Flutes<'_>, obs: IncrObserver<'_>) -> Res<std::collections::BTreeMap<String, Vec<crate::GSegment>>> {
+    use crate::brk_rsmt::RsmtNet;
+    use crate::run::{fastroute_run, RunEnd, RunInputs, RunObserver, Stage};
+    obs("incr", a);
+    let nets = a.router_nets.clone();
+    let (xg, yg) = (a.jumper_grid.x_grids as usize, a.jumper_grid.y_grids as usize);
+    let num_layers = a.caps.layers.len();
+    let pins: Vec<(Vec<i32>, Vec<i32>)> = nets.iter().map(|n| n.pins.iter().map(|p| (p.0, p.1)).unzip()).collect();
+    let lecs: Vec<Vec<i8>> = nets.iter().map(|n| vec![1; (n.max_layer - n.min_layer + 1).max(0) as usize]).collect();
+    let rnets: Vec<RsmtNet<'_>> = nets
+        .iter()
+        .enumerate()
+        .map(|(k, n)| RsmtNet { pins_x: &pins[k].0, pins_y: &pins[k].1, alpha: n.alpha, edge_cost: n.edge_cost, min_layer: (n.min_layer - 1) as usize, max_layer: (n.max_layer - 1) as usize, layer_edge_cost: &lecs[k] })
+        .collect();
+    let attrs: Vec<NetLayerAttrs> = nets
+        .iter()
+        .map(|n| NetLayerAttrs { pin_layers: n.pins.iter().map(|p| (p.2 - 1) as i16).collect(), has_ndr: false, is_clock: n.is_clock, is_res_aware: false, layer_edge_cost: vec![1; num_layers], sta_slack: 0.0 })
+        .collect();
+    let slack = vec![(0.0f32, false); nets.len()];
+    // The min-HPWL rule reads the instances where the legalization left them.
+    let hpwl: Vec<Option<i32>> = match opts.min_hpwl_alpha.filter(|&(h, _)| h > 0) {
+        Some(_) => (0..nets.len())
+            .map(|k| {
+                let n = &nets[k];
+                if !a.net_ids.contains(&k) || opts.net_alpha.contains_key(&n.name) || n.alpha <= 0.0 { Ok(None) } else { compute_hpwl(db, &n.name).map(Some) }
+            })
+            .collect::<Result<_, _>>()?,
+        None => Vec::new(),
+    };
+    let stt_net = |id: usize| stt(&pins[id].0, &pins[id].1, nets[id].root, steiner_alpha(opts, &nets[id], hpwl.get(id).copied().flatten()));
+    let layer_dir = a.layer_dir.clone();
+    let db_id: Vec<u32> = (0..nets.len() as u32).collect();
+    let (g2, g3) = (a.final_2d.clone().ok_or("no 2D graph to resume")?, a.final_3d.clone().ok_or("no 3D graph to resume")?);
+    let net_ids = a.net_ids.clone();
+    let inp = RunInputs {
+        x_grid: xg,
+        y_grid: yg,
+        h_capacity: a.h_capacity,
+        v_capacity: a.v_capacity,
+        red_h: &a.red_h,
+        red_v: &a.red_v,
+        cap_h: &g2.cap_h,
+        cap_v: &g2.cap_v,
+        entry: g2.est.clone(),
+        caps: &a.caps,
+        net_ids: &net_ids,
+        nets: &rnets,
+        attrs: &attrs,
+        slack: &slack,
+        stt: &stt_net,
+        flutes,
+        overflow_iterations: opts.congestion_iterations,
+        // setCriticalNetsPercentage(0) for the incremental run.
+        critical_nets_percentage: 0.0,
+        layer_dir: &layer_dir,
+        resistance_aware: false,
+        liberty: opts.liberty.is_some(),
+        timer_slack: crate::congestion_loop::TimerSlack::None,
+        res_aware: None,
+        origin: crate::routes::GridOrigin { tile_size: a.jumper_grid.grid.tile_size, x_corner: a.jumper_grid.grid.area.x_min, y_corner: a.jumper_grid.grid.area.y_min },
+        db_id: &db_id,
+        resume: Some((&g2, &g3)),
+    };
+    struct Observer {
+        overflow: i32,
+        g2d: Option<crate::graph2d::Graph2d>,
+        g3: Option<Graph3d>,
+    }
+    impl RunObserver for Observer {
+        fn stage(&mut self, s: Stage<'_>, g2d: &crate::graph2d::Graph2d, g3: Option<&Graph3d>, _: &[crate::brk_rsmt::NetState]) -> bool {
+            if let Stage::B19(fin) = s {
+                self.overflow = fin.overflow.total;
+                (self.g2d, self.g3) = (Some(g2d.clone()), g3.cloned());
+            }
+            true
+        }
+    }
+    let mut ov = Observer { overflow: 0, g2d: None, g3: None };
+    let mut state = std::mem::take(&mut a.final_state);
+    let end = fastroute_run(&inp, &mut state, &mut ov);
+    a.final_state = state;
+    let routes = match end? {
+        RunEnd::Routed(r) => r,
+        RunEnd::Stopped => return Err("run() stopped".into()),
+    };
+    (a.final_2d, a.final_3d, a.total_overflow) = (ov.g2d, ov.g3, ov.overflow);
+    obs("incrend", a);
+    // addRemainingGuides(routes, dirty_nets, …), connectPadPins, mergeSegments per route.
+    let mut by_name: std::collections::BTreeMap<String, Vec<crate::GSegment>> = routes.into_iter().map(|(id, segs)| (nets[id as usize].name.clone(), segs)).collect();
+    let grid_pins = |n: &RouterNet| -> Vec<crate::findrouting::GridPin> { n.net_pins.iter().map(|p| (p.on_grid.0, p.on_grid.1, p.connection_layer)).collect() };
+    let remaining: Vec<crate::findrouting::RemainingNet> = dirty_nets.iter().map(|&id| crate::findrouting::RemainingNet { name: nets[id].name.clone(), made: true, pins: grid_pins(&nets[id]) }).collect();
+    let (min, max) = (a.save_options.min_routing_layer, a.max_routing_layer);
+    crate::findrouting::add_remaining_guides(&mut by_name, &remaining, min, max, db.block_get_max_routing_layer()).map_err(|e| format!("{e:?}"))?;
+    crate::findrouting::connect_pad_pins(&mut by_name);
+    let block_min = db.block_get_min_routing_layer();
+    for (name, route) in by_name.iter_mut() {
+        if let Some(n) = nets.iter().find(|n| &n.name == name) {
+            crate::findrouting::merge_segments(&grid_pins(n), route, block_min);
+        }
+    }
+    Ok(by_name)
+}
+
+/// `mergeResults`: each net's new route replaces its old one; the re-added nets' pins are the ones
+/// `updateNetPins` read.
+fn merge_results(a: &mut AfterRoute, routes: std::collections::BTreeMap<String, Vec<crate::GSegment>>) {
+    for r in a.net_routes.iter_mut() {
+        let Some(segs) = routes.get(&r.name) else { continue };
+        r.segments = segs.clone();
+        if let Some(n) = a.router_nets.iter().find(|n| n.name == r.name) {
+            r.pins = n.net_pins.iter().map(|p| crate::Pin { connection_layer: p.connection_layer, on_grid_x: p.on_grid.0, on_grid_y: p.on_grid.1 }).collect();
+        }
+    }
 }
