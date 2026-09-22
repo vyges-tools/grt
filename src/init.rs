@@ -262,10 +262,12 @@ pub enum AbsentStage {
     PerturbCapacities,
     /// I12 — per-layer edge capacity roll-up. Implemented ([`crate::init_edges_capacity_per_layer`]).
     InitEdgesCapacityPerLayer,
-    /// I13a — reading the nets off the database. The ORDER they come back in is implemented
-    /// ([`order_nets`]); what is absent is the database walk that finds them.
+    /// I13a — reading the nets off the database. The ORDER ([`order_nets`]), the filter
+    /// ([`crate::find_nets`]) and every pin ([`crate::pins`]) are implemented; what is absent is
+    /// the database walk that hands them their facts.
     FindNetsFromDatabase,
-    /// I13b — reject pins that cannot be reached on their own layer.
+    /// I13b — reject ports sharing a position on a layer. Implemented
+    /// ([`crate::check_pin_placement`]); not wired until the nets are.
     CheckPinPlacement,
     /// I14 — build the router's netlist, its degrees and its pin-access resources.
     InitNetlist,
