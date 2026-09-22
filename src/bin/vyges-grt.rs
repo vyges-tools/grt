@@ -272,17 +272,146 @@ impl vyges_grt::wire_codec::CodecTech for DbCodec {
     }
 }
 
-/// Every ROUTING-layer pin box of the net's instance terminals, placed, by tech layer index — in
-/// `getITerms()` → MPin → geometry order (`avoidPinIntersection`).
-fn net_pin_boxes(db: &Db, net: &str, tech_names: &[String]) -> Result<Vec<(usize, vyges_grt::polygon90::R)>, Fail> {
+/// `checkAntennaViolations`' check over the whole block: a wire for every net from its guides, and
+/// each wired net checked — its violations as `(net, routing level, gate names)`, nets in block
+/// order (the violation map's order), each net's in the checker's order.
+#[allow(clippy::type_complexity)]
+fn check_design(db: &Db, db_guides: &BTreeMap<String, Vec<vyges_grt::Guide>>, with_diode: bool, ratio_margin: f32) -> Result<Vec<(String, i32, Vec<String>)>, Fail> {
+    let (nets, wtech, vias) = ant_nets(db, db_guides)?;
+    let wires = vyges_grt::wire_builder::make_net_wires_from_guides(&nets, db.block_get_g_cell_tile_size(), &wtech).map_err(|e| Fail::Refused(format!("{e:?}")))?;
+    let codec = DbCodec::read(db, &vias)?;
+    let tech = tech_layers(db)?;
+    let mut checker = Checker::read(db, with_diode, ratio_margin)?;
+    let mut out = Vec::new();
+    for w in &wires {
+        let ops = vyges_grt::wire_codec::encode(&w.ops, &codec).map_err(|e| Fail::Refused(format!("net {}: {e}", w.net)))?;
+        let shapes = vyges_grt::wire_codec::decode(&ops, &codec);
+        let pins = net_pin_facts(db, &w.net, &codec.tech_names)?;
+        let boxes: Vec<(usize, vyges_grt::polygon90::R)> = pins.iter().flat_map(|p| p.boxes.iter().copied()).collect();
+        let mut nodes = vyges_grt::antenna_check::build_layer_maps(&shapes, &boxes, &tech).map_err(Fail::Refused)?;
+        vyges_grt::antenna_check::save_gates(&mut nodes, &pins, &tech);
+        for (level, gates) in checker.check(db, &w.net, &nodes, &tech)? {
+            out.push((w.net.clone(), level, gates));
+        }
+    }
+    Ok(out)
+}
+
+/// The checker's side of a run: the layers' antenna rules, the diode repair would use, and the
+/// lines written so far.
+struct Checker {
+    layers: Vec<vyges_grt::antenna_check::LayerAntenna>,
+    dbu_per_micron: f64,
+    diode_diff_area: Option<f64>,
+    ratio_margin: f32,
+    text: String,
+}
+
+impl Checker {
+    fn read(db: &Db, with_diode: bool, ratio_margin: f32) -> Result<Self, Fail> {
+        use vyges_grt::antenna_check::{AntennaRule, LayerAntenna};
+        use vyges_opendb::DiffCurve;
+        let layers = db
+            .tech_get_layers()
+            .iter()
+            .map(|l| LayerAntenna {
+                rule: db.layer_has_default_antenna_rule(l).then(|| AntennaRule {
+                    area_factor: db.layerantenna_get_area_factor(l),
+                    area_factor_diff_use_only: db.layerantenna_is_area_factor_diff_use_only(l),
+                    side_area_factor: db.layerantenna_get_side_area_factor(l),
+                    side_area_factor_diff_use_only: db.layerantenna_is_side_area_factor_diff_use_only(l),
+                    area_minus_diff_factor: db.layerantenna_get_area_minus_diff_factor(l),
+                    gate_plus_diff_factor: db.layerantenna_get_gate_plus_diff_factor(l),
+                    gate_plus_diff_pwl: db.layerantenna_diff_pwl(l, DiffCurve::GatePlusDiff),
+                    area_diff_reduce: db.layerantenna_diff_pwl(l, DiffCurve::AreaDiffReduce),
+                    par: db.layerantenna_get_p_a_r(l),
+                    psr: db.layerantenna_get_p_s_r(l),
+                    car: db.layerantenna_get_c_a_r(l),
+                    csr: db.layerantenna_get_c_s_r(l),
+                    diff_par: db.layerantenna_diff_pwl(l, DiffCurve::Par),
+                    diff_psr: db.layerantenna_diff_pwl(l, DiffCurve::Psr),
+                    diff_car: db.layerantenna_diff_pwl(l, DiffCurve::Car),
+                    diff_csr: db.layerantenna_diff_pwl(l, DiffCurve::Csr),
+                }),
+                thickness_dbu: db.layer_thickness(l).max(0) as u32,
+            })
+            .collect();
+        // findDiodeMTerm: the first CORE ANTENNACELL master's first terminal with diffusion area.
+        let mut diode_diff_area = None;
+        if with_diode {
+            'masters: for (m, t) in db.masters_with_types().map_err(err)? {
+                if t == "CORE ANTENNACELL" {
+                    for (term, _) in db.master_mterms(&m).map_err(err)? {
+                        let d = db.mterm_antenna_diff_area(&m, &term);
+                        if d > 0.0 {
+                            diode_diff_area = Some(d);
+                            break 'masters;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Checker { layers, dbu_per_micron: f64::from(db.tech_get_db_units_per_micron()), diode_diff_area, ratio_margin, text: String::new() })
+    }
+
+    /// `checkNet` after the layer maps: areas, PAR, CAR, then the gates.
+    fn check(&mut self, db: &Db, net: &str, nodes: &vyges_grt::antenna_check::LayerNodes, tech: &vyges_grt::repair_antennas::TechLayers) -> Result<Vec<(i32, Vec<String>)>, Fail> {
+        use vyges_grt::antenna_check::{calculate_areas, calculate_car, calculate_par, check_gates, fmt_g17, GateFacts};
+        let mut gates = Vec::new();
+        for it in db.net_iterms(net) {
+            let (inst, pin) = it.rsplit_once('/').ok_or_else(|| err(format!("iterm {it}")))?;
+            let master = db.inst_master(inst);
+            let gate_area = db.mterm_antenna_gate_area(&master, pin);
+            gates.push(GateFacts {
+                name: it.clone(),
+                pin_name: format!("  {inst}/{pin} ({master})"),
+                id: db.iterm_id(inst, pin).map_err(err)?,
+                is_valid: db.mterm_get_io_type(&master, pin) == "INPUT" && gate_area > 0.0,
+                gate_area,
+                diff_area: db.mterm_antenna_diff_area(&master, pin),
+                is_antenna_cell: db.master_get_type(&master).map_err(err)? == "CORE ANTENNACELL",
+            });
+        }
+        let mut info = calculate_areas(nodes, &gates, &self.layers, tech, self.dbu_per_micron);
+        calculate_par(&mut info, &self.layers, tech);
+        calculate_car(&mut info, tech);
+        let by_id: BTreeMap<u32, usize> = gates.iter().enumerate().map(|(i, g)| (g.id, i)).collect();
+        for (id, per_layer) in &info {
+            for (t, i) in per_layer {
+                let iterms: String = i.iterms.iter().map(|&g| format!("{},", gates[g].name)).collect();
+                let f = fmt_g17;
+                self.text.push_str(&format!(
+                    "VYGC|{net}|info|{}|{}|area={}|side={}|ga={}|da={}|par={}|psr={}|dpar={}|dpsr={}|car={}|csr={}|dcar={}|dcsr={}|iterms={iterms}\n",
+                    gates[by_id[id]].name, tech.0[*t].name, f(i.area), f(i.side_area), f(i.iterm_gate_area), f(i.iterm_diff_area),
+                    f(i.par), f(i.psr), f(i.diff_par), f(i.diff_psr), f(i.car), f(i.csr), f(i.diff_car), f(i.diff_csr)
+                ));
+            }
+        }
+        let (_, violations) = check_gates(&mut info, &gates, &self.layers, tech, self.diode_diff_area, self.ratio_margin);
+        let mut out = Vec::new();
+        for v in violations {
+            let g: String = v.gates.iter().map(|&g| format!("{},", gates[g].name)).collect();
+            self.text.push_str(&format!("VYGC|{net}|viol|level={}|excess={}|diodes={}|gates={g}\n", v.routing_level, fmt_g17(v.excess_ratio), v.diode_count_per_gate));
+            out.push((v.routing_level, v.gates.iter().map(|&g| gates[g].name.clone()).collect()));
+        }
+        Ok(out)
+    }
+}
+
+/// The net's instance terminals as the checker reads them (`avoidPinIntersection`, `saveGates`):
+/// each named as `PinType` names it, with its ROUTING-layer boxes, placed, by tech layer index —
+/// `getITerms()` → MPin → geometry order.
+fn net_pin_facts(db: &Db, net: &str, tech_names: &[String]) -> Result<Vec<vyges_grt::antenna_check::PinFacts>, Fail> {
     let mut out = Vec::new();
     for it in db.net_iterms(net) {
         let (inst, pin) = it.rsplit_once('/').ok_or_else(|| err(format!("iterm {it}")))?;
+        let mut boxes = Vec::new();
         for w in db.iterm_pin_boxes(inst, pin) {
             let layer = db.layer_name_by_number(w.layer);
             let t = tech_names.iter().position(|m| *m == layer).ok_or_else(|| err(format!("layer {layer}")))?;
-            out.push((t, (w.x0, w.y0, w.x1, w.y1)));
+            boxes.push((t, (w.x0, w.y0, w.x1, w.y1)));
         }
+        out.push(vyges_grt::antenna_check::PinFacts { name: format!("  {inst}/{pin} ({})", db.inst_master(inst)), boxes });
     }
     Ok(out)
 }
@@ -334,7 +463,7 @@ fn read_violation_blocks(path: &str) -> Result<Vec<Vec<(String, i32, Vec<String>
 /// One iteration: the violations of the first check → `jumperInsertion` (unless `-diode_only`) →
 /// `saveGuides` over the nets that got jumpers → the second check. Diode insertion, and a second
 /// iteration with violations left, are refused.
-fn repair_antennas(db: &Db, step: &Value, state: &mut vyges_grt::global_route::AfterRoute, total_overflow: i32, log: &mut Vec<String>) -> Result<Vec<vyges_grt::NetGuides>, Fail> {
+fn repair_antennas(db: &Db, step: &Value, state: &mut vyges_grt::global_route::AfterRoute, total_overflow: i32, db_guides: &BTreeMap<String, Vec<vyges_grt::Guide>>, from_db: bool, log: &mut Vec<String>) -> Result<Vec<vyges_grt::NetGuides>, Fail> {
     use vyges_grt::repair_antennas::{jumper_insertion, AntViolation, FastRouteJumpers, GatePin, JumperInputs, NetViolations};
     let jumper_only = step["jumper_only"].as_bool().unwrap_or(false);
     let diode_only = step["diode_only"].as_bool().unwrap_or(false);
@@ -355,11 +484,18 @@ fn repair_antennas(db: &Db, step: &Value, state: &mut vyges_grt::global_route::A
         log.push("GRT-0246: No diode with LEF class CORE ANTENNACELL found.".into());
         return Ok(Vec::new());
     }
-    let path = step["violations"].as_str().ok_or_else(|| Fail::Refused("repair_antennas without captured violations: the antenna checker is not modelled".into()))?;
-    let blocks = read_violation_blocks(path)?;
+    let ratio_margin = step["ratio_margin"].as_f64().unwrap_or(0.0) as f32;
+    // The checker's answers: ours, or — with "violations" — the reference's, captured.
+    let oracle = step["violations"].as_str().map(read_violation_blocks).transpose()?;
+    if oracle.is_none() && from_db {
+        return Err(Fail::Refused("antenna checking a database: its terminals may carry access points, which are not modelled".into()));
+    }
     // antenna_violations_ is a PtrMap: by net ID, which is the block's net order.
     let order = db.net_names();
-    let mut first = blocks.first().cloned().unwrap_or_default();
+    let mut first = match &oracle {
+        Some(blocks) => blocks.first().cloned().unwrap_or_default(),
+        None => check_design(db, db_guides, true, ratio_margin)?,
+    };
     first.sort_by_key(|(n, ..)| order.iter().position(|m| m == n).unwrap_or(usize::MAX));
     let tech = tech_layers(db)?;
     let number_to_index: BTreeMap<i64, usize> = tech.0.iter().enumerate().map(|(i, l)| (i64::from(db.layer_get_number(&l.name)), i)).collect();
@@ -411,7 +547,18 @@ fn repair_antennas(db: &Db, step: &Value, state: &mut vyges_grt::global_route::A
         }
         saved = vyges_grt::save_guides(&modified, &state.jumper_grid.grid, &opts).map_err(|e| err(format!("{e:?}")))?;
     }
-    let second = if diode_only { blocks.first() } else { blocks.get(1) }.cloned().unwrap_or_default();
+    let second = match &oracle {
+        Some(blocks) => if diode_only { blocks.first() } else { blocks.get(1) }.cloned().unwrap_or_default(),
+        None if diode_only || by_net.is_empty() => by_net.iter().map(|n| (n.net.clone(), 0, Vec::new())).collect(),
+        None => {
+            // The second check, on the guides as the jumpers left them.
+            let mut after = db_guides.clone();
+            for ng in &saved {
+                after.insert(ng.net.clone(), ng.guides.clone());
+            }
+            check_design(db, &after, true, ratio_margin)?
+        }
+    };
     if !second.is_empty() && !jumper_only {
         return Err(Fail::Refused(format!("diode insertion is not modelled ({} nets still violate)", second.len())));
     }
@@ -797,31 +944,48 @@ fn run(job: &Value) -> Result<Value, Fail> {
                     std::fs::write(out, text).map_err(err)?;
                 }
                 // With "nodes": the checker's polygons per layer (`buildLayerMaps`), `VYGC|<net>|node|…`.
-                if let Some(out) = step["nodes"].as_str() {
+                if step["nodes"].is_string() || step["checker"].is_string() {
+                    let out = step["nodes"].as_str();
+                    // With "checker": the ratios and the verdict, `VYGC|<net>|info|…` and `…|viol|…`.
+                    // "checker_diode" answers as repair_antennas does (with its diode), otherwise as
+                    // check_antennas (none).
+                    let mut checker = step["checker"].as_str().map(|_| Checker::read(&db, step["checker_diode"].as_bool().unwrap_or(false), step["ratio_margin"].as_f64().unwrap_or(0.0) as f32)).transpose()?;
                     let codec = DbCodec::read(&db, &vias)?;
                     let tech = tech_layers(&db)?;
                     let mut text = String::new();
                     for w in &wires {
                         let ops = vyges_grt::wire_codec::encode(&w.ops, &codec).map_err(|e| Fail::Refused(format!("net {}: {e}", w.net)))?;
                         let shapes = vyges_grt::wire_codec::decode(&ops, &codec);
-                        let pins = net_pin_boxes(&db, &w.net, &codec.tech_names)?;
-                        let nodes = vyges_grt::antenna_check::build_layer_maps(&shapes, &pins, &tech).map_err(Fail::Refused)?;
+                        let pins = net_pin_facts(&db, &w.net, &codec.tech_names)?;
+                        let boxes: Vec<(usize, vyges_grt::polygon90::R)> = pins.iter().flat_map(|p| p.boxes.iter().copied()).collect();
+                        let mut nodes = vyges_grt::antenna_check::build_layer_maps(&shapes, &boxes, &tech).map_err(Fail::Refused)?;
+                        vyges_grt::antenna_check::save_gates(&mut nodes, &pins, &tech);
+                        if let Some(c) = checker.as_mut() {
+                            c.check(&db, &w.net, &nodes, &tech)?;
+                        }
                         for (t, list) in &nodes {
                             for n in list {
                                 let pts: String = n.pol.iter().map(|(x, y)| format!("{x},{y};")).collect();
                                 let low: String = n.low_adj.iter().map(|l| format!("{l},")).collect();
                                 text.push_str(&format!("VYGC|{}|node|{}|{}|{pts}|low={low}\n", w.net, tech.0[*t].name, n.id));
+                                let gates: String = n.gates.iter().map(|g| format!("{g};")).collect();
+                                text.push_str(&format!("VYGC|{}|gates|{}|{gates}\n", w.net, n.id));
                             }
                         }
                     }
-                    std::fs::write(out, text).map_err(err)?;
+                    if let Some(out) = out {
+                        std::fs::write(out, text).map_err(err)?;
+                    }
+                    if let (Some(path), Some(c)) = (step["checker"].as_str(), checker) {
+                        std::fs::write(path, c.text).map_err(err)?;
+                    }
                 }
             }
             "repair_antennas" => {
                 // ⚠️ Not GRT-45: the reference also repairs from routes a database brought with it
                 // (`have_routes` after read_db). That path is not modelled.
                 let (state, total_overflow) = after.as_mut().ok_or_else(|| Fail::Refused("repair_antennas without a global_route in this session: routes read from a database are not modelled".into()))?;
-                let repaired = repair_antennas(&db, step, state, *total_overflow, &mut log)?;
+                let repaired = repair_antennas(&db, step, state, *total_overflow, &db_guides, from_db, &mut log)?;
                 for ng in repaired {
                     guides.insert(ng.net.clone(), ng.guides.iter().map(|g| (g.box_.x_min, g.box_.y_min, g.box_.x_max, g.box_.y_max, db_layer_name(&db, g.layer))).collect());
                     db_guides.insert(ng.net.clone(), ng.guides);
