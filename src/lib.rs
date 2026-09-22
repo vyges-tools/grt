@@ -83,6 +83,7 @@ pub mod capacity;
 pub use capacity::{
     capacity_edge_order, check_adjacent_layers_direction, compute_gcell_capacity,
     init_routing_layers, Direction, LayerError, RoutingLayer, INFINITE_CAPACITY,
+    mirror_grid_to_fast_route, set_capacities, init_edges_capacity_per_layer, CapacityLayer, EdgeCapacities, FastRouteGrid,
 };
 pub mod init;
 pub use init::{

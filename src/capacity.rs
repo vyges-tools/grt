@@ -244,3 +244,199 @@ pub fn capacity_edge_order(x_grids: i32, y_grids: i32, horizontal: bool) -> Vec<
 /// "infinite" value is deliberately a tenth of that range to leave headroom for the additions
 /// downstream. A wider constant would overflow where the reference does not.
 pub const INFINITE_CAPACITY: i32 = (i16::MAX as i32) / 10;
+
+/// I8 — what `mirrorGridToFastRoute` leaves in the router.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FastRouteGrid {
+    pub x_grid: i32,
+    pub y_grid: i32,
+    pub num_layers: i32,
+    /// `x_range_ = y_range_`: the larger grid dimension, but never below 1000 (`setGridsAndLayers`).
+    pub x_range: i32,
+    pub y_range: i32,
+    pub regular_x: bool,
+    pub regular_y: bool,
+    /// The grid's lower-left corner — the DIE's.
+    pub x_corner: i32,
+    pub y_corner: i32,
+    pub tile_size: i32,
+    /// `getGridArea().xMax()/yMax()` — the die's upper-right.
+    pub x_grid_max: i32,
+    pub y_grid_max: i32,
+    /// Per router layer `l - 1`, the direction of routing level `l`.
+    pub directions: Vec<Option<Direction>>,
+}
+
+/// I8 — `mirrorGridToFastRoute(max_routing_layer)`: copy the grid into the router's own fields,
+/// and each routing level's direction into router layer `level - 1`.
+pub fn mirror_grid_to_fast_route(grid: &CoreGrid, directions: &[Option<Direction>]) -> FastRouteGrid {
+    let range = grid.x_grids.max(grid.y_grids).max(1000);
+    let mut dirs = vec![None; grid.num_layers as usize];
+    for (l, d) in directions.iter().enumerate().take(grid.num_layers as usize) {
+        dirs[l] = *d;
+    }
+    FastRouteGrid {
+        x_grid: grid.x_grids,
+        y_grid: grid.y_grids,
+        num_layers: grid.num_layers,
+        x_range: range,
+        y_range: range,
+        regular_x: grid.perfect_regular_x,
+        regular_y: grid.perfect_regular_y,
+        x_corner: grid.area.x_min,
+        y_corner: grid.area.y_min,
+        tile_size: grid.tile_size,
+        x_grid_max: grid.area.x_max,
+        y_grid_max: grid.area.y_max,
+        directions: dirs,
+    }
+}
+
+/// One routing level as `setCapacities` reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapacityLayer {
+    pub direction: Option<Direction>,
+    /// `getRoutingTracksByIndex(level)` — `None` when no entry carries the index.
+    pub tracks: Option<crate::tracks::RoutingTracks>,
+}
+
+/// The router's capacities after `setCapacities`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EdgeCapacities {
+    pub x_grid: i32,
+    pub y_grid: i32,
+    pub num_layers: i32,
+    /// `h_edges_3D_[l][y][x].cap`, flattened `(l * y_grid + y) * x_grid + x` — `uint16_t`.
+    pub h3: Vec<u16>,
+    /// `v_edges_3D_[l][y][x].cap`, flattened the same way.
+    pub v3: Vec<u16>,
+    /// The 2D horizontal caps, `[y][x]` with `x < x_grid - 1` — `uint16_t`, summed over layers.
+    pub h2: Vec<u16>,
+    /// The 2D vertical caps, `[y][x]` with `y < y_grid - 1`.
+    pub v2: Vec<u16>,
+    /// Per router layer, the smallest edge capacity — `int16_t` (`addHCapacity(int16_t, int)`).
+    pub h_capacity_3d: Vec<i16>,
+    pub v_capacity_3d: Vec<i16>,
+    /// Their sums, `int`.
+    pub h_capacity: i32,
+    pub v_capacity: i32,
+    /// `0.9f * capacity`, `float`.
+    pub h_capacity_lb: f32,
+    pub v_capacity_lb: f32,
+}
+
+impl EdgeCapacities {
+    fn at3(&self, l: i32, x: i32, y: i32) -> usize {
+        ((l * self.y_grid + y) * self.x_grid + x) as usize
+    }
+}
+
+/// I9 — `setCapacities(min, max)`: every edge's track capacity per layer, the 2D sums, each
+/// layer's minimum, and the lower bounds.
+///
+/// ⛔ Rules that decide values:
+/// - the walk is [`capacity_edge_order`] — transposed between the directions, half-open inside;
+/// - a layer whose direction is not HORIZONTAL takes the VERTICAL branch;
+/// - outside `min..=max` a layer's edges get 0; with `infinite_capacity` every edge gets
+///   [`INFINITE_CAPACITY`], inside the range or not;
+/// - the 3D edge is ASSIGNED, the 2D edge ADDED to (both `uint16_t`);
+/// - a layer's minimum starts at `INT_MAX` and becomes 0 if the layer wrote no edge (a one-cell-wide
+///   grid), then narrows to `int16_t`;
+/// - the lower bounds are `0.9f * sum` in `float`.
+pub fn set_capacities(
+    fr: &FastRouteGrid,
+    core: &CoreGrid,
+    layers: &[CapacityLayer],
+    min_routing_layer: i32,
+    max_routing_layer: i32,
+    infinite_capacity: bool,
+) -> EdgeCapacities {
+    let (xg, yg, nl) = (fr.x_grid, fr.y_grid, fr.num_layers);
+    let cells = (nl * yg * xg) as usize;
+    let mut c = EdgeCapacities {
+        x_grid: xg,
+        y_grid: yg,
+        num_layers: nl,
+        h3: vec![0; cells],
+        v3: vec![0; cells],
+        h2: vec![0; ((xg - 1).max(0) * yg) as usize],
+        v2: vec![0; (xg * (yg - 1).max(0)) as usize],
+        h_capacity_3d: vec![0; nl as usize],
+        v_capacity_3d: vec![0; nl as usize],
+        h_capacity: 0,
+        v_capacity: 0,
+        h_capacity_lb: 0.0,
+        v_capacity_lb: 0.0,
+    };
+    for layer in 1..=core.num_layers {
+        let info = layers[(layer - 1) as usize];
+        let inside_layer_range = layer >= min_routing_layer && layer <= max_routing_layer;
+        let tracks = info.tracks.unwrap_or_default();
+        let horizontal = info.direction == Some(Direction::Horizontal);
+        let mut min_cap = i32::MAX;
+        for ((x1, y1), _) in capacity_edge_order(xg, yg, horizontal) {
+            let cap = if infinite_capacity {
+                INFINITE_CAPACITY
+            } else if inside_layer_range {
+                compute_gcell_capacity(core, x1, y1, tracks.location, tracks.track_pitch, tracks.num_tracks, horizontal)
+            } else {
+                0
+            };
+            min_cap = min_cap.min(cap);
+            // setEdgeCapacity(x1, y1, x2, y2, layer, cap): the edge is named by its first cell.
+            let k = layer - 1;
+            let i3 = c.at3(k, x1, y1);
+            if horizontal {
+                let i2 = (y1 * (xg - 1) + x1) as usize;
+                c.h2[i2] = c.h2[i2].wrapping_add(cap as u16);
+                c.h3[i3] = cap as u16;
+            } else {
+                let i2 = (y1 * xg + x1) as usize;
+                c.v2[i2] = c.v2[i2].wrapping_add(cap as u16);
+                c.v3[i3] = cap as u16;
+            }
+        }
+        let min_cap = if min_cap == i32::MAX { 0 } else { min_cap } as i16;
+        if horizontal {
+            c.h_capacity_3d[(layer - 1) as usize] = min_cap;
+            c.h_capacity += min_cap as i32;
+        } else {
+            c.v_capacity_3d[(layer - 1) as usize] = min_cap;
+            c.v_capacity += min_cap as i32;
+        }
+    }
+    // initLowerBoundCapacities: `const float LB = 0.9; lb = LB * capacity`.
+    c.v_capacity_lb = 0.9f32 * c.v_capacity as f32;
+    c.h_capacity_lb = 0.9f32 * c.h_capacity as f32;
+    c
+}
+
+/// I12 — `initEdgesCapacityPerLayer`: the per-layer capacity the 2D phases monitor, copied from the
+/// 3D edges into `Cap3D { cap, cap_ndr }` — indexed `[layer][x][y]`, TRANSPOSED from the 3D edges'
+/// `[layer][y][x]`. Only real edges are copied (`x < x_grid - 1` horizontal, `y < y_grid - 1`
+/// vertical); the rest stay zero.
+///
+/// Returns `(horizontal, vertical)`, each flattened `(l * x_grid + x) * y_grid + y`, as
+/// `(cap, cap_ndr)`.
+pub fn init_edges_capacity_per_layer(c: &EdgeCapacities) -> (Vec<(u16, f64)>, Vec<(u16, f64)>) {
+    let (xg, yg, nl) = (c.x_grid, c.y_grid, c.num_layers);
+    let n = (nl * xg * yg) as usize;
+    let (mut h, mut v) = (vec![(0u16, 0.0f64); n], vec![(0u16, 0.0f64); n]);
+    for y in 0..yg {
+        for x in 0..xg {
+            for l in 0..nl {
+                let i = ((l * xg + x) * yg + y) as usize;
+                if x < xg - 1 {
+                    // updateCap3D(..., const double cap): cap = cap_ndr = the edge's cap.
+                    let cap = c.h3[c.at3(l, x, y)];
+                    h[i] = (cap, cap as f64);
+                }
+                if y < yg - 1 {
+                    let cap = c.v3[c.at3(l, x, y)];
+                    v[i] = (cap, cap as f64);
+                }
+            }
+        }
+    }
+    (h, v)
+}

@@ -248,16 +248,17 @@ pub enum AbsentStage {
     /// I6 — per-layer track pitch and line-to-via pitch. The stage itself is implemented
     /// ([`crate::init_routing_tracks`]); it is not wired here until I4 hands it the technology.
     InitRoutingTracks,
-    /// I8 — mirror the grid into the router's own coordinates.
+    /// I8 — mirror the grid into the router's own coordinates. Implemented
+    /// ([`crate::mirror_grid_to_fast_route`]); wired once I4 hands the sequencer the technology.
     MirrorGridToFastRoute,
-    /// I9 — per-edge capacity from the track counts.
+    /// I9 — per-edge capacity from the track counts. Implemented ([`crate::set_capacities`]).
     SetCapacities,
     /// I10 — obstructions, blockages and the user's layer/region adjustments.
     ApplyAdjustments,
     /// I11 — seeded capacity perturbation. ⚠️ Inert unless a seed is set, and no published case
     /// exercises it; the distributions it draws through are implementation-defined besides.
     PerturbCapacities,
-    /// I12 — per-layer edge capacity roll-up.
+    /// I12 — per-layer edge capacity roll-up. Implemented ([`crate::init_edges_capacity_per_layer`]).
     InitEdgesCapacityPerLayer,
     /// I13a — reading the nets off the database. The ORDER they come back in is implemented
     /// ([`order_nets`]); what is absent is the database walk that finds them.
