@@ -1152,8 +1152,8 @@ where
 ///
 /// ⚠️ The points beyond the loop are copied **down** over it and the length reduced — the buffer
 /// keeps its size, so anything past the new length is stale and must not be read.
-pub fn remove_loops(
-    grid: &mut EstimateGrid,
+pub fn remove_loops<G: crate::estimate::Usage2d + ?Sized>(
+    grid: &mut G,
     grids: &mut [(i32, i32)],
     routelen: &mut usize,
     edge_cost: i8,
