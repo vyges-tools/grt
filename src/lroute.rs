@@ -8,7 +8,7 @@
 //! bias**: a node already connected horizontally makes a vertical departure cost a via, and vice
 //! versa. That bias is what stops the router zig-zagging through turns it has already committed.
 
-use crate::estimate::{congestion_cost, EstimateGrid, LShape};
+use crate::estimate::{congestion_cost, EstUsage, LShape};
 
 /// A node of a net's Steiner tree, with the connection state the via bias reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,8 +115,8 @@ pub enum EdgeRoute {
 /// ⚠️ **The full edge cost is charged here, not half.** The first pass charged half to each
 /// candidate because it had pre-loaded both; this pass rips up the previous route first, so the
 /// chosen path takes the whole cost and the other takes none.
-pub fn route_edge(
-    grid: &mut EstimateGrid,
+pub fn route_edge<G: EstUsage + ?Sized>(
+    grid: &mut G,
     nodes: &mut [TreeNode],
     edge: &TreeEdge,
     edge_cost: i8,

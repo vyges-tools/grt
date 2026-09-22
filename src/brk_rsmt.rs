@@ -19,7 +19,8 @@
 //! helpers from elsewhere in the reference: [`edge_shift`], [`edge_shift_new`] (utility.cpp),
 //! [`ripup_seg_l`] (RipUp.cpp), [`newroute_l`] (route.cpp).
 
-use crate::estimate::{capacity_lower_bound, EstimateGrid, LShape};
+use crate::estimate::{capacity_lower_bound, EstUsage, EstimateGrid, LShape};
+use crate::ndr_cost::{NdrAwareGrid, NdrCostNet, NdrLedger};
 use crate::lroute::{route_edge, EdgeRoute, TreeEdge, TreeNode};
 use crate::rsmt::{segments_from_tree, Branch, Segment, COEFF_V_DEFAULT, COEFF_V_NO_ADJUSTMENTS, ROUTER_FLUTE_ACCURACY};
 
@@ -93,6 +94,22 @@ pub struct RsmtNet<'a> {
     pub edge_cost: i8,
     pub min_layer: usize,
     pub max_layer: usize,
+    /// `getLayerEdgeCost(l)` for `min_layer..=max_layer` — what the NDR-aware charge reads.
+    pub layer_edge_cost: &'a [i8],
+}
+
+impl RsmtNet<'_> {
+    /// The net as the NDR-aware charge sees it; `id` is its identity on an edge.
+    pub fn ndr_net(&self, id: usize) -> NdrCostNet {
+        NdrCostNet {
+            id,
+            edge_cost: self.edge_cost,
+            min_layer: self.min_layer,
+            max_layer: self.max_layer,
+            layer_edge_cost: Some(self.layer_edge_cost.to_vec()),
+            soft_ndr: false,
+        }
+    }
 }
 
 /// The grid state the congestion-driven call reads and writes.
@@ -109,6 +126,8 @@ pub struct BrkGrid<'a> {
     pub v_capacity: i32,
     /// `via_cost_` — the router sets it to 0 before R5, so the via bias contributes nothing here.
     pub via_cost: f64,
+    /// The NDR half of `graph2d_`: every usage update charges through it.
+    pub ndr: &'a mut NdrLedger,
 }
 
 /// The reference's `gen_brk_RSMT` flags, minus `newType` (false at both call sites).
@@ -587,8 +606,9 @@ pub fn gen_brk_rsmt(
     let mut sum = BrkSummary::default();
     for &id in net_ids {
         let net = &nets[id];
+        let nn = net.ndr_net(id);
         if flags.re_route {
-            ripup_net_segments(&state[id].seglist, grid.est);
+            ripup_net_segments(&state[id].seglist, &mut NdrAwareGrid { est: &mut *grid.est, ndr: &mut *grid.ndr, net: &nn });
         }
         let mut rec = build_tree(flags, id, net, &mut state[id], grid, stt_tree, flutes);
         if flags.gen_tree {
@@ -603,7 +623,7 @@ pub fn gen_brk_rsmt(
         sum.total_num_seg += state[id].seglist.len();
         if flags.re_route {
             let tree = state[id].tree.as_mut().expect("R7 copies the tree before re-routing it");
-            newroute_l(tree, net.edge_cost, grid, true);
+            newroute_l(tree, &nn, grid, true);
         }
         sum.num_shift += rec.shifts.unwrap_or(0);
         sum.nets.push(rec);
@@ -612,7 +632,7 @@ pub fn gen_brk_rsmt(
 }
 
 /// The rip-up loop: `ripupSegL` over every segment in the net's list.
-fn ripup_net_segments(seglist: &[RoutedSegment], est: &mut EstimateGrid) {
+fn ripup_net_segments<G: EstUsage + ?Sized>(seglist: &[RoutedSegment], est: &mut G) {
     for s in seglist {
         ripup_seg_l(est, s);
     }
@@ -932,7 +952,7 @@ pub fn edge_shift_new(t: &mut RsmtTree, num_pins: usize, est: &EstimateGrid) -> 
 }
 
 /// `ripupSegL` — take a segment's L-route usage back off the grid, the way it bent.
-pub fn ripup_seg_l(est: &mut EstimateGrid, s: &RoutedSegment) {
+pub fn ripup_seg_l<G: EstUsage + ?Sized>(est: &mut G, s: &RoutedSegment) {
     let g = s.seg;
     let cost = -(g.edge_cost as f64);
     let (ymin, ymax) = (g.y1.min(g.y2), g.y1.max(g.y2));
@@ -949,12 +969,13 @@ pub fn ripup_seg_l(est: &mut EstimateGrid, s: &RoutedSegment) {
 /// previous route to rip up. The per-edge decision is [`route_edge`]'s.
 ///
 /// ⚠️ A zero-length edge is marked `NoRoute` (`None`); the reference leaves its `xFirst` as it was.
-pub fn newroute_l(tree: &mut StTree, edge_cost: i8, grid: &mut BrkGrid<'_>, via_guided: bool) {
+pub fn newroute_l(tree: &mut StTree, net: &NdrCostNet, grid: &mut BrkGrid<'_>, via_guided: bool) {
     let (v_lb, h_lb) = (capacity_lower_bound(grid.v_capacity), capacity_lower_bound(grid.h_capacity));
     tree.routes = vec![None; tree.edges.len()];
     for i in 0..tree.edges.len() {
         let e = tree.edges[i];
-        let r = route_edge(grid.est, &mut tree.nodes, &e, edge_cost, grid.via_cost, via_guided, v_lb, h_lb, grid.red_v, grid.red_h);
+        let mut g = NdrAwareGrid { est: &mut *grid.est, ndr: &mut *grid.ndr, net };
+        let r = route_edge(&mut g, &mut tree.nodes, &e, net.edge_cost, grid.via_cost, via_guided, v_lb, h_lb, grid.red_v, grid.red_h);
         tree.routes[i] = match r {
             EdgeRoute::None => None,
             EdgeRoute::Vertical | EdgeRoute::L(LShape::YFirst) => Some(false),

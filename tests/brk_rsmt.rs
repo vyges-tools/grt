@@ -84,37 +84,41 @@ struct Seen {
     routed_edges: usize,
     usage_checked: usize,
     ndr_checked: usize,
-    ndr_overflow: usize,
+    r6_checked: usize,
+    r6_segs: usize,
     stacked_pins: usize,
     htree: usize,
 }
 
-/// The designs whose NDR nets reach the overflow charge — the known divergence.
-const NDR_OVERFLOW: [&str; 2] = ["soft_ndr_4w_6s-", "soft_ndr_escalation-"];
-
-/// Replay every run, and hold the failures to exactly the [`NDR_OVERFLOW`] runs.
+/// Replay every run; list every run that diverges rather than stopping at the first.
 fn replay(g: &Value) -> Seen {
     let mut seen = Seen::default();
-    let (mut unexpected, mut overflow) = (Vec::new(), 0);
+    let mut failed = Vec::new();
     for r in arr(&g["runs"]) {
         let who = r["design"].as_str().expect("design");
-        let known = NDR_OVERFLOW.iter().any(|p| who.starts_with(p));
         let mut one = Seen::default();
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| replay_run(r, &mut one)));
-        match (outcome, known) {
-            (Ok(()), false) => seen = add(seen, one),
-            (Err(e), true) => {
-                let msg = e.downcast_ref::<String>().cloned().unwrap_or_default();
-                assert!(msg.contains("net 0 clk: newrouteL"), "{who}: diverges, but not where the NDR overflow does: {msg}");
-                overflow += 1;
-            }
-            (Ok(()), true) => unexpected.push(format!("{who}: now MATCHES — the NDR overflow charge landed; empty NDR_OVERFLOW")),
-            (Err(e), false) => unexpected.push(format!("{who}: {}", e.downcast_ref::<String>().cloned().unwrap_or_default())),
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| replay_run(r, &mut one))) {
+            Ok(()) => seen = add(seen, one),
+            Err(e) => failed.push(format!("{who}: {}", e.downcast_ref::<String>().cloned().unwrap_or_default())),
         }
     }
-    assert!(unexpected.is_empty(), "{} runs:\n{}", unexpected.len(), unexpected.join("\n"));
-    seen.ndr_overflow = overflow;
+    assert!(failed.is_empty(), "{} runs diverge:\n{}", failed.len(), failed.join("\n"));
     seen
+}
+
+/// The first edge where a grid differs from a usage dump, if any.
+fn usage_diff(est: &EstimateGrid, u: &Value) -> Option<String> {
+    for (dir, rows) in [("H", usage(u, "H")), ("V", usage(u, "V"))] {
+        for (y, row) in rows.iter().enumerate() {
+            for (x, &(e, _)) in row.iter().enumerate() {
+                let ours = if dir == "H" { est.h(x, y) } else { est.v(x, y) };
+                if ours != e {
+                    return Some(format!("{dir} ({x}, {y}): engine {ours}, reference {e}"));
+                }
+            }
+        }
+    }
+    None
 }
 
 fn replay_run(r: &Value, seen: &mut Seen) {
@@ -124,6 +128,9 @@ fn replay_run(r: &Value, seen: &mut Seen) {
         let ndr = calls.iter().flat_map(|c| arr(&c["nets"])).any(|n| int(&n["cost"]) != 1);
         let max_id = calls.iter().flat_map(|c| arr(&c["nets"])).map(|n| int(&n["id"]) as usize).max().unwrap_or(0);
         let mut state: Vec<NetState> = vec![NetState::default(); max_id + 1];
+        let max_layer = calls.iter().flat_map(|c| arr(&c["nets"])).map(|n| int(&n["max"]) as usize).max().unwrap_or(0);
+        // R6's state carried into R7: our estimated usage and NDR ledger, not the dump's.
+        let mut chain: Option<(EstimateGrid, NdrLedger)> = None;
         for (ci, c) in calls.iter().enumerate() {
             let f = arr(&c["flags"]);
             let flags = BrkFlags { congestion_driven: int(&f[0]) == 1, re_route: int(&f[1]) == 1, gen_tree: int(&f[2]) == 1, no_adj: int(&f[4]) == 1 };
@@ -154,10 +161,37 @@ fn replay_run(r: &Value, seen: &mut Seen) {
                 };
                 caps.layers = layer_rows("H").into_iter().zip(layer_rows("V")).map(|(h, v)| CapLayer { h, v }).collect();
             }
+            // The NDR ledger as `initEdgesCapacityPerLayer` leaves it: every layer's capacity from the
+            // 3D edges (horizontal edges to x < xg-1, vertical to y < yg-1), no NDR net anywhere.
+            let mut ledger = NdrLedger::new(xg, yg, caps.layers.len().max(max_layer + 1));
+            for (l, cl) in caps.layers.iter().enumerate() {
+                for y in 0..yg {
+                    for x in 0..xg {
+                        if x + 1 < xg {
+                            ledger.update_cap_3d(x, y, l, true, cl.h[y * xg + x] as f64);
+                        }
+                        if y + 1 < yg {
+                            ledger.update_cap_3d(x, y, l, false, cl.v[y * xg + x] as f64);
+                        }
+                    }
+                }
+            }
+            // R7 continues from OUR R6: its usage must be the reference's R6 exit (R7's entry dump).
+            let chained = flags.re_route && small && chain.is_some();
+            if chained {
+                let (e, l) = chain.take().expect("chained");
+                if let Some(d) = usage_diff(&e, &c["entry"]) {
+                    panic!("{at}: R6 exit usage {d}");
+                }
+                est = e;
+                ledger = l;
+                seen.r6_checked += 1;
+            }
 
             // Nets, indexed by id; absent ids stay empty.
             let tnets = arr(&c["nets"]);
             let pins: Vec<(Vec<i32>, Vec<i32>)> = tnets.iter().map(|n| arr(&n["pins"]).iter().map(|p| (int(&p[0]), int(&p[1]))).unzip()).collect();
+            let lecs: Vec<Vec<i8>> = tnets.iter().map(|n| arr(&n["lec"]).iter().map(|v| int(v) as i8).collect()).collect();
             let empty: (Vec<i32>, Vec<i32>) = (Vec::new(), Vec::new());
             let mut by_id: Vec<Option<usize>> = vec![None; max_id + 1];
             for (i, n) in tnets.iter().enumerate() {
@@ -175,9 +209,10 @@ fn replay_run(r: &Value, seen: &mut Seen) {
                             edge_cost: int(&n["cost"]) as i8,
                             min_layer: int(&n["min"]) as usize,
                             max_layer: int(&n["max"]) as usize,
+                            layer_edge_cost: &lecs[*i],
                         }
                     }
-                    None => RsmtNet { pins_x: &empty.0, pins_y: &empty.1, alpha: 0.0, edge_cost: 1, min_layer: 0, max_layer: 0 },
+                    None => RsmtNet { pins_x: &empty.0, pins_y: &empty.1, alpha: 0.0, edge_cost: 1, min_layer: 0, max_layer: 0, layer_edge_cost: &[] },
                 })
                 .collect();
             let net_ids: Vec<usize> = tnets.iter().map(|n| int(&n["id"]) as usize).collect();
@@ -191,7 +226,13 @@ fn replay_run(r: &Value, seen: &mut Seen) {
                     let rl: Vec<RoutedSegment> = arr(&n["rl"]).iter().map(|s| RoutedSegment { seg: seg(s, cost), x_first: int(&s[4]) == 1 }).collect();
                     let ours: Vec<Segment> = state[id].seglist.iter().map(|s| s.seg).collect();
                     assert_eq!(ours, rl.iter().map(|s| s.seg).collect::<Vec<_>>(), "{at}: net {id}: R7's incoming segments are not R5's");
-                    state[id].seglist = rl;
+                    if chained {
+                        // ⛔ Our R6 chose these bends; they must be the reference's.
+                        assert_eq!(state[id].seglist, rl, "{at}: net {id}: R6's bends (xFirst)");
+                        seen.r6_segs += rl.len();
+                    } else {
+                        state[id].seglist = rl;
+                    }
                 } else {
                     state[id].seglist.clear();
                 }
@@ -209,6 +250,7 @@ fn replay_run(r: &Value, seen: &mut Seen) {
                 h_capacity: int(&c["hcap"]),
                 v_capacity: int(&c["vcap"]),
                 via_cost: 0.0,
+                ndr: &mut ledger,
             };
             let sum = gen_brk_rsmt(flags, &net_ids, &nets, &mut state, &mut grid, &|id| stt[&id].clone(), &flutes)
                 .unwrap_or_else(|e| panic!("{at}: {e:?}"));
@@ -302,6 +344,21 @@ fn replay_run(r: &Value, seen: &mut Seen) {
                 seen.usage_checked += 1;
                 seen.ndr_checked += (ndr && flags.re_route) as usize;
             }
+            // R6: `routeLAll(true)` from R5's state, carried into the next call.
+            if !flags.re_route && small {
+                let mut grid6 = BrkGrid {
+                    est: &mut est,
+                    red_h: &red_h_f,
+                    red_v: &red_v_f,
+                    caps: &caps,
+                    h_capacity: int(&c["hcap"]),
+                    v_capacity: int(&c["vcap"]),
+                    via_cost: 0.0,
+                    ndr: &mut ledger,
+                };
+                route_l_all(&net_ids, &nets, &mut state, &mut grid6);
+                chain = Some((est, ledger));
+            }
             seen.calls += 1;
         }
         seen.runs += 1;
@@ -313,7 +370,7 @@ fn gen_brk_rsmt_matches_the_reference() {
     let s = replay(&read(&format!("{}/examples/grt_gate/brk_rsmt.json", env!("CARGO_MANIFEST_DIR"))));
     eprintln!("{s:?}");
     assert!(s.runs >= 40 && s.flute_nets >= 990 && s.shifted >= 70 && s.shifts > 0 && s.copied >= 900
-            && s.routed_edges >= 1000 && s.usage_checked >= 60 && s.ndr_checked >= 1 && s.ndr_overflow == 1 && s.htree > 0,
+            && s.routed_edges >= 1000 && s.usage_checked >= 60 && s.ndr_checked >= 2 && s.r6_checked >= 40 && s.htree > 0,
             "{s:?}");
 }
 
@@ -330,7 +387,7 @@ fn add(a: Seen, b: Seen) -> Seen {
         runs: a.runs + b.runs, calls: a.calls + b.calls, nets: a.nets + b.nets, flute_nets: a.flute_nets + b.flute_nets,
         shifted: a.shifted + b.shifted, shifts: a.shifts + b.shifts, copied: a.copied + b.copied,
         routed_edges: a.routed_edges + b.routed_edges, usage_checked: a.usage_checked + b.usage_checked,
-        ndr_checked: a.ndr_checked + b.ndr_checked, ndr_overflow: a.ndr_overflow + b.ndr_overflow, stacked_pins: a.stacked_pins + b.stacked_pins, htree: a.htree + b.htree,
+        ndr_checked: a.ndr_checked + b.ndr_checked, r6_checked: a.r6_checked + b.r6_checked, r6_segs: a.r6_segs + b.r6_segs, stacked_pins: a.stacked_pins + b.stacked_pins, htree: a.htree + b.htree,
     }
 }
 
@@ -347,7 +404,7 @@ fn grid_caps(xg: usize, yg: usize, cap: i32) -> Caps3D {
 }
 
 fn net<'a>(x: &'a [i32], y: &'a [i32]) -> RsmtNet<'a> {
-    RsmtNet { pins_x: x, pins_y: y, alpha: 0.0, edge_cost: 1, min_layer: 0, max_layer: 0 }
+    RsmtNet { pins_x: x, pins_y: y, alpha: 0.0, edge_cost: 1, min_layer: 0, max_layer: 0, layer_edge_cost: &[1] }
 }
 
 /// ⛔ `fluteCongest` stretches each gap between consecutive SORTED pins by the usage across the
@@ -366,7 +423,7 @@ fn flute_congest_stretches_each_gap_by_its_usage() {
     est.update_v(0, 0, 1, 1.0); // y gap 0: one edge of 1…
     let red_v = |x: usize, y: usize| if y == 0 && x < 7 && x > 0 { 1u16 } else { 0 }; // …plus red 1 on six more = 7
     let caps = grid_caps(xg, yg, 0);
-    let grid = BrkGrid { est: &mut est, red_h: &red_h, red_v: &red_v, caps: &caps, h_capacity: 1000, v_capacity: 10, via_cost: 0.0 };
+    let grid = BrkGrid { est: &mut est, red_h: &red_h, red_v: &red_v, caps: &caps, h_capacity: 1000, v_capacity: 10, via_cost: 0.0 , ndr: &mut NdrLedger::new(1, 1, 1) };
     let sorted = SortedPins { xs: vec![0, 2, 4, 6], ys: vec![0, 1, 2, 3], s: vec![0, 1, 2, 3] };
     let seen = RefCell::new((Vec::new(), Vec::new()));
     let fake = |xs: &[i32], ys: &[i32], _: &[usize], _: i32| {
@@ -398,7 +455,7 @@ fn net_congestion_is_at_or_over_capacity() {
     let mut est = EstimateGrid::new(4, 4);
     est.update_h(0, 1, 0, 3.0);
     let caps = grid_caps(4, 4, 3);
-    let grid = BrkGrid { est: &mut est, red_h: &no_red, red_v: &no_red, caps: &caps, h_capacity: 3, v_capacity: 3, via_cost: 0.0 };
+    let grid = BrkGrid { est: &mut est, red_h: &no_red, red_v: &no_red, caps: &caps, h_capacity: 3, v_capacity: 3, via_cost: 0.0 , ndr: &mut NdrLedger::new(1, 1, 1) };
     let (x, y) = ([0, 2], [0, 2]);
     let seg = RoutedSegment { seg: Segment { x1: 0, y1: 0, x2: 2, y2: 2, edge_cost: 1 }, x_first: true };
     assert!(net_congestion(&net(&x, &y), &[seg], &grid), "usage 3 on capacity 3 is congested");
@@ -409,7 +466,7 @@ fn net_congestion_walks_the_bend_taken() {
     let mut est = EstimateGrid::new(4, 4);
     est.update_v(0, 0, 1, 5.0); // column x1 — on the y-first path only
     let caps = grid_caps(4, 4, 3);
-    let grid = BrkGrid { est: &mut est, red_h: &no_red, red_v: &no_red, caps: &caps, h_capacity: 3, v_capacity: 3, via_cost: 0.0 };
+    let grid = BrkGrid { est: &mut est, red_h: &no_red, red_v: &no_red, caps: &caps, h_capacity: 3, v_capacity: 3, via_cost: 0.0 , ndr: &mut NdrLedger::new(1, 1, 1) };
     let (x, y) = ([0, 2], [0, 2]);
     let s = Segment { x1: 0, y1: 0, x2: 2, y2: 2, edge_cost: 1 };
     assert!(!net_congestion(&net(&x, &y), &[RoutedSegment { seg: s, x_first: true }], &grid));
@@ -435,7 +492,7 @@ fn a_congested_net_takes_the_congestion_flute() {
     let r7 = BrkFlags { congestion_driven: true, re_route: true, gen_tree: true, no_adj: false };
     let no_stt = |_: usize| -> RsmtTree { unreachable!("alpha 0") };
     {
-        let mut grid = BrkGrid { est: &mut est, red_h: &no_red, red_v: &no_red, caps: &caps, h_capacity: 1, v_capacity: 1, via_cost: 0.0 };
+        let mut grid = BrkGrid { est: &mut est, red_h: &no_red, red_v: &no_red, caps: &caps, h_capacity: 1, v_capacity: 1, via_cost: 0.0 , ndr: &mut NdrLedger::new(1, 1, 1) };
         gen_brk_rsmt(r5, &[0], &nets, &mut state, &mut grid, &no_stt, &fake).expect("R5");
     }
     // Another net's usage fills the first segment's path — y-first, the bend an unrouted segment
@@ -443,7 +500,7 @@ fn a_congested_net_takes_the_congestion_flute() {
     let first = state[0].seglist[0].seg;
     est.update_v(first.x1, first.y1.min(first.y2), first.y1.max(first.y2), 5.0);
     est.update_h(first.x1, first.x2, first.y2, 5.0);
-    let mut grid = BrkGrid { est: &mut est, red_h: &no_red, red_v: &no_red, caps: &caps, h_capacity: 1, v_capacity: 1, via_cost: 0.0 };
+    let mut grid = BrkGrid { est: &mut est, red_h: &no_red, red_v: &no_red, caps: &caps, h_capacity: 1, v_capacity: 1, via_cost: 0.0 , ndr: &mut NdrLedger::new(1, 1, 1) };
     let sum = gen_brk_rsmt(r7, &[0], &nets, &mut state, &mut grid, &no_stt, &fake).expect("R7");
     assert_eq!((sum.nets[0].kind, sum.nets[0].congested), (TreeKind::Congest, Some(true)));
 }
