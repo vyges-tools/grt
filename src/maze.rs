@@ -989,6 +989,9 @@ pub enum EdgeOutcome {
         region: (i32, i32, i32, i32),
         src: Vec<(i32, i32)>,
         dest: Vec<(i32, i32)>,
+        /// Every `corr_edge` write the seeding made, in order — the surgery looks the path's ends up
+        /// here (the last write for a point wins).
+        corr_edge: Vec<((i32, i32), usize)>,
     },
     /// ⛔ The surgery could not place a contact point. The net's tree must be rebuilt and the
     /// **whole net** reprocessed — the reference steps its net index back before breaking out.
@@ -1075,6 +1078,7 @@ pub fn route_one_edge(
         region,
         src: heaps.src,
         dest: heaps.dest,
+        corr_edge: heaps.corr_edge,
     })
 }
 

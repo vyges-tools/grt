@@ -141,7 +141,7 @@ fn the_per_edge_sequence_produces_the_reference_path() {
             .unwrap_or_else(|e| panic!("sequence failed on {}: {e}", c.design));
 
         match got {
-            EdgeOutcome::Routed { path, region, src, dest } => {
+            EdgeOutcome::Routed { path, region, src, dest, .. } => {
                 // ⛔ The region the sequence computed, not one recomputed beside it: a region
                 // handed to the wrong stage usually still yields the same path.
                 assert_eq!(region, c.region, "region on {} edge {}", c.design, c.edge_id);

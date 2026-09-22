@@ -94,6 +94,11 @@ struct Seen {
     maze_routes: usize,
     maze_passes: usize,
     usage_errors: usize,
+    loop_iterations: usize,
+    snapshot_batched: usize,
+    thinned: usize,
+    loop_partial_slack: usize,
+    loop_extra_stops: usize,
     stacked_pins: usize,
     htree: usize,
 }
@@ -107,6 +112,12 @@ struct Seen {
 const INCREMENTAL: [&str; 4] =
     ["repair_antennas_adjacent_jumpers-", "repair_antennas_allow_congestion-", "repair_antennas_from_odb-", "repair_antennas_only_diodes-"];
 
+/// ⛔ Known limitation — the SNAPSHOT-BATCHED maze router. With a batch width configured and enough
+/// nets, `mazeRouteMSMD` routes early iterations in parallel snapshot batches ("intentionally not
+/// exact-preserving", per its own comment) instead of the sequential kernel this engine transcribes.
+/// Those runs must diverge at their first loop iteration's result, and every other run must match.
+const SNAPSHOT_BATCHED: [&str; 2] = ["snapshot_batched_smoke-", "snapshot_batched_single_thread_smoke-"];
+
 /// Replay every run; list every run that diverges rather than stopping at the first. `bounds` is
 /// the boundary golden: each run's router state after R7, R8, R9, R10, per `global_route`.
 fn replay(g: &Value, bounds: &Value) -> Seen {
@@ -118,18 +129,24 @@ fn replay(g: &Value, bounds: &Value) -> Seen {
         let who = r["design"].as_str().expect("design");
         let mut one = Seen::default();
         let b = by_design.get(who).copied();
-        let known = INCREMENTAL.iter().any(|p| who.starts_with(p));
+        let (known, expect) = if INCREMENTAL.iter().any(|p| who.starts_with(p)) {
+            (true, "B7: committed usage")
+        } else if SNAPSHOT_BATCHED.iter().any(|p| who.starts_with(p)) {
+            (true, "B14_1: getOverflow2D")
+        } else {
+            (false, "")
+        };
         match (std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| replay_run(r, b, &mut one))), known) {
             (Ok(()), false) => seen = add(seen, one),
             (Err(e), true) => {
                 let msg = e.downcast_ref::<String>().cloned().unwrap_or_default();
-                if msg.contains("B7: committed usage") {
-                    seen.incremental += 1;
+                if msg.contains(expect) {
+                    if expect.starts_with("B7") { seen.incremental += 1 } else { seen.snapshot_batched += 1 }
                 } else {
-                    failed.push(format!("{who}: diverges, but not where the incremental setup does: {msg}"));
+                    failed.push(format!("{who}: diverges, but not where expected ({expect}): {msg}"));
                 }
             }
-            (Ok(()), true) => failed.push(format!("{who}: now MATCHES — the incremental setup landed; empty INCREMENTAL")),
+            (Ok(()), true) => failed.push(format!("{who}: now MATCHES where it was expected to diverge at {expect} — update the known list")),
             (Err(e), false) => failed.push(format!("{who}: {}", e.downcast_ref::<String>().cloned().unwrap_or_default())),
         }
     }
@@ -144,6 +161,14 @@ fn check_boundary(at: &str, b: &Value, scan: &Overflow2DScan, g2d: &Graph2d, sta
     let at = format!("{at} {tag}");
     assert_eq!((scan.total_overflow, scan.max_overflow, scan.ahth), (int(&b["total_overflow"]), int(&b["max_overflow"]), int(&b["ahth"])),
                "{at}: getOverflow2D (total, max, ahth)");
+    if tag.starts_with("B12_") || tag.starts_with("B14_") {
+        assert_eq!(scan.total_usage, int(&b["t_usage"]), "{at}: getOverflow2Dmaze tUsage");
+    }
+    // ⚠️ A THINNED loop boundary carries only its parameters and the scalars above.
+    if b["thinned"].as_bool() == Some(true) {
+        seen.thinned += 1;
+        return;
+    }
     for (dir, rows) in [("H", &b["est"]["H"]), ("V", &b["est"]["V"])] {
         for (y, row) in arr(rows).iter().enumerate() {
             let flat: Vec<f64> = arr(row).iter().flat_map(|p| std::iter::repeat(p[0].as_f64().expect("f")).take(int(&p[1]) as usize)).collect();
@@ -162,8 +187,23 @@ fn check_boundary(at: &str, b: &Value, scan: &Overflow2DScan, g2d: &Graph2d, sta
             }
         }
     }
-    if tag.starts_with("B12_") {
-        assert_eq!(scan.total_usage, int(&b["t_usage"]), "{at}: getOverflow2Dmaze tUsage");
+    // The congestion history, present from B13 on.
+    for (key, what) in [("last", "last_usage"), ("cong", "congCNT")] {
+        let Some(rows) = b.get(key) else { continue };
+        for (dir, rows) in [("H", &rows["H"]), ("V", &rows["V"])] {
+            for (y, row) in arr(rows).iter().enumerate() {
+                let flat: Vec<i32> = arr(row).iter().flat_map(|p| std::iter::repeat(int(&p[0])).take(int(&p[1]) as usize)).collect();
+                for (x, &want) in flat.iter().enumerate() {
+                    let ours = match (key, dir) {
+                        ("last", "H") => g2d.est.last_usage_h(x, y) as i32,
+                        ("last", _) => g2d.est.last_usage_v(x, y) as i32,
+                        (_, "H") => g2d.est.cong_cnt_h(x, y) as i32,
+                        _ => g2d.est.cong_cnt_v(x, y) as i32,
+                    };
+                    assert_eq!(ours, want, "{at}: {what} {dir} ({x}, {y})");
+                }
+            }
+        }
     }
     for (dir, ours) in [("H", &g2d.used_h), ("V", &g2d.used_v)] {
         let want: Vec<(i32, i32)> = arr(&b["used"][dir]).iter().map(|p| (int(&p[0]), int(&p[1]))).collect();
@@ -181,6 +221,18 @@ fn check_boundary(at: &str, b: &Value, scan: &Overflow2DScan, g2d: &Graph2d, sta
         }).collect();
         assert_eq!(ours, edges, "{at}: net {id} edges (n1, n2, len, type, xFirst, HVH, Zpoint)");
         seen.boundary_nets += 1;
+        if let Some(topo) = b.get("topo").and_then(|t| t.get(id.to_string())) {
+            for (i, v) in arr(topo).iter().enumerate() {
+                let cnt = int(&v[0]) as usize;
+                let want: Vec<(usize, usize)> = (0..cnt).map(|k| (int(&v[1 + k]) as usize, int(&v[4 + k]) as usize)).collect();
+                let ours: Vec<(usize, usize)> = (0..t.nbr_count[i]).map(|k| (t.nbr[i][k], t.edge[i][k])).collect();
+                assert_eq!(ours, want, "{at}: net {id} node {i} neighbours (count {cnt})");
+            }
+        }
+        if let Some(ns) = b.get("netstate").and_then(|t| t.get(id.to_string())) {
+            assert_eq!((state[id].slack.to_bits(), state[id].critical), (int(&ns["slack_bits"]) as u32, ns["critical"].as_bool().expect("critical")),
+                       "{at}: net {id} (slack bits, critical)");
+        }
         for (eid, r) in t.routes.iter().enumerate().filter(|(_, r)| r.kind == RouteKind::MazeRoute) {
             let g = &b["grids"][format!("{id},{eid}")];
             assert!(!g.is_null(), "{at}: net {id} edge {eid}: a maze route the reference does not have");
@@ -538,8 +590,83 @@ fn replay_run(r: &Value, bounds: Option<&Value>, seen: &mut Seen) {
                             last = round.scan;
                         });
                         init_for_congestion_loop(&net_ids, &mut state, &mut g2d);
-                        check_boundary(&at, at_b("B13").expect("B13 follows B12"), &last, &g2d, &state, seen);
+                        let b13 = at_b("B13").expect("B13 follows B12");
+                        // The nets' slacks come from timing setup: an INPUT, seeded from B13.
+                        for (id, ns) in b13["netstate"].as_object().expect("netstate") {
+                            let id: usize = id.parse().expect("id");
+                            state[id].slack = f32::from_bits(int(&ns["slack_bits"]) as u32);
+                            state[id].critical = ns["critical"].as_bool().expect("critical");
+                        }
+                        check_boundary(&at, b13, &last, &g2d, &state, seen);
                         seen.maze_passes += 1;
+
+                        // R14 — the congestion loop, iteration by iteration, with the reference's own
+                        // per-iteration parameters (the schedule itself is checked separately).
+                        let pass_pres: Vec<&Value> = {
+                            // This pass's iterations: those between this B13 and the next B7 (if any).
+                            let tags: Vec<&str> = group.iter().map(|b| b["tag"].as_str().unwrap_or("")).collect();
+                            let starts: Vec<usize> = tags.iter().enumerate().filter(|(_, t)| **t == "B13").map(|(k, _)| k).collect();
+                            let from = starts[pass];
+                            let to = tags.iter().enumerate().skip(from + 1).find(|(_, t)| **t == "B7").map_or(tags.len(), |(k, _)| k);
+                            group[from..to].iter().filter(|b| b["tag"].as_str().is_some_and(|t| t.starts_with("B14pre_"))).copied().collect()
+                        };
+                        {
+                            let mut scan = last;
+                            let mut max_adj = 0;
+                            for pre in pass_pres {
+                                let q = &pre["params"];
+                                let h = &pre["history"];
+                                let i = int(&q["i"]);
+                                let got = g2d.update_congestion_history(int(&h["up_type"]), int(&h["ahth"]), int(&h["stop_dec"]) == 1, max_adj);
+                                assert_eq!(got, int(&h["max_adj"]), "{at} iteration {i}: updateCongestionHistory max_adj");
+                                max_adj = got;
+                                if i == 8 {
+                                    g2d.est.init_last_usage(2);
+                                }
+                                check_boundary(&at, pre, &scan, &g2d, &state, seen);
+                                // ⛔ `critical_nets_percentage_` defaults to 10 and is zeroed only when no
+                                // Liberty is loaded: with it on, an ordering iteration runs the
+                                // partial-slack pass, which needs timing. Stop before it.
+                                if int(&q["cnp"]) != 0 && int(&q["ordering"]) == 1 {
+                                    seen.loop_partial_slack += 1;
+                                    break;
+                                }
+                                let p = MsmdParams {
+                                    iter: i,
+                                    expand: int(&q["enlarge"]),
+                                    ripup_threshold: int(&q["ripup_threshold"]),
+                                    maze_edge_threshold: int(&q["maze_edge_threshold"]),
+                                    ordering: int(&q["ordering"]) == 1,
+                                    via: int(&q["via"]),
+                                    l: int(&q["L"]),
+                                    cost: vyges_grt::mazecost::CostParams {
+                                        slope: int(&q["slope"]),
+                                        logistic_coef: q["logistic"].as_f64().expect("f"),
+                                        cost_height: f64::from(int(&q["costheight"])),
+                                    },
+                                    slack_th: f32::from_bits(int(&q["slack_th_bits"]) as u32),
+                                    critical_nets_percentage: 0,
+                                };
+                                let mut grid14 = BrkGrid {
+                                    g: &mut g2d,
+                                    red_h: &red_h_f,
+                                    red_v: &red_v_f,
+                                    caps: &caps,
+                                    h_capacity: hcap,
+                                    v_capacity: vcap,
+                                    via_cost: 0.0,
+                                };
+                                maze_route_msmd_sequential(&p, &net_ids, &nets, &mut state, &mut grid14).unwrap_or_else(|e| panic!("{at} iteration {i}: {e}"));
+                                scan = g2d.get_overflow_2d_maze();
+                                let after = at_b(&format!("B14_{i}")).unwrap_or_else(|| panic!("{at}: B14_{i} follows B14pre_{i}"));
+                                check_boundary(&at, after, &scan, &g2d, &state, seen);
+                                seen.loop_iterations += 1;
+                                if at_b(&format!("B14b_{}", i + 1)).is_some() || at_b(&format!("B14c_{}", i + 1)).is_some() {
+                                    seen.loop_extra_stops += 1;
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
                 pass += 1;
@@ -556,7 +683,7 @@ fn gen_brk_rsmt_matches_the_reference() {
     let s = replay(&read(&format!("{dir}/brk_rsmt.json")), &read(&format!("{dir}/boundaries.json")));
     eprintln!("{s:?}");
     assert!(s.runs >= 40 && s.flute_nets >= 990 && s.shifted >= 70 && s.shifts > 0 && s.copied >= 900
-            && s.routed_edges >= 1000 && s.usage_checked >= 60 && s.ndr_checked >= 2 && s.r6_checked >= 40 && s.boundaries >= 160 && s.gate_hvh > 0 && s.gate_vhv > 0 && s.maze_passes >= 18 && s.htree > 0,
+            && s.routed_edges >= 1000 && s.usage_checked >= 60 && s.ndr_checked >= 2 && s.r6_checked >= 40 && s.boundaries >= 160 && s.gate_hvh > 0 && s.gate_vhv > 0 && s.maze_passes >= 18 && s.loop_iterations >= 50 && s.htree > 0,
             "{s:?}");
 }
 
@@ -574,7 +701,7 @@ fn add(a: Seen, b: Seen) -> Seen {
         runs: a.runs + b.runs, calls: a.calls + b.calls, nets: a.nets + b.nets, flute_nets: a.flute_nets + b.flute_nets,
         shifted: a.shifted + b.shifted, shifts: a.shifts + b.shifts, copied: a.copied + b.copied,
         routed_edges: a.routed_edges + b.routed_edges, usage_checked: a.usage_checked + b.usage_checked,
-        ndr_checked: a.ndr_checked + b.ndr_checked, r6_checked: a.r6_checked + b.r6_checked, r6_segs: a.r6_segs + b.r6_segs, boundaries: a.boundaries + b.boundaries, boundary_nets: a.boundary_nets + b.boundary_nets, incremental: a.incremental + b.incremental, gate_hvh: a.gate_hvh + b.gate_hvh, gate_vhv: a.gate_vhv + b.gate_vhv, maze_routes: a.maze_routes + b.maze_routes, maze_passes: a.maze_passes + b.maze_passes, usage_errors: a.usage_errors + b.usage_errors, stacked_pins: a.stacked_pins + b.stacked_pins, htree: a.htree + b.htree,
+        ndr_checked: a.ndr_checked + b.ndr_checked, r6_checked: a.r6_checked + b.r6_checked, r6_segs: a.r6_segs + b.r6_segs, boundaries: a.boundaries + b.boundaries, boundary_nets: a.boundary_nets + b.boundary_nets, incremental: a.incremental + b.incremental, gate_hvh: a.gate_hvh + b.gate_hvh, gate_vhv: a.gate_vhv + b.gate_vhv, maze_routes: a.maze_routes + b.maze_routes, maze_passes: a.maze_passes + b.maze_passes, usage_errors: a.usage_errors + b.usage_errors, loop_iterations: a.loop_iterations + b.loop_iterations, snapshot_batched: a.snapshot_batched + b.snapshot_batched, thinned: a.thinned + b.thinned, loop_partial_slack: a.loop_partial_slack + b.loop_partial_slack, loop_extra_stops: a.loop_extra_stops + b.loop_extra_stops, stacked_pins: a.stacked_pins + b.stacked_pins, htree: a.htree + b.htree,
     }
 }
 
@@ -890,4 +1017,33 @@ fn the_lv_rounds_follow_the_reference_schedule() {
     assert_eq!(schedule, vec![(10, 10), (5, 15), (1, 20)]);
     assert_eq!(rounds[0].logistic_coef, (2.0 / (1.0 + 701f64.ln())) as f32, "round 0 reads the pattern phase's max overflow");
     assert_eq!(rounds[1].logistic_coef.to_bits(), (-0.0f32).to_bits(), "round 1 reads round 0's scan: nothing routed, ln 0");
+}
+
+/// ⛔ The seeding WRITES each point's edge into an array, so a point two edges share keeps the LAST
+/// write. No corpus search ends on such a point.
+#[test]
+fn corr_edge_keeps_the_last_write() {
+    let writes = [((3, 4), 7), ((5, 5), 2), ((3, 4), 9)];
+    assert_eq!(corr_edge_at(&writes, (3, 4)), Some(9));
+    assert_eq!(corr_edge_at(&writes, (5, 5)), Some(2));
+    assert_eq!(corr_edge_at(&writes, (0, 0)), None);
+}
+
+/// ⛔ `StNetOrder` stamps an uncongested net still carrying the sentinel slack, past the first 30% of
+/// the congestion order, with `f32::MAX` — and WRITES it back onto the net, so it persists into later
+/// rounds. Only a run with the partial-slack pass has sentinel slacks, and no such run is replayable.
+#[test]
+fn st_net_order_stamps_and_keeps_the_deprioritised_slack() {
+    let pins = [(0, 0), (4, 0)];
+    let (px, py): (Vec<i32>, Vec<i32>) = pins.iter().copied().unzip();
+    let nets: Vec<RsmtNet<'_>> = (0..4).map(|_| RsmtNet { layer_edge_cost: &[1], ..net(&px, &py) }).collect();
+    let mut state: Vec<NetState> = (0..4).map(|_| st_tree(2, &[(0, 0, 1), (4, 0, 1)], &pins)).collect();
+    let mut g2d = Graph2d::new(6, 2, 1);
+    let caps = grid_caps(6, 2, 10);
+    let grid = BrkGrid { g: &mut g2d, red_h: &no_red, red_v: &no_red, caps: &caps, h_capacity: 10, v_capacity: 10, via_cost: 0.0 };
+    // Four uncongested nets, all at the sentinel: 30% of 4 is 1, so positions 1..3 are stamped.
+    let order = st_net_order(&[0, 1, 2, 3], &nets, &mut state, &grid);
+    assert_eq!(order, vec![0, 1, 2, 3], "stable: the stamped nets keep their order, after the unstamped one");
+    let slacks: Vec<f32> = state.iter().map(|s| s.slack).collect();
+    assert_eq!(slacks, vec![vyges_grt::ripup::SLACK_SENTINEL, f32::MAX, f32::MAX, f32::MAX]);
 }

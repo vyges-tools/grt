@@ -43,6 +43,12 @@ pub const DEPRIORITISE_PERCENT: usize = 30;
 ///
 /// Returns the final order.
 pub fn order_for_ripup(nets: &[OrderTree]) -> Vec<String> {
+    order_trees_for_ripup(nets).into_iter().map(|t| t.net).collect()
+}
+
+/// [`order_for_ripup`] returning the whole records — ⛔ with the slacks step 2 stamped, which the
+/// reference writes back onto its nets (`setSlack`) and which persist into later rounds.
+pub fn order_trees_for_ripup(nets: &[OrderTree]) -> Vec<OrderTree> {
     let mut v: Vec<OrderTree> = nets.to_vec();
 
     // 1 · descending congestion, STABLE
@@ -61,8 +67,7 @@ pub fn order_for_ripup(nets: &[OrderTree]) -> Vec<String> {
 
     // 3 · ascending slack, STABLE
     v.sort_by(|a, b| a.slack.partial_cmp(&b.slack).expect("slack is never NaN"));
-
-    v.into_iter().map(|t| t.net).collect()
+    v
 }
 
 /// The order after step 1 alone — exposed so a divergence can be attributed to one sort.

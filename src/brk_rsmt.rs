@@ -220,13 +220,24 @@ pub struct StTree {
 }
 
 /// Per-net router state that outlives one call.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct NetState {
     /// `seglist_[net]`. ⛔ **R7 appends to it without clearing**: the old segments are ripped up
     /// (their usage removed) but stay in the list, and the new tree's segments follow them.
     pub seglist: Vec<RoutedSegment>,
     pub sorted: Option<SortedPins>,
     pub tree: Option<StTree>,
+    /// `FrNet::slack_` — ⛔ MUTATED by the maze phase: the congestion ordering stamps de-prioritised
+    /// nets with `f32::MAX`. Starts at the sentinel `ceil(lowest float)`.
+    pub slack: f32,
+    /// `FrNet::is_critical_` — set by the rip-up gate's critical arm, never cleared.
+    pub critical: bool,
+}
+
+impl Default for NetState {
+    fn default() -> Self {
+        NetState { seglist: Vec::new(), sorted: None, tree: None, slack: crate::ripup::SLACK_SENTINEL, critical: false }
+    }
 }
 
 /// What one net went through, returned so a divergence can be pinned to its stage.

@@ -39,8 +39,9 @@ pub struct EstimateGrid {
     /// ⛔ `last_usage` is `int16_t` in the reference, not a float.
     last_usage_h: Vec<i16>,
     last_usage_v: Vec<i16>,
-    cong_cnt_h: Vec<i32>,
-    cong_cnt_v: Vec<i32>,
+    /// ⛔ `int16_t`, as the reference's `Edge::congCNT`.
+    cong_cnt_h: Vec<i16>,
+    cong_cnt_v: Vec<i16>,
 }
 
 impl EstimateGrid {
@@ -67,11 +68,21 @@ impl EstimateGrid {
         self.last_usage_v[y * self.x_grids + x]
     }
     /// How many rounds the edge leaving `(x, y)` has been counted congested.
-    pub fn cong_cnt_h(&self, x: usize, y: usize) -> i32 {
+    pub fn cong_cnt_h(&self, x: usize, y: usize) -> i16 {
         self.cong_cnt_h[y * self.h_columns() + x]
     }
-    pub fn cong_cnt_v(&self, x: usize, y: usize) -> i32 {
+    pub fn cong_cnt_v(&self, x: usize, y: usize) -> i16 {
         self.cong_cnt_v[y * self.x_grids + x]
+    }
+    /// The congestion history of one edge, `(last_usage, congCNT)`, for the stages that update it.
+    pub fn history_mut(&mut self, horizontal: bool, x: usize, y: usize) -> (&mut i16, &mut i16) {
+        if horizontal {
+            let i = y * self.h_columns() + x;
+            (&mut self.last_usage_h[i], &mut self.cong_cnt_h[i])
+        } else {
+            let i = y * self.x_grids + x;
+            (&mut self.last_usage_v[i], &mut self.cong_cnt_v[i])
+        }
     }
 
     /// Clear the estimate on every edge — the reference's `InitEstUsage`.

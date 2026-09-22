@@ -66,6 +66,64 @@ impl Graph2d {
         get_overflow_2d_maze(&h, &v)
     }
 
+    /// `updateCongestionHistory(up_type, ahth, stop_decreasing, max_adj)` — over the USED grids, in
+    /// set order: an overflowing edge counts one more congested round and banks its overflow in
+    /// `last_usage`; otherwise (unless decreasing is stopped) the count decays (not for type 1) and
+    /// `last_usage` decays by 0.9 (types other than 3) or by the negative overflow (type 3).
+    /// Returns `max_adj`, the largest `last_usage` seen.
+    ///
+    /// ⛔ Type 2 decides `stop_decreasing` from the INCOMING `max_adj` (`max_adj < ahth`), and the
+    /// caller's own flag is not changed. ⛔ `last_usage` is `int16_t`: `*= 0.9` truncates, `+=` wraps.
+    pub fn update_congestion_history(&mut self, up_type: i32, ahth: i32, stop_decreasing: bool, max_adj_in: i32) -> i32 {
+        let stop = if up_type == 2 { max_adj_in < ahth } else { stop_decreasing };
+        let mut maxlimit = 0i32;
+        let xg = self.est.x_grids;
+        for (horizontal, used) in [(true, self.used_h.clone()), (false, self.used_v.clone())] {
+            for (x, y) in used {
+                let (usage, cap) = if horizontal {
+                    (self.est.usage_h(x as usize, y as usize), self.cap_h[y as usize * xg + x as usize])
+                } else {
+                    (self.est.usage_v(x as usize, y as usize), self.cap_v[y as usize * xg + x as usize])
+                };
+                let overflow = i32::from(usage) - i32::from(cap);
+                let (last, cnt) = self.est.history_mut(horizontal, x as usize, y as usize);
+                if overflow > 0 {
+                    *cnt = cnt.wrapping_add(1);
+                    *last = (i32::from(*last) + overflow) as i16;
+                } else if !stop {
+                    if up_type != 1 {
+                        *cnt = (i32::from(*cnt) - 1).max(0) as i16;
+                    }
+                    if up_type != 3 {
+                        *last = (f64::from(*last) * 0.9) as i16;
+                    } else {
+                        *last = (i32::from(*last) + overflow).max(0) as i16;
+                    }
+                }
+                maxlimit = maxlimit.max(i32::from(*last));
+            }
+        }
+        maxlimit
+    }
+
+    /// `str_accu(rnd)` — over EVERY edge: one that overflows, or has been congested more than `rnd`
+    /// rounds, banks `congCNT * overflow / 2` (integer division) in `last_usage`.
+    pub fn str_accu(&mut self, rnd: i32) {
+        let (xg, yg) = (self.est.x_grids, self.est.y_grids);
+        for (horizontal, xs, ys) in [(true, xg.saturating_sub(1), yg), (false, xg, yg.saturating_sub(1))] {
+            for y in 0..ys {
+                for x in 0..xs {
+                    let (usage, cap) = if horizontal { (self.est.usage_h(x, y), self.cap_h[y * xg + x]) } else { (self.est.usage_v(x, y), self.cap_v[y * xg + x]) };
+                    let overflow = i32::from(usage) - i32::from(cap);
+                    let (last, cnt) = self.est.history_mut(horizontal, x, y);
+                    if overflow > 0 || i32::from(*cnt) > rnd {
+                        *last = (i32::from(*last) + i32::from(*cnt) * overflow / 2) as i16;
+                    }
+                }
+            }
+        }
+    }
+
     /// `getUsageRedH` — committed usage plus the edge's reduction, ⛔ as `uint16_t` (the sum wraps).
     pub fn usage_red_h(&self, x: i32, y: i32, red: u16) -> u16 {
         (u32::from(self.est.usage_h(x as usize, y as usize)) + u32::from(red)) as u16
