@@ -187,6 +187,55 @@ pub fn order_nets(nets: &[DiscoveredNet]) -> Vec<String> {
     clk.into_iter().chain(rest).map(str::to_string).collect()
 }
 
+/// The run's options that the first setup stages read (I3, I5).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetupOptions {
+    pub verbose: bool,
+    /// Whether any Liberty library is loaded (`defaultLibertyLibrary() != nullptr`).
+    pub has_liberty: bool,
+    /// The router's critical-nets percentage going IN — it is router state, and survives across
+    /// runs: `clear()` does not reset it.
+    pub critical_nets_percentage: f32,
+    /// `adjustment_` — a `float`, set by the global layer adjustment.
+    pub adjustment: f32,
+    pub grid_origin: (i32, i32),
+    /// The names of the min and max routing layers, as indexed by I4.
+    pub min_layer_name: String,
+    pub max_layer_name: String,
+}
+
+/// What `configFastRoute` leaves in the router that later stages read.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FastRouteConfig {
+    pub critical_nets_percentage: f32,
+}
+
+/// I3 — `configFastRoute`: push the run's options into the router.
+///
+/// ⛔ With no Liberty loaded the critical-nets percentage is FORCED to 0, with GRT-300 — every run,
+/// whatever it was (a warning even when it already was 0). The value persists in the router.
+pub fn config_fast_route(opts: &SetupOptions, log: &mut Vec<String>) -> FastRouteConfig {
+    let mut critical_nets_percentage = opts.critical_nets_percentage;
+    if !opts.has_liberty {
+        log.push("[WARNING GRT-0300] Timing is not available, setting critical nets percentage to 0.".into());
+        critical_nets_percentage = 0.0;
+    }
+    FastRouteConfig { critical_nets_percentage }
+}
+
+/// I5 — `reportLayerSettings`: GRT-20 … GRT-23, verbose only.
+///
+/// ⛔ `int(adjustment_ * 100)` multiplies in `float` and TRUNCATES: 0.29f × 100 is 29.0f (29%),
+/// where the same product in `double` is 28.99999… (28%).
+pub fn report_layer_settings(opts: &SetupOptions, log: &mut Vec<String>) {
+    if opts.verbose {
+        log.push(format!("[INFO GRT-0020] Min routing layer: {}", opts.min_layer_name));
+        log.push(format!("[INFO GRT-0021] Max routing layer: {}", opts.max_layer_name));
+        log.push(format!("[INFO GRT-0022] Global adjustment: {}%", (opts.adjustment * 100.0f32) as i32));
+        log.push(format!("[INFO GRT-0023] Grid origin: ({}, {})", opts.grid_origin.0, opts.grid_origin.1));
+    }
+}
+
 /// A stage of the setup sequence that this engine does not implement yet.
 ///
 /// 🔑 **Named, not omitted.** A stage that simply is not called produces no diff to chase — it
@@ -194,11 +243,7 @@ pub fn order_nets(nets: &[DiscoveredNet]) -> Vec<String> {
 /// order and reports the gaps by name instead of silently skipping them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AbsentStage {
-    /// I1/I2 — reset the router's edge state and its per-position net maps.
-    ClearRouterState,
-    /// I3 — push the run's options into the router.
-    ConfigFastRoute,
-    /// I4/I5 — validate layer directions and track grids, then report the layer settings.
+    /// I4 — validate layer directions and track grids.
     InitRoutingLayers,
     /// I6 — per-layer track pitch and line-to-via pitch.
     InitRoutingTracks,
@@ -225,7 +270,10 @@ pub enum AbsentStage {
 /// What a setup run produced, and what it did not.
 #[derive(Debug, Clone)]
 pub struct SetupReport {
+    pub config: FastRouteConfig,
     pub grid: CoreGrid,
+    /// The reference's log lines the stages emit, in order.
+    pub log: Vec<String>,
     /// ⬜ The stages of the published order this engine does not run yet, in that order.
     pub absent: Vec<AbsentStage>,
 }
@@ -236,23 +284,29 @@ pub struct SetupReport {
 /// the order here is the order there. Keeping the shape means a trace of the two can be read side
 /// by side instead of bisected — which is a debugging property, not a stylistic one.
 ///
-/// Today it derives the grid (I7) and reports every other stage as absent. The nets (I13a) are
-/// supplied by the caller until net discovery is implemented.
+/// The nets (I13a) are supplied by the caller until net discovery is implemented.
 pub fn init_fast_route(
+    opts: &SetupOptions,
     area: Rect,
     tile_size: i32,
     routing_layer_count: i32,
     max_layer: i32,
 ) -> SetupReport {
     use AbsentStage::*;
+    let mut log = Vec::new();
+    // I1, I2 — clearing the router: this engine builds its state fresh, and nothing observable
+    // survives `clear()` except the options it does not touch (see `SetupOptions`).
+    let config = config_fast_route(opts, &mut log); // I3 ✅
+    // I4 ⬜ (`init_routing_layers` exists; the layer names come in through the options)
+    report_layer_settings(opts, &mut log); // I5 ✅
+    // I6 ⬜
+    let grid = init_grid(area, tile_size, routing_layer_count, max_layer); // I7 ✅
+    // I8 ⬜  I9 ⬜  I10 ⬜  I11 n/a  I12 ⬜  I13b ⬜  I14 ⬜
     SetupReport {
-        // I1, I2 ⬜  I3 ⬜  I4, I5 ⬜  I6 ⬜
-        // I7 ✅ — the grid, and its track pitches are part of the absent I6.
-        grid: init_grid(area, tile_size, routing_layer_count, max_layer),
-        // I8 ⬜  I9 ⬜  I10 ⬜  I11 n/a  I12 ⬜  I13b ⬜  I14 ⬜
+        config,
+        grid,
+        log,
         absent: vec![
-            ClearRouterState,
-            ConfigFastRoute,
             InitRoutingLayers,
             InitRoutingTracks,
             MirrorGridToFastRoute,

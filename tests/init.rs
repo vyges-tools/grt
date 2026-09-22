@@ -165,12 +165,21 @@ fn max_layer_caps_the_layer_count_and_minus_one_does_not() {
 fn the_sequencer_REPORTS_every_stage_it_does_not_run() {
     // 🔑 A stage that is simply not called produces no diff to chase. The setup run names its
     // gaps so they are visible from the outside rather than discovered later as a wrong answer.
-    let r = init_fast_route(Rect::new(0, 0, 200_260, 201_600), 5_700, 10, -1);
+    let opts = vyges_grt::SetupOptions {
+        verbose: false,
+        has_liberty: true,
+        critical_nets_percentage: 0.0,
+        adjustment: 0.0,
+        grid_origin: (0, 0),
+        min_layer_name: String::new(),
+        max_layer_name: String::new(),
+    };
+    let r = init_fast_route(&opts, Rect::new(0, 0, 200_260, 201_600), 5_700, 10, -1);
     assert_eq!(r.grid.x_grids, 35);
     assert!(r.absent.contains(&AbsentStage::SetCapacities));
     assert!(r.absent.contains(&AbsentStage::InitNetlist));
     assert!(r.absent.contains(&AbsentStage::FindNetsFromDatabase));
-    assert_eq!(r.absent.len(), 12, "twelve stages are still absent; I7 and I13's RULES are done");
+    assert_eq!(r.absent.len(), 10, "ten stages are still absent; I1-I3, I5, I7 and I13's RULES are done");
 }
 
 // ---- I13a: net discovery order, and the clock classification that drives it ---------------

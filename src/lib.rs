@@ -85,7 +85,7 @@ pub use capacity::{
 pub mod init;
 pub use init::{
     init_fast_route, init_grid, is_clk_term, is_local, is_non_leaf_clock, is_routable, order_nets,
-    AbsentStage, CoreGrid, DiscoveredNet, ITermClockFacts, SetupReport,
+    AbsentStage, CoreGrid, DiscoveredNet, ITermClockFacts, SetupReport, config_fast_route, report_layer_settings, FastRouteConfig, SetupOptions,
 };
 
 #[cfg(feature = "odb")]
