@@ -56,6 +56,11 @@ pub struct RouteOptions {
     pub alpha: f32,
     /// `set_routing_alpha <a> -min_fanout <n>` — `(n, a)`.
     pub min_fanout_alpha: Option<(i32, f32)>,
+    /// `set_routing_alpha <a> -min_hpwl <µm>` — `(hpwl in dbu, a)`; the µm are rounded
+    /// (`microns_to_dbu`) where the command runs.
+    pub min_hpwl_alpha: Option<(i32, f32)>,
+    /// `set_routing_alpha <a> -net …` and `-clock_nets` — `setNetAlpha`, by net name.
+    pub net_alpha: std::collections::BTreeMap<String, f32>,
     /// `global_route -allow_congestion`.
     pub allow_congestion: bool,
     /// `global_route -congestion_iterations` (default 50).
@@ -81,6 +86,8 @@ impl RouteOptions {
             nets_to_route: None,
             alpha: 0.3,
             min_fanout_alpha: None,
+            min_hpwl_alpha: None,
+            net_alpha: std::collections::BTreeMap::new(),
             allow_congestion: false,
             congestion_iterations: 50,
             macro_extension: 0,
@@ -656,7 +663,8 @@ pub fn setup_nets(db: &Db, t: &TechSetup, e: &mut RouterEdges, has_macros_or_pad
             max_layer: hi,
             edge_cost,
             layer_edge_cost: lec,
-            alpha: opts.alpha,
+            // getAlpha: the net's own alpha, else the global one — FastRoute's path gate reads it.
+            alpha: opts.net_alpha.get(&n.name).copied().unwrap_or(opts.alpha),
             net_pins: pins.iter().map(|(p, _)| p.clone()).collect(),
             term_count: n.term_count,
         });
@@ -701,6 +709,37 @@ pub struct RouteResult {
     /// The nets `initClockNets` re-typed CLOCK (`findClkNets`), by name.
     pub clock_nets: std::collections::BTreeSet<String>,
     pub log: Vec<String>,
+}
+
+/// `SteinerTreeBuilder::computeHPWL`: the bounding box of every instance terminal's average pin
+/// location (`getAvgXY`) and every block terminal's first pin location.
+///
+/// ⛔ An instance that is NONE or UNPLACED is STT-0004, an error. The block-terminal guard is
+/// `status != NONE || status != UNPLACED` — always true — so a block terminal never errors.
+fn compute_hpwl(db: &Db, net: &str) -> Result<i32, String> {
+    let (iterms, bterms) = (db.net_iterms(net), db.net_bterms(net));
+    if iterms.is_empty() && bterms.is_empty() {
+        return Ok(0);
+    }
+    let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+    let mut add = |x: i32, y: i32| {
+        (x0, x1, y0, y1) = (x0.min(x), x1.max(x), y0.min(y), y1.max(y));
+    };
+    for it in &iterms {
+        let (inst, term) = it.split_once('/').ok_or("an instance terminal without a '/'")?;
+        let status = db.inst_get_placement_status(inst);
+        if status == "NONE" || status == "UNPLACED" {
+            return Err(format!("STT-0004: connected to unplaced instance {inst}"));
+        }
+        // getAvgXY's failure (ODB-0034) leaves the coordinates unset in the reference: refused.
+        let (x, y) = db.iterm_avg_xy(inst, term).ok_or_else(|| format!("{it}: no pin shape for getAvgXY — not modelled"))?;
+        add(x, y);
+    }
+    for b in &bterms {
+        let (x, y) = db.bterm_first_pin_location(b).ok_or_else(|| format!("{b}: no pin location — not modelled"))?;
+        add(x, y);
+    }
+    Ok((x1 - x0) + (y1 - y0))
 }
 
 /// The Steiner tree builder as R5 calls it: pins, driver index, the net's alpha.
@@ -796,12 +835,31 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         (Some(_), false, Some(_)) => crate::congestion_loop::TimerSlack::PerCall(&captured),
         _ => crate::congestion_loop::TimerSlack::None,
     };
-    // makeSteinerTree(net, …): the net's alpha — the min-fanout rule when set.
+    // makeSteinerTree(net, …): the net's own alpha, else — ⛔ an else-if chain — the min-HPWL rule
+    // whenever one is set (the min-fanout rule is then never consulted), else the min-fanout rule.
+    let min_hpwl = opts.min_hpwl_alpha.filter(|&(h, _)| h > 0);
+    let hpwl: Vec<Option<i32>> = match min_hpwl {
+        Some(_) => nets
+            .iter()
+            .enumerate()
+            .map(|(k, n)| {
+                // Asked only of routed nets with no alpha of their own (every one reaches R5).
+                if n.is_local || opts.net_alpha.contains_key(&n.name) || n.alpha <= 0.0 { Ok(None) } else { compute_hpwl(db, &n.name).map(Some) }.map_err(|e| format!("net {}: {e}", nets[k].name))
+            })
+            .collect::<Result<_, _>>()?,
+        None => Vec::new(),
+    };
     let stt_net = |id: usize| {
         let n = &nets[id];
-        let alpha = match opts.min_fanout_alpha {
-            Some((min_fanout, a)) if min_fanout > 0 && n.term_count - 1 >= min_fanout => a,
-            _ => n.alpha,
+        let alpha = if opts.net_alpha.contains_key(&n.name) {
+            n.alpha
+        } else if let Some((min, a)) = min_hpwl {
+            if hpwl[id].expect("computed above") >= min { a } else { n.alpha }
+        } else {
+            match opts.min_fanout_alpha {
+                Some((min_fanout, a)) if min_fanout > 0 && n.term_count - 1 >= min_fanout => a,
+                _ => n.alpha,
+            }
         };
         stt(&pins[id].0, &pins[id].1, n.root, alpha)
     };

@@ -33,7 +33,7 @@ JOB (JSON):
     { \"cmd\": \"layer_adjustment\", \"layers\": [lo, hi], \"value\": f }      (one layer: lo == hi)
     { \"cmd\": \"global_adjustment\", \"value\": f }                         (the `*` form)
     { \"cmd\": \"region_adjustment\", \"rect_um\": [x0, y0, x1, y1], \"layer\": l, \"value\": f }
-    { \"cmd\": \"routing_alpha\", \"alpha\": f, \"min_fanout\": n }
+    { \"cmd\": \"routing_alpha\", \"alpha\": f, \"nets\": [..] | \"min_fanout\": n | \"min_hpwl\": um | \"clock_nets\": true }
     { \"cmd\": \"nets_to_route\", \"patterns\": [..] }                        (Tcl globs)
     { \"cmd\": \"global_route\", \"verbose\": b, \"allow_congestion\": b, \"grid_origin\": [x, y],
       \"skip_large_fanout\": n, \"congestion_iterations\": n, \"critical_nets_percentage\": f }
@@ -192,11 +192,35 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 let layer = level(&db, &step["layer"])?;
                 opts.region_adjustments.push((vyges_grt::Rect { x_min: u(r[0]), y_min: u(r[1]), x_max: u(r[2]), y_max: u(r[3]) }, layer, step["value"].as_f64().unwrap_or(0.0) as f32));
             }
+            // stt's set_routing_alpha: -net, else -min_fanout, else -min_hpwl, else -clock_nets, else
+            // the global alpha.
             "routing_alpha" => {
                 let a = step["alpha"].as_f64().ok_or_else(|| err("alpha"))? as f32;
-                match step["min_fanout"].as_i64() {
-                    Some(n) => opts.min_fanout_alpha = Some((n as i32, a)),
-                    None => opts.alpha = a,
+                if let Some(nets) = step["nets"].as_array() {
+                    for n in nets {
+                        let n = n.as_str().ok_or_else(|| err("a net name"))?;
+                        if !db.net_names().iter().any(|m| m == n) {
+                            return Err(err(format!("net {n} not found")));
+                        }
+                        opts.net_alpha.insert(n.to_string(), a);
+                    }
+                } else if let Some(n) = step["min_fanout"].as_i64() {
+                    opts.min_fanout_alpha = Some((n as i32, a));
+                } else if let Some(um) = step["min_hpwl"].as_f64() {
+                    // microns_to_dbu: std::round, half away from zero.
+                    let dbu = (um * f64::from(db.tech_get_db_units_per_micron())).round() as i32;
+                    opts.min_hpwl_alpha = Some((dbu, a));
+                } else if step["clock_nets"].as_bool() == Some(true) {
+                    // filter_clk_nets: the nets typed CLOCK in the database right now.
+                    let clk: Vec<String> = db.net_names().into_iter().filter(|n| db.net_sigtype(n) == "CLOCK").collect();
+                    if clk.is_empty() {
+                        return Err(Fail::Error("STT-0006: Clock nets for set_routing_alpha command were not found".into()));
+                    }
+                    for n in clk {
+                        opts.net_alpha.insert(n, a);
+                    }
+                } else {
+                    opts.alpha = a;
                 }
             }
             "nets_to_route" => {
