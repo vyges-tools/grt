@@ -24,7 +24,8 @@ USAGE:
   vyges-grt --help
 
 JOB (JSON):
-  { \"lefs\": [..], \"def\": \"..\" | \"db\": \"..\", \"steps\": [ STEP, .. ] }
+  { \"lefs\": [..], \"liberty\": [..], \"def\": \"..\" | \"db\": \"..\", \"steps\": [ STEP, .. ] }
+  With liberty and no clock defined (there is no clock step), every net is unconstrained.
   STEP is one of
     { \"cmd\": \"set_routing_layers\", \"signal\": [lo, hi], \"clock\": [lo, hi] }
     { \"cmd\": \"layer_adjustment\", \"layers\": [lo, hi], \"value\": f }      (one layer: lo == hi)
@@ -33,7 +34,7 @@ JOB (JSON):
     { \"cmd\": \"routing_alpha\", \"alpha\": f, \"min_fanout\": n }
     { \"cmd\": \"nets_to_route\", \"patterns\": [..] }                        (Tcl globs)
     { \"cmd\": \"global_route\", \"verbose\": b, \"allow_congestion\": b, \"grid_origin\": [x, y],
-      \"skip_large_fanout\": n, \"congestion_iterations\": n }
+      \"skip_large_fanout\": n, \"congestion_iterations\": n, \"critical_nets_percentage\": f }
     { \"cmd\": \"write_guides\", \"path\": \"..\" }
 
 EXIT STATUS:
@@ -129,6 +130,12 @@ fn run(job: &Value) -> Result<Value, Fail> {
         db = Db::open(odb).map_err(err)?;
     }
     let mut opts = RouteOptions::new();
+    // read_liberty — the libraries in read order; a cell in two resolves to the first.
+    for lib in job["liberty"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
+        let path = lib.as_str().ok_or_else(|| err("a liberty path"))?;
+        let text = std::fs::read_to_string(path).map_err(err)?;
+        opts.liberty.get_or_insert_with(Default::default).read(&text).map_err(|e| Fail::Refused(format!("{path}: {e}")))?;
+    }
     let mut guides: BTreeMap<String, Vec<(i32, i32, i32, i32, String)>> = BTreeMap::new();
     let mut calls = Vec::new();
     let mut log = Vec::new();
@@ -184,6 +191,11 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 }
                 if let Some(n) = step["congestion_iterations"].as_i64() {
                     opts.congestion_iterations = n as i32;
+                }
+                // setCriticalNetsPercentage: zeroed without a liberty library (GRT-301); it persists
+                // into later calls like the router's member.
+                if let Some(p) = step["critical_nets_percentage"].as_f64() {
+                    opts.critical_nets_percentage = if opts.liberty.is_some() { p as f32 } else { 0.0 };
                 }
                 let res = route_design(&mut db, &opts, &stt, &flutes).map_err(|e| classify(e.to_string()))?;
                 // saveGuides replaces the guides of every net it routes; the others keep theirs.

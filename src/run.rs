@@ -58,10 +58,13 @@ pub struct RunInputs<'a> {
     pub flutes: Flutes<'a>,
     /// `overflow_iterations_` and `critical_nets_percentage_`.
     pub overflow_iterations: i32,
-    pub critical_nets_percentage: i32,
+    pub critical_nets_percentage: f32,
     pub layer_dir: &'a [LayerDir],
     pub resistance_aware: bool,
     pub liberty: bool,
+    /// The timer's slack per net id (`getNetSlack`, `sta::INF` = `1E+30F` when unconstrained), read
+    /// by the loop's partial-slack pass. `None` without a liberty library.
+    pub timer_slack: Option<&'a [f32]>,
     /// For R20's database units.
     pub origin: GridOrigin,
     /// Each net's database id, indexed by net id (R20's key).
@@ -187,7 +190,7 @@ pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn 
         overflow_iterations: inp.overflow_iterations,
         critical_nets_percentage: inp.critical_nets_percentage,
     };
-    let end = congestion_loop(&start, ids, nets, state, &mut grid!(), &mut |ev, g, st| {
+    let end = congestion_loop(&start, ids, nets, state, &mut grid!(), inp.timer_slack, &mut |ev, g, st| {
         let _ = obs.stage(Stage::Loop(ev), g, None, st);
     })?;
     stop_unless!(Stage::LoopEnd(&end), None);

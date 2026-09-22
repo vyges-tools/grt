@@ -33,7 +33,8 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 #[derive(Debug, Clone, PartialEq)]
 pub struct RouteOptions {
     pub verbose: bool,
-    pub has_liberty: bool,
+    /// `read_liberty` — the libraries' pad cells and register clocks; `None` without one.
+    pub liberty: Option<crate::liberty_clk::LibertyClocks>,
     pub critical_nets_percentage: f32,
     /// `set_global_routing_layer_adjustment *`.
     pub adjustment: f32,
@@ -63,7 +64,7 @@ impl RouteOptions {
     pub fn new() -> Self {
         RouteOptions {
             verbose: false,
-            has_liberty: false,
+            liberty: None,
             critical_nets_percentage: 10.0,
             adjustment: 0.0,
             grid_origin: (0, 0),
@@ -123,7 +124,7 @@ pub fn setup_tech(db: &mut Db, opts: &RouteOptions) -> Res<TechSetup> {
     let name_of = |level: i32| tech.routing_layers.iter().find(|l| l.routing_level == level).map(|l| l.name.clone()).unwrap_or_default();
     let setup = SetupOptions {
         verbose: opts.verbose,
-        has_liberty: opts.has_liberty,
+        has_liberty: opts.liberty.is_some(),
         critical_nets_percentage: opts.critical_nets_percentage,
         adjustment: opts.adjustment,
         grid_origin: opts.grid_origin,
@@ -528,7 +529,8 @@ pub fn setup_nets(db: &Db, t: &TechSetup, e: &mut RouterEdges, has_macros_or_pad
     let directions: std::collections::BTreeMap<i32, Option<crate::capacity::Direction>> =
         t.tech.routing_layers.iter().map(|l| (l.routing_level, l.direction)).collect();
     let die = t.core.area;
-    // findNets — initClockNets needs a liberty library; none here.
+    // findNets — initClockNets: with a liberty library the timer retypes its clock network's nets
+    // to CLOCK; ⛔ with no clock defined (the only case the caller lets through) it finds none.
     let all = read_nets(db);
     let db_nets: Vec<&NetFacts> = match &opts.nets_to_route {
         None => all.iter().collect(),
@@ -602,10 +604,19 @@ pub fn setup_nets(db: &Db, t: &TechSetup, e: &mut RouterEdges, has_macros_or_pad
         }
         nets.push((n, pins));
     }
-    // The order: non-leaf clock nets first, each group by name. With no liberty library no
-    // terminal is a clock terminal, so every CLOCK-typed net is a non-leaf clock.
+    // The order: non-leaf clock nets first, each group by name. `isClkTerm` asks the liberty port
+    // of each terminal (its instance's master, by name); with no library no terminal is a clock
+    // terminal, so every CLOCK-typed net is a non-leaf clock.
     let no_liberty = ITermClockFacts { has_liberty_port: false, is_reg_clk: false, cell_is_pad: false };
-    let non_leaf = |n: &NetFacts| is_non_leaf_clock(n.sig_type == "CLOCK", &vec![no_liberty; n.iterms.len()]);
+    let mut iterm_facts: std::collections::HashMap<&str, Vec<ITermClockFacts>> = std::collections::HashMap::new();
+    for (n, _) in &nets {
+        let facts = match &opts.liberty {
+            Some(lib) if n.sig_type == "CLOCK" => n.iterms.iter().map(|(inst, mterm)| lib.iterm_facts(&db.inst_master(inst), mterm)).collect(),
+            _ => vec![no_liberty; n.iterms.len()],
+        };
+        iterm_facts.insert(n.name.as_str(), facts);
+    }
+    let non_leaf = |n: &NetFacts| is_non_leaf_clock(n.sig_type == "CLOCK", &iterm_facts[n.name.as_str()]);
     let order = order_nets(&nets.iter().map(|(n, _)| DiscoveredNet { name: n.name.clone(), is_non_leaf_clock: non_leaf(n) }).collect::<Vec<_>>());
     let order_all = order.clone();
     // I14 initNetlist — no seed: the order stands. (addResourcesForPinAccess closes it, below.)
@@ -743,6 +754,8 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         })
         .collect();
     let slack = vec![(0.0f32, false); nets.len()];
+    // getNetSlack: with no clock defined every net is unconstrained — the timer's INF (`1E+30F`).
+    let timer_slack = opts.liberty.as_ref().map(|_| vec![1.0e30f32; nets.len()]);
     // makeSteinerTree(net, …): the net's alpha — the min-fanout rule when set.
     let stt_net = |id: usize| {
         let n = &nets[id];
@@ -778,10 +791,11 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         stt: &stt_net,
         flutes,
         overflow_iterations: opts.congestion_iterations,
-        critical_nets_percentage: t.config.critical_nets_percentage as i32,
+        critical_nets_percentage: t.config.critical_nets_percentage,
         layer_dir: &layer_dir,
         resistance_aware: false,
-        liberty: opts.has_liberty,
+        liberty: opts.liberty.is_some(),
+        timer_slack: timer_slack.as_deref(),
         origin: crate::routes::GridOrigin { tile_size: t.core.tile_size, x_corner: t.core.area.x_min, y_corner: t.core.area.y_min },
         db_id: &db_id,
     };

@@ -28,8 +28,8 @@ pub struct LoopStart {
     pub scan: Overflow2DScan,
     /// `overflow_iterations_` (`-congestion_iterations`, 50 by default).
     pub overflow_iterations: i32,
-    /// `critical_nets_percentage_`.
-    pub critical_nets_percentage: i32,
+    /// `critical_nets_percentage_` — a `float` in the reference.
+    pub critical_nets_percentage: f32,
 }
 
 /// The schedule's values at one maze pass, beside the parameters it passed.
@@ -102,6 +102,7 @@ pub fn congestion_loop(
     nets: &[RsmtNet<'_>],
     state: &mut [NetState],
     grid: &mut BrkGrid<'_>,
+    timer_slack: Option<&[f32]>,
     on: &mut dyn FnMut(&LoopEvent, &crate::graph2d::Graph2d, &[NetState]),
 ) -> Result<LoopEnd, String> {
     const ENLARGE: i32 = 15;
@@ -140,7 +141,9 @@ pub fn congestion_loop(
     let mut up_type = 1;
     let mut max_adj = 0;
     let (mut bmfl, mut bwcnt) = (BIG_INT, 0);
-    let slack_th = f32::MIN;
+    // ⛔ Passed BY REFERENCE (`float& slack_th`) to every pass: an ordering pass's partial slack
+    // rewrites it, and the passes after it — ordering or not — gate on the new value.
+    let slack_th = std::cell::Cell::new(f32::MIN);
     let mut overflow_increases = -1;
     let mut last_total_overflow = 0;
     let mut minofl_stagnant = 0;
@@ -151,7 +154,8 @@ pub fn congestion_loop(
     // ⛔ The pass computes an `enlarge_` per edge, but into the router's MEMBER; run()'s loop uses a
     // LOCAL `int enlarge_` that shadows it, so the pass never changes the schedule's value.
     let pass = |grid: &mut BrkGrid<'_>, state: &mut [NetState], p: &MsmdParams| -> Result<(), String> {
-        maze_route_msmd_sequential(p, net_ids, nets, state, grid).map(|_| ())
+        slack_th.set(maze_route_msmd_sequential(p, net_ids, nets, state, grid, timer_slack)?.slack_th);
+        Ok(())
     };
 
     while total_overflow > 0 && i <= start.overflow_iterations && overflow_increases <= MAX_OVERFLOW_INCREASES {
@@ -223,7 +227,7 @@ pub fn congestion_loop(
             via,
             l,
             cost: CostParams { slope, logistic_coef: f64::from(logistic_coef), cost_height: f64::from(costheight) },
-            slack_th,
+            slack_th: slack_th.get(),
             critical_nets_percentage: cnp,
         };
         let p = params(i, enlarge, ripup_threshold, via, l, logistic_coef, costheight, slope);

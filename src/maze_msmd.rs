@@ -8,9 +8,9 @@
 //! [`update_route_type2`], [`rewire_after_type2`]). This module is the call sequence over them, and
 //! the adapter between the router's tree and the surgery's node/edge lists.
 //!
-//! ⚠️ Not transcribed, and refused rather than guessed: the partial-slack pass
-//! (`CalculatePartialSlack`, which needs timing) and the rebuild after a failed surgery
+//! ⚠️ Not transcribed, and refused rather than guessed: the rebuild after a failed surgery
 //! (`reInitTree`, which no corpus pass reaches). The snapshot-batched variant is a separate mode.
+//! The partial-slack pass needs the timer's per-net slack, and is refused without one.
 
 use crate::brk_rsmt::{BrkGrid, NetState, RouteKind, RsmtNet, StTree};
 use crate::lroute::TreeNode;
@@ -37,8 +37,8 @@ pub struct MsmdParams {
     pub cost: CostParams,
     pub slack_th: f32,
     /// `critical_nets_percentage_` — non-zero turns on the partial-slack pass and the gate's
-    /// critical arm.
-    pub critical_nets_percentage: i32,
+    /// critical arm. ⛔ A `float` in the reference: the threshold index is computed in f32.
+    pub critical_nets_percentage: f32,
 }
 
 /// What a pass leaves for the run loop.
@@ -88,17 +88,53 @@ pub fn st_net_order(net_ids: &[usize], nets: &[RsmtNet<'_>], state: &mut [NetSta
         .collect()
 }
 
+/// `CalculatePartialSlack` — every routed net takes the timer's slack; the slack at index
+/// `ceil(n * percentage / 100)` (clamped to the last) is the threshold, and every net ABOVE it is
+/// stamped with the sentinel so the congestion sort, not slack, orders it. Returns the threshold.
+///
+/// ⛔ The index is `std::ceil(slacks.size() * critical_nets_percentage_ / 100)` with a `float`
+/// percentage: computed in f32, then truncated into an `int`. An empty net list gives 0.0.
+/// ⛔ With no timing constraints every slack is the timer's INF (`1E+30F`): the threshold is INF,
+/// nothing is demoted, and the rip-up gate's critical arm (`slack <= INF`) is live for every net.
+pub fn calculate_partial_slack(net_ids: &[usize], state: &mut [NetState], timer_slack: &[f32], critical_nets_percentage: f32) -> f32 {
+    let mut slacks = Vec::with_capacity(net_ids.len());
+    for &id in net_ids {
+        let slack = timer_slack[id];
+        slacks.push(slack);
+        state[id].slack = slack;
+    }
+    slacks.sort_by(|a, b| a.partial_cmp(b).expect("a slack is never NaN"));
+    let threshold_index = (slacks.len() as f32 * critical_nets_percentage / 100.0).ceil() as i32;
+    let slack_th = if slacks.is_empty() { 0.0 } else { slacks[(threshold_index as usize).min(slacks.len() - 1)] };
+    for &id in net_ids {
+        if state[id].slack > slack_th {
+            state[id].slack = crate::ripup::SLACK_SENTINEL;
+        }
+    }
+    slack_th
+}
+
 /// `mazeRouteMSMDSequential` — the call sequence, and nothing else.
 ///
 /// Per net (congestion order when `ordering`, else `net_ids`), per edge by descending route length:
 /// recompute the length, skip if not over `maze_edge_threshold`, ask the gate (which gives the old
 /// route back), search, move the path's ends onto the tree ([`attach_path_end`] for each side),
 /// write the route and charge it.
-pub fn maze_route_msmd_sequential(p: &MsmdParams, net_ids: &[usize], nets: &[RsmtNet<'_>], state: &mut [NetState], grid: &mut BrkGrid<'_>) -> Result<MsmdResult, String> {
-    let slack_th = p.slack_th;
+///
+/// `timer_slack` is the timer's slack per net id (`getNetSlack`), `None` without a liberty library.
+pub fn maze_route_msmd_sequential(
+    p: &MsmdParams,
+    net_ids: &[usize],
+    nets: &[RsmtNet<'_>],
+    state: &mut [NetState],
+    grid: &mut BrkGrid<'_>,
+    timer_slack: Option<&[f32]>,
+) -> Result<MsmdResult, String> {
+    let mut slack_th = p.slack_th;
     let order: Vec<usize> = if p.ordering {
-        if p.critical_nets_percentage != 0 {
-            return Err("CalculatePartialSlack needs timing slacks; not transcribed".into());
+        if p.critical_nets_percentage != 0.0 {
+            let timer = timer_slack.ok_or("CalculatePartialSlack needs the timer's slacks; none bound")?;
+            slack_th = calculate_partial_slack(net_ids, state, timer, p.critical_nets_percentage);
         }
         st_net_order(net_ids, nets, state, grid)
     } else {
@@ -127,7 +163,7 @@ pub fn maze_route_msmd_sequential(p: &MsmdParams, net_ids: &[usize], nets: &[Rsm
                 let used_v = |x: i32, y: i32| f64::from(g.usage_red_v(x, y, red_v(x as usize, y as usize)));
                 let r = &t.routes[eid];
                 let critical = Some(CriticalCheck {
-                    enabled: p.critical_nets_percentage != 0,
+                    enabled: p.critical_nets_percentage != 0.0,
                     last_routelen: r.last_routelen.max(0) as usize,
                     critical_slack: slack_th,
                     slack: st.slack,

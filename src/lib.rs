@@ -97,6 +97,7 @@ pub mod route_l;
 pub mod maze_phase;
 pub mod maze_msmd;
 pub mod congestion_loop;
+pub mod liberty_clk;
 pub mod finalize;
 pub mod run;
 pub use run::{fastroute_run, RunEnd, RunInputs, RunObserver, Stage};

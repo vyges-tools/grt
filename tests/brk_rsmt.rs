@@ -627,7 +627,7 @@ fn replay_chain(who: &str, pass: usize, c5: &Value, c7: &Value, group: &[&Value]
             group[from..to].iter().filter(|b| b["tag"].as_str().is_some_and(|t| t.starts_with("B14pre_"))).copied().collect()
         }).unwrap_or_default()
     };
-    let cnp = pass_pres.first().map_or(0, |b| int(&b["params"]["cnp"]));
+    let cnp = pass_pres.first().map_or(0, |b| int(&b["params"]["cnp"])) as f32;
     let stt: std::collections::HashMap<usize, RsmtTree> = arr(&c5["nets"]).iter().map(|n| (int(&n["id"]) as usize, tree_of(&n["rt"]))).collect();
     let stt_f = |id: usize| stt[&id].clone();
     let inp = RunInputs {
@@ -652,6 +652,7 @@ fn replay_chain(who: &str, pass: usize, c5: &Value, c7: &Value, group: &[&Value]
         layer_dir: &dirs,
         resistance_aware: flag("resaware"),
         liberty: flag("liberty"),
+        timer_slack: None,
         origin,
         db_id: &db_id,
     };
@@ -678,7 +679,7 @@ fn replay_chain(who: &str, pass: usize, c5: &Value, c7: &Value, group: &[&Value]
             obs.seen.usage_errors += 1;
         }
         Err(e) if e.contains("CalculatePartialSlack") => {
-            assert!(cnp != 0, "{at}: partial slack refused with cnp 0");
+            assert!(cnp != 0.0, "{at}: partial slack refused with cnp 0");
             obs.seen.loop_partial_slack += 1;
         }
         // ⛔ Resistance-aware with a liberty library: updateSlacks keeps a net (an unconstrained
@@ -1352,9 +1353,9 @@ fn the_congestion_loop_steps_enlarge_until_the_clamp() {
     let mut grid = BrkGrid { g: &mut g2d, red_h: &no_red, red_v: &no_red, caps: &caps, h_capacity: 10, v_capacity: 10, via_cost: 0.0 };
     let scan = grid.g.get_overflow_2d_maze();
     assert!(scan.total_overflow > 0 && scan.total_overflow < 500);
-    let start = LoopStart { pattern_max_overflow: 0, logistic_coef: 0.0, scan, overflow_iterations: 4, critical_nets_percentage: 0 };
+    let start = LoopStart { pattern_max_overflow: 0, logistic_coef: 0.0, scan, overflow_iterations: 4, critical_nets_percentage: 0.0 };
     let mut expands = Vec::new();
-    let _ = congestion_loop(&start, &[0], &nets, &mut state, &mut grid, &mut |ev, _, _| {
+    let _ = congestion_loop(&start, &[0], &nets, &mut state, &mut grid, None, &mut |ev, _, _| {
         if let LoopEvent::Before { params, .. } = ev {
             expands.push(params.expand);
         }
