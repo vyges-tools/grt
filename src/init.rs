@@ -269,7 +269,8 @@ pub enum AbsentStage {
     /// I13b — reject ports sharing a position on a layer. Implemented
     /// ([`crate::check_pin_placement`]); not wired until the nets are.
     CheckPinPlacement,
-    /// I14 — build the router's netlist, its degrees and its pin-access resources.
+    /// I14 — build the router's netlist, its degrees and its pin-access resources. Implemented
+    /// ([`crate::netlist`]); not wired until the nets are.
     InitNetlist,
 }
 

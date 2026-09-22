@@ -34,6 +34,8 @@ pub mod pricing;
 pub mod tracks;
 pub mod adjust;
 pub mod pins;
+pub mod netlist;
+pub use netlist::{add_resources_for_pin_access, compute_net_degree, compute_track_consumption, find_fastroute_pins, get_net_layer_range, has_stacked_vias, initial_net_order_is_kept, makes_fastroute_net, net_max_routing_layer, pin_access_edges, report_net_degree, AccessPinFacts, NdrConsumptionTooLarge, NdrLayerRule, NetlistGrid, RouterPinFacts};
 pub use pins::{check_pin_placement, InvalidPinPlacement, compute_pin_position_on_grid, determine_edge, find_nets, find_on_grid_positions, find_pin, is_pin_reachable, make_bterm_pin, make_iterm_pin, pin_overlaps_with_single_track, position_near_inst_edge, rect_middle, AccessPoint, MasterClass, NetCandidate, NetPin, PinEdge, PinError, PinGrid, TermBox};
 pub use adjust::{adjust_tile_set, apply_obstruction_adjustment, compute_region_adjustments, compute_tile_reduce, compute_tile_reduce_interval, compute_user_global_adjustments, compute_user_layer_adjustments, init_blocked_intervals, save_resources_before_adjustments, EdgeState, IntervalSet, RegionOutsideDie, RouterEdges};
 pub use tracks::{calc_layer_pitches, get_average_track_spacing, get_default_vias, get_via_dims, init_routing_tracks, PitchLayer, RoutingTracks, SpacingLookup, TechVia, TrackError, TrackGrid, TrackLayer, TrackPattern, V54Rule};
