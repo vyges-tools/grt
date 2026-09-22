@@ -31,6 +31,8 @@ pub mod overflow2d;
 pub mod maze3d;
 pub mod maze3d_pass;
 pub mod pricing;
+pub mod tracks;
+pub use tracks::{calc_layer_pitches, get_average_track_spacing, get_default_vias, get_via_dims, init_routing_tracks, PitchLayer, RoutingTracks, SpacingLookup, TechVia, TrackError, TrackGrid, TrackLayer, TrackPattern, V54Rule};
 pub use pricing::{get_maze_route_cost_3d, get_via_cost, get_via_resistance, get_wire_cost, get_wire_resistance, MoveCost, TechLayers, WireNet};
 pub use maze3d_pass::{counts_for_grt183, maze_route_3d_pass, route_one_edge_3d, PassGrid, PassNet, PassParams};
 pub use maze3d::{recover_edge, RecoverZeroLength, new_update_node_layers, set_tree_nodes_variables, split_edge_3d, tree_surgery_3d, Edge3D as SurgEdge3D, Node3D, SurgeryOutcome, Tree3D, copy_grids_3d, update_route_type1_3d, update_route_type2_3d, ShiftError, SurgeryEdge3D, SurgeryNode3D, backtrace_3d, Backtrace3D, Recovery, maze_search_3d, CellState, Dir3, NotInHeap, Search3D, Search3DInputs, setup_heap_3d, Cell3, Heaps3D, SeedEdge, SeedNode, new_ripup_3d_type3, remove_edge_from_node, MazeRipupWrong, NodeConnections, edge_in_window, end_index, max_reroute_iter, maze_route_msmd_order_3d, prelude, skips_for_slack, EdgeResult, Maze3DCall, Maze3DEdgeWork, Maze3DEvent, OrderedNet, Prelude, FINAL_RES_AWARE_NETS_PERCENTAGE, HIGH_DETOUR_PENALTY, LOW_DETOUR_PENALTY};

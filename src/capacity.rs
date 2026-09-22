@@ -2,7 +2,7 @@
 //! Routing layers, and how much track capacity each grid cell has.
 //!
 //! Stage I4 (validate and index the routing layers) and the core of I9 (per-edge capacity).
-//! I6 — track pitches — is not here; see [`AbsentStage::InitRoutingTracks`](crate::AbsentStage).
+//! I6 — track pitches — is [`crate::tracks`].
 
 use crate::init::CoreGrid;
 use crate::Rect;

@@ -245,7 +245,8 @@ pub fn report_layer_settings(opts: &SetupOptions, log: &mut Vec<String>) {
 pub enum AbsentStage {
     /// I4 — validate layer directions and track grids.
     InitRoutingLayers,
-    /// I6 — per-layer track pitch and line-to-via pitch.
+    /// I6 — per-layer track pitch and line-to-via pitch. The stage itself is implemented
+    /// ([`crate::init_routing_tracks`]); it is not wired here until I4 hands it the technology.
     InitRoutingTracks,
     /// I8 — mirror the grid into the router's own coordinates.
     MirrorGridToFastRoute,
