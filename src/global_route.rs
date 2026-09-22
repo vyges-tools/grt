@@ -439,6 +439,8 @@ pub struct RouteResult {
     /// The router's total overflow after R19, and whether the guides are marked congested.
     pub total_overflow: i32,
     pub guide_is_congested: bool,
+    /// R20's routes as run() emitted them, by FastRoute id — before F.
+    pub routes: std::collections::BTreeMap<u32, Vec<crate::GSegment>>,
     pub log: Vec<String>,
 }
 
@@ -560,6 +562,7 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         RunEnd::Stopped => return Err("run() stopped".into()),
     };
     // F — findRouting's post-processing: remaining guides, pad pins (inert), then each merge.
+    let raw_routes = routes.clone();
     let mut by_name: std::collections::BTreeMap<String, Vec<crate::GSegment>> =
         routes.into_iter().map(|(id, segs)| (nets[id as usize].name.clone(), segs)).collect();
     let grid_pins = |n: &RouterNet| -> Vec<crate::findrouting::GridPin> { n.net_pins.iter().map(|p| (p.on_grid.0, p.on_grid.1, p.connection_layer)).collect() };
@@ -593,5 +596,5 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     let save = crate::SaveOptions { guide_is_congested, origin_x: opts.grid_origin.0, origin_y: opts.grid_origin.1, min_routing_layer: t.min_routing_layer };
     let guides = crate::save_guides(&net_routes, &grid, &save).map_err(|e| format!("{e:?}"))?;
     let layer_names = t.tech.routing_layers.iter().map(|l| (l.routing_level, l.name.clone())).collect();
-    Ok(RouteResult { guides, layer_names, total_overflow, guide_is_congested, log })
+    Ok(RouteResult { guides, layer_names, total_overflow, guide_is_congested, routes: raw_routes, log })
 }

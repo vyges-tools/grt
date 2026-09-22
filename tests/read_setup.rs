@@ -387,11 +387,6 @@ fn the_guides_match_a_fresh_reference_run() {
     let mut report = Vec::new();
     let (mut exact, mut attempted) = (0, 0);
     for (script, lefs, def, _) in TIER_A {
-        // multiple_calls writes after a SECOND global_route; set_nets_to_route1 needs its patterns
-        // resolved — both held out until the driver models them.
-        if matches!(*script, "multiple_calls" | "set_nets_to_route1") {
-            continue;
-        }
         attempted += 1;
         let (mut db, mut opts) = load_with(&dir, lefs, def, &tier_a_commands(script));
         match *script {
@@ -399,9 +394,33 @@ fn the_guides_match_a_fresh_reference_run() {
             "pd3" => opts.min_fanout_alpha = Some((9, 0.9)),
             "skip_large_fanout1" => opts.skip_large_fanout = 30,
             "congestion1" | "congestion2" | "congestion7" => opts.allow_congestion = true,
+            // `set_nets_to_route {net* req_* resp_* clk reset}` — STA's `get_nets` per pattern.
+            "set_nets_to_route1" => {
+                let names = db.net_names();
+                opts.nets_to_route = Some(["net*", "req_*", "resp_*", "clk", "reset"].iter().flat_map(|p| names.iter().filter(|n| glob(p, n)).cloned().collect::<Vec<_>>()).collect());
+            }
             _ => {}
         }
         opts.verbose = *script != "silence";
+        // `multiple_calls`: `global_route`, then `set_global_routing_layer_adjustment * 0.8` and a
+        // SECOND `global_route` on the same database, whose guides are the ones written.
+        if *script == "multiple_calls" {
+            match vyges_grt::global_route::route_design(&mut db, &opts, &stt, &flutes) {
+                Err(e) => {
+                    report.push(format!("{script}: ERROR in the first call: {e}"));
+                    continue;
+                }
+                // The first call's guides, where a fresh reference run of it alone was kept.
+                Ok(first) => {
+                    if let Ok(text) = std::fs::read_to_string(format!("{fresh}/../guides-fresh-first-multiple_calls.guide")) {
+                        let want: std::collections::HashMap<String, Vec<(i32, i32, i32, i32, String)>> = parse_guides(&text).into_iter().collect();
+                        let ok = first.guides.iter().filter(|ng| want.get(&ng.net).is_some_and(|w| *w == ng.guides.iter().map(|g| (g.box_.x_min, g.box_.y_min, g.box_.x_max, g.box_.y_max, first.layer_names[&g.layer].clone())).collect::<Vec<_>>())).count();
+                        report.push(format!("{script} (first call alone): {ok}/{} nets exact", want.len()));
+                    }
+                }
+            }
+            opts.adjustment = 0.8;
+        }
         let res = match vyges_grt::global_route::route_design(&mut db, &opts, &stt, &flutes) {
             Ok(r) => r,
             Err(e) => {
@@ -418,7 +437,17 @@ fn the_guides_match_a_fresh_reference_run() {
                 Some(w) if **w == got => nets_ok += 1,
                 w => {
                     if first_bad.is_none() {
-                        first_bad = Some(format!("net {}: ours {} guides {:?}…, reference {:?}", ng.net, got.len(), got.first(), w.map(|w| (w.len(), w.first()))));
+                        let at = w.map(|w| (0..got.len().min(w.len())).find(|&i| got[i] != w[i]).unwrap_or(got.len().min(w.len())));
+                        let around = |v: &[(i32, i32, i32, i32, String)], i: usize| v.iter().skip(i.saturating_sub(1)).take(3).cloned().collect::<Vec<_>>();
+                        first_bad = Some(format!(
+                            "net {}: ours {} guides, reference {:?}; first difference at {:?}: ours {:?} | reference {:?}",
+                            ng.net,
+                            got.len(),
+                            w.map(|w| w.len()),
+                            at,
+                            at.map(|i| around(&got, i)),
+                            at.zip(w).map(|(i, w)| around(w, i))
+                        ));
                     }
                 }
             }
@@ -459,4 +488,76 @@ fn instance_transforms_follow_odb() {
     assert_eq!(t("MX"), (101, 195, 103, 198)); // → (x, -y)
     assert_eq!(t("MYR90"), (95, 197, 98, 199)); // (-x, y) then R90 → (-y, -x)
     assert_eq!(t("MXR90"), (102, 201, 105, 203)); // (x, -y) then R90 → (y, x)
+}
+
+/// A Tcl `string match`-style glob: `*` any run, `?` one character.
+fn glob(pattern: &str, name: &str) -> bool {
+    fn m(p: &[u8], n: &[u8]) -> bool {
+        match (p.first(), n.first()) {
+            (None, None) => true,
+            (Some(b'*'), _) => m(&p[1..], n) || (!n.is_empty() && m(p, &n[1..])),
+            (Some(b'?'), Some(_)) => m(&p[1..], &n[1..]),
+            (Some(a), Some(b)) if a == b => m(&p[1..], &n[1..]),
+            _ => false,
+        }
+    }
+    m(pattern.as_bytes(), name.as_bytes())
+}
+
+/// `multiple_calls`' SECOND `global_route` (after `set_global_routing_layer_adjustment * 0.8`):
+/// its setup against run()'s entry for that call (R5's third captured call), after a first call on
+/// the same database.
+#[test]
+fn a_second_global_route_reaches_its_entry() {
+    let (Ok(dir), Ok(path)) = (std::env::var("GRT_REF_TESTS"), std::env::var("GRT_BRK_RSMT_FULL")) else {
+        eprintln!("GRT_REF_TESTS / GRT_BRK_RSMT_FULL unset: skipped");
+        return;
+    };
+    let r7 = read(&path);
+    let run = arr(&r7["runs"]).iter().find(|r| r["design"] == "multiple_calls-plain").expect("run");
+    let c = &arr(&run["calls"])[2];
+    let (mut db, mut opts) = load_with(&dir, &["Nangate45/Nangate45.lef"], "multiple_calls.def", &[]);
+    vyges_grt::global_route::route_design(&mut db, &opts, &stt, &flutes).expect("first call");
+    opts.adjustment = 0.8;
+    let t = vyges_grt::global_route::setup_tech(&mut db, &opts).expect("tech");
+    let mut log = Vec::new();
+    let e = vyges_grt::global_route::setup_adjust(&mut db, &t, &opts, &mut log).expect("adjust");
+    let (xg, yg) = (e.x_grid, e.y_grid);
+    assert_eq!((t.capacities.h_capacity, t.capacities.v_capacity), (int(&c["hcap"]), int(&c["vcap"])), "h/v capacity");
+    for (d, ours) in [("H", &e.h3), ("V", &e.v3)] {
+        for (l, layer) in arr(&c["caps"][d]).iter().enumerate() {
+            let want: Vec<i32> = arr(layer).iter().flat_map(unrle).collect();
+            let got: Vec<i32> = (0..yg).flat_map(|y| (0..xg).map(move |x| (y, x))).map(|(y, x)| i32::from(ours[((l as i32 * yg + y) * xg + x) as usize].cap)).collect();
+            if let Some(k) = (0..got.len()).find(|&k| got[k] != want[k]) {
+                panic!("3D capacity {d} layer {l} at (x {}, y {}): ours {}, reference {}", k as i32 % xg, k as i32 / xg, got[k], want[k]);
+            }
+        }
+    }
+    let nets = vyges_grt::global_route::setup_nets(&db, &t, &e, &opts, &mut log).expect("nets");
+    for w in arr(&c["nets"]) {
+        let k = int(&w["id"]) as usize;
+        let pins: Vec<(i32, i32)> = arr(&w["pins"]).iter().map(|p| (int(&p[0]), int(&p[1]))).collect();
+        assert_eq!((nets[k].name.as_str(), nets[k].pins.iter().map(|p| (p.0, p.1)).collect::<Vec<_>>()), (w["name"].as_str().expect("n"), pins), "net {k}");
+        assert_eq!((nets[k].min_layer - 1, nets[k].max_layer - 1), (int(&w["min"]), int(&w["max"])), "net {k} layers");
+    }
+    eprintln!("second call: entry and {} nets exact", arr(&c["nets"]).len());
+    // And run()'s routes for that call against its B20 (the second `global_route`'s group).
+    if let Ok(rb) = std::env::var("GRT_BOUNDARIES_FULL") {
+        let rb = read(&rb);
+        let run = arr(&rb["runs"]).iter().find(|r| r["design"] == "multiple_calls-plain").expect("boundaries");
+        let b20 = arr(&run["boundaries"]).iter().filter(|b| b["tag"] == "B20").nth(1).expect("second B20");
+        let res = vyges_grt::global_route::route_design(&mut db, &opts, &stt, &flutes).expect("second call");
+        let mut bad = 0;
+        for (id, segs) in b20["routes"].as_object().expect("routes") {
+            let want: Vec<[i32; 6]> = arr(segs).iter().map(|v| std::array::from_fn(|k| int(&v[k]))).collect();
+            let ours: Vec<[i32; 6]> = res.routes.get(&id.parse::<u32>().expect("id")).map(|r| r.iter().map(|g| [g.init_x, g.init_y, g.init_layer, g.final_x, g.final_y, g.final_layer]).collect()).unwrap_or_default();
+            if ours != want {
+                if bad == 0 {
+                    eprintln!("B20 net {id}: ours {} segs {:?}…, reference {} {:?}", ours.len(), ours.first(), want.len(), want.first());
+                }
+                bad += 1;
+            }
+        }
+        eprintln!("second call B20: {bad} nets differ of {}", b20["routes"].as_object().expect("r").len());
+    }
 }
