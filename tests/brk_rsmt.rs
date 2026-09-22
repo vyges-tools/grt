@@ -96,6 +96,8 @@ struct Seen {
     usage_errors: usize,
     loop_iterations: usize,
     snapshot_batched: usize,
+    loops_removed: usize,
+    r15_checked: usize,
     thinned: usize,
     loop_partial_slack: usize,
     loop_extra_stops: usize,
@@ -161,7 +163,7 @@ fn check_boundary(at: &str, b: &Value, scan: &Overflow2DScan, g2d: &Graph2d, sta
     let at = format!("{at} {tag}");
     assert_eq!((scan.total_overflow, scan.max_overflow, scan.ahth), (int(&b["total_overflow"]), int(&b["max_overflow"]), int(&b["ahth"])),
                "{at}: getOverflow2D (total, max, ahth)");
-    if tag.starts_with("B12_") || tag.starts_with("B14_") {
+    if tag.starts_with("B12_") || tag.starts_with("B14_") || tag == "B15" {
         assert_eq!(scan.total_usage, int(&b["t_usage"]), "{at}: getOverflow2Dmaze tUsage");
     }
     // ⚠️ A THINNED loop boundary carries only its parameters and the scalars above.
@@ -632,6 +634,7 @@ fn replay_run(r: &Value, bounds: Option<&Value>, seen: &mut Seen) {
                             via_cost: 0.0,
                         };
                         let mut befores = 0usize;
+                        let mut final_ready = false;
                         let mut prev_scan = last;
                         let outcome = congestion_loop(&start, &net_ids, &nets, &mut state, &mut grid14, &mut |ev, g, st| match ev {
                             LoopEvent::Before { params: p, schedule: sc } => {
@@ -669,6 +672,7 @@ fn replay_run(r: &Value, bounds: Option<&Value>, seen: &mut Seen) {
                                 // ⛔ Asserted, not noted: no corpus loop reaches these branches. A recapture
                                 // that does fails here and points at the constructed-only coverage.
                                 assert_eq!(end.rare, RareBranches::default(), "{at}: a loop branch the corpus never reached fired: {:?}", end.rare);
+                                final_ready = true;
                             }
                             Err(e) if e.contains("CalculatePartialSlack") => {
                                 assert!(cnp != 0, "{at}: partial slack refused with cnp 0");
@@ -677,6 +681,23 @@ fn replay_run(r: &Value, bounds: Option<&Value>, seen: &mut Seen) {
                             Err(e) => panic!("{at}: {e}"),
                         }
                         let _ = befores;
+                        // R15 — freeRR (the loop's own backup, dropped with it) and removeLoops, then
+                        // getOverflow2Dmaze.
+                        if final_ready {
+                            if let Some(b15) = at_b("B15") {
+                                let removed = remove_loops_all(&net_ids, &nets, &mut state, &mut g2d);
+                                // ⛔ Asserted, not noted: no corpus run leaves a loop for R15 to remove (0
+                                // across all 112 exhaustive runs that reach B15), so B15 witnesses only the
+                                // walk and the overflow scan. The removal itself is witnessed by the
+                                // constructed cases in `tests/removeloops.rs` alone (whose own capture
+                                // found no loop either); a recapture that removes one fails here.
+                                assert_eq!(removed, 0, "{at}: R15 removed {removed} loops; the corpus never did");
+                                seen.loops_removed += removed;
+                                let scan = g2d.get_overflow_2d_maze();
+                                check_boundary(&at, b15, &scan, &g2d, &state, seen);
+                                seen.r15_checked += 1;
+                            }
+                        }
                     }
                 }
                 pass += 1;
@@ -711,7 +732,7 @@ fn add(a: Seen, b: Seen) -> Seen {
         runs: a.runs + b.runs, calls: a.calls + b.calls, nets: a.nets + b.nets, flute_nets: a.flute_nets + b.flute_nets,
         shifted: a.shifted + b.shifted, shifts: a.shifts + b.shifts, copied: a.copied + b.copied,
         routed_edges: a.routed_edges + b.routed_edges, usage_checked: a.usage_checked + b.usage_checked,
-        ndr_checked: a.ndr_checked + b.ndr_checked, r6_checked: a.r6_checked + b.r6_checked, r6_segs: a.r6_segs + b.r6_segs, boundaries: a.boundaries + b.boundaries, boundary_nets: a.boundary_nets + b.boundary_nets, incremental: a.incremental + b.incremental, gate_hvh: a.gate_hvh + b.gate_hvh, gate_vhv: a.gate_vhv + b.gate_vhv, maze_routes: a.maze_routes + b.maze_routes, maze_passes: a.maze_passes + b.maze_passes, usage_errors: a.usage_errors + b.usage_errors, loop_iterations: a.loop_iterations + b.loop_iterations, snapshot_batched: a.snapshot_batched + b.snapshot_batched, thinned: a.thinned + b.thinned, loop_partial_slack: a.loop_partial_slack + b.loop_partial_slack, loop_extra_stops: a.loop_extra_stops + b.loop_extra_stops, stacked_pins: a.stacked_pins + b.stacked_pins, htree: a.htree + b.htree,
+        ndr_checked: a.ndr_checked + b.ndr_checked, r6_checked: a.r6_checked + b.r6_checked, r6_segs: a.r6_segs + b.r6_segs, boundaries: a.boundaries + b.boundaries, boundary_nets: a.boundary_nets + b.boundary_nets, incremental: a.incremental + b.incremental, gate_hvh: a.gate_hvh + b.gate_hvh, gate_vhv: a.gate_vhv + b.gate_vhv, maze_routes: a.maze_routes + b.maze_routes, maze_passes: a.maze_passes + b.maze_passes, usage_errors: a.usage_errors + b.usage_errors, loop_iterations: a.loop_iterations + b.loop_iterations, snapshot_batched: a.snapshot_batched + b.snapshot_batched, loops_removed: a.loops_removed + b.loops_removed, r15_checked: a.r15_checked + b.r15_checked, thinned: a.thinned + b.thinned, loop_partial_slack: a.loop_partial_slack + b.loop_partial_slack, loop_extra_stops: a.loop_extra_stops + b.loop_extra_stops, stacked_pins: a.stacked_pins + b.stacked_pins, htree: a.htree + b.htree,
     }
 }
 
@@ -1133,4 +1154,57 @@ fn copy_br_restores_the_saved_routes_and_their_usage() {
     let usage: Vec<(u16, u16)> = (0..4).map(|x| (g2d.est.usage_h(x, 0), g2d.est.usage_h(x, 1))).collect();
     assert_eq!(usage, vec![(1, 0); 4], "row 0 charged again, row 1 given back");
     assert_eq!((g2d.est.usage_v(0, 0), g2d.est.usage_v(4, 0)), (0, 0), "the detour's columns given back");
+}
+
+/// R15, constructed — no corpus run leaves a loop (asserted in the replay), so this is the driver's
+/// only witness. `removeLoops` walks every positive-length edge of every net, cuts the stretch
+/// between two visits of one point, gives back what that stretch was charged through the net's
+/// `updateUsageH/V`, and shortens `routelen` by the points cut.
+///
+/// ⛔ For an NDR net (edge cost > 1) the give-back goes through `getCostNDRAware`, which charges an
+/// edge ONCE per net and gives it back WHOLE: an edge the loop crosses and the kept path also
+/// crosses is left uncharged. Transcribed, not levelled — pinned by the second half.
+#[test]
+fn remove_loops_all_cuts_the_detour_and_gives_back_its_usage() {
+    use vyges_grt::estimate::Usage2d as _;
+    let pins = [(0, 0), (4, 0)];
+    // Out along row 0, up and back over row 1, down onto (1,0) again, then on to (4,0).
+    let looped = vec![(0, 0), (1, 0), (1, 1), (2, 1), (2, 0), (1, 0), (2, 0), (3, 0), (4, 0)];
+    let (px, py): (Vec<i32>, Vec<i32>) = pins.iter().copied().unzip();
+    let run = |edge_cost: i8| {
+        // Two nets on the same looped route; net 1 only so the count is summed over nets.
+        let mut state = vec![st_tree(2, &[(0, 0, 1), (4, 0, 1)], &pins), st_tree(2, &[(0, 0, 1), (4, 0, 1)], &pins)];
+        for st in &mut state {
+            let r = &mut st.tree.as_mut().expect("tree").routes[0];
+            (r.kind, r.grids, r.routelen) = (RouteKind::MazeRoute, looped.clone(), 8);
+        }
+        let lec = [edge_cost];
+        let nets = [RsmtNet { edge_cost, layer_edge_cost: &lec, ..net(&px, &py) }, RsmtNet { edge_cost, layer_edge_cost: &lec, ..net(&px, &py) }];
+        let mut g2d = Graph2d::new(6, 3, 1);
+        // Charged as the route stands, through each net's own ledger as a route is.
+        for id in 0..2 {
+            let nn = nets[id].ndr_net(id);
+            let mut u = g2d.for_net(&nn);
+            for w in looped.windows(2) {
+                let ((x1, y1), (x2, y2)) = (w[0], w[1]);
+                if y1 == y2 { u.update_usage_h(x1.min(x2), y1, f64::from(edge_cost)) } else { u.update_usage_v(x1, y1.min(y2), f64::from(edge_cost)) }
+            }
+        }
+        let removed = remove_loops_all(&[0, 1], &nets, &mut state, &mut g2d);
+        let r = &state[0].tree.as_ref().expect("tree").routes[0];
+        let row0: Vec<u16> = (0..4).map(|x| g2d.est.usage_h(x, 0)).collect();
+        let detour = (g2d.est.usage_h(1, 1), g2d.est.usage_v(1, 0), g2d.est.usage_v(2, 0));
+        (removed, r.routelen, r.grids[..=4].to_vec(), row0, detour)
+    };
+    let straight = vec![(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)];
+    let (removed, routelen, grids, row0, detour) = run(1);
+    assert_eq!((removed, routelen), (2, 4), "one loop per net, four points cut");
+    assert_eq!(grids, straight, "the straight path is left");
+    assert_eq!(row0, vec![2; 4], "row 0 keeps one step each per net; (1,0) was crossed twice and loses one");
+    assert_eq!(detour, (0, 0, 0), "the detour given back");
+    // NDR: no capacity here, so every first charge is an overflow charge (100 x edge cost).
+    let (removed, routelen, grids, row0, detour) = run(2);
+    assert_eq!((removed, routelen, grids), (2, 4, straight), "the same cut");
+    assert_eq!(row0, vec![400, 0, 400, 400], "(1,0) charged once per net, given back whole though the path still crosses it");
+    assert_eq!(detour, (0, 0, 0), "the detour given back");
 }
