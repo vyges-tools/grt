@@ -728,6 +728,11 @@ fn replay_run(r: &Value, bounds: Option<&Value>, seen: &mut Seen) {
                                                "{at} B16: (past_cong, getOverflow3D overflow, 3D usage)");
                                     check_boundary(&at, b16, &Overflow2DScan { total_overflow: ov3.total, ..scan }, &g2d, &state, seen);
                                     check_3d(&at, b16, &g3, &state, &nets, seen);
+                                    // R17 — `past_cong != total_overflow_` (2D and 3D disagree: NDR nets)
+                                    // runs disableNDRForCongestedNets. ⛔ Asserted, not noted: no corpus
+                                    // call takes it (no B17 anywhere in the full dump).
+                                    assert_eq!(scan.total_overflow, ov3.total, "{at}: 2D and 3D overflow differ — the NDR-disable branch (R17) runs; the corpus never did");
+                                    assert!(at_b("B17").is_none(), "{at}: B17 captured");
                                     seen.r16_checked += 1;
                                     }
                                 }
