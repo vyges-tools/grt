@@ -19,9 +19,11 @@
 //! helpers from elsewhere in the reference: [`edge_shift`], [`edge_shift_new`] (utility.cpp),
 //! [`ripup_seg_l`] (RipUp.cpp), [`newroute_l`] (route.cpp).
 
-use crate::estimate::{capacity_lower_bound, EstUsage, EstimateGrid, LShape};
-use crate::ndr_cost::{NdrAwareGrid, NdrCostNet, NdrLedger};
+use crate::estimate::{capacity_lower_bound, Usage2d, EstimateGrid, LShape};
+use crate::graph2d::Graph2d;
+use crate::ndr_cost::NdrCostNet;
 use crate::lroute::{route_edge, EdgeRoute, TreeEdge, TreeNode};
+use crate::ripup_route::{new_ripup, RoutedShape};
 use crate::rsmt::{segments_from_tree, Branch, Segment, COEFF_V_DEFAULT, COEFF_V_NO_ADJUSTMENTS, ROUTER_FLUTE_ACCURACY};
 
 /// The reference's `BIG_INT`.
@@ -114,9 +116,9 @@ impl RsmtNet<'_> {
 
 /// The grid state the congestion-driven call reads and writes.
 pub struct BrkGrid<'a> {
-    /// The estimated usage (`est_usage`), read by the tree builders and written by the rip-up and
-    /// re-route.
-    pub est: &'a mut EstimateGrid,
+    /// The 2D graph: estimated usage (read by the tree builders, written by the rip-up and
+    /// re-route through the NDR-aware charge), used grids, 2D capacities.
+    pub g: &'a mut Graph2d,
     /// The edge reduction (`red`) — `getEstUsageRed*` is `est_usage + red`.
     pub red_h: &'a dyn Fn(usize, usize) -> u16,
     pub red_v: &'a dyn Fn(usize, usize) -> u16,
@@ -126,8 +128,6 @@ pub struct BrkGrid<'a> {
     pub v_capacity: i32,
     /// `via_cost_` — the router sets it to 0 before R5, so the via bias contributes nothing here.
     pub via_cost: f64,
-    /// The NDR half of `graph2d_`: every usage update charges through it.
-    pub ndr: &'a mut NdrLedger,
 }
 
 /// The reference's `gen_brk_RSMT` flags, minus `newType` (false at both call sites).
@@ -150,6 +150,45 @@ pub enum TreeKind {
     Congest,
 }
 
+/// A tree edge's route type — `RouteType`, in the reference's order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RouteKind {
+    #[default]
+    NoRoute = 0,
+    LRoute = 1,
+    ZRoute = 2,
+    MazeRoute = 3,
+}
+
+/// The symbolic part of a tree edge's route (`TreeEdge::route`): the type and the fields the L and Z
+/// shapes read. ⚠️ Defaults are the reference's: `NoRoute`, `xFirst` false, `HVH` false, `Zpoint -1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreeRoute {
+    pub kind: RouteKind,
+    pub x_first: bool,
+    pub hvh: bool,
+    /// ⛔ `int16_t`.
+    pub z_point: i16,
+}
+
+impl Default for TreeRoute {
+    fn default() -> Self {
+        TreeRoute { kind: RouteKind::NoRoute, x_first: false, hvh: false, z_point: -1 }
+    }
+}
+
+impl TreeRoute {
+    /// The route as `newRipup` undoes it.
+    pub fn shape(&self) -> RoutedShape {
+        match self.kind {
+            RouteKind::NoRoute => RoutedShape::None,
+            RouteKind::LRoute => RoutedShape::L { x_first: self.x_first },
+            RouteKind::ZRoute => RoutedShape::Z { hvh: self.hvh, z_point: self.z_point as i32 },
+            RouteKind::MazeRoute => unimplemented!("maze routes are not held on the pattern-phase tree"),
+        }
+    }
+}
+
 /// The router's copy of a net's tree (`sttrees_[net]`), as [`copy_st_tree`] writes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StTree {
@@ -162,9 +201,8 @@ pub struct StTree {
     pub edges: Vec<TreeEdge>,
     /// `node_to_pin_idx` for the terminals; `-1` where no pin sits at the node.
     pub node_to_pin_idx: Vec<i32>,
-    /// Per edge, the bend [`newroute_l`] chose: `None` is `RouteType::NoRoute`, `Some(x_first)` an
-    /// `LRoute`. ⚠️ Empty until the edges are routed.
-    pub routes: Vec<Option<bool>>,
+    /// Per edge, the route (`TreeEdge::route`) — every edge starts at the default.
+    pub routes: Vec<TreeRoute>,
 }
 
 /// Per-net router state that outlives one call.
@@ -290,8 +328,8 @@ pub fn flute_congest(
     let mut y_seg: Vec<i32> = (0..d - 1).map(|i| (ys[i + 1] - ys[i]) * 100).collect();
     let height = ys[d - 1] - ys[0] + 1;
     let width = xs[d - 1] - xs[0] + 1;
-    let est_red_h = |x: i32, y: i32| grid.est.h(x as usize, y as usize) + (grid.red_h)(x as usize, y as usize) as f64;
-    let est_red_v = |x: i32, y: i32| grid.est.v(x as usize, y as usize) + (grid.red_v)(x as usize, y as usize) as f64;
+    let est_red_h = |x: i32, y: i32| grid.g.est.h(x as usize, y as usize) + (grid.red_h)(x as usize, y as usize) as f64;
+    let est_red_v = |x: i32, y: i32| grid.g.est.v(x as usize, y as usize) + (grid.red_v)(x as usize, y as usize) as f64;
 
     for i in 0..d - 1 {
         let mut usage_h: i32 = 0;
@@ -345,23 +383,23 @@ pub fn net_congestion(net: &RsmtNet<'_>, seglist: &[RoutedSegment], grid: &BrkGr
         let (ymin, ymax) = (s.y1.min(s.y2), s.y1.max(s.y2));
         if rs.x_first {
             for i in s.x1..s.x2 {
-                if grid.est.h(i as usize, s.y1 as usize) >= cap(i, s.y1, true) as f64 {
+                if grid.g.est.h(i as usize, s.y1 as usize) >= cap(i, s.y1, true) as f64 {
                     return true;
                 }
             }
             for i in ymin..ymax {
-                if grid.est.v(s.x2 as usize, i as usize) >= cap(s.x2, i, false) as f64 {
+                if grid.g.est.v(s.x2 as usize, i as usize) >= cap(s.x2, i, false) as f64 {
                     return true;
                 }
             }
         } else {
             for i in ymin..ymax {
-                if grid.est.v(s.x1 as usize, i as usize) >= cap(s.x1, i, false) as f64 {
+                if grid.g.est.v(s.x1 as usize, i as usize) >= cap(s.x1, i, false) as f64 {
                     return true;
                 }
             }
             for i in s.x1..s.x2 {
-                if grid.est.h(i as usize, s.y2 as usize) >= cap(i, s.y2, true) as f64 {
+                if grid.g.est.h(i as usize, s.y2 as usize) >= cap(i, s.y2, true) as f64 {
                     return true;
                 }
             }
@@ -410,26 +448,26 @@ pub fn coeff_adj(net: &RsmtNet<'_>, grid: &BrkGrid<'_>) -> f32 {
     if xmin == xmax {
         for j in ymin..ymax {
             vcap += cap(xmin, j, false);
-            vusage = (vusage as f64 + grid.est.v(xmin as usize, j as usize)) as f32;
+            vusage = (vusage as f64 + grid.g.est.v(xmin as usize, j as usize)) as f32;
         }
         coef = 1.0;
     } else if ymin == ymax {
         for i in xmin..xmax {
             hcap += cap(i, ymin, true);
-            husage = (husage as f64 + grid.est.h(i as usize, ymin as usize)) as f32;
+            husage = (husage as f64 + grid.g.est.h(i as usize, ymin as usize)) as f32;
         }
         coef = 1.0;
     } else {
         for j in ymin..=ymax {
             for i in xmin..xmax {
                 hcap += cap(i, j, true);
-                husage = (husage as f64 + grid.est.h(i as usize, j as usize)) as f32;
+                husage = (husage as f64 + grid.g.est.h(i as usize, j as usize)) as f32;
             }
         }
         for j in ymin..ymax {
             for i in xmin..=xmax {
                 vcap += cap(i, j, false);
-                vusage = (vusage as f64 + grid.est.v(i as usize, j as usize)) as f32;
+                vusage = (vusage as f64 + grid.g.est.v(i as usize, j as usize)) as f32;
             }
         }
         coef = if husage * vcap as f32 > 0.0 {
@@ -572,7 +610,7 @@ pub fn copy_st_tree(rsmt: &RsmtTree, net: &RsmtNet<'_>) -> Result<StTree, CopyTr
         return Err(CopyTreeError::EdgeCount { edges: edges.len(), nodes: numnodes });
     }
     nbrcnt.truncate(numnodes);
-    Ok(StTree { num_terminals: d, nodes, nbr, edge, nbr_count: nbrcnt, edges, node_to_pin_idx, routes: Vec::new() })
+    Ok(StTree { num_terminals: d, nodes, nbr, edge, nbr_count: nbrcnt, edges, node_to_pin_idx, routes: vec![TreeRoute::default(); numnodes - 1] })
 }
 
 /// `FrNet::getPinIdxFromPosition` — the index of the `count`-th pin at `(x, y)`, or `-1`.
@@ -608,7 +646,7 @@ pub fn gen_brk_rsmt(
         let net = &nets[id];
         let nn = net.ndr_net(id);
         if flags.re_route {
-            ripup_net_segments(&state[id].seglist, &mut NdrAwareGrid { est: &mut *grid.est, ndr: &mut *grid.ndr, net: &nn });
+            ripup_net_segments(&state[id].seglist, &mut grid.g.for_net(&nn));
         }
         let mut rec = build_tree(flags, id, net, &mut state[id], grid, stt_tree, flutes);
         if flags.gen_tree {
@@ -623,7 +661,7 @@ pub fn gen_brk_rsmt(
         sum.total_num_seg += state[id].seglist.len();
         if flags.re_route {
             let tree = state[id].tree.as_mut().expect("R7 copies the tree before re-routing it");
-            newroute_l(tree, &nn, grid, true);
+            newroute_l(tree, &nn, grid, false, true);
         }
         sum.num_shift += rec.shifts.unwrap_or(0);
         sum.nets.push(rec);
@@ -632,7 +670,7 @@ pub fn gen_brk_rsmt(
 }
 
 /// The rip-up loop: `ripupSegL` over every segment in the net's list.
-fn ripup_net_segments<G: EstUsage + ?Sized>(seglist: &[RoutedSegment], est: &mut G) {
+fn ripup_net_segments<G: Usage2d + ?Sized>(seglist: &[RoutedSegment], est: &mut G) {
     for s in seglist {
         ripup_seg_l(est, s);
     }
@@ -676,7 +714,7 @@ fn build_tree(
             t
         };
         if d > 3 {
-            rec.shifts = Some(edge_shift_new(&mut t, d, grid.est));
+            rec.shifts = Some(edge_shift_new(&mut t, d, &grid.g.est));
         }
         rec.tree = t;
     } else {
@@ -952,7 +990,7 @@ pub fn edge_shift_new(t: &mut RsmtTree, num_pins: usize, est: &EstimateGrid) -> 
 }
 
 /// `ripupSegL` — take a segment's L-route usage back off the grid, the way it bent.
-pub fn ripup_seg_l<G: EstUsage + ?Sized>(est: &mut G, s: &RoutedSegment) {
+pub fn ripup_seg_l<G: Usage2d + ?Sized>(est: &mut G, s: &RoutedSegment) {
     let g = s.seg;
     let cost = -(g.edge_cost as f64);
     let (ymin, ymax) = (g.y1.min(g.y2), g.y1.max(g.y2));
@@ -965,21 +1003,32 @@ pub fn ripup_seg_l<G: EstUsage + ?Sized>(est: &mut G, s: &RoutedSegment) {
     }
 }
 
-/// `newrouteL(net, RouteType::NoRoute, viaGuided)` — route every tree edge as an L, with no
-/// previous route to rip up. The per-edge decision is [`route_edge`]'s.
+/// `newrouteL(net, ripuptype, viaGuided)` — route every tree edge as an L, first ripping up its
+/// previous route when `ripup` (the reference's `ripuptype > RouteType::NoRoute`). The per-edge
+/// decision is [`route_edge`]'s.
 ///
-/// ⚠️ A zero-length edge is marked `NoRoute` (`None`); the reference leaves its `xFirst` as it was.
-pub fn newroute_l(tree: &mut StTree, net: &NdrCostNet, grid: &mut BrkGrid<'_>, via_guided: bool) {
+/// ⚠️ An edge of positive length becomes an `LRoute` (H/V edges too, with `xFirst` true for H and
+/// false for V); a zero-length edge becomes `NoRoute` and keeps its other fields.
+pub fn newroute_l(tree: &mut StTree, net: &NdrCostNet, grid: &mut BrkGrid<'_>, ripup: bool, via_guided: bool) {
     let (v_lb, h_lb) = (capacity_lower_bound(grid.v_capacity), capacity_lower_bound(grid.h_capacity));
-    tree.routes = vec![None; tree.edges.len()];
     for i in 0..tree.edges.len() {
         let e = tree.edges[i];
-        let mut g = NdrAwareGrid { est: &mut *grid.est, ndr: &mut *grid.ndr, net };
+        if e.len <= 0 {
+            tree.routes[i].kind = RouteKind::NoRoute;
+            continue;
+        }
+        let mut g = grid.g.for_net(net);
+        if ripup {
+            let (a, b) = (&tree.nodes[e.n1], &tree.nodes[e.n2]);
+            new_ripup(&mut g, (a.x as i32, a.y as i32), (b.x as i32, b.y as i32), &tree.routes[i].shape(), net.edge_cost);
+        }
         let r = route_edge(&mut g, &mut tree.nodes, &e, net.edge_cost, grid.via_cost, via_guided, v_lb, h_lb, grid.red_v, grid.red_h);
-        tree.routes[i] = match r {
-            EdgeRoute::None => None,
-            EdgeRoute::Vertical | EdgeRoute::L(LShape::YFirst) => Some(false),
-            EdgeRoute::Horizontal | EdgeRoute::L(LShape::XFirst) => Some(true),
+        let rt = &mut tree.routes[i];
+        rt.kind = RouteKind::LRoute;
+        rt.x_first = match r {
+            EdgeRoute::Vertical | EdgeRoute::L(LShape::YFirst) => false,
+            EdgeRoute::Horizontal | EdgeRoute::L(LShape::XFirst) => true,
+            EdgeRoute::None => unreachable!("a positive-length edge is routed"),
         };
     }
 }

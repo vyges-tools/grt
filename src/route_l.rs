@@ -8,16 +8,15 @@
 //! ⚠️ `routeLAll` is called ONCE, with `firstTime = true`; its `false` branch (rip-up + `routeSegL`)
 //! has no caller in `run()` and is not transcribed.
 
-use crate::brk_rsmt::{BrkGrid, NetState, RoutedSegment, RsmtNet};
-use crate::estimate::{capacity_lower_bound, choose_l_shape, commit_l_shape, congestion_cost, estimate_one_seg, needs_l_route, EstUsage, LShape};
-use crate::ndr_cost::NdrAwareGrid;
+use crate::brk_rsmt::{newroute_l, BrkGrid, NetState, RoutedSegment, RsmtNet};
+use crate::estimate::{capacity_lower_bound, choose_l_shape, commit_l_shape, congestion_cost, estimate_one_seg, needs_l_route, Usage2d, LShape};
 
 /// `routeSegLFirstTime` — price both Ls against the half-and-half estimate, then commit the cheaper.
 ///
 /// ⚠️ The price is the same congestion sum the later L passes use — `est + red` above the lower
 /// bound — over column `x1` + row `y2` (y-first) against column `x2` + row `y1` (x-first). The
 /// segment's bend is recorded on it (`xFirst`).
-pub fn route_seg_l_first_time<G: EstUsage + ?Sized>(
+pub fn route_seg_l_first_time<G: Usage2d + ?Sized>(
     grid: &mut G,
     seg: &mut RoutedSegment,
     v_lb: f32,
@@ -48,7 +47,7 @@ pub fn route_seg_l_first_time<G: EstUsage + ?Sized>(
 pub fn route_l_all(net_ids: &[usize], nets: &[RsmtNet<'_>], state: &mut [NetState], grid: &mut BrkGrid<'_>) {
     for &id in net_ids {
         let nn = nets[id].ndr_net(id);
-        let mut g = NdrAwareGrid { est: &mut *grid.est, ndr: &mut *grid.ndr, net: &nn };
+        let mut g = grid.g.for_net(&nn);
         for s in &state[id].seglist {
             estimate_one_seg(&mut g, &s.seg);
         }
@@ -56,11 +55,22 @@ pub fn route_l_all(net_ids: &[usize], nets: &[RsmtNet<'_>], state: &mut [NetStat
     let (v_lb, h_lb) = (capacity_lower_bound(grid.v_capacity), capacity_lower_bound(grid.h_capacity));
     for &id in net_ids {
         let nn = nets[id].ndr_net(id);
-        let mut g = NdrAwareGrid { est: &mut *grid.est, ndr: &mut *grid.ndr, net: &nn };
+        let mut g = grid.g.for_net(&nn);
         for s in state[id].seglist.iter_mut() {
             if needs_l_route(&s.seg) {
                 route_seg_l_first_time(&mut g, s, v_lb, h_lb, grid.red_v, grid.red_h);
             }
         }
+    }
+}
+
+/// `newrouteLAll(firstTime, viaGuided)` — [`newroute_l`] over every net in `net_ids` order, ripping
+/// up each edge's previous route unless `first_time`. The run calls it once, as R8:
+/// `newrouteLAll(false, true)`.
+pub fn newroute_l_all(first_time: bool, via_guided: bool, net_ids: &[usize], nets: &[RsmtNet<'_>], state: &mut [NetState], grid: &mut BrkGrid<'_>) {
+    for &id in net_ids {
+        let nn = nets[id].ndr_net(id);
+        let tree = state[id].tree.as_mut().expect("R7 copied every net's tree");
+        newroute_l(tree, &nn, grid, !first_time, via_guided);
     }
 }

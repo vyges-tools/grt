@@ -86,24 +86,85 @@ struct Seen {
     ndr_checked: usize,
     r6_checked: usize,
     r6_segs: usize,
+    boundaries: usize,
+    boundary_nets: usize,
+    incremental: usize,
     stacked_pins: usize,
     htree: usize,
 }
 
-/// Replay every run; list every run that diverges rather than stopping at the first.
-fn replay(g: &Value) -> Seen {
+/// ⛔ Known limitation — INCREMENTAL passes. A pass that keeps other nets' routes
+/// (`is_incremental_grt_`) rebuilds the used-grid sets from the COMMITTED usage at run() entry
+/// (`rebuildUsedGrids`), which this replay does not carry: those runs match on the overflow outputs
+/// and estimated usage at B7 and diverge on the used grids. They must diverge exactly there, and every
+/// other run must match — so this list fails the day the incremental setup lands.
+const INCREMENTAL: [&str; 4] =
+    ["repair_antennas_adjacent_jumpers-", "repair_antennas_allow_congestion-", "repair_antennas_from_odb-", "repair_antennas_only_diodes-"];
+
+/// Replay every run; list every run that diverges rather than stopping at the first. `bounds` is
+/// the boundary golden: each run's router state after R7, R8, R9, R10, per `global_route`.
+fn replay(g: &Value, bounds: &Value) -> Seen {
     let mut seen = Seen::default();
     let mut failed = Vec::new();
+    let by_design: std::collections::HashMap<&str, &Value> =
+        arr(&bounds["runs"]).iter().map(|r| (r["design"].as_str().expect("design"), &r["boundaries"])).collect();
     for r in arr(&g["runs"]) {
         let who = r["design"].as_str().expect("design");
         let mut one = Seen::default();
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| replay_run(r, &mut one))) {
-            Ok(()) => seen = add(seen, one),
-            Err(e) => failed.push(format!("{who}: {}", e.downcast_ref::<String>().cloned().unwrap_or_default())),
+        let b = by_design.get(who).copied();
+        let known = INCREMENTAL.iter().any(|p| who.starts_with(p));
+        match (std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| replay_run(r, b, &mut one))), known) {
+            (Ok(()), false) => seen = add(seen, one),
+            (Err(e), true) => {
+                let msg = e.downcast_ref::<String>().cloned().unwrap_or_default();
+                if msg.contains("B7: used grids") {
+                    seen.incremental += 1;
+                } else {
+                    failed.push(format!("{who}: diverges, but not where the incremental setup does: {msg}"));
+                }
+            }
+            (Ok(()), true) => failed.push(format!("{who}: now MATCHES — the incremental setup landed; empty INCREMENTAL")),
+            (Err(e), false) => failed.push(format!("{who}: {}", e.downcast_ref::<String>().cloned().unwrap_or_default())),
         }
     }
     assert!(failed.is_empty(), "{} runs diverge:\n{}", failed.len(), failed.join("\n"));
     seen
+}
+
+/// Compare our router state with one boundary: the overflow outputs, estimated usage, the
+/// used-grid sets, and every routed net's node statuses and edge routes.
+fn check_boundary(at: &str, b: &Value, scan: &Overflow2DScan, g2d: &Graph2d, state: &[NetState], seen: &mut Seen) {
+    let tag = b["tag"].as_str().expect("tag");
+    let at = format!("{at} {tag}");
+    assert_eq!((scan.total_overflow, scan.max_overflow, scan.ahth), (int(&b["total_overflow"]), int(&b["max_overflow"]), int(&b["ahth"])),
+               "{at}: getOverflow2D (total, max, ahth)");
+    for (dir, rows) in [("H", &b["est"]["H"]), ("V", &b["est"]["V"])] {
+        for (y, row) in arr(rows).iter().enumerate() {
+            let flat: Vec<f64> = arr(row).iter().flat_map(|p| std::iter::repeat(p[0].as_f64().expect("f")).take(int(&p[1]) as usize)).collect();
+            for (x, &want) in flat.iter().enumerate() {
+                let ours = if dir == "H" { g2d.est.h(x, y) } else { g2d.est.v(x, y) };
+                assert_eq!(ours, want, "{at}: estimated usage {dir} ({x}, {y})");
+            }
+        }
+    }
+    for (dir, ours) in [("H", &g2d.used_h), ("V", &g2d.used_v)] {
+        let want: Vec<(i32, i32)> = arr(&b["used"][dir]).iter().map(|p| (int(&p[0]), int(&p[1]))).collect();
+        assert_eq!(ours.iter().copied().collect::<Vec<_>>(), want, "{at}: used grids {dir}");
+    }
+    for (id, n) in b["nets"].as_object().expect("nets") {
+        let id: usize = id.parse().expect("net id");
+        let t = state[id].tree.as_ref().unwrap_or_else(|| panic!("{at}: net {id} has no tree"));
+        let nodes: Vec<(i32, i32, i32)> = arr(&n["nodes"]).iter().map(|v| (int(&v[0]), int(&v[1]), int(&v[2]))).collect();
+        let ours: Vec<(i32, i32, i32)> = t.nodes.iter().map(|v| (v.x as i32, v.y as i32, v.status as i32)).collect();
+        assert_eq!(ours, nodes, "{at}: net {id} nodes (x, y, status)");
+        let edges: Vec<[i32; 7]> = arr(&n["edges"]).iter().map(|e| std::array::from_fn(|k| int(&e[k]))).collect();
+        let ours: Vec<[i32; 7]> = t.edges.iter().zip(&t.routes).map(|(e, r)| {
+            [e.n1 as i32, e.n2 as i32, e.len, r.kind as i32, r.x_first as i32, r.hvh as i32, r.z_point as i32]
+        }).collect();
+        assert_eq!(ours, edges, "{at}: net {id} edges (n1, n2, len, type, xFirst, HVH, Zpoint)");
+        seen.boundary_nets += 1;
+    }
+    seen.boundaries += 1;
 }
 
 /// The first edge where a grid differs from a usage dump, if any.
@@ -121,7 +182,7 @@ fn usage_diff(est: &EstimateGrid, u: &Value) -> Option<String> {
     None
 }
 
-fn replay_run(r: &Value, seen: &mut Seen) {
+fn replay_run(r: &Value, bounds: Option<&Value>, seen: &mut Seen) {
     {
         let who = r["design"].as_str().expect("design");
         let calls = arr(&r["calls"]);
@@ -130,7 +191,9 @@ fn replay_run(r: &Value, seen: &mut Seen) {
         let mut state: Vec<NetState> = vec![NetState::default(); max_id + 1];
         let max_layer = calls.iter().flat_map(|c| arr(&c["nets"])).map(|n| int(&n["max"]) as usize).max().unwrap_or(0);
         // R6's state carried into R7: our estimated usage and NDR ledger, not the dump's.
-        let mut chain: Option<(EstimateGrid, NdrLedger)> = None;
+        let mut chain: Option<Graph2d> = None;
+        // Each `global_route` contributes one group of boundaries; R7 calls pair with them in order.
+        let mut pass = 0usize;
         for (ci, c) in calls.iter().enumerate() {
             let f = arr(&c["flags"]);
             let flags = BrkFlags { congestion_driven: int(&f[0]) == 1, re_route: int(&f[1]) == 1, gen_tree: int(&f[2]) == 1, no_adj: int(&f[4]) == 1 };
@@ -177,14 +240,16 @@ fn replay_run(r: &Value, seen: &mut Seen) {
                 }
             }
             // R7 continues from OUR R6: its usage must be the reference's R6 exit (R7's entry dump).
+            let mut g2d = Graph2d::new(xg, yg, 1);
+            g2d.est = est;
+            g2d.ndr = ledger;
             let chained = flags.re_route && small && chain.is_some();
             if chained {
-                let (e, l) = chain.take().expect("chained");
-                if let Some(d) = usage_diff(&e, &c["entry"]) {
+                let g = chain.take().expect("chained");
+                if let Some(d) = usage_diff(&g.est, &c["entry"]) {
                     panic!("{at}: R6 exit usage {d}");
                 }
-                est = e;
-                ledger = l;
+                g2d = g;
                 seen.r6_checked += 1;
             }
 
@@ -243,14 +308,13 @@ fn replay_run(r: &Value, seen: &mut Seen) {
             let red_h_f = move |x: usize, y: usize| rh[y * xg + x];
             let red_v_f = move |x: usize, y: usize| rv[y * xg + x];
             let mut grid = BrkGrid {
-                est: &mut est,
+                g: &mut g2d,
                 red_h: &red_h_f,
                 red_v: &red_v_f,
                 caps: &caps,
                 h_capacity: int(&c["hcap"]),
                 v_capacity: int(&c["vcap"]),
                 via_cost: 0.0,
-                ndr: &mut ledger,
             };
             let sum = gen_brk_rsmt(flags, &net_ids, &nets, &mut state, &mut grid, &|id| stt[&id].clone(), &flutes)
                 .unwrap_or_else(|e| panic!("{at}: {e:?}"));
@@ -307,10 +371,10 @@ fn replay_run(r: &Value, seen: &mut Seen) {
                 assert_eq!(state[id].seglist.iter().map(|s| s.seg).collect::<Vec<_>>(), rs, "{at}: the segment list");
 
                 if let Some(rr) = n.get("rr") {
-                    let want: Vec<Option<bool>> = arr(rr).iter().map(|e| match int(&e[0]) {
-                        0 => { assert_eq!(int(&e[1]), 0, "{at}: a NoRoute edge keeps xFirst false"); None }
-                        1 => Some(int(&e[1]) == 1),
-                        t => panic!("{at}: route type {t}"),
+                    let want: Vec<TreeRoute> = arr(rr).iter().map(|e| TreeRoute {
+                        kind: match int(&e[0]) { 0 => RouteKind::NoRoute, 1 => RouteKind::LRoute, t => panic!("{at}: route type {t}") },
+                        x_first: int(&e[1]) == 1,
+                        ..TreeRoute::default()
                     }).collect();
                     let t = state[id].tree.as_ref().expect("routed");
                     // ⚠️ Large grids carry no usage in the dump, so their L decisions cannot be
@@ -330,7 +394,7 @@ fn replay_run(r: &Value, seen: &mut Seen) {
                 'scan: for (dir, rows) in [("H", &exit.0), ("V", &exit.1)] {
                     for (y, row) in rows.iter().enumerate() {
                         for (x, &(e, red)) in row.iter().enumerate() {
-                            let (ours, our_red) = if dir == "H" { (est.h(x, y), red_h[y * xg + x]) } else { (est.v(x, y), red_v[y * xg + x]) };
+                            let (ours, our_red) = if dir == "H" { (g2d.est.h(x, y), red_h[y * xg + x]) } else { (g2d.est.v(x, y), red_v[y * xg + x]) };
                             if ours != e || our_red != red {
                                 first_diff = Some(format!("{dir} ({x}, {y}): engine {ours}/{our_red}, reference {e}/{red}"));
                                 break 'scan;
@@ -347,17 +411,45 @@ fn replay_run(r: &Value, seen: &mut Seen) {
             // R6: `routeLAll(true)` from R5's state, carried into the next call.
             if !flags.re_route && small {
                 let mut grid6 = BrkGrid {
-                    est: &mut est,
+                    g: &mut g2d,
                     red_h: &red_h_f,
                     red_v: &red_v_f,
                     caps: &caps,
                     h_capacity: int(&c["hcap"]),
                     v_capacity: int(&c["vcap"]),
                     via_cost: 0.0,
-                    ndr: &mut ledger,
-                };
+                    };
                 route_l_all(&net_ids, &nets, &mut state, &mut grid6);
-                chain = Some((est, ledger));
+                chain = Some(g2d);
+            } else if chained {
+                // Past R7, from our own state: B7, then R8 (`newrouteLAll(false, true)`) and B8.
+                let group: Vec<&Value> = bounds.map(|b| arr(b).iter().collect()).unwrap_or_default();
+                let at_b = |tag: &str| group.iter().filter(|x| x["tag"] == tag).nth(pass).copied();
+                if let Some(b7) = at_b("B7") {
+                    for (d, cap) in [("H", &mut g2d.cap_h), ("V", &mut g2d.cap_v)] {
+                        for (y, row) in arr(&b7["cap"][d]).iter().enumerate() {
+                            let flat: Vec<u16> = arr(row).iter().flat_map(|p| std::iter::repeat(int(&p[0]) as u16).take(int(&p[1]) as usize)).collect();
+                            for (x, c) in flat.into_iter().enumerate() {
+                                cap[y * xg + x] = c;
+                            }
+                        }
+                    }
+                    let scan = g2d.get_overflow_2d();
+                    check_boundary(&at, b7, &scan, &g2d, &state, seen);
+                    let mut grid8 = BrkGrid {
+                        g: &mut g2d,
+                        red_h: &red_h_f,
+                        red_v: &red_v_f,
+                        caps: &caps,
+                        h_capacity: int(&c["hcap"]),
+                        v_capacity: int(&c["vcap"]),
+                        via_cost: 0.0,
+                    };
+                    newroute_l_all(false, true, &net_ids, &nets, &mut state, &mut grid8);
+                    let scan = g2d.get_overflow_2d();
+                    check_boundary(&at, at_b("B8").expect("B8 follows B7"), &scan, &g2d, &state, seen);
+                }
+                pass += 1;
             }
             seen.calls += 1;
         }
@@ -367,19 +459,21 @@ fn replay_run(r: &Value, seen: &mut Seen) {
 
 #[test]
 fn gen_brk_rsmt_matches_the_reference() {
-    let s = replay(&read(&format!("{}/examples/grt_gate/brk_rsmt.json", env!("CARGO_MANIFEST_DIR"))));
+    let dir = format!("{}/examples/grt_gate", env!("CARGO_MANIFEST_DIR"));
+    let s = replay(&read(&format!("{dir}/brk_rsmt.json")), &read(&format!("{dir}/boundaries.json")));
     eprintln!("{s:?}");
     assert!(s.runs >= 40 && s.flute_nets >= 990 && s.shifted >= 70 && s.shifts > 0 && s.copied >= 900
-            && s.routed_edges >= 1000 && s.usage_checked >= 60 && s.ndr_checked >= 2 && s.r6_checked >= 40 && s.htree > 0,
+            && s.routed_edges >= 1000 && s.usage_checked >= 60 && s.ndr_checked >= 2 && s.r6_checked >= 40 && s.boundaries >= 80 && s.htree > 0,
             "{s:?}");
 }
 
-/// GRT_BRK_RSMT_FULL=/path/to/r7-all.json cargo test --release --test brk_rsmt -- --ignored
+/// GRT_BRK_RSMT_FULL=/path/to/r7-all.json GRT_BOUNDARIES_FULL=/path/to/rb-all.json cargo test --release --test brk_rsmt -- --ignored
 #[test]
 #[ignore = "needs the uncapped dump; the committed sample is what CI runs"]
 fn gen_brk_rsmt_matches_the_reference_exhaustively() {
     let path = std::env::var("GRT_BRK_RSMT_FULL").expect("set GRT_BRK_RSMT_FULL");
-    eprintln!("exhaustive: {:?}", replay(&read(&path)));
+    let bpath = std::env::var("GRT_BOUNDARIES_FULL").expect("set GRT_BOUNDARIES_FULL");
+    eprintln!("exhaustive: {:?}", replay(&read(&path), &read(&bpath)));
 }
 
 fn add(a: Seen, b: Seen) -> Seen {
@@ -387,7 +481,7 @@ fn add(a: Seen, b: Seen) -> Seen {
         runs: a.runs + b.runs, calls: a.calls + b.calls, nets: a.nets + b.nets, flute_nets: a.flute_nets + b.flute_nets,
         shifted: a.shifted + b.shifted, shifts: a.shifts + b.shifts, copied: a.copied + b.copied,
         routed_edges: a.routed_edges + b.routed_edges, usage_checked: a.usage_checked + b.usage_checked,
-        ndr_checked: a.ndr_checked + b.ndr_checked, r6_checked: a.r6_checked + b.r6_checked, r6_segs: a.r6_segs + b.r6_segs, stacked_pins: a.stacked_pins + b.stacked_pins, htree: a.htree + b.htree,
+        ndr_checked: a.ndr_checked + b.ndr_checked, r6_checked: a.r6_checked + b.r6_checked, r6_segs: a.r6_segs + b.r6_segs, boundaries: a.boundaries + b.boundaries, boundary_nets: a.boundary_nets + b.boundary_nets, incremental: a.incremental + b.incremental, stacked_pins: a.stacked_pins + b.stacked_pins, htree: a.htree + b.htree,
     }
 }
 
@@ -414,16 +508,16 @@ fn net<'a>(x: &'a [i32], y: &'a [i32]) -> RsmtNet<'a> {
 #[test]
 fn flute_congest_stretches_each_gap_by_its_usage() {
     let (xg, yg) = (8, 5);
-    let mut est = EstimateGrid::new(xg, yg);
+    let mut g2d = Graph2d::new(xg, yg, 1);
     for y in 0..=3 {
-        est.update_h(0, 2, y, 500.0); // gap 0: 8 edges × 500 = 4000 → factor 4000/(2·4·1000) = 0.5
-        est.update_h(4, 6, y, 0.6); // gap 2: every add truncates to 0 (rounding would not) → unchanged
+        g2d.est.update_h(0, 2, y, 500.0); // gap 0: 8 edges × 500 = 4000 → factor 4000/(2·4·1000) = 0.5
+        g2d.est.update_h(4, 6, y, 0.6); // gap 2: every add truncates to 0 (rounding would not) → unchanged
     }
     let red_h = |x: usize, y: usize| (x == 2 && y == 0) as u16; // gap 1: reduction 1 → 1/8000 of 200 is 0 → floored to 1
-    est.update_v(0, 0, 1, 1.0); // y gap 0: one edge of 1…
+    g2d.est.update_v(0, 0, 1, 1.0); // y gap 0: one edge of 1…
     let red_v = |x: usize, y: usize| if y == 0 && x < 7 && x > 0 { 1u16 } else { 0 }; // …plus red 1 on six more = 7
     let caps = grid_caps(xg, yg, 0);
-    let grid = BrkGrid { est: &mut est, red_h: &red_h, red_v: &red_v, caps: &caps, h_capacity: 1000, v_capacity: 10, via_cost: 0.0 , ndr: &mut NdrLedger::new(1, 1, 1) };
+    let grid = BrkGrid { g: &mut g2d, red_h: &red_h, red_v: &red_v, caps: &caps, h_capacity: 1000, v_capacity: 10, via_cost: 0.0 };
     let sorted = SortedPins { xs: vec![0, 2, 4, 6], ys: vec![0, 1, 2, 3], s: vec![0, 1, 2, 3] };
     let seen = RefCell::new((Vec::new(), Vec::new()));
     let fake = |xs: &[i32], ys: &[i32], _: &[usize], _: i32| {
@@ -452,10 +546,10 @@ fn mapxy_maps_back_or_gives_minus_one() {
 /// took: x-first checks row y1 then column x2.
 #[test]
 fn net_congestion_is_at_or_over_capacity() {
-    let mut est = EstimateGrid::new(4, 4);
-    est.update_h(0, 1, 0, 3.0);
+    let mut g2d = Graph2d::new(4, 4, 1);
+    g2d.est.update_h(0, 1, 0, 3.0);
     let caps = grid_caps(4, 4, 3);
-    let grid = BrkGrid { est: &mut est, red_h: &no_red, red_v: &no_red, caps: &caps, h_capacity: 3, v_capacity: 3, via_cost: 0.0 , ndr: &mut NdrLedger::new(1, 1, 1) };
+    let grid = BrkGrid { g: &mut g2d, red_h: &no_red, red_v: &no_red, caps: &caps, h_capacity: 3, v_capacity: 3, via_cost: 0.0 };
     let (x, y) = ([0, 2], [0, 2]);
     let seg = RoutedSegment { seg: Segment { x1: 0, y1: 0, x2: 2, y2: 2, edge_cost: 1 }, x_first: true };
     assert!(net_congestion(&net(&x, &y), &[seg], &grid), "usage 3 on capacity 3 is congested");
@@ -463,10 +557,10 @@ fn net_congestion_is_at_or_over_capacity() {
 
 #[test]
 fn net_congestion_walks_the_bend_taken() {
-    let mut est = EstimateGrid::new(4, 4);
-    est.update_v(0, 0, 1, 5.0); // column x1 — on the y-first path only
+    let mut g2d = Graph2d::new(4, 4, 1);
+    g2d.est.update_v(0, 0, 1, 5.0); // column x1 — on the y-first path only
     let caps = grid_caps(4, 4, 3);
-    let grid = BrkGrid { est: &mut est, red_h: &no_red, red_v: &no_red, caps: &caps, h_capacity: 3, v_capacity: 3, via_cost: 0.0 , ndr: &mut NdrLedger::new(1, 1, 1) };
+    let grid = BrkGrid { g: &mut g2d, red_h: &no_red, red_v: &no_red, caps: &caps, h_capacity: 3, v_capacity: 3, via_cost: 0.0 };
     let (x, y) = ([0, 2], [0, 2]);
     let s = Segment { x1: 0, y1: 0, x2: 2, y2: 2, edge_cost: 1 };
     assert!(!net_congestion(&net(&x, &y), &[RoutedSegment { seg: s, x_first: true }], &grid));
@@ -476,7 +570,7 @@ fn net_congestion_walks_the_bend_taken() {
 /// A net whose old route is congested is rebuilt by `fluteCongest`, from the pins R5 sorted.
 #[test]
 fn a_congested_net_takes_the_congestion_flute() {
-    let mut est = EstimateGrid::new(8, 8);
+    let mut g2d = Graph2d::new(8, 8, 1);
     let caps = grid_caps(8, 8, 1);
     let (x, y) = ([0, 3, 5, 7], [0, 4, 2, 6]);
     let nets = [net(&x, &y)];
@@ -492,15 +586,15 @@ fn a_congested_net_takes_the_congestion_flute() {
     let r7 = BrkFlags { congestion_driven: true, re_route: true, gen_tree: true, no_adj: false };
     let no_stt = |_: usize| -> RsmtTree { unreachable!("alpha 0") };
     {
-        let mut grid = BrkGrid { est: &mut est, red_h: &no_red, red_v: &no_red, caps: &caps, h_capacity: 1, v_capacity: 1, via_cost: 0.0 , ndr: &mut NdrLedger::new(1, 1, 1) };
+        let mut grid = BrkGrid { g: &mut g2d, red_h: &no_red, red_v: &no_red, caps: &caps, h_capacity: 1, v_capacity: 1, via_cost: 0.0 };
         gen_brk_rsmt(r5, &[0], &nets, &mut state, &mut grid, &no_stt, &fake).expect("R5");
     }
     // Another net's usage fills the first segment's path — y-first, the bend an unrouted segment
     // carries — so it is congested once this net is ripped up.
     let first = state[0].seglist[0].seg;
-    est.update_v(first.x1, first.y1.min(first.y2), first.y1.max(first.y2), 5.0);
-    est.update_h(first.x1, first.x2, first.y2, 5.0);
-    let mut grid = BrkGrid { est: &mut est, red_h: &no_red, red_v: &no_red, caps: &caps, h_capacity: 1, v_capacity: 1, via_cost: 0.0 , ndr: &mut NdrLedger::new(1, 1, 1) };
+    g2d.est.update_v(first.x1, first.y1.min(first.y2), first.y1.max(first.y2), 5.0);
+    g2d.est.update_h(first.x1, first.x2, first.y2, 5.0);
+    let mut grid = BrkGrid { g: &mut g2d, red_h: &no_red, red_v: &no_red, caps: &caps, h_capacity: 1, v_capacity: 1, via_cost: 0.0 };
     let sum = gen_brk_rsmt(r7, &[0], &nets, &mut state, &mut grid, &no_stt, &fake).expect("R7");
     assert_eq!((sum.nets[0].kind, sum.nets[0].congested), (TreeKind::Congest, Some(true)));
 }

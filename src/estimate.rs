@@ -183,14 +183,14 @@ impl EstimateGrid {
     }
 }
 
-/// The estimated-usage surface a routing step reads and writes — `graph2d_`'s `getEstUsage*` and
-/// `updateEstUsage*`.
+/// The 2D usage surface a routing step reads and writes — `graph2d_`'s `getEstUsage*`,
+/// `updateEstUsage*` and the committed `updateUsageH/V`.
 ///
 /// ⛔ **The reference's updaters charge through the NDR-aware cost**, per edge. The plain
 /// [`EstimateGrid`] charges the amount as given, which is what the cost does for a net of edge
 /// cost 1; [`crate::ndr_cost::NdrAwareGrid`] charges an NDR net the way the reference does. A step
 /// written against this trait takes either.
-pub trait EstUsage {
+pub trait Usage2d {
     /// Demand on the horizontal edge leaving cell `(x, y)`.
     fn h(&self, x: usize, y: usize) -> f64;
     /// Demand on the vertical edge leaving cell `(x, y)`.
@@ -199,9 +199,13 @@ pub trait EstUsage {
     fn update_h(&mut self, x1: i32, x2: i32, y: i32, amount: f64);
     /// Charge `y1..y2` in column `x`, one edge at a time in increasing `y`.
     fn update_v(&mut self, x: i32, y1: i32, y2: i32, amount: f64);
+    /// Charge ONE horizontal edge's committed usage — `updateUsageH(x, y, net, usage)`.
+    fn update_usage_h(&mut self, x: i32, y: i32, amount: f64);
+    /// Charge ONE vertical edge's committed usage — `updateUsageV(x, y, net, usage)`.
+    fn update_usage_v(&mut self, x: i32, y: i32, amount: f64);
 }
 
-impl EstUsage for EstimateGrid {
+impl Usage2d for EstimateGrid {
     fn h(&self, x: usize, y: usize) -> f64 {
         EstimateGrid::h(self, x, y)
     }
@@ -213,6 +217,12 @@ impl EstUsage for EstimateGrid {
     }
     fn update_v(&mut self, x: i32, y1: i32, y2: i32, amount: f64) {
         EstimateGrid::update_v(self, x, y1, y2, amount)
+    }
+    fn update_usage_h(&mut self, x: i32, y: i32, amount: f64) {
+        EstimateGrid::update_usage_h(self, x, y, amount)
+    }
+    fn update_usage_v(&mut self, x: i32, y: i32, amount: f64) {
+        EstimateGrid::update_usage_v(self, x, y, amount)
     }
 }
 
@@ -237,7 +247,7 @@ impl EstUsage for EstimateGrid {
 ///
 /// ⚠️ The halving is a **float** division of an `i8` cost. Both `f32` and `f64` represent
 /// `i8 / 2` exactly, so the width does not change the answer here — stated rather than assumed.
-pub fn estimate_one_seg<G: EstUsage + ?Sized>(grid: &mut G, seg: &Segment) {
+pub fn estimate_one_seg<G: Usage2d + ?Sized>(grid: &mut G, seg: &Segment) {
     let cost = seg.edge_cost as f64;
     let (ymin, ymax) = (seg.y1.min(seg.y2), seg.y1.max(seg.y2));
 
@@ -339,7 +349,7 @@ pub fn choose_l_shape(cost_y_first: f64, cost_x_first: f64) -> LShape {
 /// ⚠️ The estimate pass charged **half** to each candidate. Committing adds another half to the
 /// winner and subtracts a half from the loser, which leaves the winner at full cost and the loser
 /// at zero — without either ever being recomputed from scratch.
-pub fn commit_l_shape<G: EstUsage + ?Sized>(grid: &mut G, seg: &Segment, shape: LShape) {
+pub fn commit_l_shape<G: Usage2d + ?Sized>(grid: &mut G, seg: &Segment, shape: LShape) {
     let half = seg.edge_cost as f64 / 2.0;
     let (ymin, ymax) = (seg.y1.min(seg.y2), seg.y1.max(seg.y2));
     match shape {

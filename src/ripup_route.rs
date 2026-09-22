@@ -12,7 +12,7 @@
 //! 🔑 **Every undo indexes an edge at its LOWER endpoint** — `min(a, b)` here, which is the same
 //! rule the monotonic walk states as `step > 0 ? i : i - 1`. Two independent sites, one rule.
 
-use crate::estimate::EstimateGrid;
+use crate::estimate::Usage2d;
 
 /// A route as the rip-up code finds it.
 ///
@@ -37,14 +37,14 @@ enum Layer {
     Committed,
 }
 
-fn give_back_h(grid: &mut EstimateGrid, x1: i32, x2: i32, y: i32, cost: f64, layer: Layer) {
+fn give_back_h<G: Usage2d + ?Sized>(grid: &mut G, x1: i32, x2: i32, y: i32, cost: f64, layer: Layer) {
     match layer {
         Layer::Estimate => grid.update_h(x1, x2, y, -cost),
         Layer::Committed => grid.update_usage_h(x1, y, -cost),
     }
 }
 
-fn give_back_v(grid: &mut EstimateGrid, x: i32, y1: i32, y2: i32, cost: f64, layer: Layer) {
+fn give_back_v<G: Usage2d + ?Sized>(grid: &mut G, x: i32, y1: i32, y2: i32, cost: f64, layer: Layer) {
     match layer {
         Layer::Estimate => grid.update_v(x, y1, y2, -cost),
         Layer::Committed => grid.update_usage_v(x, y1, -cost),
@@ -58,8 +58,8 @@ fn give_back_v(grid: &mut EstimateGrid, x: i32, y1: i32, y2: i32, cost: f64, lay
 ///
 /// ⚠️ Each arm mirrors the stage that charged it, run in reverse with a negated cost. A shape
 /// whose undo does not match its route leaves demand behind that nothing will ever remove.
-pub fn new_ripup(
-    grid: &mut EstimateGrid,
+pub fn new_ripup<G: Usage2d + ?Sized>(
+    grid: &mut G,
     (x1, y1): (i32, i32),
     (x2, y2): (i32, i32),
     shape: &RoutedShape,
@@ -109,8 +109,8 @@ pub fn new_ripup(
 /// ⚠️ **Only `routelen` steps are taken, not `grids.len() - 1`.** The reference sizes the point
 /// buffer from the edge's length and walks the stored route length; the two agree, but the loop
 /// bound is the stored one.
-fn give_back_walked(
-    grid: &mut EstimateGrid,
+fn give_back_walked<G: Usage2d + ?Sized>(
+    grid: &mut G,
     grids: &[(i32, i32)],
     routelen: usize,
     cost: f64,
@@ -133,8 +133,8 @@ fn give_back_walked(
 /// Give back every edge of one net — the reference's `newRipupNet`.
 ///
 /// It is [`new_ripup`] over each edge, and is kept separate only because the reference does.
-pub fn new_ripup_net(
-    grid: &mut EstimateGrid,
+pub fn new_ripup_net<G: Usage2d + ?Sized>(
+    grid: &mut G,
     edges: &[((i32, i32), (i32, i32), RoutedShape)],
     edge_cost: i8,
 ) {
@@ -157,8 +157,8 @@ pub fn new_ripup_net(
 /// mark is removed unconditionally. A terminal therefore keeps its horizontal mark even after the
 /// route that set it has gone.
 #[allow(clippy::too_many_arguments)]
-pub fn new_ripup_congested_l(
-    grid: &mut EstimateGrid,
+pub fn new_ripup_congested_l<G: Usage2d + ?Sized>(
+    grid: &mut G,
     statuses: &mut [i16],
     (n1, n2): (usize, usize),
     (x1, y1): (i32, i32),
@@ -233,8 +233,8 @@ pub enum RipupReason {
 /// `slack > ceil(lowest float)`, which excludes the value it uses to mean "no slack known". A net
 /// carrying the sentinel would otherwise look like the most critical net in the design.
 #[allow(clippy::too_many_arguments)]
-pub fn new_ripup_check(
-    grid: &mut EstimateGrid,
+pub fn new_ripup_check<G: Usage2d + ?Sized>(
+    grid: &mut G,
     grids: &[(i32, i32)],
     routelen: usize,
     ripup_threshold: i32,

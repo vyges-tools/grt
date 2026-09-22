@@ -250,36 +250,3 @@ impl NdrLedger {
     }
 }
 
-/// The estimated usage as the reference's `updateEstUsageH/V` charge it: each edge's amount passes
-/// through [`NdrLedger::get_cost_ndr_aware`] for the net doing the update.
-///
-/// ⚠️ For a net of edge cost 1 this charges exactly what the plain grid charges; for an NDR net it
-/// is the only faithful charge. The interval is walked edge by edge in increasing coordinate, as
-/// the reference's `for (x = lo; x < hi; x++) updateEstUsageH(x, ...)` does — the order matters,
-/// because each edge's charge reads and writes that edge's state.
-pub struct NdrAwareGrid<'a> {
-    pub est: &'a mut crate::estimate::EstimateGrid,
-    pub ndr: &'a mut NdrLedger,
-    pub net: &'a NdrCostNet,
-}
-
-impl crate::estimate::EstUsage for NdrAwareGrid<'_> {
-    fn h(&self, x: usize, y: usize) -> f64 {
-        self.est.h(x, y)
-    }
-    fn v(&self, x: usize, y: usize) -> f64 {
-        self.est.v(x, y)
-    }
-    fn update_h(&mut self, x1: i32, x2: i32, y: i32, amount: f64) {
-        for x in x1..x2 {
-            let c = self.ndr.get_cost_ndr_aware(self.net, x as usize, y as usize, amount, true);
-            self.est.update_h(x, x + 1, y, c);
-        }
-    }
-    fn update_v(&mut self, x: i32, y1: i32, y2: i32, amount: f64) {
-        for y in y1..y2 {
-            let c = self.ndr.get_cost_ndr_aware(self.net, x as usize, y as usize, amount, false);
-            self.est.update_v(x, y, y + 1, c);
-        }
-    }
-}
