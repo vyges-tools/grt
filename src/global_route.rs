@@ -54,6 +54,8 @@ pub struct RouteOptions {
     pub allow_congestion: bool,
     /// `global_route -congestion_iterations` (default 50).
     pub congestion_iterations: i32,
+    /// `set_macro_extension` — in tiles (default 0).
+    pub macro_extension: i32,
 }
 
 impl RouteOptions {
@@ -73,6 +75,7 @@ impl RouteOptions {
             min_fanout_alpha: None,
             allow_congestion: false,
             congestion_iterations: 50,
+            macro_extension: 0,
         }
     }
 }
@@ -157,7 +160,7 @@ pub fn setup_tech(db: &mut Db, opts: &RouteOptions) -> Res<TechSetup> {
 /// extension, layer±1 blocking, transition layers — and `has_macros_or_pads_`), and a net with
 /// routed wires (`findNetsObstructions` decodes them). `perturbCapacities` is inert at its default
 /// (0%); `findLayerExtensions` feeds only the macro branch.
-pub fn setup_adjust(db: &mut Db, t: &TechSetup, opts: &RouteOptions, log: &mut Vec<String>) -> Res<RouterEdges> {
+pub fn setup_adjust(db: &mut Db, t: &TechSetup, opts: &RouteOptions, log: &mut Vec<String>) -> Res<Adjusted> {
     let c = &t.capacities;
     let (min, max) = (t.min_routing_layer, t.max_routing_layer);
     let state = |cap: &[u16]| cap.iter().map(|&cap| EdgeState { cap, red: 0, real_cap: 0 }).collect::<Vec<_>>();
@@ -181,6 +184,7 @@ pub fn setup_adjust(db: &mut Db, t: &TechSetup, opts: &RouteOptions, log: &mut V
     let dir = |level: i32| t.tech.routing_layers.iter().find(|l| l.routing_level == level).and_then(|l| l.direction);
     let in_range = |level: i32| min <= level && level <= max;
     let die = t.core.area;
+    let mut stream: Vec<(Rect, i32, bool)> = Vec::new();
     let contains = |r: &Rect| die.x_min <= r.x_min && die.y_min <= r.y_min && r.x_max <= die.x_max && r.y_max <= die.y_max;
     // findObstructions — the block's own (DEF) obstructions.
     for (n, x0, y0, x1, y1) in db.obstruction_boxes()? {
@@ -190,11 +194,14 @@ pub fn setup_adjust(db: &mut Db, t: &TechSetup, opts: &RouteOptions, log: &mut V
             if !contains(&rect) && opts.verbose {
                 log.push("[WARNING GRT-0037] Found blockage outside die area.".into());
             }
-            apply_obstruction_adjustment(&mut e, rect, level, dir(level), false);
+            { stream.push((rect, level, false)); apply_obstruction_adjustment(&mut e, rect, level, dir(level), false); }
         }
     }
     // findInstancesObstructions — every instance, in the block's order; masters read once.
     let mut masters: std::collections::HashMap<String, MasterShapes> = std::collections::HashMap::new();
+    let mut has_macros_or_pads = false;
+    let mut extensions: Option<Vec<i32>> = None;
+    let mut layer_obs: std::collections::BTreeMap<i32, Vec<Rect>> = std::collections::BTreeMap::new();
     let mut pins_out_of_die = 0;
     for inst in db.inst_names() {
         let master = db.inst_master(&inst);
@@ -202,17 +209,46 @@ pub fn setup_adjust(db: &mut Db, t: &TechSetup, opts: &RouteOptions, log: &mut V
             masters.insert(master.clone(), read_master_shapes(db, &master)?);
         }
         let m = &masters[&master];
-        if m.is_block || m.is_pad {
-            return Err(format!("instance {inst}: macro/pad master {master} — the macro obstruction path is not wired").into());
-        }
+        has_macros_or_pads |= m.is_block || m.is_pad;
         let (orient, origin) = (db.inst_get_orient(&inst), (db.inst_get_origin_x(&inst), db.inst_get_origin_y(&inst)));
-        for &(level, r) in &m.obstructions {
+        if m.is_block {
+            // The macro branch: obstructions grouped per layer, layer±1 blocking, then each widened
+            // across its layer's direction and applied as a MACRO obstruction.
+            let mut per_layer: std::collections::BTreeMap<i32, Vec<Rect>> = std::collections::BTreeMap::new();
+            let (mut bottom, mut top) = (i32::MAX, i32::MIN);
+            for &(level, r) in &m.obstructions {
+                if in_range(level) {
+                    per_layer.entry(level).or_default().push(transform_rect(&orient, origin, r));
+                    bottom = bottom.min(level);
+                    top = top.max(level);
+                }
+            }
+            extend_obstructions(&mut per_layer, bottom, top, min, max);
+            if extensions.is_none() {
+                extensions = Some(find_layer_extensions(db, t)?);
+            }
+            let ext = extensions.as_ref().expect("computed");
+            for (&layer, obs) in &per_layer {
+                let extension = ext[layer as usize] + opts.macro_extension * t.core.tile_size;
+                for &o in obs {
+                    let mut o = o;
+                    match dir(layer) {
+                        Some(crate::capacity::Direction::Horizontal) => (o.y_min, o.y_max) = (o.y_min - extension, o.y_max + extension),
+                        Some(crate::capacity::Direction::Vertical) => (o.x_min, o.x_max) = (o.x_min - extension, o.x_max + extension),
+                        None => {}
+                    }
+                    layer_obs.entry(layer).or_default().push(o);
+                    { stream.push((o, layer, true)); apply_obstruction_adjustment(&mut e, o, layer, dir(layer), true); }
+                }
+            }
+        }
+        for &(level, r) in m.obstructions.iter().filter(|_| !m.is_block) {
             if in_range(level) {
                 let rect = transform_rect(&orient, origin, r);
                 if !contains(&rect) && opts.verbose {
                     log.push(format!("[WARNING GRT-0038] Found blockage outside die area in instance {inst}."));
                 }
-                apply_obstruction_adjustment(&mut e, rect, level, dir(level), false);
+                { stream.push((rect, level, false)); apply_obstruction_adjustment(&mut e, rect, level, dir(level), false); }
             }
         }
         for (term, supply, routing, level, r) in &m.pins {
@@ -224,22 +260,59 @@ pub fn setup_adjust(db: &mut Db, t: &TechSetup, opts: &RouteOptions, log: &mut V
                 log.push(format!("[WARNING GRT-0039] Found pin {term} outside die area in instance {inst}."));
                 pins_out_of_die += 1;
             }
-            apply_obstruction_adjustment(&mut e, rect, *level, dir(*level), false);
+            { stream.push((rect, *level, false)); apply_obstruction_adjustment(&mut e, rect, *level, dir(*level), false); }
         }
     }
     if pins_out_of_die > 0 && opts.verbose {
         return Err(format!("GRT-0028: Found {pins_out_of_die} pins outside die area.").into());
     }
-    // findNetsObstructions — a net with routed wires is refused (see above).
+    // findNetsObstructions — every net with wires: a supply net's special wires, any other net's
+    // routed wire, vias decomposed into their boxes (a cut box, routing level 0, skipped), each
+    // through applyNetObstruction.
     let nets = db.net_names();
     if nets.is_empty() {
         return Err("GRT-0094: Design with no nets.".into());
     }
-    if let Some(n) = nets.iter().find(|n| db.net_get_wire_count_wire_cnt(n) > 0) {
-        return Err(format!("net {n} has routed wires — findNetsObstructions is not wired").into());
+    for net in &nets {
+        if db.net_get_wire_count_wire_cnt(net) == 0 {
+            continue;
+        }
+        let sig = db.net_sigtype(net);
+        let shapes: Vec<(i64, i32, i32, i32, i32, bool)> = if sig == "POWER" || sig == "GROUND" {
+            db.net_swire_shapes(net)?.into_iter().map(|s| (s.0, s.1, s.2, s.3, s.4, s.6)).collect()
+        } else {
+            db.net_wire_boxes(net).into_iter().map(|b| (b.layer, b.x0, b.y0, b.x1, b.y1, b.from_via)).collect()
+        };
+        for (n, x0, y0, x1, y1, _) in shapes {
+            let level = db.layer_get_routing_level(&db.layer_name_by_number(n));
+            // applyNetObstruction — the range test also drops a cut box (level 0).
+            if in_range(level) {
+                let rect = Rect { x_min: x0, y_min: y0, x_max: x1, y_max: y1 };
+                if !contains(&rect) && opts.verbose {
+                    log.push(format!("[WARNING GRT-0041] Net {net} has wires/vias outside die area."));
+                }
+                { stream.push((rect, level, false)); apply_obstruction_adjustment(&mut e, rect, level, dir(level), false); }
+            }
+        }
     }
-    // findTransitionLayers / adjustTransitionLayers: only macro obstructions are adjusted, and a
-    // macro is refused above — nothing to do.
+    // findTransitionLayers / adjustTransitionLayers — tiles under the MACRO obstructions one layer
+    // below each transition layer.
+    let transition_layers = find_transition_layers(t);
+    for &layer in &transition_layers {
+        let mut tiles = std::collections::BTreeSet::new();
+        for &obs in layer_obs.get(&(layer - 1)).map(Vec::as_slice).unwrap_or(&[]) {
+            let (_, _, first, last) = e.get_blocked_tiles(obs);
+            if first == last {
+                continue;
+            }
+            for y in first.1..last.1 {
+                for x in first.0..last.0 {
+                    tiles.insert((x, y));
+                }
+            }
+        }
+        crate::adjust::adjust_tile_set(&mut e, &tiles, layer, dir(layer));
+    }
     init_blocked_intervals(&mut e);
     save_resources_before_adjustments(&mut e);
     // computeUserGlobalAdjustments — WRITES the layer adjustment into the database.
@@ -261,7 +334,140 @@ pub fn setup_adjust(db: &mut Db, t: &TechSetup, opts: &RouteOptions, log: &mut V
         compute_region_adjustments(&mut e, region, layer, adjustment, dir(layer), use_pitch).map_err(|_| format!("GRT: region adjustment on layer {layer} outside the die"))?;
     }
     log.extend(e.log.drain(..));
-    Ok(e)
+    Ok(Adjusted { edges: e, has_macros_or_pads, stream, extensions, transition_layers })
+}
+
+/// I10's result: the edges, and whether any instance is a macro or pad (`has_macros_or_pads_`).
+pub struct Adjusted {
+    pub edges: RouterEdges,
+    pub has_macros_or_pads: bool,
+    /// Every obstruction applied, in order: `(rect, routing level, is_macro)`.
+    pub stream: Vec<(Rect, i32, bool)>,
+    /// `findLayerExtensions` (computed at the first macro), per routing level.
+    pub extensions: Option<Vec<i32>>,
+    /// `findTransitionLayers`.
+    pub transition_layers: Vec<i32>,
+}
+
+/// `findLayerExtensions`: per routing level in range, the largest of the layer's spacing at the
+/// largest width and parallel run, its V5.4 spacings and (refused: not bound) its two-widths
+/// table's last entry — the halo a macro obstruction is widened by.
+fn find_layer_extensions(db: &Db, t: &TechSetup) -> Res<Vec<i32>> {
+    let mut ext = vec![0; t.routing_layers.len() + 1];
+    for (level, l) in &t.routing_layers {
+        if *level < t.min_routing_layer || *level > t.max_routing_layer {
+            continue;
+        }
+        let mut spacing = db.layer_get_spacing_for(&l.name, i32::MAX, i32::MAX)?;
+        for (s, _) in db.layer_v54_spacing_rules(&l.name)? {
+            spacing = spacing.max(s as i32);
+        }
+        if db.layer_has_two_widths_spacing_rules(&l.name) {
+            return Err(format!("layer {}: a TWOWIDTHS table — its last entry is not bound", l.name).into());
+        }
+        ext[*level as usize] = spacing;
+    }
+    Ok(ext)
+}
+
+/// `extendObstructions`: a macro blocking layer±1 blocks the layer between, and the min/max
+/// routing layers take their only neighbour's obstructions. ⛔ Layers are visited bottom-up and
+/// the map is MUTATED as it goes, so a layer reads its lower neighbour already extended.
+fn extend_obstructions(per_layer: &mut std::collections::BTreeMap<i32, Vec<Rect>>, mut bottom: i32, mut top: i32, min: i32, max: i32) {
+    if bottom - 1 == min {
+        bottom -= 1;
+    }
+    if top + 1 == max {
+        top += 1;
+    }
+    for layer in bottom..=top {
+        per_layer.entry(layer).or_default();
+        let mut extended = Vec::new();
+        if layer == max {
+            if let Some(v) = per_layer.get(&(layer - 1)) {
+                extended = v.clone();
+            }
+        }
+        if layer == min {
+            if let Some(v) = per_layer.get(&(layer + 1)) {
+                extended = v.clone();
+            }
+        }
+        let empty = Vec::new();
+        let upper = per_layer.get(&(layer + 1)).unwrap_or(&empty);
+        let lower = per_layer.get(&(layer - 1)).unwrap_or(&empty);
+        extended.extend(intersection_rectangles(lower, upper));
+        if !extended.is_empty() {
+            per_layer.get_mut(&layer).expect("inserted").extend(extended);
+        }
+    }
+}
+
+/// `polygon_90_set(lower) & polygon_90_set(upper)`, then `get_rectangles`: the intersection region
+/// as horizontal slabs (maximal runs in x per y band, bands merged where identical).
+fn intersection_rectangles(lower: &[Rect], upper: &[Rect]) -> Vec<Rect> {
+    let mut pieces: Vec<Rect> = Vec::new();
+    for a in lower {
+        for b in upper {
+            let r = Rect { x_min: a.x_min.max(b.x_min), y_min: a.y_min.max(b.y_min), x_max: a.x_max.min(b.x_max), y_max: a.y_max.min(b.y_max) };
+            if r.x_min < r.x_max && r.y_min < r.y_max {
+                pieces.push(r);
+            }
+        }
+    }
+    if pieces.is_empty() {
+        return pieces;
+    }
+    let mut ys: Vec<i32> = pieces.iter().flat_map(|p| [p.y_min, p.y_max]).collect();
+    ys.sort_unstable();
+    ys.dedup();
+    let mut out: Vec<Rect> = Vec::new();
+    let mut prev: Vec<(i32, i32)> = Vec::new();
+    for w in ys.windows(2) {
+        let (y0, y1) = (w[0], w[1]);
+        let mut xs: Vec<(i32, i32)> = pieces.iter().filter(|p| p.y_min <= y0 && p.y_max >= y1).map(|p| (p.x_min, p.x_max)).collect();
+        xs.sort_unstable();
+        let mut runs: Vec<(i32, i32)> = Vec::new();
+        for (a, b) in xs {
+            match runs.last_mut() {
+                Some(l) if a <= l.1 => l.1 = l.1.max(b),
+                _ => runs.push((a, b)),
+            }
+        }
+        for &(a, b) in &runs {
+            // Extend a slab from the band below when it spans the same x run.
+            if prev.contains(&(a, b)) {
+                if let Some(r) = out.iter_mut().rev().find(|r| r.x_min == a && r.x_max == b && r.y_max == y0) {
+                    r.y_max = y1;
+                    continue;
+                }
+            }
+            out.push(Rect { x_min: a, y_min: y0, x_max: b, y_max: y1 });
+        }
+        prev = runs;
+    }
+    out
+}
+
+/// `findTransitionLayers`: a default via's bottom layer (at or below the max routing layer) whose
+/// via is wider, across the layer's direction, than 0.8 of its track pitch.
+fn find_transition_layers(t: &TechSetup) -> Vec<i32> {
+    let defaults = crate::tracks::get_default_vias(&t.tech.vias);
+    let mut bottoms: Vec<(i32, usize)> = defaults.iter().filter_map(|(b, &v)| b.map(|b| (b, v))).collect();
+    bottoms.sort_unstable();
+    let mut out = Vec::new();
+    for (level, via) in bottoms {
+        if level > t.max_routing_layer || level < 1 {
+            continue;
+        }
+        let vertical = t.tech.routing_layers.iter().find(|l| l.routing_level == level).and_then(|l| l.direction) == Some(crate::capacity::Direction::Vertical);
+        let via_width = t.tech.vias[via].boxes.iter().find(|b| b.0 == level).map_or(0, |b| if vertical { b.2 } else { b.1 });
+        let pitch = t.tracks.iter().find(|r| r.layer_index == level).map_or(0, |r| r.track_pitch);
+        if f64::from(via_width) / f64::from(pitch) > f64::from(0.8f32) {
+            out.push(level);
+        }
+    }
+    out
 }
 
 /// `addLayerAdjustment(level, adjustment)` — what `set_global_routing_layer_adjustment <layer> <adj>`
@@ -316,7 +522,7 @@ pub struct RouterNet {
 ///
 /// ⛔ Refused as in I10: a pad or macro terminal, a net with a wire. A block terminal skipped for
 /// having no routing geometry is the Rudy path's leniency, reproduced (`check_pin_placement` off).
-pub fn setup_nets(db: &Db, t: &TechSetup, e: &RouterEdges, opts: &RouteOptions, log: &mut Vec<String>) -> Res<Vec<RouterNet>> {
+pub fn setup_nets(db: &Db, t: &TechSetup, e: &mut RouterEdges, has_macros_or_pads: bool, opts: &RouteOptions, log: &mut Vec<String>) -> Res<Vec<RouterNet>> {
     let (min, max) = (t.min_routing_layer, t.max_routing_layer);
     let (clk_min, clk_max) = (t.tech.min_layer_for_clock, t.tech.max_layer_for_clock);
     let directions: std::collections::BTreeMap<i32, Option<crate::capacity::Direction>> =
@@ -363,15 +569,22 @@ pub fn setup_nets(db: &Db, t: &TechSetup, e: &RouterEdges, opts: &RouteOptions, 
                 masters.insert(master.clone(), read_master_shapes(db, &master)?);
             }
             let m = &masters[&master];
-            if m.is_block || m.is_pad {
-                return Err(format!("{inst}/{term}: pad/macro terminal — not wired").into());
-            }
-            let class = if db.master_is_cover(&master) { MasterClass::Cover } else { MasterClass::Core };
+            let class = if m.is_pad {
+                MasterClass::Pad
+            } else if m.is_block {
+                MasterClass::Block
+            } else if db.master_is_cover(&master) {
+                MasterClass::Cover
+            } else {
+                MasterClass::Core
+            };
+            // The instance box — read by a pad or macro pin's edge only.
+            let bbox = db.inst_bbox(inst)?;
+            let inst_box = if bbox.len() == 4 { Rect { x_min: bbox[0], y_min: bbox[1], x_max: bbox[2], y_max: bbox[3] } } else { die };
             let (orient, origin) = (db.inst_get_orient(inst), (db.inst_get_origin_x(inst), db.inst_get_origin_y(inst)));
             let boxes: Vec<TermBox> = m.pins.iter().filter(|p| &p.0 == term).map(|p| TermBox { pin: 0, level: p.3, routing: p.2, rect: transform_rect(&orient, origin, p.4) }).collect();
             let name = format!("{inst}/{term}");
-            // The instance box is read only for a pad or macro pin (its edge), refused above.
-            let pin = make_iterm_pin(&name, class, db.master_is_core(&master), db.inst_is_placed(inst), die, &boxes, die, max_for_pins, &directions, opts.verbose, log)
+            let pin = make_iterm_pin(&name, class, db.master_is_core(&master), db.inst_is_placed(inst), inst_box, &boxes, die, max_for_pins, &directions, opts.verbose, log)
                 .map_err(|e| format!("{e:?}"))?;
             let io = db.mterm_get_io_type(&master, term);
             pins.push((pin, io == "OUTPUT" || io == "INOUT"));
@@ -394,15 +607,19 @@ pub fn setup_nets(db: &Db, t: &TechSetup, e: &RouterEdges, opts: &RouteOptions, 
     let no_liberty = ITermClockFacts { has_liberty_port: false, is_reg_clk: false, cell_is_pad: false };
     let non_leaf = |n: &NetFacts| is_non_leaf_clock(n.sig_type == "CLOCK", &vec![no_liberty; n.iterms.len()]);
     let order = order_nets(&nets.iter().map(|(n, _)| DiscoveredNet { name: n.name.clone(), is_non_leaf_clock: non_leaf(n) }).collect::<Vec<_>>());
-    // I14 initNetlist — no seed: the order stands.
+    let order_all = order.clone();
+    // I14 initNetlist — no seed: the order stands. (addResourcesForPinAccess closes it, below.)
     let grid = NetlistGrid { x_min: die.x_min, y_min: die.y_min, tile_size: t.core.tile_size, x_grids: t.core.x_grids, y_grids: t.core.y_grids, num_layers: t.core.num_layers };
     let mut out = Vec::new();
     for name in order {
         let (n, pins) = nets.iter().find(|(n, _)| n.name == name).expect("ordered from these");
         let conn: Vec<i32> = pins.iter().map(|(p, _)| p.connection_layer).collect();
         let (lo, hi) = get_net_layer_range(&conn, non_leaf(n), min, max, clk_min, clk_max);
-        if n.has_wire {
-            return Err(format!("net {} has a wire — hasStackedVias is not wired", n.name).into());
+        // Net::hasStackedVias — only a net of vias and no wire segments reads the decoded via
+        // points (refused: not wired); any other wired net has none.
+        let (wire_cnt, via_cnt) = (db.net_get_wire_count_wire_cnt(&n.name), db.net_get_wire_count_via_cnt(&n.name));
+        if n.has_wire && wire_cnt == 0 && via_cnt > 0 {
+            return Err(format!("net {}: a via-only wire — hasStackedVias' via points are not wired", n.name).into());
         }
         if !makes_fastroute_net(pins.len(), n.has_wire, || false) {
             continue;
@@ -425,6 +642,28 @@ pub fn setup_nets(db: &Db, t: &TechSetup, e: &RouterEdges, opts: &RouteOptions, 
             net_pins: pins.iter().map(|(p, _)| p.clone()).collect(),
             term_count: n.term_count,
         });
+    }
+    // addResourcesForPinAccess — over every net initNets returned, in its order, when the design
+    // has macros or pads: one more track on the edge a pad/macro pin faces. ⚠️ After
+    // initEdgesCapacityPerLayer, so the NDR ledger's per-layer capacities do not see it (inert
+    // without NDR nets).
+    if has_macros_or_pads {
+        let ordered: Vec<(bool, Vec<crate::netlist::AccessPinFacts>)> = order_all
+            .iter()
+            .map(|name| {
+                let (_, pins) = nets.iter().find(|(n, _)| &n.name == name).expect("ordered from these");
+                let facts: Vec<crate::netlist::AccessPinFacts> = pins
+                    .iter()
+                    .map(|(p, _)| crate::netlist::AccessPinFacts { on_grid: p.on_grid, connection_layer: p.connection_layer, edge: p.edge, connected_to_pad_or_macro: p.connected_to_pad_or_macro })
+                    .collect();
+                (facts.iter().any(|f| f.connected_to_pad_or_macro), facts)
+            })
+            .collect();
+        let dir = |l: i32| directions.get(&l).copied().flatten();
+        for (x1, y1, x2, y2, layer) in crate::netlist::pin_access_edges(&ordered, grid, &dir) {
+            let cap = e.get_edge_capacity(x1, y1, x2, y2, layer);
+            e.add_adjustment(x1, y1, x2, y2, layer, (cap + 1) as u16, false);
+        }
     }
     Ok(out)
 }
@@ -454,8 +693,9 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     use crate::run::{fastroute_run, RunEnd, RunInputs, RunObserver, Stage};
     let t = setup_tech(db, opts)?;
     let mut log = t.log.clone();
-    let e = setup_adjust(db, &t, opts, &mut log)?;
-    let nets = setup_nets(db, &t, &e, opts, &mut log)?;
+    let adj = setup_adjust(db, &t, opts, &mut log)?;
+    let mut e = adj.edges;
+    let nets = setup_nets(db, &t, &mut e, adj.has_macros_or_pads, opts, &mut log)?;
     let (xg, yg) = (e.x_grid as usize, e.y_grid as usize);
     // The router's grid, in run()'s layout (`[y * xg + x]` for both directions).
     let (mut red_h, mut red_v, mut cap_h, mut cap_v) = (vec![0u16; xg * yg], vec![0u16; xg * yg], vec![0u16; xg * yg], vec![0u16; xg * yg]);

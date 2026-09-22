@@ -35,6 +35,16 @@ const TIER_A: &[(&str, &[&str], &str, Option<(&str, &str)>)] = &[
     ("upper_layer_net", &["Nangate45/Nangate45.lef"], "upper_layer_net.def", Some(("metal1", "metal9"))),
 ];
 
+/// The rest of the no-Liberty guide scripts: DEF obstructions, macros, routed wires.
+const TIER_B: &[(&str, &[&str], &str, Option<(&str, &str)>)] = &[
+    ("obstruction", &["sky130hs/sky130hs.tlef", "sky130hs/sky130hs_std_cell.lef"], "obstruction.def", None),
+    ("pin_edge", &["pin_edge.lef"], "pin_edge.def", None),
+    ("macro_obs_not_aligned", &["macro_obs_not_aligned.lef"], "macro_obs_not_aligned.def", None),
+    ("modeling_instance_obs", &["macro_obs_not_aligned.lef"], "modeling_instance_obs.def", None),
+    ("pin_track_not_aligned", &["pin_track_not_aligned.lef"], "pin_track_not_aligned.def", None),
+    ("overlapping_edges", &["overlapping_edges.lef"], "overlapping_edges.def", None),
+];
+
 fn read(path: &str) -> Value {
     serde_json::from_str(&std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"))).expect("golden parses")
 }
@@ -185,6 +195,8 @@ enum Cmd {
     GlobalAdj(f32),
     /// `set_global_routing_region_adjustment {x0 y0 x1 y1} -layer l -adjustment a` (microns).
     Region([f64; 4], &'static str, f32),
+    /// `set_routing_layers -clock lo-hi`.
+    ClockLayers(&'static str, &'static str),
 }
 
 /// Tier A with each script's setup commands (its first `global_route` only).
@@ -198,6 +210,11 @@ fn tier_a_commands(script: &str) -> Vec<Cmd> {
         "set_nets_to_route1" => vec![Layers("metal2", "metal8")],
         "top_level_term1" | "top_level_term2" | "top_level_term3" => vec![LayerAdj("met1", "met1", 0.8), LayerAdj("met2", "met2", 0.7), GlobalAdj(0.5), Layers("met1", "met4")],
         "upper_layer_net" => vec![Layers("metal1", "metal9")],
+        "obstruction" => vec![LayerAdj("met1", "met1", 0.8), LayerAdj("met2", "met2", 0.7), GlobalAdj(0.5), Layers("met1", "met5"), ClockLayers("met3", "met5")],
+        "macro_obs_not_aligned" => vec![LayerAdj("met1", "met5", 0.7), Layers("met1", "met5")],
+        "modeling_instance_obs" => vec![Layers("met1", "met5")],
+        "pin_track_not_aligned" => vec![Layers("met1", "met4")],
+        "overlapping_edges" => vec![GlobalAdj(0.3), Layers("met1", "met5")],
         _ => vec![],
     }
 }
@@ -220,6 +237,11 @@ fn load_with(dir: &str, lefs: &[&str], def: &str, cmds: &[Cmd]) -> (Db, vyges_gr
                 }
             }
             Cmd::GlobalAdj(a) => opts.adjustment = a,
+            Cmd::ClockLayers(lo, hi) => {
+                let (lo, hi) = (db.layer_get_routing_level(lo), db.layer_get_routing_level(hi));
+                db.block_set_min_layer_for_clock(lo).expect("clock min");
+                db.block_set_max_layer_for_clock(hi).expect("clock max");
+            }
             Cmd::Region(r, layer, a) => {
                 let dbu = f64::from(db.dbu_per_micron());
                 let u = |v: f64| (v * dbu) as i32;
@@ -248,16 +270,25 @@ fn the_setup_reaches_the_routers_entry() {
     let r7 = read(&path);
     let runs: std::collections::HashMap<&str, &Value> = arr(&r7["runs"]).iter().map(|r| (r["design"].as_str().expect("d"), r)).collect();
     let (mut designs, mut edges) = (0, 0usize);
-    for (script, lefs, def, _) in TIER_A {
+    for (script, lefs, def, _) in TIER_A.iter().chain(TIER_B) {
         let Some(run) = runs.get(format!("{script}-plain").as_str()) else { continue };
         let c = &arr(&run["calls"])[0];
         if !c["small"].as_bool().expect("small") {
             continue;
         }
-        let (mut db, opts) = load_with(&dir, lefs, def, &tier_a_commands(script));
+        let (mut db, mut opts) = load_with(&dir, lefs, def, &tier_a_commands(script));
+        if *script == "skip_large_fanout1" {
+            opts.skip_large_fanout = 30;
+        }
         let t = vyges_grt::global_route::setup_tech(&mut db, &opts).unwrap_or_else(|e| panic!("{script}: {e}"));
         let mut log = Vec::new();
-        let e = vyges_grt::global_route::setup_adjust(&mut db, &t, &opts, &mut log).unwrap_or_else(|e| panic!("{script}: {e}"));
+        let adj = vyges_grt::global_route::setup_adjust(&mut db, &t, &opts, &mut log).unwrap_or_else(|e| panic!("{script}: {e}"));
+        let mut e = adj.edges;
+        // run()'s entry is captured after initNetlist, whose addResourcesForPinAccess (designs
+        // with macros or pads) adds capacity.
+        if adj.has_macros_or_pads {
+            vyges_grt::global_route::setup_nets(&db, &t, &mut e, true, &opts, &mut log).unwrap_or_else(|e| panic!("{script}: {e}"));
+        }
         let (xg, yg) = (e.x_grid, e.y_grid);
         assert_eq!((xg, yg), (int(&c["xg"]), int(&c["yg"])), "{script}: grid");
         assert_eq!((t.capacities.h_capacity, t.capacities.v_capacity), (int(&c["hcap"]), int(&c["vcap"])), "{script}: h/v capacity");
@@ -283,6 +314,8 @@ fn the_setup_reaches_the_routers_entry() {
         designs += 1;
     }
     eprintln!("entry: {designs} designs, {edges} 3D edges");
+    // Which tier-B designs reached the comparison (small grids only).
+    eprintln!("entry: tier B compared: {:?}", TIER_B.iter().filter(|(s, ..)| runs.get(format!("{s}-plain").as_str()).is_some_and(|r| arr(&r["calls"])[0]["small"].as_bool() == Some(true))).map(|(s, ..)| *s).collect::<Vec<_>>());
     assert!(designs >= 10, "{designs} designs reached");
 }
 
@@ -311,8 +344,9 @@ fn the_nets_reach_the_router_as_the_reference_built_them() {
         }
         let t = vyges_grt::global_route::setup_tech(&mut db, &opts).unwrap_or_else(|e| panic!("{script}: {e}"));
         let mut log = Vec::new();
-        let e = vyges_grt::global_route::setup_adjust(&mut db, &t, &opts, &mut log).unwrap_or_else(|e| panic!("{script}: {e}"));
-        let nets = vyges_grt::global_route::setup_nets(&db, &t, &e, &opts, &mut log).unwrap_or_else(|e| panic!("{script}: {e}"));
+        let adj = vyges_grt::global_route::setup_adjust(&mut db, &t, &opts, &mut log).unwrap_or_else(|e| panic!("{script}: {e}"));
+        let mut e = adj.edges;
+        let nets = vyges_grt::global_route::setup_nets(&db, &t, &mut e, adj.has_macros_or_pads, &opts, &mut log).unwrap_or_else(|e| panic!("{script}: {e}"));
         // The capture lists `net_ids_` — the ROUTED nets — by their FastRoute id; a local net has
         // an id but is not routed.
         let want = arr(&c["nets"]);
@@ -386,7 +420,7 @@ fn the_guides_match_a_fresh_reference_run() {
     };
     let mut report = Vec::new();
     let (mut exact, mut attempted) = (0, 0);
-    for (script, lefs, def, _) in TIER_A {
+    for (script, lefs, def, _) in TIER_A.iter().chain(TIER_B) {
         attempted += 1;
         let (mut db, mut opts) = load_with(&dir, lefs, def, &tier_a_commands(script));
         match *script {
@@ -394,6 +428,7 @@ fn the_guides_match_a_fresh_reference_run() {
             "pd3" => opts.min_fanout_alpha = Some((9, 0.9)),
             "skip_large_fanout1" => opts.skip_large_fanout = 30,
             "congestion1" | "congestion2" | "congestion7" => opts.allow_congestion = true,
+            "pin_edge" | "pin_track_not_aligned" => opts.verbose = false,
             // `set_nets_to_route {net* req_* resp_* clk reset}` — STA's `get_nets` per pattern.
             "set_nets_to_route1" => {
                 let names = db.net_names();
@@ -401,7 +436,7 @@ fn the_guides_match_a_fresh_reference_run() {
             }
             _ => {}
         }
-        opts.verbose = *script != "silence";
+        opts.verbose = !matches!(*script, "silence" | "pin_edge" | "pin_track_not_aligned");
         // `multiple_calls`: `global_route`, then `set_global_routing_layer_adjustment * 0.8` and a
         // SECOND `global_route` on the same database, whose guides are the ones written.
         if *script == "multiple_calls" {
@@ -465,7 +500,7 @@ fn the_guides_match_a_fresh_reference_run() {
     }
     eprintln!("gate:\n  {}", report.join("\n  "));
     eprintln!("gate: {exact}/{attempted} designs exact");
-    assert_eq!(exact, attempted, "the end-to-end guide gate");
+    assert_eq!((exact, attempted), (TIER_A.len() + TIER_B.len(), TIER_A.len() + TIER_B.len()), "the end-to-end guide gate: every no-Liberty design");
 }
 
 /// ⛔ `dbTransform::apply(Rect&)`, all eight orientations, worked from odb's point rules: the box
@@ -521,7 +556,8 @@ fn a_second_global_route_reaches_its_entry() {
     opts.adjustment = 0.8;
     let t = vyges_grt::global_route::setup_tech(&mut db, &opts).expect("tech");
     let mut log = Vec::new();
-    let e = vyges_grt::global_route::setup_adjust(&mut db, &t, &opts, &mut log).expect("adjust");
+    let adj = vyges_grt::global_route::setup_adjust(&mut db, &t, &opts, &mut log).expect("adjust");
+    let mut e = adj.edges;
     let (xg, yg) = (e.x_grid, e.y_grid);
     assert_eq!((t.capacities.h_capacity, t.capacities.v_capacity), (int(&c["hcap"]), int(&c["vcap"])), "h/v capacity");
     for (d, ours) in [("H", &e.h3), ("V", &e.v3)] {
@@ -533,7 +569,7 @@ fn a_second_global_route_reaches_its_entry() {
             }
         }
     }
-    let nets = vyges_grt::global_route::setup_nets(&db, &t, &e, &opts, &mut log).expect("nets");
+    let nets = vyges_grt::global_route::setup_nets(&db, &t, &mut e, adj.has_macros_or_pads, &opts, &mut log).expect("nets");
     for w in arr(&c["nets"]) {
         let k = int(&w["id"]) as usize;
         let pins: Vec<(i32, i32)> = arr(&w["pins"]).iter().map(|p| (int(&p[0]), int(&p[1]))).collect();
@@ -560,4 +596,68 @@ fn a_second_global_route_reaches_its_entry() {
         }
         eprintln!("second call B20: {bad} nets differ of {}", b20["routes"].as_object().expect("r").len());
     }
+}
+
+/// Unroll a state row `[[cap, red, real_cap, count], …]`.
+fn unrle_state(v: &Value) -> Vec<(u16, u16, u16)> {
+    arr(v).iter().flat_map(|p| std::iter::repeat((int(&p[0]) as u16, int(&p[1]) as u16, int(&p[2]) as u16)).take(int(&p[3]) as usize)).collect()
+}
+
+/// The MACRO path of I10 — extension halo, layer±1 blocking, transition layers — on the three
+/// macro designs, against the reference's own I10 capture: the per-level extensions, the
+/// transition layers, the whole obstruction stream (as a multiset: the reference groups a macro's
+/// rectangles in an `unordered_map`), and every 3D / 2D edge after the last I10 step.
+///
+/// Needs `GRT_ADJUSTMENTS_FULL` (the uncapped I10 dump) besides `GRT_REF_TESTS`.
+#[test]
+fn the_macro_designs_adjust_as_the_reference() {
+    let (Ok(dir), Ok(path)) = (std::env::var("GRT_REF_TESTS"), std::env::var("GRT_ADJUSTMENTS_FULL")) else {
+        eprintln!("GRT_REF_TESTS / GRT_ADJUSTMENTS_FULL unset: skipped");
+        return;
+    };
+    let dump = read(&path);
+    let runs: std::collections::HashMap<&str, &Value> = arr(&dump["runs"]).iter().map(|r| (r["design"].as_str().expect("d"), r)).collect();
+    let (mut designs, mut rects, mut edges) = (0, 0, 0);
+    for (script, lefs, def, _) in TIER_B.iter().filter(|(s, ..)| matches!(*s, "macro_obs_not_aligned" | "modeling_instance_obs" | "pin_track_not_aligned")) {
+        let c = &runs[format!("{script}-plain").as_str()]["calls"][0];
+        let (mut db, opts) = load_with(&dir, lefs, def, &tier_a_commands(script));
+        let t = vyges_grt::global_route::setup_tech(&mut db, &opts).unwrap_or_else(|e| panic!("{script}: {e}"));
+        let mut log = Vec::new();
+        let adj = vyges_grt::global_route::setup_adjust(&mut db, &t, &opts, &mut log).unwrap_or_else(|e| panic!("{script}: {e}"));
+        let ext: Vec<i32> = arr(&c["extensions"]).iter().map(int).collect();
+        let ours = adj.extensions.clone().expect("a macro computed the extensions");
+        assert_eq!(&ours[..ext.len().min(ours.len())], &ext[..ext.len().min(ours.len())], "{script}: layer extensions");
+        let tl: Vec<i32> = arr(&c["transition"]).iter().map(int).collect();
+        assert_eq!(adj.transition_layers, tl, "{script}: transition layers");
+        let mut want: Vec<(i32, i32, i32, i32, i32, bool)> = arr(&c["stream"]).iter().map(|s| (int(&s[1]), int(&s[2]), int(&s[3]), int(&s[4]), int(&s[5]), int(&s[6]) == 1)).collect();
+        let mut got: Vec<(i32, i32, i32, i32, i32, bool)> = adj.stream.iter().map(|(r, l, m)| (r.x_min, r.y_min, r.x_max, r.y_max, *l, *m)).collect();
+        want.sort_unstable();
+        got.sort_unstable();
+        if got != want {
+            let only_ours: Vec<_> = got.iter().filter(|x| !want.contains(x)).take(3).collect();
+            let only_theirs: Vec<_> = want.iter().filter(|x| !got.contains(x)).take(3).collect();
+            panic!("{script}: obstruction stream ({} ours, {} reference); only ours {only_ours:?}; only reference {only_theirs:?}", got.len(), want.len());
+        }
+        rects += got.len();
+        // The edges after the last I10 step captured (the per-layer adjustments).
+        let st = &c["steps"]["layer"];
+        let e = &adj.edges;
+        let (yg, nl) = (e.y_grid, e.num_layers);
+        for (d, ours) in [("H", &e.h3), ("V", &e.v3)] {
+            let w: Vec<(u16, u16, u16)> = (0..nl).flat_map(|l| (0..yg).flat_map(move |y| unrle_state(&st["e3"][format!("{d},{l},{y}")]))).collect();
+            let g: Vec<(u16, u16, u16)> = ours.iter().map(|s| (s.cap, s.red, s.real_cap)).collect();
+            if let Some(k) = (0..g.len().min(w.len())).find(|&k| g[k] != w[k]) {
+                panic!("{script}: {d}3 edge {k}: ours {:?}, reference {:?}", g[k], w[k]);
+            }
+            assert_eq!(g.len(), w.len(), "{script}: {d}3 size");
+            edges += g.len();
+        }
+        let w2h: Vec<(u16, u16, u16)> = (0..yg).flat_map(|y| unrle_state(&st["e2"][format!("H,{y}")])).collect();
+        let w2v: Vec<(u16, u16, u16)> = (0..yg - 1).flat_map(|y| unrle_state(&st["e2"][format!("V,{y}")])).collect();
+        assert_eq!(e.h2.iter().map(|s| (s.cap, s.red, s.real_cap)).collect::<Vec<_>>(), w2h, "{script}: H2");
+        assert_eq!(e.v2.iter().map(|s| (s.cap, s.red, s.real_cap)).collect::<Vec<_>>(), w2v, "{script}: V2");
+        designs += 1;
+    }
+    eprintln!("macro I10: {designs} designs, {rects} obstructions, {edges} 3D edges");
+    assert_eq!(designs, 3);
 }
