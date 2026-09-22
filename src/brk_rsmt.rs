@@ -203,6 +203,13 @@ pub struct StTree {
     pub node_to_pin_idx: Vec<i32>,
     /// Per edge, the route (`TreeEdge::route`) — every edge starts at the default.
     pub routes: Vec<TreeRoute>,
+    /// The walk's node state (`topL`, `botL`, `assigned`, `stackAlias`, `hID`, `lID`, the alias's
+    /// edge list) — empty until spiral routing (R9) resets it. `x`/`y`/`status` stay canonical in
+    /// [`nodes`](Self::nodes); the walk copies its statuses back.
+    pub walk: Vec<crate::spiral::SpiralNode>,
+    /// Per edge, the endpoints' alias nodes (`n1a`, `n2a`) and `assigned`, as spiral routing
+    /// registers them — empty until R9.
+    pub edge_reg: Vec<crate::spiral::EdgeReg>,
 }
 
 /// Per-net router state that outlives one call.
@@ -610,7 +617,7 @@ pub fn copy_st_tree(rsmt: &RsmtTree, net: &RsmtNet<'_>) -> Result<StTree, CopyTr
         return Err(CopyTreeError::EdgeCount { edges: edges.len(), nodes: numnodes });
     }
     nbrcnt.truncate(numnodes);
-    Ok(StTree { num_terminals: d, nodes, nbr, edge, nbr_count: nbrcnt, edges, node_to_pin_idx, routes: vec![TreeRoute::default(); numnodes - 1] })
+    Ok(StTree { num_terminals: d, nodes, nbr, edge, nbr_count: nbrcnt, edges, node_to_pin_idx, routes: vec![TreeRoute::default(); numnodes - 1], walk: Vec::new(), edge_reg: Vec::new() })
 }
 
 /// `FrNet::getPinIdxFromPosition` — the index of the `count`-th pin at `(x, y)`, or `-1`.

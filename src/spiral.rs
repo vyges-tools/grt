@@ -16,7 +16,7 @@
 //! reused with a different meaning from this point on. Carrying it forward would change the
 //! traversal.
 
-use crate::estimate::{congestion_cost, EstimateGrid, LShape};
+use crate::estimate::{congestion_cost, LShape};
 use crate::lroute::{mark_h, mark_v, via_bias, EdgeRoute};
 
 /// How many edges one node can carry.
@@ -273,8 +273,8 @@ fn mark_horizontal(nodes: &mut [SpiralNode], n: usize, na: usize) {
 /// ⚠️ **The degenerate arm is not a no-op**: a zero-length edge is explicitly set to "no route",
 /// not left at whatever the previous iteration wrote.
 #[allow(clippy::too_many_arguments)]
-pub fn spiral_route(
-    grid: &mut EstimateGrid,
+pub fn spiral_route<G: crate::estimate::Usage2d + ?Sized>(
+    grid: &mut G,
     nodes: &mut [SpiralNode],
     edge: (usize, usize, i32),
     edge_cost: i8,

@@ -94,7 +94,7 @@ pub mod ndr_cost;
 pub mod graph2d;
 pub use graph2d::{Graph2d, NetUsage};
 pub mod route_l;
-pub use route_l::{newroute_l_all, route_l_all, route_seg_l_first_time};
+pub use route_l::{newroute_l_all, newroute_z_all, newroute_z_net, route_l_all, route_seg_l_first_time, spiral_route_all};
 pub use ndr_cost::{NdrCap, NdrCostNet, NdrLedger, OVERFLOW_COST_MULTIPLIER};
 pub use brk_rsmt::{coeff_adj, copy_st_tree, edge_shift, edge_shift_new, flute_congest, flute_normal, gen_brk_rsmt, htree_suite, mapxy, net_congestion, newroute_l, pin_idx_from_position, ripup_seg_l, BrkFlags, BrkGrid, BrkSummary, CapLayer, Caps3D, CopyTreeError, Flutes, NetRecord, NetState, RoutedSegment, RouteKind, RsmtNet, RsmtTree, SortedPins, StTree, TreeKind, TreeRoute};
 pub use rsmt::{

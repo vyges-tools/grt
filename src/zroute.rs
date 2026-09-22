@@ -25,7 +25,7 @@
 //! ℹ️ `cost_hvh_test_` is sized from the y range while being indexed over a width, which looks
 //! wrong and is not: both ranges are set to `max(x_grid, y_grid)`.
 
-use crate::estimate::{congestion_cost, EstimateGrid};
+use crate::estimate::{congestion_cost, Usage2d};
 use crate::lroute::{mark_h, mark_v};
 use crate::spiral::SpiralNode;
 
@@ -76,8 +76,8 @@ fn add_congestion(over: f64, cost: &mut f64, cost_test: &mut f64) {
 /// ⚠️ `x2 - x1` is used as a width with no ordering, exactly as the reference does — the caller
 /// only reaches here for edges that are neither straight nor reversed.
 #[allow(clippy::too_many_arguments)]
-pub fn newroute_z(
-    grid: &mut EstimateGrid,
+pub fn newroute_z<G: Usage2d + ?Sized>(
+    grid: &mut G,
     nodes: &mut [SpiralNode],
     n1a: usize,
     n2a: usize,
@@ -121,10 +121,10 @@ pub fn newroute_z(
         }
     }
 
-    let over_v = |grid: &EstimateGrid, x: usize, y: usize| -> f64 {
+    let over_v = |grid: &G, x: usize, y: usize| -> f64 {
         grid.v(x, y) + f64::from(red_v(x, y)) - f64::from(v_lb)
     };
-    let over_h = |grid: &EstimateGrid, x: usize, y: usize| -> f64 {
+    let over_h = |grid: &G, x: usize, y: usize| -> f64 {
         grid.h(x, y) + f64::from(red_h(x, y)) - f64::from(h_lb)
     };
 
@@ -270,8 +270,8 @@ pub fn newroute_z(
 ///
 /// Returns the chosen column, or `None` on an early return (nothing ripped up or written).
 #[allow(clippy::too_many_arguments)]
-pub fn newroute_z_edge(
-    grid: &mut EstimateGrid,
+pub fn newroute_z_edge<G: Usage2d + ?Sized>(
+    grid: &mut G,
     len: i32,
     (x1, y1): (i32, i32),
     (x2, y2): (i32, i32),
@@ -308,8 +308,8 @@ pub fn newroute_z_edge(
 /// `cost_tb_test[0]` holds the whole top row's sum. So the tie-break compares a running total at
 /// column 0 with single deltas everywhere else.
 #[allow(clippy::too_many_arguments)]
-pub fn route_z_edge_after_ripup(
-    grid: &mut EstimateGrid,
+pub fn route_z_edge_after_ripup<G: Usage2d + ?Sized>(
+    grid: &mut G,
     (x1, y1): (i32, i32),
     (x2, y2): (i32, i32),
     edge_cost: i8,
@@ -322,10 +322,10 @@ pub fn route_z_edge_after_ripup(
     let (ymin, ymax) = (y1.min(y2), y1.max(y2));
     let npts = seg_width + 1;
 
-    let over_v = |grid: &EstimateGrid, x: i32, y: i32| -> f64 {
+    let over_v = |grid: &G, x: i32, y: i32| -> f64 {
         grid.v(x as usize, y as usize) + f64::from(red_v(x as usize, y as usize)) - f64::from(v_lb)
     };
-    let over_h = |grid: &EstimateGrid, x: i32, y: i32| -> f64 {
+    let over_h = |grid: &G, x: i32, y: i32| -> f64 {
         grid.h(x as usize, y as usize) + f64::from(red_h(x as usize, y as usize)) - f64::from(h_lb)
     };
 

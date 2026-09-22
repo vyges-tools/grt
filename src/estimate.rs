@@ -290,9 +290,11 @@ pub fn estimate_all(grid: &mut EstimateGrid, nets: &[Vec<Segment>]) {
 ///
 /// ⛔ **`f32`, and that is load-bearing.** The reference computes the bound as
 /// `float LB = 0.9; lb = LB * capacity`, in single precision, and only then compares it against a
-/// `double` demand. `0.9f32` is `0.899999976…` while `0.9f64` is `0.900000000…`, so on a capacity
-/// of 10 the two bounds are `8.99999976` and `9.00000000`. A demand of exactly `9.0` overflows
-/// a demand landing between them overflows under one and not the other.
+/// `double` demand. `0.9f32` is `0.899999976…`, and the product is rounded to `f32` too — so the
+/// gap depends on the capacity: at 13 the bounds are `11.6999998` (f32) and `11.7` (f64), while at
+/// 10, 20 or 30 the f32 product rounds to exactly `9`, `18`, `27` and there is no gap at all. A
+/// demand landing in a gap overflows under one and not the other. (Corrected 2026-09-21: an earlier
+/// version of this comment claimed `8.99999976` at capacity 10.)
 ///
 /// ⬜ **Kept in `f32` because that is what the reference does, NOT because a difference has been
 /// observed.** Recomputing the bound in `f64` passes every reference check on the designs scored

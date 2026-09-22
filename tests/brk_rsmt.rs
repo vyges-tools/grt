@@ -89,6 +89,8 @@ struct Seen {
     boundaries: usize,
     boundary_nets: usize,
     incremental: usize,
+    gate_hvh: usize,
+    gate_vhv: usize,
     stacked_pins: usize,
     htree: usize,
 }
@@ -163,6 +165,12 @@ fn check_boundary(at: &str, b: &Value, scan: &Overflow2DScan, g2d: &Graph2d, sta
         }).collect();
         assert_eq!(ours, edges, "{at}: net {id} edges (n1, n2, len, type, xFirst, HVH, Zpoint)");
         seen.boundary_nets += 1;
+        if tag == "B10" && t.num_terminals > 2 {
+            // A Z route on a net of more than two terminals came through the congestion gate.
+            for r in t.routes.iter().filter(|r| r.kind == RouteKind::ZRoute) {
+                if r.hvh { seen.gate_hvh += 1 } else { seen.gate_vhv += 1 }
+            }
+        }
     }
     seen.boundaries += 1;
 }
@@ -448,6 +456,32 @@ fn replay_run(r: &Value, bounds: Option<&Value>, seen: &mut Seen) {
                     newroute_l_all(false, true, &net_ids, &nets, &mut state, &mut grid8);
                     let scan = g2d.get_overflow_2d();
                     check_boundary(&at, at_b("B8").expect("B8 follows B7"), &scan, &g2d, &state, seen);
+                    // R9 `spiralRouteAll`; no overflow scan follows, so B9 still carries R8's.
+                    let mut grid9 = BrkGrid {
+                        g: &mut g2d,
+                        red_h: &red_h_f,
+                        red_v: &red_v_f,
+                        caps: &caps,
+                        h_capacity: int(&c["hcap"]),
+                        v_capacity: int(&c["vcap"]),
+                        via_cost: 0.0,
+                    };
+                    let nl = caps.layers.len().max(max_layer + 1) as i16;
+                    spiral_route_all(&net_ids, &nets, &mut state, &mut grid9, nl, &|_, _| 0);
+                    check_boundary(&at, at_b("B9").expect("B9 follows B8"), &scan, &g2d, &state, seen);
+                    // R10 `newrouteZAll(10)`, then `getOverflow2D`.
+                    let mut grid10 = BrkGrid {
+                        g: &mut g2d,
+                        red_h: &red_h_f,
+                        red_v: &red_v_f,
+                        caps: &caps,
+                        h_capacity: int(&c["hcap"]),
+                        v_capacity: int(&c["vcap"]),
+                        via_cost: 0.0,
+                    };
+                    newroute_z_all(10, &net_ids, &nets, &mut state, &mut grid10);
+                    let scan = g2d.get_overflow_2d();
+                    check_boundary(&at, at_b("B10").expect("B10 follows B9"), &scan, &g2d, &state, seen);
                 }
                 pass += 1;
             }
@@ -463,7 +497,7 @@ fn gen_brk_rsmt_matches_the_reference() {
     let s = replay(&read(&format!("{dir}/brk_rsmt.json")), &read(&format!("{dir}/boundaries.json")));
     eprintln!("{s:?}");
     assert!(s.runs >= 40 && s.flute_nets >= 990 && s.shifted >= 70 && s.shifts > 0 && s.copied >= 900
-            && s.routed_edges >= 1000 && s.usage_checked >= 60 && s.ndr_checked >= 2 && s.r6_checked >= 40 && s.boundaries >= 80 && s.htree > 0,
+            && s.routed_edges >= 1000 && s.usage_checked >= 60 && s.ndr_checked >= 2 && s.r6_checked >= 40 && s.boundaries >= 160 && s.gate_hvh > 0 && s.gate_vhv > 0 && s.htree > 0,
             "{s:?}");
 }
 
@@ -481,7 +515,7 @@ fn add(a: Seen, b: Seen) -> Seen {
         runs: a.runs + b.runs, calls: a.calls + b.calls, nets: a.nets + b.nets, flute_nets: a.flute_nets + b.flute_nets,
         shifted: a.shifted + b.shifted, shifts: a.shifts + b.shifts, copied: a.copied + b.copied,
         routed_edges: a.routed_edges + b.routed_edges, usage_checked: a.usage_checked + b.usage_checked,
-        ndr_checked: a.ndr_checked + b.ndr_checked, r6_checked: a.r6_checked + b.r6_checked, r6_segs: a.r6_segs + b.r6_segs, boundaries: a.boundaries + b.boundaries, boundary_nets: a.boundary_nets + b.boundary_nets, incremental: a.incremental + b.incremental, stacked_pins: a.stacked_pins + b.stacked_pins, htree: a.htree + b.htree,
+        ndr_checked: a.ndr_checked + b.ndr_checked, r6_checked: a.r6_checked + b.r6_checked, r6_segs: a.r6_segs + b.r6_segs, boundaries: a.boundaries + b.boundaries, boundary_nets: a.boundary_nets + b.boundary_nets, incremental: a.incremental + b.incremental, gate_hvh: a.gate_hvh + b.gate_hvh, gate_vhv: a.gate_vhv + b.gate_vhv, stacked_pins: a.stacked_pins + b.stacked_pins, htree: a.htree + b.htree,
     }
 }
 
@@ -700,4 +734,53 @@ fn edge_shift_new_takes_the_second_pair_and_runs_three_rounds() {
     assert_eq!(edge_shift_new(&mut t, 7, &est), 0);
     let parents: Vec<usize> = at(&t).iter().map(|b| b.2).collect();
     assert_eq!(parents, vec![7, 7, 8, 10, 9, 9, 11, 8, 11, 10, 11, 11]);
+}
+
+/// A tree for the driver-level cases: `(x, y, parent)` per branch, pins first.
+fn st_tree(deg: usize, b: &[(i32, i32, usize)], pins: &[(i32, i32)]) -> NetState {
+    let (px, py): (Vec<i32>, Vec<i32>) = pins.iter().copied().unzip();
+    let t = copy_st_tree(&tree(deg, b), &RsmtNet { layer_edge_cost: &[1], ..net(&px, &py) }).expect("valid tree");
+    NetState { tree: Some(t), ..NetState::default() }
+}
+
+/// ⛔ `spiralRouteAll` routes a net's edges in the order the walk reaches them from the pins, not by
+/// edge index. Here the walk reaches S6–S7 (edge 6) before S5–S6 (edge 5), and edge 6's route loads
+/// column 5, which edge 5's x-first L needs: in the walk's order edge 5 turns y-first; by index it
+/// would tie and go x-first. Worked by hand from the reference's rules.
+#[test]
+fn spiral_route_all_walks_outward_from_the_pins() {
+    let pins = [(12, 0), (0, 2), (2, 0), (5, 7), (10, 2)];
+    let mut state = vec![st_tree(5, &[(12, 0, 7), (0, 2, 5), (2, 0, 5), (5, 7, 6), (10, 2, 7), (0, 0, 6), (5, 5, 7), (10, 0, 7)], &pins)];
+    let (px, py): (Vec<i32>, Vec<i32>) = pins.iter().copied().unzip();
+    let nets = [RsmtNet { layer_edge_cost: &[1], ..net(&px, &py) }];
+    let mut g2d = Graph2d::new(14, 10, 1);
+    // ⚠️ Capacity 10 puts the f32 bound at exactly 9.0: AT the bound is free, above it is not.
+    g2d.est.update_v(5, 0, 5, 9.0); // at the bound: free until one more route lands on it
+    g2d.est.update_h(5, 10, 5, 10.0); // over the bound: edge 6 avoids its x-first L
+    let caps = grid_caps(14, 10, 10);
+    let mut grid = BrkGrid { g: &mut g2d, red_h: &no_red, red_v: &no_red, caps: &caps, h_capacity: 10, v_capacity: 10, via_cost: 0.0 };
+    spiral_route_all(&[0], &nets, &mut state, &mut grid, 1, &|_, _| 0);
+    let r = &state[0].tree.as_ref().expect("tree").routes;
+    assert_eq!((r[6].x_first, r[5].x_first), (false, false), "edge 6 y-first, then edge 5 y-first around the loaded column");
+}
+
+/// ⛔ The Z route reads and marks the ALIAS nodes. S3 sits on pin 0, so it is aliased to node 0: the
+/// Z of edge S3–p1 must count on node 0 and leave node 3's counters alone.
+#[test]
+fn the_z_route_marks_the_alias_nodes() {
+    let pins = [(0, 0), (20, 15), (0, 5)];
+    let mut state = vec![st_tree(3, &[(0, 0, 3), (20, 15, 3), (0, 5, 3), (0, 0, 3)], &pins)];
+    let (px, py): (Vec<i32>, Vec<i32>) = pins.iter().copied().unzip();
+    let nets = [RsmtNet { layer_edge_cost: &[1], ..net(&px, &py) }];
+    let mut g2d = Graph2d::new(22, 17, 1);
+    let caps = grid_caps(22, 17, 0); // no capacity anywhere: the gate rips up every long L
+    let mut grid = BrkGrid { g: &mut g2d, red_h: &no_red, red_v: &no_red, caps: &caps, h_capacity: 10, v_capacity: 10, via_cost: 0.0 };
+    spiral_route_all(&[0], &nets, &mut state, &mut grid, 1, &|_, _| 0);
+    let before: Vec<(i32, i32)> = state[0].tree.as_ref().expect("tree").walk.iter().map(|w| (w.h_id, w.l_id)).collect();
+    newroute_z_all(10, &[0], &nets, &mut state, &mut grid);
+    let t = state[0].tree.as_ref().expect("tree");
+    assert_eq!(t.walk[3].stack_alias, 0, "S3 is aliased to pin 0");
+    assert_eq!(t.routes[1].kind, RouteKind::ZRoute, "edge S3-p1 was Z-routed");
+    let bump = |i: usize| (t.walk[i].h_id - before[i].0) + (t.walk[i].l_id - before[i].1);
+    assert_eq!((bump(0), bump(3)), (1, 0), "the Z counts on the alias, not on S3");
 }
