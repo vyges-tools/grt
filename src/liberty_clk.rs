@@ -96,11 +96,22 @@ fn parse_body(t: &[Tok], mut i: usize, g: &mut Group) -> Result<usize, String> {
         i += 1;
         match t.get(i) {
             Some(Tok::Punct(b':')) => {
+                // ONE value, the `;` optional (LibertyParse: a simple attribute ends at its value —
+                // `area : 0.2` with no `;` is followed directly by the next statement); only a
+                // voltage expression (`VDD + 0.1`) continues through its operators.
                 i += 1;
                 let mut v = Vec::new();
-                while let Some(Tok::Word(w)) = t.get(i) {
+                if let Some(Tok::Word(w)) = t.get(i) {
                     v.push(w.clone());
                     i += 1;
+                    while let (Some(Tok::Word(op)), Some(Tok::Word(w))) = (t.get(i), t.get(i + 1)) {
+                        if !["+", "-", "*", "/"].contains(&op.as_str()) {
+                            break;
+                        }
+                        v.push(op.clone());
+                        v.push(w.clone());
+                        i += 2;
+                    }
                 }
                 g.attrs.push((name, v.join(" ")));
             }
@@ -499,11 +510,49 @@ fn read_cell(cell: &Group) -> Result<CellClock, String> {
     Ok(CellClock { is_pad: truthy("is_pad") || truthy("pad_cell"), ports, arcs, latch_roles_may_be_inferred })
 }
 
+/// The timer's command units, as far as `set_layer_rc` converts through them.
+///
+/// ⛔ `Unit::scale_` is a `float`: 1e-6 enters as `9.99999997e-7`, and the layer resistances
+/// `set_layer_rc` writes differ in their low bits if it is taken as a double.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Units {
+    /// `pulling_resistance_unit` (default 1 ohm).
+    pub resistance: f32,
+    /// `distance_unit` (default 1 micron).
+    pub distance: f32,
+}
+
+/// `LibertyReader::readUnit`: `<1|10|100><scale char><suffix>`, the scale char one of k m u n p f.
+/// ⚠️ An unknown multiplier, scale or suffix only WARNS: the multiplier or scale stays 1.
+fn read_unit(value: Option<&str>, suffix: &str, default: f32) -> f32 {
+    let Some(units) = value.filter(|v| !v.is_empty()) else { return default };
+    let mult_end = units.find(|c: char| !c.is_ascii_digit());
+    let (mult, scale_suffix) = match mult_end {
+        Some(k) => (match &units[..k] { "1" => 1.0f32, "10" => 10.0, "100" => 100.0, _ => 1.0 }, &units[k..]),
+        None => (1.0, units),
+    };
+    let mut scale_mult = 1.0f32;
+    if scale_suffix.len() == suffix.len() + 1 && scale_suffix[1..].eq_ignore_ascii_case(suffix) {
+        scale_mult = match scale_suffix.as_bytes()[0].to_ascii_lowercase() {
+            b'k' => 1e3,
+            b'm' => 1e-3,
+            b'u' => 1e-6,
+            b'n' => 1e-9,
+            b'p' => 1e-12,
+            b'f' => 1e-15,
+            _ => 1.0,
+        };
+    }
+    scale_mult * mult
+}
+
 /// The cells of every library read, by name. ⛔ A cell in two libraries resolves to the FIRST
 /// library read (the network's cell lookup walks the libraries in read order).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LibertyClocks {
     pub cells: BTreeMap<String, CellClock>,
+    /// ⛔ The FIRST library's units become the timer's (`Sta::readLiberty`); later ones do not.
+    pub units: Option<Units>,
 }
 
 impl LibertyClocks {
@@ -513,6 +562,12 @@ impl LibertyClocks {
         let mut top = Group::default();
         parse_body(&toks, 0, &mut top)?;
         for lib in top.children("library") {
+            if self.units.is_none() {
+                self.units = Some(Units {
+                    resistance: read_unit(lib.attr("pulling_resistance_unit"), "ohm", 1.0),
+                    distance: read_unit(lib.attr("distance_unit"), "m", 1e-6),
+                });
+            }
             for cell in lib.children("cell") {
                 let name = cell.args.first().cloned().unwrap_or_default();
                 if !self.cells.contains_key(&name) {
@@ -678,6 +733,30 @@ mod tests {
         assert_eq!(s("B ^ C", "A"), Sense::Unknown);
         assert_eq!(s("B & C", "A"), Sense::None);
         assert_eq!(s("1", "A"), Sense::None);
+    }
+
+    // readUnit: multiplier × scale, all float; unknowns keep 1; a missing attribute keeps the default.
+    #[test]
+    fn units_follow_read_unit() {
+        assert_eq!(read_unit(Some("1kohm"), "ohm", 1.0), 1e3);
+        assert_eq!(read_unit(Some("100ohm"), "ohm", 1.0), 100.0);
+        assert_eq!(read_unit(Some("10mohm"), "ohm", 1.0), 10.0 * 1e-3f32);
+        assert_eq!(read_unit(Some("1xohm"), "ohm", 1.0), 1.0);
+        assert_eq!(read_unit(None, "m", 1e-6), 1e-6f32);
+        let mut l = LibertyClocks::default();
+        l.read(r#"library (a) { pulling_resistance_unit : "1kohm"; }"#).expect("parse");
+        l.read(r#"library (b) { pulling_resistance_unit : "1ohm"; }"#).expect("parse");
+        assert_eq!(l.units, Some(Units { resistance: 1e3, distance: 1e-6 }), "the first library's units stand");
+    }
+
+    // A simple attribute without its `;` ends at its value: the next statement still parses.
+    #[test]
+    fn an_attribute_without_a_semicolon_ends_at_its_value() {
+        let c = cell(r#"area : 0.2
+            pin (A) { direction : input }
+            pin (Y) { function : "!A"; timing () { related_pin : "A"; } }"#);
+        assert_eq!(c.arcs.len(), 1);
+        assert!(c.ports.contains_key("A"));
     }
 
     #[test]

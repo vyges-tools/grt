@@ -146,3 +146,54 @@ pub fn get_maze_route_cost_3d(
         get_wire_cost(t, resistance_aware, mv.from_layer, (length * tile_size as f32) as i32, net) as f32;
     base_cost + wire_resistance_cost
 }
+
+/// `set_layer_rc -layer L -resistance r` as it reaches the database (`set_dblayer_wire_rc`): the
+/// user-unit resistance per length converted to ohm/m through the timer's units, then to ohms per
+/// square at the layer's width — the Tcl's double arithmetic, in its order:
+/// `res = (r * r_scale) / (1.0 * d_scale)`, `wire_width = width / dbu`, `wire_width * 1e-6 * res`.
+///
+/// ⛔ The unit scales are `float` (`Unit::scale_`): `d_scale` 1e-6 enters as `9.99999997e-7`.
+/// ⛔ No `-resistance` is 0.0, and it is still WRITTEN.
+pub fn set_dblayer_wire_r(res_ui: f64, r_scale: f32, d_scale: f32, width_dbu: i32, dbu_per_micron: i32) -> f64 {
+    let res = (res_ui * f64::from(r_scale)) / (1.0 * f64::from(d_scale));
+    let wire_width = f64::from(width_dbu) / f64::from(dbu_per_micron);
+    wire_width * 1e-6 * res
+}
+
+/// `set_layer_rc -via V -resistance r` (`set_dbvia_wire_r`): ohms per cut, `r * r_scale`.
+pub fn set_dbvia_wire_r(res_ui: f64, r_scale: f32) -> f64 {
+    res_ui * f64::from(r_scale)
+}
+
+#[cfg(test)]
+mod layer_rc_tests {
+    use super::*;
+
+    // Against the reference's own tech-layer resistances after `source sky130hs.rc` and
+    // `source asap7/setRC.tcl` (grt-slack-trace.py, `VYGS|layerR` / `VYGS|viaR`), kohm libraries.
+    #[test]
+    fn set_layer_rc_writes_what_the_reference_writes() {
+        let (kohm, um) = (1e3f32, 1e-6f32);
+        let cases = [
+            (7.176e-02, 170, 1000, 0x402865fd8be34bec_u64), // sky130 li1
+            (8.929e-04, 140, 1000, 0x3fc0003255946443),     // sky130 met1
+            (1.567e-04, 300, 1000, 0x3fa811b1da307fc0),     // sky130 met3
+            (7.04175E-02, 18, 1000, 0x3ff447bdcfdef1e3),    // asap7 M1
+            (1.18619E-02, 32, 1000, 0x3fd84b0d45938ee4),    // asap7 M6
+        ];
+        for (r, w, dbu, bits) in cases {
+            assert_eq!(set_dblayer_wire_r(r, kohm, um, w, dbu).to_bits(), bits, "{r} at width {w}");
+        }
+        assert_eq!(set_dbvia_wire_r(4.5E-3, kohm).to_bits(), 0x4012000000000000); // sky130 via
+        assert_eq!(set_dbvia_wire_r(9.249146E-3, kohm).to_bits(), 0x40227f901083dbc2); // sky130 mcon
+        assert_eq!(set_dbvia_wire_r(1.72E-02, kohm).to_bits(), 0x4031333333333333); // asap7 V1
+    }
+
+    // ⛔ The trap: with the scales taken as doubles the wire resistances move in their low bits.
+    #[test]
+    fn double_unit_scales_would_miss_the_reference() {
+        let res: f64 = (7.176e-02 * 1e3) / (1.0 * 1e-6);
+        let as_double: f64 = 170.0 / 1000.0 * 1e-6 * res;
+        assert_ne!(as_double.to_bits(), set_dblayer_wire_r(7.176e-02, 1e3, 1e-6, 170, 1000).to_bits());
+    }
+}

@@ -36,8 +36,10 @@ JOB (JSON):
     { \"cmd\": \"routing_alpha\", \"alpha\": f, \"nets\": [..] | \"min_fanout\": n | \"min_hpwl\": um | \"clock_nets\": true }
     { \"cmd\": \"nets_to_route\", \"patterns\": [..] }                        (Tcl globs)
     { \"cmd\": \"global_route\", \"verbose\": b, \"allow_congestion\": b, \"grid_origin\": [x, y],
-      \"skip_large_fanout\": n, \"congestion_iterations\": n, \"critical_nets_percentage\": f }
+      \"skip_large_fanout\": n, \"congestion_iterations\": n, \"critical_nets_percentage\": f,
+      \"resistance_aware\": b, \"res_aware_nets_percentage\": f }
     { \"cmd\": \"create_clock\", \"ports\": [..] }                        (clock network only)
+    { \"cmd\": \"set_layer_rc\", \"layer\" | \"via\": name, \"resistance\": f } (user units)
     { \"cmd\": \"propagated_clock\" }
     { \"cmd\": \"write_guides\", \"path\": \"..\" }
 
@@ -137,17 +139,28 @@ fn run(job: &Value) -> Result<Value, Fail> {
     // read_liberty — the libraries in read order; a cell in two resolves to the first.
     for lib in job["liberty"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
         let path = lib.as_str().ok_or_else(|| err("a liberty path"))?;
-        let text = std::fs::read_to_string(path).map_err(err)?;
+        let text = if path.ends_with(".gz") {
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut flate2::read::MultiGzDecoder::new(std::fs::File::open(path).map_err(err)?), &mut s).map_err(err)?;
+            s
+        } else {
+            std::fs::read_to_string(path).map_err(err)?
+        };
         opts.liberty.get_or_insert_with(Default::default).read(&text).map_err(|e| Fail::Refused(format!("{path}: {e}")))?;
     }
-    // timer_slacks — the reference timer's slacks at each partial-slack call, captured: one
-    // `<call> <net> <f32 bits in hex>` line per net per call. An ORACLE: no timing is computed here.
+    // timer_slacks — the reference timer's slacks, captured per call: `P <call> <net> <bits>` for
+    // a partial-slack call (`CalculatePartialSlack`), `U <call> <net> <bits>` for an `updateSlacks`
+    // call (a bare `<call> <net> <bits>` is a P line). An ORACLE: no timing is computed here.
     if let Some(path) = job["timer_slacks"].as_str() {
-        let mut calls: Vec<BTreeMap<String, f32>> = Vec::new();
+        let (mut partial, mut update): (Vec<BTreeMap<String, f32>>, Vec<BTreeMap<String, f32>>) = (Vec::new(), Vec::new());
         for (n, line) in std::fs::read_to_string(path).map_err(err)?.lines().enumerate() {
             let f: Vec<&str> = line.split_whitespace().collect();
-            let bad = || err(format!("{path}:{}: expected `<call> <net> <bits>`", n + 1));
-            let [k, net, bits] = f[..] else { return Err(bad()) };
+            let bad = || err(format!("{path}:{}: expected `[P|U] <call> <net> <bits>`", n + 1));
+            let (calls, k, net, bits) = match f[..] {
+                ["U", k, net, bits] => (&mut update, k, net, bits),
+                ["P", k, net, bits] | [k, net, bits] => (&mut partial, k, net, bits),
+                _ => return Err(bad()),
+            };
             let k: usize = k.parse().map_err(|_| bad())?;
             let v = f32::from_bits(u32::from_str_radix(bits, 16).map_err(|_| bad())?);
             if k > calls.len() {
@@ -158,7 +171,8 @@ fn run(job: &Value) -> Result<Value, Fail> {
             }
             calls[k].insert(net.to_string(), v);
         }
-        opts.captured_slacks = Some(calls);
+        opts.captured_slacks = Some(partial);
+        opts.captured_update_slacks = Some(update);
     }
     let mut guides: BTreeMap<String, Vec<(i32, i32, i32, i32, String)>> = BTreeMap::new();
     let mut calls = Vec::new();
@@ -242,6 +256,12 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 }
                 // setCriticalNetsPercentage: zeroed without a liberty library (GRT-301); it persists
                 // into later calls like the router's member.
+                // setResistanceAware; setResAwareNetsPercentage — zeroed (GRT-308) when not enabled,
+                // and FIXED from then on either way.
+                opts.resistance_aware = step["resistance_aware"].as_bool().unwrap_or(false);
+                if let Some(p) = step["res_aware_nets_percentage"].as_f64() {
+                    opts.res_aware_nets_percentage = Some(if opts.resistance_aware { p as f32 } else { 0.0 });
+                }
                 if let Some(p) = step["critical_nets_percentage"].as_f64() {
                     opts.critical_nets_percentage = if opts.liberty.is_some() { p as f32 } else { 0.0 };
                 }
@@ -254,6 +274,24 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 if res.total_overflow > 0 && !opts.allow_congestion {
                     // GRT-116: the reference ends the command in error after writing the guides.
                     return Err(Fail::Error("GRT-0116: Global routing finished with congestion".into()));
+                }
+            }
+            // set_layer_rc — ⛔ it WRITES the technology's resistance (set_dblayer_wire_rc /
+            // set_dbvia_wire_r), which resistance-aware routing reads. Converted through the timer's
+            // units (the first liberty's; float scales) in the Tcl's double arithmetic, in its order.
+            // The capacitance reaches no router input; `-corner` writes no database value.
+            "set_layer_rc" => {
+                let units = opts.liberty.as_ref().and_then(|l| l.units).ok_or_else(|| Fail::Refused("set_layer_rc before a liberty library: the timer's default units are not modelled".into()))?;
+                let res_ui = step["resistance"].as_f64();
+                if let Some(layer) = step["layer"].as_str() {
+                    // ⛔ No -resistance is 0.0, and set_dblayer_wire_rc still WRITES it.
+                    let r = vyges_grt::pricing::set_dblayer_wire_r(res_ui.unwrap_or(0.0), units.resistance, units.distance, db.layer_get_width(layer) as i32, db.tech_get_db_units_per_micron());
+                    db.layer_set_resistance(layer, r).map_err(err)?;
+                } else if let Some(via) = step["via"].as_str() {
+                    let r = vyges_grt::pricing::set_dbvia_wire_r(res_ui.ok_or_else(|| err("set_layer_rc -via needs -resistance"))?, units.resistance);
+                    db.layer_set_resistance(via, r).map_err(err)?;
+                } else {
+                    return Err(err("set_layer_rc needs a layer or via"));
                 }
             }
             // create_clock on top-level ports; the clock's period and waveform do not reach the

@@ -13,7 +13,7 @@ fn every_port_is_a_register_clock_exactly_when_the_timer_says() {
         eprintln!("GRT_REGCLK_DIR unset — skipped");
         return;
     };
-    let mut libs = 0;
+    let (mut libs, mut reg_clocks) = (0, 0);
     for e in std::fs::read_dir(&dir).expect("dir") {
         let p = e.expect("entry").path();
         if p.extension().is_none_or(|x| x != "regclk") {
@@ -21,7 +21,13 @@ fn every_port_is_a_register_clock_exactly_when_the_timer_says() {
         }
         let lib_path = std::fs::read_to_string(p.with_extension("lib")).expect("lib path");
         let mut ours = LibertyClocks::default();
-        ours.read(&std::fs::read_to_string(lib_path.trim()).expect("lib")).expect("read");
+        let lib_path = lib_path.trim();
+        let text = if lib_path.ends_with(".gz") {
+            String::from_utf8(std::process::Command::new("zcat").arg(lib_path).output().expect("zcat").stdout).expect("utf-8")
+        } else {
+            std::fs::read_to_string(lib_path).expect("lib")
+        };
+        ours.read(&text).expect("read");
         let text = std::fs::read_to_string(&p).expect("oracle");
         let mut want = BTreeMap::new();
         let mut total = None;
@@ -36,7 +42,7 @@ fn every_port_is_a_register_clock_exactly_when_the_timer_says() {
         // The oracle's own aggregate checks this parser.
         let (n, k) = total.expect("#total");
         assert_eq!((want.len(), want.values().filter(|&&v| v).count()), (n, k), "{}: parsed rows vs the oracle's totals", p.display());
-        assert!(k > 0, "{}: a library with no register clock cannot fail this test", p.display());
+        reg_clocks += k;
         let mut diffs = Vec::new();
         for ((cell, port), &v) in &want {
             // Ports the timer lists that are no `pin` group (a cell's internal ff/latch outputs)
@@ -56,4 +62,6 @@ fn every_port_is_a_register_clock_exactly_when_the_timer_says() {
         libs += 1;
     }
     assert!(libs > 0, "no oracle in {dir}");
+    // A combinational library has none; the corpus as a whole must, or the test cannot fail.
+    assert!(reg_clocks > 0, "no register clock in any oracle — the test cannot fail");
 }

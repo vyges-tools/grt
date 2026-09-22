@@ -65,6 +65,8 @@ pub struct RunInputs<'a> {
     /// The timer's slack per net id (`getNetSlack`, `sta::INF` = `1E+30F` when unconstrained), read
     /// by the loop's partial-slack pass.
     pub timer_slack: crate::congestion_loop::TimerSlack<'a>,
+    /// The resistance-aware router's inputs — `None` when `resistance_aware` is off.
+    pub res_aware: Option<ResAwareInputs<'a>>,
     /// For R20's database units.
     pub origin: GridOrigin,
     /// Each net's database id, indexed by net id (R20's key).
@@ -99,6 +101,16 @@ pub enum Stage<'a> {
 /// Watches the run. `false` from a stoppable stage ends the run there.
 pub trait RunObserver {
     fn stage(&mut self, s: Stage<'_>, g2d: &Graph2d, g3: Option<&Graph3d>, state: &[NetState]) -> bool;
+}
+
+/// What a resistance-aware run reads beyond the rest: the technology's resistances
+/// (`preProcessTechLayers`), the tile size, `-res_aware_nets_percentage`, and the timer's slacks at
+/// each `updateSlacks` call.
+pub struct ResAwareInputs<'a> {
+    pub tech: crate::pricing::TechLayers,
+    pub tile_size: i32,
+    pub fixed_percentage: Option<f32>,
+    pub update_slacks: crate::congestion_loop::TimerSlack<'a>,
 }
 
 /// How a run ended.
@@ -200,7 +212,19 @@ pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn 
     stop_unless!(Stage::Scan { tag: "B15", scan: &scan }, None);
     // R16
     let mut g3 = graph_3d(inp.caps, xg, yg);
-    let layer = LayerParams { layer_dir: inp.layer_dir, resistance_aware: inp.resistance_aware, liberty: inp.liberty, has_2d_overflow: end.has_2d_overflow };
+    let ra = inp.res_aware.as_ref().map(|r| {
+        std::cell::RefCell::new(crate::finalize::ResAware {
+            tech: r.tech.clone(),
+            tile_size: r.tile_size,
+            fixed: r.fixed_percentage.is_some(),
+            percentage: r.fixed_percentage.unwrap_or(0.0),
+            worst: crate::slacks::WorstMetrics::reset(1e30),
+            member: false,
+            slacks: r.update_slacks,
+            calls: 0,
+        })
+    });
+    let layer = LayerParams { layer_dir: inp.layer_dir, resistance_aware: inp.resistance_aware, liberty: inp.liberty, has_2d_overflow: end.has_2d_overflow, ra: ra.as_ref() };
     let mut order = layer_assignment(ids, nets, inp.attrs, state, &mut g3, &layer)?;
     let overflow = get_overflow_3d_all(&g2d, &g3);
     let past_cong = scan.total_overflow;

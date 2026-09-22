@@ -243,11 +243,30 @@ pub struct NetState {
     /// connection arrays (`eID`, `heights`), edges with layered grids. ⛔ From R16 on this is the
     /// canonical tree: the 3D passes rewrite it, and [`tree`](Self::tree) stays as R16 left it.
     pub tree3d: Option<crate::maze3d::Tree3D>,
+    /// `FrNet::is_res_aware_` — set by `updateSlacks` (a survivor clock or NDR net, or a marked
+    /// candidate), never cleared within a run.
+    pub res_aware: bool,
+    /// `FrNet::resistance_` — written only for a net that survived `updateSlacks`' skip rules; ⚠️ a
+    /// net skipped later keeps the value an earlier call wrote.
+    pub resistance: f32,
+    /// `FrNet::net_length_` — written by every `updateSlacks` call, for every net.
+    pub net_length: i32,
 }
 
 impl Default for NetState {
     fn default() -> Self {
-        NetState { seglist: Vec::new(), sorted: None, tree: None, slack: crate::ripup::SLACK_SENTINEL, critical: false, layer_range: None, tree3d: None }
+        NetState {
+            seglist: Vec::new(),
+            sorted: None,
+            tree: None,
+            slack: crate::ripup::SLACK_SENTINEL,
+            critical: false,
+            layer_range: None,
+            tree3d: None,
+            res_aware: false,
+            resistance: 0.0,
+            net_length: 0,
+        }
     }
 }
 

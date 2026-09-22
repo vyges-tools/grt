@@ -40,6 +40,12 @@ pub struct RouteOptions {
     /// The timer's slacks captured from the reference at each partial-slack call, by net name —
     /// the ORACLE for a run with a clock (this engine computes no timing).
     pub captured_slacks: Option<Vec<std::collections::BTreeMap<String, f32>>>,
+    /// The same, at each `updateSlacks` call (resistance-aware only).
+    pub captured_update_slacks: Option<Vec<std::collections::BTreeMap<String, f32>>>,
+    /// `global_route -resistance_aware`.
+    pub resistance_aware: bool,
+    /// `-res_aware_nets_percentage` — once given, FIXED (`is_fixed_nets_percentage_`).
+    pub res_aware_nets_percentage: Option<f32>,
     pub critical_nets_percentage: f32,
     /// `set_global_routing_layer_adjustment *`.
     pub adjustment: f32,
@@ -77,6 +83,9 @@ impl RouteOptions {
             liberty: None,
             clock_sources: Vec::new(),
             captured_slacks: None,
+            captured_update_slacks: None,
+            resistance_aware: false,
+            res_aware_nets_percentage: None,
             critical_nets_percentage: 10.0,
             adjustment: 0.0,
             grid_origin: (0, 0),
@@ -830,6 +839,43 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
             .collect::<Result<_, _>>()?,
         _ => Vec::new(),
     };
+    // The same for updateSlacks' reads (resistance-aware only).
+    let captured_update: Vec<Vec<f32>> = match (&opts.liberty, opts.clock_sources.is_empty(), &opts.captured_update_slacks) {
+        (Some(_), false, Some(calls)) => calls
+            .iter()
+            .map(|by_name| {
+                (0..nets.len())
+                    .map(|k| match by_name.get(&nets[k].name) {
+                        Some(&s) => Ok(s),
+                        None if nets[k].is_local => Ok(0.0),
+                        None => Err(format!("net {}: no captured updateSlacks slack — not bound", nets[k].name)),
+                    })
+                    .collect::<Result<Vec<f32>, String>>()
+            })
+            .collect::<Result<_, _>>()?,
+        _ => Vec::new(),
+    };
+    let update_slacks = match (&opts.liberty, opts.clock_sources.is_empty(), &opts.captured_update_slacks) {
+        (Some(_), true, _) => crate::congestion_loop::TimerSlack::Every(&unconstrained),
+        (Some(_), false, Some(_)) => crate::congestion_loop::TimerSlack::PerCall(&captured_update),
+        _ => crate::congestion_loop::TimerSlack::None,
+    };
+    // preProcessTechLayers: each routing layer (by level, up to the router's layers) and the cut
+    // layer above it — their widths and resistances as the database holds them now (after any
+    // set_layer_rc).
+    let res_aware = if opts.resistance_aware {
+        let mut tech = crate::pricing::TechLayers { dbu_per_micron: db.tech_get_db_units_per_micron(), width: Vec::new(), resistance: Vec::new(), via_resistance: Vec::new() };
+        for level in 1..=num_layers as i32 {
+            let l = t.tech.routing_layers.iter().find(|r| r.routing_level == level).ok_or_else(|| format!("no routing layer at level {level}"))?;
+            tech.width.push(db.layer_get_width(&l.name) as i32);
+            tech.resistance.push(db.layer_get_resistance(&l.name));
+            let cut = db.layer_get_upper_layer(&l.name);
+            tech.via_resistance.push((!cut.is_empty()).then(|| db.layer_get_resistance(&cut)));
+        }
+        Some(crate::run::ResAwareInputs { tech, tile_size: t.core.tile_size, fixed_percentage: opts.res_aware_nets_percentage, update_slacks })
+    } else {
+        None
+    };
     let timer_slack = match (&opts.liberty, opts.clock_sources.is_empty(), &opts.captured_slacks) {
         (Some(_), true, _) => crate::congestion_loop::TimerSlack::Every(&unconstrained),
         (Some(_), false, Some(_)) => crate::congestion_loop::TimerSlack::PerCall(&captured),
@@ -891,9 +937,10 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         overflow_iterations: opts.congestion_iterations,
         critical_nets_percentage: t.config.critical_nets_percentage,
         layer_dir: &layer_dir,
-        resistance_aware: false,
+        resistance_aware: opts.resistance_aware,
         liberty: opts.liberty.is_some(),
         timer_slack,
+        res_aware,
         origin: crate::routes::GridOrigin { tile_size: t.core.tile_size, x_corner: t.core.area.x_min, y_corner: t.core.area.y_min },
         db_id: &db_id,
     };

@@ -653,6 +653,7 @@ fn replay_chain(who: &str, pass: usize, c5: &Value, c7: &Value, group: &[&Value]
         resistance_aware: flag("resaware"),
         liberty: flag("liberty"),
         timer_slack: vyges_grt::congestion_loop::TimerSlack::None,
+        res_aware: None,
         origin,
         db_id: &db_id,
     };
@@ -1500,7 +1501,7 @@ fn la_case(dirs: &[LayerDir], xg: usize, yg: usize, spec: &[LaNet], cap: impl Fn
     let attrs: Vec<NetLayerAttrs> = spec.iter().map(|n| NetLayerAttrs { pin_layers: vec![0; n.pins.len()], has_ndr: n.ndr, is_clock: n.clock, is_res_aware: false, layer_edge_cost: n.lec.clone(), sta_slack: 0.0 }).collect();
     let layers = |h: bool| -> Vec<Vec<u16>> { (0..nl).map(|l| (0..xg * yg).map(|i| cap(h, l, i % xg, i / xg)).collect()).collect() };
     let mut g3 = Graph3d { x_grid: xg, num_layers: nl, h_cap: layers(true), v_cap: layers(false), h_usage: vec![vec![0; xg * yg]; nl], v_usage: vec![vec![0; xg * yg]; nl] };
-    let p = LayerParams { layer_dir: dirs, resistance_aware, liberty: false, has_2d_overflow };
+    let p = LayerParams { layer_dir: dirs, resistance_aware, liberty: false, has_2d_overflow, ra: None };
     layer_assignment(ids, &nets, &attrs, &mut state, &mut g3, &p).expect("layer assignment");
     (state, g3)
 }
