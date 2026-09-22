@@ -89,6 +89,8 @@ pub use ripup::{
     step_threshold_m, OrderTree, Schedule, DEPRIORITISE_PERCENT, SLACK_SENTINEL,
 };
 pub mod rsmt;
+pub mod brk_rsmt;
+pub use brk_rsmt::{coeff_adj, copy_st_tree, edge_shift, edge_shift_new, flute_congest, flute_normal, gen_brk_rsmt, htree_suite, mapxy, net_congestion, newroute_l, pin_idx_from_position, ripup_seg_l, BrkFlags, BrkGrid, BrkSummary, CapLayer, Caps3D, CopyTreeError, Flutes, NetRecord, NetState, RoutedSegment, RsmtNet, RsmtTree, SortedPins, StTree, TreeKind};
 pub use rsmt::{
     segments_from_tree, Branch, NetSegments, Segment, COEFF_V_DEFAULT, COEFF_V_NO_ADJUSTMENTS,
     ROUTER_FLUTE_ACCURACY,

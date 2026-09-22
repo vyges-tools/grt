@@ -22,6 +22,9 @@ odb = ["dep:vyges-opendb", "vyges-opendb/gen-write"]
 [dev-dependencies]
 # Test-only: the end-to-end corpus is JSON. The library itself stays dependency-free.
 serde_json = "1"
+# Test-only: the router's own flute path (R5/R7) calls the Steiner-tree engine's pre-sorted FLUTE;
+# the library takes that call as an injected function until the sequencer wiring links it for real.
+vyges-stt = { git = "https://github.com/vyges-tools/stt.git", branch = "main" }
 
 [dependencies]
 vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "main", optional = true }
