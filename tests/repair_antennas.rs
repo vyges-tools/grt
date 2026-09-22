@@ -216,7 +216,8 @@ fn jumper_splits_the_segment_and_moves_usage_up_two_layers() {
     let mut g = g3(10);
     let lec = BTreeMap::new();
     let inp = JumperInputs { tech: &tech, grid: grid(), max_routing_layer: 6 };
-    let mut router = FastRouteJumpers { g3: &mut g, grid: grid(), layer_edge_cost: &lec };
+    let (mut trees, ids) = (Vec::new(), BTreeMap::new());
+    let mut router = FastRouteJumpers { g3: &mut g, grid: grid(), layer_edge_cost: &lec, trees: &mut trees, ids: &ids };
     let res = jumper_insertion(&v, &mut routes, &inp, &mut router, None).unwrap();
     assert_eq!((res.total_jumpers, res.net_with_jumpers, res.modified_nets.clone()), (1, 1, vec!["n".to_string()]));
     assert_eq!(
@@ -249,7 +250,8 @@ fn no_headroom_no_jumper() {
     g.h_cap[4] = vec![0; 100];
     let lec = BTreeMap::new();
     let inp = JumperInputs { tech: &tech, grid: grid(), max_routing_layer: 6 };
-    let mut router = FastRouteJumpers { g3: &mut g, grid: grid(), layer_edge_cost: &lec };
+    let (mut trees, ids) = (Vec::new(), BTreeMap::new());
+    let mut router = FastRouteJumpers { g3: &mut g, grid: grid(), layer_edge_cost: &lec, trees: &mut trees, ids: &ids };
     let res = jumper_insertion(&v, &mut routes, &inp, &mut router, None).unwrap();
     assert_eq!(res.total_jumpers, 0);
     assert_eq!(routes, before);

@@ -1279,9 +1279,9 @@ pub type IncrObserver<'a> = &'a mut dyn FnMut(&str, &AfterRoute);
 /// The reference's call sequence and nothing else; each stage is its own function below, named
 /// after the reference's.
 ///
-/// ⛔ Refused where the reference goes on: a resistance-aware net (`isResAware` skips the filter), a
-/// re-routed net that carries jumpers (`updateRouteGridsLayer` would have moved its tree's layers),
-/// and overflow after the re-route (the incremental congestion loop).
+/// ⛔ Refused where the reference goes on: a resistance-aware net (`isResAware` skips the filter) and
+/// overflow after the re-route (the incremental congestion loop). A jumpered net releases through
+/// the tree the jumper pass relayered ([`crate::repair_antennas::update_route_grids_layer`]).
 pub fn update_dirty_routes_fast_route(db: &mut Db, opts: &RouteOptions, a: &mut AfterRoute, dirty: &[String], stt: SteinerBuilder<'_>, flutes: crate::brk_rsmt::Flutes<'_>, obs: IncrObserver<'_>) -> Res<Vec<String>> {
     if dirty.is_empty() {
         return Ok(Vec::new());
@@ -1327,9 +1327,6 @@ fn update_dirty_nets(a: &mut AfterRoute, fresh: &[RouterNet], dirty: &[String]) 
         let Some(id) = a.router_nets.iter().position(|n| &n.name == name) else { continue }; // not in db_net_map_
         let key = |n: &RouterNet| n.net_pins.iter().map(|p| (p.on_grid.0, p.on_grid.1, p.connection_layer)).collect::<Vec<_>>();
         if pin_positions_changed(&key(&a.router_nets[id]), &key(&fresh[id])) {
-            if a.net_routes.iter().any(|r| &r.name == name && r.segments.iter().any(|s| s.is_jumper)) {
-                return Err(format!("net {name} carries jumpers: updateRouteGridsLayer is not modelled").into());
-            }
             clear_net_route(a, id);
             if let Some(r) = a.net_routes.iter_mut().find(|r| &r.name == name) {
                 r.segments.clear();

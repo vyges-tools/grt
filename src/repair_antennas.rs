@@ -121,6 +121,10 @@ pub struct FastRouteJumpers<'a> {
     pub grid: JumperGrid,
     /// `getLayerEdgeCost(k)` per net, by 0-based layer.
     pub layer_edge_cost: &'a BTreeMap<String, Vec<i8>>,
+    /// The router's per-net state by FastRoute id, and each net's id: a jumper rewrites the net's
+    /// 3D tree (`updateRouteGridsLayer`), which a later rip-up of the net walks.
+    pub trees: &'a mut [crate::brk_rsmt::NetState],
+    pub ids: &'a BTreeMap<String, usize>,
 }
 
 impl FastRouteJumpers<'_> {
@@ -166,10 +170,21 @@ impl JumperRouter for FastRouteJumpers<'_> {
     fn has_jumper_resources(&mut self, _: (i32, i32), _: (i32, i32), _: i32, _: &str) -> bool {
         true
     }
-    /// Move the span's usage from the segment's layer to the jumper's; always accepted.
+    /// `updateJumperedRoute`: move the span's usage from the segment's layer to the jumper's, then
+    /// the net's tree onto it (`updateRouteGridsLayer`, on the span's ends in tiles, 0-based
+    /// layers); always accepted.
+    ///
+    /// ⚠️ Only the 3D half of the usage move is modelled: the 2D half is `-edgeCost` then
+    /// `+edgeCost` on the same edges and cancels, and the used-grid entries the `+` adds are
+    /// discarded by the next run's `clearUsed`.
     fn update_jumpered_route(&mut self, init: (i32, i32), fin: (i32, i32), layer_level: i32, new_layer_level: i32, net: &str) -> bool {
         self.update_resources(init, fin, layer_level, -1, net);
         self.update_resources(init, fin, new_layer_level, 1, net);
+        let (x1, y1) = (self.grid.dbu_to_tile(init.0, true), self.grid.dbu_to_tile(init.1, false));
+        let (x2, y2) = (self.grid.dbu_to_tile(fin.0, true), self.grid.dbu_to_tile(fin.1, false));
+        if let Some(t) = self.ids.get(net).and_then(|&id| self.trees[id].tree3d.as_mut()) {
+            update_route_grids_layer(t, (x1, y1), (x2, y2), (layer_level - 1) as i16, (new_layer_level - 1) as i16);
+        }
         true
     }
     fn restore_net_demand(&mut self, _: &str) {}
@@ -180,6 +195,49 @@ impl JumperRouter for FastRouteJumpers<'_> {
         let i = gy * self.g3.x_grid + gx;
         let (cap, usage) = if is_horizontal { (self.g3.h_cap[k][i], self.g3.h_usage[k][i]) } else { (self.g3.v_cap[k][i], self.g3.v_usage[k][i]) };
         (i32::from(cap), i32::from(usage), self.cost(net, layer_level))
+    }
+}
+
+/// `updateRouteGridsLayer`: every grid point of the net's tree inside the tile box `lo..=hi` on
+/// `layer` moves to `new_layer`. Where a promoted run meets an unpromoted point, a copy of the
+/// boundary point on the OLD layer is kept beside it — before the run's first point (unless it is
+/// the route's first) and after its last (unless it is the route's last) — so a later rip-up sees a
+/// via there, not a same-layer step it never charged. Only edges with `len > 0 || routelen > 0`;
+/// an edge with nothing promoted is left exactly as it was.
+///
+/// ⚠️ `lo`/`hi` are the span's init and final tiles AS GIVEN, not sorted: a span given final-first
+/// matches no point.
+pub fn update_route_grids_layer(tree: &mut crate::maze3d::Tree3D, lo: (i32, i32), hi: (i32, i32), layer: i16, new_layer: i16) {
+    use crate::full3d::Point3D;
+    let inside = |p: &Point3D| lo.0 <= i32::from(p.x) && i32::from(p.x) <= hi.0 && lo.1 <= i32::from(p.y) && i32::from(p.y) <= hi.1 && p.layer == layer;
+    for e in tree.edges.iter_mut() {
+        if e.len <= 0 && e.routelen <= 0 {
+            continue;
+        }
+        let n = e.routelen as usize;
+        let g = &e.grids;
+        let mut out: Vec<Point3D> = Vec::with_capacity(g.len() + 4);
+        let mut modified = false;
+        for i in 0..=n {
+            if !inside(&g[i]) {
+                out.push(g[i]);
+                continue;
+            }
+            modified = true;
+            let prev_outside = i == 0 || !inside(&g[i - 1]);
+            let next_outside = i == n || !inside(&g[i + 1]);
+            if prev_outside && i > 0 {
+                out.push(Point3D { layer, ..g[i] });
+            }
+            out.push(Point3D { layer: new_layer, ..g[i] });
+            if next_outside && i < n {
+                out.push(Point3D { layer, ..g[i] });
+            }
+        }
+        if modified {
+            e.routelen = out.len() as i32 - 1;
+            e.grids = out;
+        }
     }
 }
 

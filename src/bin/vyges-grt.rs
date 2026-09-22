@@ -534,7 +534,8 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, state: &mut v
         let g3 = state.final_3d.as_mut().ok_or_else(|| Fail::Refused("jumper insertion without the router's 3D edges".into()))?;
         let mut routes: BTreeMap<String, Vec<vyges_grt::GSegment>> = state.net_routes.iter().map(|n| (n.name.clone(), n.segments.clone())).collect();
         let inp = JumperInputs { tech: &tech, grid: state.jumper_grid, max_routing_layer: state.max_routing_layer };
-        let mut router = FastRouteJumpers { g3, grid: state.jumper_grid, layer_edge_cost: &state.layer_edge_cost };
+        let ids: BTreeMap<String, usize> = state.router_nets.iter().enumerate().map(|(k, n)| (n.name.clone(), k)).collect();
+        let mut router = FastRouteJumpers { g3, grid: state.jumper_grid, layer_edge_cost: &state.layer_edge_cost, trees: &mut state.final_state, ids: &ids };
         let mut trace = step["trace"].as_str().map(|_| Vec::new());
         let res = jumper_insertion(&by_net, &mut routes, &inp, &mut router, trace.as_mut()).map_err(Fail::Refused)?;
         if let (Some(p), Some(t)) = (step["trace"].as_str(), &trace) {

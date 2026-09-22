@@ -52,3 +52,74 @@ fn a_released_edge_leaves_the_set_only_at_zero() {
     let r = resumed_graph_2d(&g);
     assert_eq!(r.used_h.iter().copied().collect::<Vec<_>>(), vec![(0, 0)]);
 }
+
+use vyges_grt::full3d::{Point3D, RouteType};
+use vyges_grt::maze3d::{Edge3D, Tree3D};
+use vyges_grt::repair_antennas::update_route_grids_layer;
+
+fn tree(points: &[(i16, i16, i16)], len: i32) -> Tree3D {
+    let grids: Vec<Point3D> = points.iter().map(|&(x, y, layer)| Point3D { x, y, layer }).collect();
+    let e = Edge3D { n1: 0, n2: 1, n1a: 0, n2a: 1, len, route_type: RouteType::MazeRoute, routelen: grids.len() as i32 - 1, grids };
+    Tree3D { num_terminals: 2, num_layers: 6, pin_layers: vec![0, 0], nodes: Vec::new(), edges: vec![e] }
+}
+
+fn points(t: &Tree3D) -> Vec<(i16, i16, i16)> {
+    t.edges[0].grids.iter().map(|p| (p.x, p.y, p.layer)).collect()
+}
+
+/// The same-layer unit steps a rip-up (`releaseNetResources`) takes back, per layer.
+fn released(t: &Tree3D) -> Vec<(i16, i16, i16)> {
+    let g = &t.edges[0].grids;
+    (0..t.edges[0].routelen as usize).filter(|&i| g[i].layer == g[i + 1].layer).map(|i| (g[i].x.min(g[i + 1].x), g[i].y.min(g[i + 1].y), g[i].layer)).collect()
+}
+
+/// `updateRouteGridsLayer`: an interior run moves to the new layer with an OLD-layer copy of its
+/// boundary point on each side, so the rip-up sees vias there — and releases exactly what the
+/// jumper charged: layer 1 outside the span, layer 3 inside it.
+#[test]
+fn a_jumpered_run_is_relayered_with_vias_at_both_ends() {
+    let mut t = tree(&[(0, 0, 1), (1, 0, 1), (2, 0, 1), (3, 0, 1)], 3);
+    update_route_grids_layer(&mut t, (1, 0), (2, 0), 1, 3);
+    assert_eq!(points(&t), vec![(0, 0, 1), (1, 0, 1), (1, 0, 3), (2, 0, 3), (2, 0, 1), (3, 0, 1)]);
+    assert_eq!(t.edges[0].routelen, 5);
+    // updateEdge2DAnd3DUsage over tiles 1..2 walks x = 1 only: that edge moved to layer 3.
+    assert_eq!(released(&t), vec![(0, 0, 1), (1, 0, 3), (2, 0, 1)]);
+}
+
+/// At the route's ends no copy is added: the first point has no predecessor, the last no successor.
+#[test]
+fn a_run_at_the_route_ends_adds_no_via_there() {
+    let mut t = tree(&[(0, 0, 1), (1, 0, 1), (2, 0, 1)], 2);
+    update_route_grids_layer(&mut t, (0, 0), (2, 0), 1, 3);
+    assert_eq!(points(&t), vec![(0, 0, 3), (1, 0, 3), (2, 0, 3)]);
+    let mut t = tree(&[(0, 0, 1), (1, 0, 1), (2, 0, 1)], 2);
+    update_route_grids_layer(&mut t, (0, 0), (0, 0), 1, 3);
+    assert_eq!(points(&t), vec![(0, 0, 3), (0, 0, 1), (1, 0, 1), (2, 0, 1)]);
+}
+
+/// ⛔ Two back-to-back jumpers, applied one after the other: the second's run starts next to the
+/// first's OLD-layer copy, which is outside it — so each keeps its own vias, and the two promoted
+/// points never merge into one same-layer chain.
+#[test]
+fn back_to_back_jumpers_keep_separate_vias() {
+    let mut t = tree(&[(0, 0, 1), (1, 0, 1), (2, 0, 1), (3, 0, 1)], 3);
+    update_route_grids_layer(&mut t, (1, 0), (1, 0), 1, 3);
+    update_route_grids_layer(&mut t, (2, 0), (2, 0), 1, 3);
+    assert_eq!(points(&t), vec![(0, 0, 1), (1, 0, 1), (1, 0, 3), (1, 0, 1), (2, 0, 1), (2, 0, 3), (2, 0, 1), (3, 0, 1)]);
+}
+
+/// Untouched: a point on another layer inside the box; a span given final-first (the box is the
+/// ends AS GIVEN, so it is empty); an edge with `len` and `routelen` both zero.
+#[test]
+fn what_the_relayering_leaves_alone() {
+    let before = [(0, 0, 1), (1, 0, 2), (2, 0, 1)];
+    let mut t = tree(&before, 2);
+    update_route_grids_layer(&mut t, (1, 0), (1, 0), 1, 3);
+    assert_eq!(points(&t), before.to_vec());
+    let mut t = tree(&before, 2);
+    update_route_grids_layer(&mut t, (2, 0), (0, 0), 1, 3);
+    assert_eq!(points(&t), before.to_vec());
+    let mut t = tree(&[(4, 4, 1)], 0);
+    update_route_grids_layer(&mut t, (4, 4), (4, 4), 1, 3);
+    assert_eq!(points(&t), vec![(4, 4, 1)]);
+}
