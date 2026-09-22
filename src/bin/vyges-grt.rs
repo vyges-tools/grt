@@ -137,6 +137,141 @@ fn db_layer_name(db: &Db, level: i32) -> String {
     db.tech_get_layers().into_iter().find(|l| db.layer_get_type(l).is_ok_and(|t| t == "ROUTING") && db.layer_get_routing_level(l) == level).unwrap_or_default()
 }
 
+/// What the antenna wire builder reads from the database: every net in block order, with its
+/// terminals as `makeWireFromGuides` / `makeWireToTerm` see them; the min routing layer; and
+/// `dbBlock::getDefaultVias` by bottom routing level.
+#[allow(clippy::type_complexity)]
+fn ant_nets(db: &Db, db_guides: &BTreeMap<String, Vec<vyges_grt::Guide>>) -> Result<(Vec<vyges_grt::wire_builder::AntNet>, vyges_grt::wire_builder::WireTech, BTreeMap<i32, String>), Fail> {
+    use vyges_grt::wire_builder::{AntNet, TermFacts, WireTech};
+    let level_of = |n: i64| -> (i32, bool) {
+        let name = db.layer_name_by_number(n);
+        let routing = db.layer_get_type(&name).is_ok_and(|t| t == "ROUTING");
+        (if routing { db.layer_get_routing_level(&name) } else { 0 }, routing)
+    };
+    // A terminal from its shapes: (level, is ROUTING, placed rect), in pin -> shape order.
+    let facts = |name: String, shapes: &[(i32, bool, vyges_grt::Rect)]| -> TermFacts {
+        let top_level = shapes.iter().filter(|s| s.1).map(|s| s.0).max().unwrap_or(0);
+        let mut bbox: Option<vyges_grt::Rect> = None;
+        for (_, _, r) in shapes {
+            bbox = Some(match bbox {
+                None => *r,
+                Some(b) => vyges_grt::Rect::new(b.x_min.min(r.x_min), b.y_min.min(r.y_min), b.x_max.max(r.x_max), b.y_max.max(r.y_max)),
+            });
+        }
+        let top_rects = shapes.iter().filter(|s| s.1 && s.0 == top_level).map(|s| s.2).collect();
+        // An empty terminal's box is inverted in the reference and overlaps nothing.
+        TermFacts { name, top_level, bbox: bbox.unwrap_or(vyges_grt::Rect { x_min: i32::MAX, y_min: i32::MAX, x_max: i32::MIN, y_max: i32::MIN }), top_rects }
+    };
+    let mut nets = Vec::new();
+    for n in db.net_names() {
+        let mut iterms = Vec::new();
+        for it in db.net_iterms(&n) {
+            let (inst, pin) = it.rsplit_once('/').ok_or_else(|| err(format!("iterm {it}")))?;
+            let master = db.inst_master(inst);
+            let origin = (db.inst_get_origin_x(inst), db.inst_get_origin_y(inst));
+            let orient = db.inst_get_orient(inst);
+            let shapes: Vec<(i32, bool, vyges_grt::Rect)> = db
+                .mterm_pin_boxes(&master, pin)
+                .map_err(err)?
+                .into_iter()
+                .map(|(l, x0, y0, x1, y1)| {
+                    let (level, routing) = level_of(l);
+                    (level, routing, vyges_grt::read::transform_rect(&orient, origin, vyges_grt::Rect::new(x0, y0, x1, y1)))
+                })
+                .collect();
+            iterms.push(facts(it.clone(), &shapes));
+        }
+        let mut bterms = Vec::new();
+        for bt in db.net_bterms(&n) {
+            let (_, boxes) = vyges_grt::read::read_bterm(db, &bt).map_err(|e| err(format!("{e:?}")))?;
+            bterms.push(facts(bt.clone(), &boxes));
+        }
+        nets.push(AntNet {
+            is_special: db.net_is_special(&n),
+            is_connected_by_abutment: db.net_is_connected_by_abutment(&n),
+            term_count: db.net_get_term_count(&n),
+            is_detailed_routed: db.net_get_wire_type(&n) == "ROUTED" && db.net_has_wire(&n),
+            guides: db_guides.get(&n).cloned().unwrap_or_default(),
+            iterms,
+            bterms,
+            name: n,
+        });
+    }
+    let min = db.block_get_min_routing_layer();
+    let dir = db.layers_with_direction().map_err(err)?.into_iter().find(|(l, _)| db.layer_get_routing_level(l) == min).map(|(_, d)| d).unwrap_or_default();
+    // getDefaultVias: the OR_DEFAULT vias by bottom layer, the LAST in tech order winning; with
+    // none at all, the FIRST via per bottom routing layer.
+    let mut vias: BTreeMap<i32, String> = BTreeMap::new();
+    let bottom = |v: &str| db.tech_via_layer(v, "bottom").map(|l| db.layer_get_routing_level(&l)).unwrap_or(0);
+    for v in db.tech_get_vias() {
+        if db.techvia_has_string_property(&v, "OR_DEFAULT") {
+            vias.insert(bottom(&v), v);
+        }
+    }
+    if vias.is_empty() {
+        for v in db.tech_get_vias() {
+            let b = bottom(&v);
+            if b != 0 {
+                vias.entry(b).or_insert(v);
+            }
+        }
+    }
+    Ok((nets, WireTech { min_routing_layer: min, min_layer_vertical: dir == "VERTICAL" }, vias))
+}
+
+/// The database as the wire codec reads it: routing layers by level, the default vias by bottom
+/// level, and every tech layer's name by its position.
+struct DbCodec {
+    layers: BTreeMap<i32, vyges_grt::wire_codec::CodecLayer>,
+    vias: BTreeMap<i32, vyges_grt::wire_codec::CodecVia>,
+    tech_names: Vec<String>,
+}
+
+impl DbCodec {
+    fn read(db: &Db, default_vias: &BTreeMap<i32, String>) -> Result<Self, Fail> {
+        let tech_names = db.tech_get_layers();
+        let mut layers = BTreeMap::new();
+        for (name, dir) in db.layers_with_direction().map_err(err)? {
+            let level = db.layer_get_routing_level(&name);
+            if level > 0 {
+                layers.insert(level, vyges_grt::wire_codec::CodecLayer {
+                    width: db.layer_get_width(&name) as i32,
+                    wrong_way_width: db.layer_get_wrong_way_width(&name) as i32,
+                    vertical: dir == "VERTICAL",
+                    horizontal: dir == "HORIZONTAL",
+                });
+            }
+        }
+        let mut vias = BTreeMap::new();
+        for (&bottom, name) in default_vias {
+            let top = db.tech_via_layer(name, "top").map(|l| db.layer_get_routing_level(&l)).map_err(err)?;
+            let mut boxes = Vec::new();
+            let mut bbox: Option<vyges_grt::Rect> = None;
+            for (n, x0, y0, x1, y1) in db.tech_via_boxes(name).map_err(err)? {
+                let layer = db.layer_name_by_number(n);
+                let t = tech_names.iter().position(|m| *m == layer).ok_or_else(|| err(format!("via {name}: layer {layer}")))?;
+                let r = vyges_grt::Rect::new(x0, y0, x1, y1);
+                bbox = Some(match bbox {
+                    None => r,
+                    Some(b) => vyges_grt::Rect::new(b.x_min.min(r.x_min), b.y_min.min(r.y_min), b.x_max.max(r.x_max), b.y_max.max(r.y_max)),
+                });
+                boxes.push((t, r));
+            }
+            vias.insert(bottom, vyges_grt::wire_codec::CodecVia { name: name.clone(), bottom, top, bbox, boxes });
+        }
+        Ok(DbCodec { layers, vias, tech_names })
+    }
+}
+
+impl vyges_grt::wire_codec::CodecTech for DbCodec {
+    fn layer(&self, level: i32) -> &vyges_grt::wire_codec::CodecLayer {
+        &self.layers[&level]
+    }
+    fn via(&self, bottom: i32) -> Option<&vyges_grt::wire_codec::CodecVia> {
+        self.vias.get(&bottom)
+    }
+}
+
 /// `dbTech`'s layer stack as the jumper graph walks it: every layer, cut layers included, with
 /// `getUpperLayer` / `getLowerLayer` resolved to positions.
 fn tech_layers(db: &Db) -> Result<vyges_grt::repair_antennas::TechLayers, Fail> {
@@ -273,6 +408,8 @@ fn repair_antennas(db: &Db, step: &Value, state: &mut vyges_grt::global_route::A
 
 fn run(job: &Value) -> Result<Value, Fail> {
     let mut db = Db::new();
+    // A design from a database may carry pin access points; one from DEF carries none.
+    let from_db = job["db"].is_string();
     for lef in job["lefs"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
         db.read_lef(lef.as_str().ok_or_else(|| err("a LEF path"))?).map_err(err)?;
     }
@@ -586,27 +723,64 @@ fn run(job: &Value) -> Result<Value, Fail> {
             }
             // ant::WireBuilder::makeNetWiresFromGuides over the block's nets, in block order —
             // `VYGA|wire|<net>|<x1>,<y1>,<l1>|<x2>,<y2>,<l2>` per segment, in creation order.
+            // With "encoder": that path gets the encoder calls, `VYGW|<net>|…` as the reference's
+            // stage-2 trace prints them (less its pass number).
             "antenna_wires" => {
+                if from_db {
+                    return Err(Fail::Refused("antenna wires from a database: its terminals may carry access points, which are not modelled".into()));
+                }
                 let path = step["path"].as_str().ok_or_else(|| err("path"))?;
-                let nets: Vec<vyges_grt::wire_builder::AntNet> = db
-                    .net_names()
-                    .into_iter()
-                    .map(|n| vyges_grt::wire_builder::AntNet {
-                        is_special: db.net_is_special(&n),
-                        is_connected_by_abutment: db.net_is_connected_by_abutment(&n),
-                        term_count: db.net_get_term_count(&n),
-                        is_detailed_routed: db.net_get_wire_type(&n) == "ROUTED" && db.net_has_wire(&n),
-                        guides: db_guides.get(&n).cloned().unwrap_or_default(),
-                        name: n,
-                    })
-                    .collect();
+                let (nets, tech, vias) = ant_nets(&db, &db_guides)?;
+                let wires = vyges_grt::wire_builder::make_net_wires_from_guides(&nets, db.block_get_g_cell_tile_size(), &tech).map_err(|e| Fail::Refused(format!("{e:?}")))?;
                 let mut text = String::new();
-                for w in vyges_grt::wire_builder::make_net_wires_from_guides(&nets, db.block_get_g_cell_tile_size()) {
+                for w in &wires {
                     for sg in &w.route {
                         text.push_str(&format!("VYGA|wire|{}|{},{},{}|{},{},{}\n", w.net, sg.pt1.x, sg.pt1.y, sg.pt1.layer, sg.pt2.x, sg.pt2.y, sg.pt2.layer));
                     }
                 }
                 std::fs::write(path, text).map_err(err)?;
+                if let Some(enc) = step["encoder"].as_str() {
+                    let name = |l: i32| db_layer_name(&db, l);
+                    let mut text = String::new();
+                    for w in &wires {
+                        let net = nets.iter().find(|n| n.name == w.net).expect("a built net");
+                        for (pt, pins) in &w.pt_pins {
+                            let it: String = pins.iterms.iter().map(|&i| format!("{},", net.iterms[i].name)).collect();
+                            let bt: String = pins.bterms.iter().map(|&b| format!("{},", net.bterms[b].name)).collect();
+                            text.push_str(&format!("VYGW|{}|ptpin|{},{},{}|iterms={it}|bterms={bt}\n", w.net, pt.x, pt.y, pt.layer));
+                        }
+                        for op in &w.ops {
+                            text.push_str(&match op {
+                                vyges_grt::wire_builder::WireOp::Path(l) => format!("VYGW|{}|path|{}\n", w.net, name(*l)),
+                                vyges_grt::wire_builder::WireOp::Point(x, y) => format!("VYGW|{}|point|{x},{y}\n", w.net),
+                                vyges_grt::wire_builder::WireOp::Via(l) => format!("VYGW|{}|via|{}\n", w.net, vias.get(l).cloned().unwrap_or_else(|| "(null)".into())),
+                            });
+                        }
+                    }
+                    std::fs::write(enc, text).map_err(err)?;
+                }
+                // With "shapes": what the database decodes from that wire, `VYGC|<net>|shape|…` and
+                // `…|vbox|…` as the reference's stage-2 trace prints them.
+                if let Some(out) = step["shapes"].as_str() {
+                    let codec = DbCodec::read(&db, &vias)?;
+                    let mut text = String::new();
+                    for w in &wires {
+                        let ops = vyges_grt::wire_codec::encode(&w.ops, &codec).map_err(|e| Fail::Refused(format!("net {}: {e}", w.net)))?;
+                        for sh in vyges_grt::wire_codec::decode(&ops, &codec) {
+                            let r = |r: &vyges_grt::Rect| format!("{},{},{},{}", r.x_min, r.y_min, r.x_max, r.y_max);
+                            match sh {
+                                vyges_grt::wire_codec::Shape::Segment { level, rect } => text.push_str(&format!("VYGC|{}|shape|{}|{}|via=-\n", w.net, db_layer_name(&db, level), r(&rect))),
+                                vyges_grt::wire_codec::Shape::Via { name, rect, boxes } => {
+                                    text.push_str(&format!("VYGC|{}|shape|-|{}|via={name}\n", w.net, r(&rect)));
+                                    for (t, b) in boxes {
+                                        text.push_str(&format!("VYGC|{}|vbox|{}|{}\n", w.net, codec.tech_names[t], r(&b)));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    std::fs::write(out, text).map_err(err)?;
+                }
             }
             "repair_antennas" => {
                 // ⚠️ Not GRT-45: the reference also repairs from routes a database brought with it

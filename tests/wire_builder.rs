@@ -9,11 +9,12 @@
 
 use vyges_grt::wire_builder::{
     box_to_guide_segment, db_net_is_local, make_net_wires_from_guides, make_wire_from_guides, AntNet, GuidePoint,
-    GuideSegment,
+    GuideSegment, WireTech,
 };
 use vyges_grt::{Guide, Rect};
 
 const G: i32 = 7200;
+const TECH: WireTech = WireTech { min_routing_layer: 2, min_layer_vertical: false };
 
 fn guide(layer: i32, via_layer: i32, b: Rect) -> Guide {
     Guide { layer, via_layer, box_: b, is_congested: false, is_jumper: false, is_connected_to_term: false }
@@ -100,7 +101,7 @@ fn corners_snap_to_cells() {
 #[test]
 fn guides_append_in_order_without_dedup() {
     let cell = Rect::new(0, 0, G, G);
-    let (route, ends) = make_wire_from_guides(&[guide(1, 2, cell), guide(2, 1, cell), guide(1, 2, cell)], G);
+    let (route, ends, _) = make_wire_from_guides(&net("n", 2, vec![guide(1, 2, cell), guide(2, 1, cell), guide(1, 2, cell)]), G);
     let c = G / 2;
     assert_eq!(
         route,
@@ -127,6 +128,8 @@ fn net(name: &str, term_count: u32, guides: Vec<Guide>) -> AntNet {
         term_count,
         is_detailed_routed: false,
         guides,
+        iterms: vec![],
+        bterms: vec![],
     }
 }
 
@@ -151,7 +154,7 @@ fn filter_drops_each_excluded_kind_and_keeps_order() {
         routed,
         net("a", 2, vec![guide(2, 2, row), guide(2, 3, cell)]),
     ];
-    let names: Vec<String> = make_net_wires_from_guides(&nets, G).into_iter().map(|w| w.net).collect();
+    let names: Vec<String> = make_net_wires_from_guides(&nets, G, &TECH).unwrap().into_iter().map(|w| w.net).collect();
     assert_eq!(names, vec!["b", "a"]);
 }
 
@@ -159,6 +162,72 @@ fn filter_drops_each_excluded_kind_and_keeps_order() {
 /// dropped by its terminal count and never reaches the unguarded read.
 #[test]
 fn filter_short_circuits_before_the_local_test() {
-    let wires = make_net_wires_from_guides(&[net("lonely", 1, vec![])], G);
+    let wires = make_net_wires_from_guides(&[net("lonely", 1, vec![])], G, &TECH).unwrap();
     assert!(wires.is_empty());
+}
+
+// ---- stage 2a: the encoder calls (`makeNetWire` and its stubs) ----
+//
+// End to end, `grt-antenna-wires-score.py --encoder` scores the pin binding and every
+// newPath / addPoint / addTechVia against the reference's trace: exact on 8 suite scripts
+// (18,979–33,134 lines each). sky130hs's min routing layer (met1) is HORIZONTAL and its cell pins
+// sit on li1, so the three rules below are golden-blind there.
+
+use vyges_grt::wire_builder::{make_wire_to_term, pin_overlaps_g_segment, WireOp};
+
+/// A pin below the min routing layer, stubbed from a segment on the min layer: an L on the min
+/// layer with the min layer's OWN via at the corner, then vias down to the pin — horizontal leg
+/// first on a horizontal min layer, VERTICAL leg first on a vertical one.
+#[test]
+fn stub_to_a_pin_below_the_min_layer_turns_on_the_min_layer_direction() {
+    let pin = [Rect::new(900, 400, 1100, 600)]; // centre (1000, 500)
+    for (vertical, corner) in [(false, (1000, 3600)), (true, (3600, 500))] {
+        let tech = WireTech { min_routing_layer: 2, min_layer_vertical: vertical };
+        let mut ops = Vec::new();
+        make_wire_to_term(&[], 2, 1, &pin, (3600, 3600), &mut ops, true, &tech).unwrap();
+        assert_eq!(
+            ops,
+            vec![
+                WireOp::Path(2), WireOp::Point(3600, 3600), WireOp::Point(corner.0, corner.1),
+                WireOp::Via(2),
+                WireOp::Path(2), WireOp::Point(corner.0, corner.1), WireOp::Point(1000, 500),
+                WireOp::Via(1),
+            ],
+            "vertical = {vertical}"
+        );
+    }
+}
+
+/// ⛔ Golden-blind: from a segment ABOVE the min layer, a path on the segment's layer first drops
+/// through a via stack listed from the min layer UP — the reference's loop order, not the order a
+/// descent would take.
+#[test]
+fn stub_from_above_the_min_layer_lists_its_vias_bottom_up() {
+    let tech = WireTech { min_routing_layer: 2, min_layer_vertical: false };
+    let mut ops = Vec::new();
+    make_wire_to_term(&[], 4, 1, &[Rect::new(0, 0, 200, 200)], (100, 3600), &mut ops, true, &tech).unwrap();
+    assert_eq!(&ops[..5], &[WireOp::Path(4), WireOp::Point(100, 3600), WireOp::Via(2), WireOp::Via(3), WireOp::Path(2)]);
+    // Not connecting to a segment: no stack.
+    let mut ops = Vec::new();
+    make_wire_to_term(&[], 4, 1, &[Rect::new(0, 0, 200, 200)], (100, 3600), &mut ops, false, &tech).unwrap();
+    assert_eq!(ops[0], WireOp::Path(2));
+}
+
+/// The stub targets the grid point itself when it lies STRICTLY inside a pin shape — a point on
+/// the pin's edge does not count — or when a same-layer route segment touches a pin shape (edges
+/// DO count there).
+#[test]
+fn stub_target_stays_on_the_grid_when_the_pin_covers_it() {
+    let pin = [Rect::new(0, 0, 200, 200)];
+    assert!(pin_overlaps_g_segment((100, 100), 3, &pin, &[]));
+    assert!(!pin_overlaps_g_segment((200, 100), 3, &pin, &[]));
+    let touching = [seg(pt(200, 100, 3), pt(900, 100, 3))];
+    assert!(pin_overlaps_g_segment((5000, 5000), 3, &pin, &touching));
+    let other_layer = [seg(pt(200, 100, 4), pt(900, 100, 4))];
+    assert!(!pin_overlaps_g_segment((5000, 5000), 3, &pin, &other_layer));
+    // A pin at/above the min layer: an L on the segment's layer, x first, to the target.
+    let tech = WireTech { min_routing_layer: 2, min_layer_vertical: false };
+    let mut ops = Vec::new();
+    make_wire_to_term(&[], 3, 3, &pin, (100, 100), &mut ops, true, &tech).unwrap();
+    assert_eq!(ops, vec![WireOp::Path(3), WireOp::Point(100, 100), WireOp::Point(100, 100), WireOp::Point(100, 100)]);
 }

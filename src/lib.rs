@@ -104,6 +104,7 @@ pub mod clk_network;
 pub mod finalize;
 pub mod run;
 pub mod wire_builder;
+pub mod wire_codec;
 pub mod repair_antennas;
 pub use run::{fastroute_run, RunEnd, RunInputs, RunObserver, Stage};
 pub use finalize::{ensure_pin_coverage_all, finish_3d, get_overflow_3d_all, get_routes_all, layer_assignment, maze_route_msmd_order_3d_all, Finish3d, remove_loops_all, Graph3d, LayerParams, Maze3dParams, NetLayerAttrs};
