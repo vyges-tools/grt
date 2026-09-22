@@ -583,11 +583,14 @@ fn replay_run(r: &Value, bounds: Option<&Value>, seen: &mut Seen) {
                             via_cost: 0.0,
                         };
                         let mut last = scan;
+                        let pattern_scan = scan;
+                        let mut last_lc = 0.0f32;
                         lv_rounds(scan.max_overflow, &net_ids, &nets, &mut state, &mut grid12, &mut |k, round, g, st| {
                             let b = at_b(&format!("B12_{k}")).unwrap_or_else(|| panic!("B12_{k} follows B11"));
                             assert_eq!(round.logistic_coef as f64, b["logistic_coef"].as_f64().expect("f"), "{at} B12_{k}: logistic_coef");
                             check_boundary(&at, b, &round.scan, g, st, seen);
                             last = round.scan;
+                            last_lc = round.logistic_coef;
                         });
                         init_for_congestion_loop(&net_ids, &mut state, &mut g2d);
                         let b13 = at_b("B13").expect("B13 follows B12");
@@ -600,8 +603,9 @@ fn replay_run(r: &Value, bounds: Option<&Value>, seen: &mut Seen) {
                         check_boundary(&at, b13, &last, &g2d, &state, seen);
                         seen.maze_passes += 1;
 
-                        // R14 — the congestion loop, iteration by iteration, with the reference's own
-                        // per-iteration parameters (the schedule itself is checked separately).
+                        // R14 — the congestion loop, run by OUR schedule. Every maze pass's computed
+                        // parameters must equal the reference's (BQ, BH), and the state before and
+                        // after it the reference's boundaries.
                         let pass_pres: Vec<&Value> = {
                             // This pass's iterations: those between this B13 and the next B7 (if any).
                             let tags: Vec<&str> = group.iter().map(|b| b["tag"].as_str().unwrap_or("")).collect();
@@ -610,63 +614,69 @@ fn replay_run(r: &Value, bounds: Option<&Value>, seen: &mut Seen) {
                             let to = tags.iter().enumerate().skip(from + 1).find(|(_, t)| **t == "B7").map_or(tags.len(), |(k, _)| k);
                             group[from..to].iter().filter(|b| b["tag"].as_str().is_some_and(|t| t.starts_with("B14pre_"))).copied().collect()
                         };
-                        {
-                            let mut scan = last;
-                            let mut max_adj = 0;
-                            for pre in pass_pres {
-                                let q = &pre["params"];
-                                let h = &pre["history"];
-                                let i = int(&q["i"]);
-                                let got = g2d.update_congestion_history(int(&h["up_type"]), int(&h["ahth"]), int(&h["stop_dec"]) == 1, max_adj);
-                                assert_eq!(got, int(&h["max_adj"]), "{at} iteration {i}: updateCongestionHistory max_adj");
-                                max_adj = got;
-                                if i == 8 {
-                                    g2d.est.init_last_usage(2);
+                        let cnp = pass_pres.first().map_or(0, |b| int(&b["params"]["cnp"]));
+                        let start = LoopStart {
+                            pattern_max_overflow: pattern_scan.max_overflow,
+                            logistic_coef: last_lc,
+                            scan: last,
+                            overflow_iterations: 50,
+                            critical_nets_percentage: cnp,
+                        };
+                        let mut grid14 = BrkGrid {
+                            g: &mut g2d,
+                            red_h: &red_h_f,
+                            red_v: &red_v_f,
+                            caps: &caps,
+                            h_capacity: hcap,
+                            v_capacity: vcap,
+                            via_cost: 0.0,
+                        };
+                        let mut befores = 0usize;
+                        let mut prev_scan = last;
+                        let outcome = congestion_loop(&start, &net_ids, &nets, &mut state, &mut grid14, &mut |ev, g, st| match ev {
+                            LoopEvent::Before { params: p, schedule: sc } => {
+                                let i = p.iter;
+                                let pre = at_b(&format!("B14pre_{i}")).unwrap_or_else(|| panic!("{at}: iteration {i} the reference did not run"));
+                                let (q, h) = (&pre["params"], &pre["history"]);
+                                let ours = [
+                                    ("enlarge", p.expand), ("ripup_threshold", p.ripup_threshold), ("maze_edge_threshold", p.maze_edge_threshold),
+                                    ("ordering", p.ordering as i32), ("via", p.via), ("L", p.l), ("costheight", p.cost.cost_height as i32),
+                                    ("slope", p.cost.slope), ("upType", sc.up_type), ("stopDEC", sc.stop_dec as i32), ("THRESH_M", sc.thresh_m),
+                                    ("cost_step", sc.cost_step), ("max_adj", sc.max_adj),
+                                ];
+                                for (k, v) in ours {
+                                    assert_eq!(v, int(&q[k]), "{at} iteration {i}: schedule {k}");
                                 }
-                                check_boundary(&at, pre, &scan, &g2d, &state, seen);
-                                // ⛔ `critical_nets_percentage_` defaults to 10 and is zeroed only when no
-                                // Liberty is loaded: with it on, an ordering iteration runs the
-                                // partial-slack pass, which needs timing. Stop before it.
-                                if int(&q["cnp"]) != 0 && int(&q["ordering"]) == 1 {
-                                    seen.loop_partial_slack += 1;
-                                    break;
-                                }
-                                let p = MsmdParams {
-                                    iter: i,
-                                    expand: int(&q["enlarge"]),
-                                    ripup_threshold: int(&q["ripup_threshold"]),
-                                    maze_edge_threshold: int(&q["maze_edge_threshold"]),
-                                    ordering: int(&q["ordering"]) == 1,
-                                    via: int(&q["via"]),
-                                    l: int(&q["L"]),
-                                    cost: vyges_grt::mazecost::CostParams {
-                                        slope: int(&q["slope"]),
-                                        logistic_coef: q["logistic"].as_f64().expect("f"),
-                                        cost_height: f64::from(int(&q["costheight"])),
-                                    },
-                                    slack_th: f32::from_bits(int(&q["slack_th_bits"]) as u32),
-                                    critical_nets_percentage: 0,
-                                };
-                                let mut grid14 = BrkGrid {
-                                    g: &mut g2d,
-                                    red_h: &red_h_f,
-                                    red_v: &red_v_f,
-                                    caps: &caps,
-                                    h_capacity: hcap,
-                                    v_capacity: vcap,
-                                    via_cost: 0.0,
-                                };
-                                maze_route_msmd_sequential(&p, &net_ids, &nets, &mut state, &mut grid14).unwrap_or_else(|e| panic!("{at} iteration {i}: {e}"));
-                                scan = g2d.get_overflow_2d_maze();
-                                let after = at_b(&format!("B14_{i}")).unwrap_or_else(|| panic!("{at}: B14_{i} follows B14pre_{i}"));
-                                check_boundary(&at, after, &scan, &g2d, &state, seen);
-                                seen.loop_iterations += 1;
-                                if at_b(&format!("B14b_{}", i + 1)).is_some() || at_b(&format!("B14c_{}", i + 1)).is_some() {
-                                    seen.loop_extra_stops += 1;
-                                    break;
-                                }
+                                assert_eq!(p.cost.logistic_coef.to_bits(), q["logistic"].as_f64().expect("f").to_bits(), "{at} iteration {i}: logistic_coef");
+                                assert_eq!(p.slack_th.to_bits(), int(&q["slack_th_bits"]) as u32, "{at} iteration {i}: slack_th");
+                                let (ut, ah, sd) = sc.history_args;
+                                assert_eq!((ut, ah, sd as i32, sc.max_adj), (int(&h["up_type"]), int(&h["ahth"]), int(&h["stop_dec"]), int(&h["max_adj"])),
+                                           "{at} iteration {i}: updateCongestionHistory (upType, ahth, stopDEC, max_adj)");
+                                check_boundary(&at, pre, &prev_scan, g, st, seen);
+                                befores += 1;
                             }
+                            LoopEvent::After { kind, iter, scan } => {
+                                let tag = match kind { PassKind::Main => "B14", PassKind::Extra20 => "B14b", PassKind::ExtraCopyRs => "B14c" };
+                                let b = at_b(&format!("{tag}_{iter}")).unwrap_or_else(|| panic!("{at}: {tag}_{iter} missing"));
+                                check_boundary(&at, b, scan, g, st, seen);
+                                prev_scan = *scan;
+                                if kind == &PassKind::Main { seen.loop_iterations += 1 } else { seen.loop_extra_stops += 1 }
+                            }
+                        });
+                        match outcome {
+                            Ok(end) => {
+                                assert_eq!(end.iterations as usize, pass_pres.len(), "{at}: the loop ran {} iterations; the reference {}", end.iterations, pass_pres.len());
+                                // ⛔ Asserted, not noted: no corpus loop reaches these branches. A recapture
+                                // that does fails here and points at the constructed-only coverage.
+                                assert_eq!(end.rare, RareBranches::default(), "{at}: a loop branch the corpus never reached fired: {:?}", end.rare);
+                            }
+                            Err(e) if e.contains("CalculatePartialSlack") => {
+                                assert!(cnp != 0, "{at}: partial slack refused with cnp 0");
+                                seen.loop_partial_slack += 1;
+                            }
+                            Err(e) => panic!("{at}: {e}"),
                         }
+                        let _ = befores;
                     }
                 }
                 pass += 1;
@@ -1046,4 +1056,81 @@ fn st_net_order_stamps_and_keeps_the_deprioritised_slack() {
     assert_eq!(order, vec![0, 1, 2, 3], "stable: the stamped nets keep their order, after the unstamped one");
     let slacks: Vec<f32> = state.iter().map(|s| s.slack).collect();
     assert_eq!(slacks, vec![vyges_grt::ripup::SLACK_SENTINEL, f32::MAX, f32::MAX, f32::MAX]);
+}
+
+/// ⛔ The loop's `enlarge_` steps by 5 (`ESTEP3`) while the overflow is under 500, clamped at half the
+/// grid width. A wide grid with one permanently overflowing edge keeps the loop running unclamped
+/// for a few rounds: 20, 25, 30, 35. (Every corpus run that replays the loop is clamped at 17.)
+#[test]
+fn the_congestion_loop_steps_enlarge_until_the_clamp() {
+    let pins = [(0, 0), (4, 0)];
+    let mut state = vec![st_tree(2, &[(0, 0, 1), (4, 0, 1)], &pins)];
+    {
+        let r = &mut state[0].tree.as_mut().expect("tree").routes[0];
+        (r.kind, r.grids, r.routelen) = (RouteKind::MazeRoute, (0..=4).map(|x| (x, 0)).collect(), 4);
+    }
+    let (px, py): (Vec<i32>, Vec<i32>) = pins.iter().copied().unzip();
+    let nets = [RsmtNet { layer_edge_cost: &[1], ..net(&px, &py) }];
+    let mut g2d = Graph2d::new(80, 3, 1);
+    for x in 0..4 {
+        g2d.est.update_usage_h(x, 0, 1.0); // the net's own route
+        g2d.used_h.insert((x, 0));
+    }
+    // Capacity 0 on row 0 everywhere, 10 elsewhere: the route overflows wherever it runs on row 0.
+    for y in 0..3usize {
+        for x in 0..80usize {
+            g2d.cap_h[y * 80 + x] = if y == 0 { 0 } else { 10 };
+            g2d.cap_v[y * 80 + x] = 10;
+        }
+    }
+    let caps = grid_caps(80, 3, 10);
+    let mut grid = BrkGrid { g: &mut g2d, red_h: &no_red, red_v: &no_red, caps: &caps, h_capacity: 10, v_capacity: 10, via_cost: 0.0 };
+    let scan = grid.g.get_overflow_2d_maze();
+    assert!(scan.total_overflow > 0 && scan.total_overflow < 500);
+    let start = LoopStart { pattern_max_overflow: 0, logistic_coef: 0.0, scan, overflow_iterations: 4, critical_nets_percentage: 0 };
+    let mut expands = Vec::new();
+    let _ = congestion_loop(&start, &[0], &nets, &mut state, &mut grid, &mut |ev, _, _| {
+        if let LoopEvent::Before { params, .. } = ev {
+            expands.push(params.expand);
+        }
+    });
+    assert_eq!(expands, vec![20, 25, 30, 35], "ESTEP3 per round, under the clamp of 40");
+}
+
+/// ⛔ `copyBR` restores the trees `copyRS` saved AND moves the committed usage with them: the current
+/// routes are given back, the saved ones charged. No corpus loop reaches it (`i > 80`).
+#[test]
+fn copy_br_restores_the_saved_routes_and_their_usage() {
+    let pins = [(0, 0), (4, 0)];
+    let mut state = vec![st_tree(2, &[(0, 0, 1), (4, 0, 1)], &pins)];
+    let row = |y: i32| -> Vec<(i32, i32)> { let mut v = vec![(0, 0)]; if y > 0 { v.push((0, y)); } v.extend((1..=4).map(|x| (x, y))); if y > 0 { v.push((4, 0)); } v };
+    {
+        let r = &mut state[0].tree.as_mut().expect("tree").routes[0];
+        (r.kind, r.grids, r.routelen) = (RouteKind::MazeRoute, row(0), 4);
+    }
+    let (px, py): (Vec<i32>, Vec<i32>) = pins.iter().copied().unzip();
+    let nets = [RsmtNet { layer_edge_cost: &[1], ..net(&px, &py) }];
+    let mut g2d = Graph2d::new(6, 3, 1);
+    for x in 0..4 {
+        g2d.est.update_usage_h(x, 0, 1.0);
+    }
+    let caps = grid_caps(6, 3, 10);
+    let mut grid = BrkGrid { g: &mut g2d, red_h: &no_red, red_v: &no_red, caps: &caps, h_capacity: 10, v_capacity: 10, via_cost: 0.0 };
+    let saved = copy_rs(&[0], &state);
+    // Move the net onto row 1 by hand, usage and all.
+    for x in 0..4 {
+        grid.g.est.update_usage_h(x, 0, -1.0);
+        grid.g.est.update_usage_h(x, 1, 1.0);
+    }
+    grid.g.est.update_usage_v(0, 0, 1.0);
+    grid.g.est.update_usage_v(4, 0, 1.0);
+    {
+        let r = &mut state[0].tree.as_mut().expect("tree").routes[0];
+        (r.grids, r.routelen) = (row(1), 6);
+    }
+    copy_br(&[0], &nets, &mut state, &mut grid, Some(&saved));
+    assert_eq!(state[0].tree.as_ref().expect("tree").routes[0].grids, row(0), "the saved route is back");
+    let usage: Vec<(u16, u16)> = (0..4).map(|x| (g2d.est.usage_h(x, 0), g2d.est.usage_h(x, 1))).collect();
+    assert_eq!(usage, vec![(1, 0); 4], "row 0 charged again, row 1 given back");
+    assert_eq!((g2d.est.usage_v(0, 0), g2d.est.usage_v(4, 0)), (0, 0), "the detour's columns given back");
 }

@@ -96,6 +96,8 @@ pub use graph2d::{Graph2d, NetUsage};
 pub mod route_l;
 pub mod maze_phase;
 pub mod maze_msmd;
+pub mod congestion_loop;
+pub use congestion_loop::{congestion_loop, copy_br, copy_rs, LoopEnd, LoopEvent, LoopStart, PassKind, LoopSchedule, RareBranches};
 pub use maze_msmd::{attach_path_end, corr_edge_at, maze_route_msmd_sequential, st_net_order, MsmdParams, MsmdResult};
 pub use maze_phase::{convert_to_mazeroute_all, init_for_congestion_loop, lv_rounds, route_monotonic_all, route_monotonic_edge, LvRound};
 pub use route_l::{newroute_l_all, newroute_z_all, newroute_z_net, route_l_all, route_seg_l_first_time, spiral_route_all};

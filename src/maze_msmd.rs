@@ -42,12 +42,11 @@ pub struct MsmdParams {
 }
 
 /// What a pass leaves for the run loop.
+///
+/// ⚠️ Not the `enlarge_` it computes per edge: that is the router's MEMBER, and run() routes with a
+/// LOCAL `int enlarge_` that shadows it — nothing outside the pass reads the member.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MsmdResult {
-    /// ⛔ The run-level `enlarge_` as the pass left it: every re-routed edge overwrites it with
-    /// `min(expand, (iter / 6 + 3) * routelen)`, and the loop's next iteration starts from it.
-    /// `None` when no edge was re-routed (the loop's value stands).
-    pub enlarge: Option<i32>,
     pub slack_th: f32,
 }
 
@@ -105,7 +104,6 @@ pub fn maze_route_msmd_sequential(p: &MsmdParams, net_ids: &[usize], nets: &[Rsm
     } else {
         net_ids.to_vec()
     };
-    let mut enlarge = None;
     let dims = (grid.g.est.x_grids as i32, grid.g.est.y_grids as i32);
     for id in order {
         let net = &nets[id];
@@ -144,8 +142,6 @@ pub fn maze_route_msmd_sequential(p: &MsmdParams, net_ids: &[usize], nets: &[Rsm
                 let r = &t.routes[eid];
                 give_back_committed(&mut grid.g.for_net(&nn), &r.grids, r.routelen as usize, nn.edge_cost);
             }
-            enlarge = Some(p.expand.min((p.iter / 6 + 3) * t.routes[eid].routelen));
-
             // The search.
             let (maze_nodes, maze_edges) = (maze_nodes_of(t), maze_edges_of(t));
             let outcome = {
@@ -208,7 +204,7 @@ pub fn maze_route_msmd_sequential(p: &MsmdParams, net_ids: &[usize], nets: &[Rsm
             }
         }
     }
-    Ok(MsmdResult { enlarge, slack_th })
+    Ok(MsmdResult { slack_th })
 }
 
 /// The tree edge the seeding recorded at `pt` — the reference's `corr_edge_[y][x]`, an array each
