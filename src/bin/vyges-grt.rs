@@ -1221,6 +1221,12 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 let path = step["path"].as_str().ok_or_else(|| err("path"))?;
                 std::fs::write(path, vyges_grt::global_route::router_state_text("end", state).map_err(Fail::Refused)?).map_err(err)?;
             }
+            // Filler insertion is deliberately NOT a step. It only adds new, unconnected instances in
+            // the row gaps and touches nothing already placed, and the router listens for database
+            // changes only inside a repair's own re-route — so it dirties no net and changes no
+            // route or guide. A job may therefore drop it when nothing after it reads the placement.
+            // ⛔ Followed by a route, a repair or a legalization it is NOT inert (the fillers occupy
+            // sites the diode placer and the legalizer would avoid): such a job must be refused.
             "placement_padding" => {
                 padding = (step["left"].as_i64().unwrap_or(0) as i32, step["right"].as_i64().unwrap_or(0) as i32);
             }
