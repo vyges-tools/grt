@@ -101,6 +101,14 @@ struct Seen {
     r16_checked: usize,
     r16_widened: usize,
     r16_res_aware: usize,
+    r18_passes: usize,
+    r18_ra_skipped: usize,
+    emptied_routes: usize,
+    r19_checked: usize,
+    r19_defects: usize,
+    r19_pin_stacks: usize,
+    r20_checked: usize,
+    r20_segments: usize,
     thinned: usize,
     loop_partial_slack: usize,
     loop_extra_stops: usize,
@@ -163,6 +171,20 @@ fn replay(g: &Value, bounds: &Value) -> Seen {
 /// used-grid sets, and every routed net's node statuses and edge routes.
 fn check_boundary(at: &str, b: &Value, scan: &Overflow2DScan, g2d: &Graph2d, state: &[NetState], seen: &mut Seen) {
     let tag = b["tag"].as_str().expect("tag");
+    if !check_grid(at, b, scan, g2d, seen) {
+        return;
+    }
+    let at = format!("{at} {tag}");
+    for (id, n) in b["nets"].as_object().expect("nets") {
+        check_net_2d(&at, tag, id, n, b, state, seen);
+    }
+    seen.boundaries += 1;
+}
+
+/// The router-wide half of a boundary: the scalars, both 2D usages, the history and the used-grid
+/// sets. False for a THINNED loop boundary, which carries nothing more.
+fn check_grid(at: &str, b: &Value, scan: &Overflow2DScan, g2d: &Graph2d, seen: &mut Seen) -> bool {
+    let tag = b["tag"].as_str().expect("tag");
     let at = format!("{at} {tag}");
     assert_eq!((scan.total_overflow, scan.max_overflow, scan.ahth), (int(&b["total_overflow"]), int(&b["max_overflow"]), int(&b["ahth"])),
                "{at}: getOverflow2D (total, max, ahth)");
@@ -172,7 +194,7 @@ fn check_boundary(at: &str, b: &Value, scan: &Overflow2DScan, g2d: &Graph2d, sta
     // ⚠️ A THINNED loop boundary carries only its parameters and the scalars above.
     if b["thinned"].as_bool() == Some(true) {
         seen.thinned += 1;
-        return;
+        return false;
     }
     for (dir, rows) in [("H", &b["est"]["H"]), ("V", &b["est"]["V"])] {
         for (y, row) in arr(rows).iter().enumerate() {
@@ -214,7 +236,12 @@ fn check_boundary(at: &str, b: &Value, scan: &Overflow2DScan, g2d: &Graph2d, sta
         let want: Vec<(i32, i32)> = arr(&b["used"][dir]).iter().map(|p| (int(&p[0]), int(&p[1]))).collect();
         assert_eq!(ours.iter().copied().collect::<Vec<_>>(), want, "{at}: used grids {dir}");
     }
-    for (id, n) in b["nets"].as_object().expect("nets") {
+    true
+}
+
+/// One net's 2D state at a boundary: its tree, topology, slack and maze routes.
+fn check_net_2d(at: &str, tag: &str, id: &str, n: &Value, b: &Value, state: &[NetState], seen: &mut Seen) {
+    {
         let id: usize = id.parse().expect("net id");
         let t = state[id].tree.as_ref().unwrap_or_else(|| panic!("{at}: net {id} has no tree"));
         let nodes: Vec<(i32, i32, i32)> = arr(&n["nodes"]).iter().map(|v| (int(&v[0]), int(&v[1]), int(&v[2]))).collect();
@@ -252,6 +279,63 @@ fn check_boundary(at: &str, b: &Value, scan: &Overflow2DScan, g2d: &Graph2d, sta
                 if r.hvh { seen.gate_hvh += 1 } else { seen.gate_vhv += 1 }
             }
         }
+    }
+}
+
+/// A boundary from B18 on, where the 3D tree is canonical: the grid half, then each net's 3D tree —
+/// nodes (x, y, status), edges (n1, n2, len, type), neighbours, slack, every maze route's
+/// (routelen, x, y, layer) and every node's layer bookkeeping — and the 3D usage.
+///
+/// ⚠️ Not compared: an edge's xFirst / HVH / Zpoint and `last_routelen` — 2D-stage fields nothing
+/// reads after R16, which the 3D tree does not carry.
+fn check_boundary_3d(at: &str, b: &Value, scan: &Overflow2DScan, g2d: &Graph2d, g3: &Graph3d, state: &[NetState], nets: &[RsmtNet<'_>], seen: &mut Seen) {
+    assert!(check_grid(at, b, scan, g2d, seen), "{at}: a 3D boundary is never thinned");
+    let at = format!("{at} {}", b["tag"].as_str().expect("tag"));
+    let (xg, yg) = (int(&b["xg"]) as usize, int(&b["yg"]) as usize);
+    let want = graph3d_from(&serde_json::json!({ "c3": b["u3"], "u3": b["u3"] }), xg, yg);
+    assert_eq!((&g3.h_usage, &g3.v_usage), (&want.h_usage, &want.v_usage), "{at}: 3D usage");
+    for (id, n) in b["nets"].as_object().expect("nets") {
+        let id: usize = id.parse().expect("net id");
+        let t = state[id].tree3d.as_ref().unwrap_or_else(|| panic!("{at}: net {id} has no 3D tree"));
+        let nodes: Vec<(i32, i32, i32)> = arr(&n["nodes"]).iter().map(|v| (int(&v[0]), int(&v[1]), int(&v[2]))).collect();
+        let ours: Vec<(i32, i32, i32)> = t.nodes.iter().map(|v| (i32::from(v.x), i32::from(v.y), i32::from(v.status))).collect();
+        assert_eq!(ours, nodes, "{at}: net {id} nodes (x, y, status)");
+        let edges: Vec<[i32; 4]> = arr(&n["edges"]).iter().map(|e| std::array::from_fn(|k| int(&e[k]))).collect();
+        let ours: Vec<[i32; 4]> = t.edges.iter().map(|e| [e.n1 as i32, e.n2 as i32, e.len, e.route_type as i32]).collect();
+        assert_eq!(ours, edges, "{at}: net {id} edges (n1, n2, len, type)");
+        if let Some(topo) = b.get("topo").and_then(|t| t.get(id.to_string())) {
+            for (i, v) in arr(topo).iter().enumerate() {
+                let cnt = int(&v[0]) as usize;
+                let want: Vec<(usize, usize)> = (0..cnt).map(|k| (int(&v[1 + k]) as usize, int(&v[4 + k]) as usize)).collect();
+                assert_eq!(t.nodes[i].nbr, want, "{at}: net {id} node {i} neighbours");
+            }
+        }
+        if let Some(ns) = b.get("netstate").and_then(|t| t.get(id.to_string())) {
+            assert_eq!((state[id].slack.to_bits(), state[id].critical), (int(&ns["slack_bits"]) as u32, ns["critical"].as_bool().expect("critical")), "{at}: net {id} (slack bits, critical)");
+        }
+        for (eid, e) in t.edges.iter().enumerate().filter(|(_, e)| e.route_type == vyges_grt::RouteType::MazeRoute) {
+            let g = &b["grids"][format!("{id},{eid}")];
+            assert!(!g.is_null(), "{at}: net {id} edge {eid}: a maze route the reference does not have");
+            let pts: Vec<(i16, i16, i16)> = arr(&g["points"]).iter().map(|p| (int(&p[0]) as i16, int(&p[1]) as i16, int(&p[2]) as i16)).collect();
+            // ⚠️ `updateRouteType2` with `len_A1A2 == 1` CLEARS the grids and never resizes them: the
+            // reference's vector is EMPTY with `routelen` 0 (its captured size says so). Ours too.
+            let size = int(&g["size"]) as usize;
+            assert_eq!(e.grids.len().min(e.routelen as usize + 1), size.min(int(&g["routelen"]) as usize + 1), "{at}: net {id} edge {eid}: points held (reference size {size})");
+            if size == 0 {
+                seen.emptied_routes += 1;
+                continue;
+            }
+            let ours: Vec<(i16, i16, i16)> = e.grids.iter().take(e.routelen as usize + 1).map(|q| (q.x, q.y, q.layer)).collect();
+            assert_eq!((e.routelen, ours), (int(&g["routelen"]), pts), "{at}: net {id} edge {eid} (routelen, grids)");
+            seen.maze_routes += 1;
+        }
+        let ours: Vec<[i32; 6]> = t.nodes.iter().map(|w| [i32::from(w.conn.top_layer), i32::from(w.conn.bot_layer), w.conn.h_id, w.conn.l_id, i32::from(w.conn.con_cnt), i32::from(w.assigned)]).collect();
+        let want: Vec<[i32; 6]> = arr(&b["layers"][id.to_string()]).iter().map(|v| std::array::from_fn(|k| int(&v[k]))).collect();
+        assert_eq!(ours, want, "{at}: net {id} nodes (topL, botL, hID, lID, conCNT, assigned)");
+        let a = arr(&b["attrs"][id.to_string()]);
+        let range = state[id].layer_range.unwrap_or((nets[id].min_layer, nets[id].max_layer));
+        assert_eq!((range.0 as i32, range.1 as i32), (int(&a[3]), int(&a[4])), "{at}: net {id} layer range");
+        seen.boundary_nets += 1;
     }
     seen.boundaries += 1;
 }
@@ -639,6 +723,7 @@ fn replay_run(r: &Value, bounds: Option<&Value>, seen: &mut Seen) {
                         let mut befores = 0usize;
                         let mut final_ready = false;
                         let mut has_2d_overflow = false;
+                        let mut loop_enlarge = 0;
                         let mut prev_scan = last;
                         let outcome = congestion_loop(&start, &net_ids, &nets, &mut state, &mut grid14, &mut |ev, g, st| match ev {
                             LoopEvent::Before { params: p, schedule: sc } => {
@@ -678,6 +763,7 @@ fn replay_run(r: &Value, bounds: Option<&Value>, seen: &mut Seen) {
                                 assert_eq!(end.rare, RareBranches::default(), "{at}: a loop branch the corpus never reached fired: {:?}", end.rare);
                                 final_ready = true;
                                 has_2d_overflow = end.has_2d_overflow;
+                                loop_enlarge = end.enlarge;
                             }
                             Err(e) if e.contains("CalculatePartialSlack") => {
                                 assert!(cnp != 0, "{at}: partial slack refused with cnp 0");
@@ -711,18 +797,18 @@ fn replay_run(r: &Value, bounds: Option<&Value>, seen: &mut Seen) {
                                     let attrs = layer_attrs(b15, b16, max_id + 1);
                                     let p = LayerParams { layer_dir: &dirs, resistance_aware: int(&dims["resaware"]) == 1, liberty: int(&dims["liberty"]) == 1, has_2d_overflow };
                                     let assigned = match layer_assignment(&net_ids, &nets, &attrs, &mut state, &mut g3, &p) {
-                                        Ok(()) => true,
+                                        Ok(order) => Some(order),
                                         // ⛔ Resistance-aware with a liberty library: updateSlacks keeps a net
                                         // (an unconstrained CLOCK net is not skipped) and reads its resistance
                                         // from the database — not wired. A declared stop, counted.
                                         Err(e) if e.contains("needs its resistance") => {
                                             assert!(p.liberty && p.resistance_aware, "{at}: {e} without liberty + resistance-aware");
                                             seen.r16_res_aware += 1;
-                                            false
+                                            None
                                         }
                                         Err(e) => panic!("{at}: {e}"),
                                     };
-                                    if assigned {
+                                    if let Some(order) = assigned {
                                     let ov3 = get_overflow_3d_all(&g2d, &g3);
                                     assert_eq!((b16["logistic_coef"].as_f64().expect("past_cong") as i32, int(&b16["total_overflow"]), int(&b16["t_usage"])), (scan.total_overflow, ov3.total, ov3.total_usage),
                                                "{at} B16: (past_cong, getOverflow3D overflow, 3D usage)");
@@ -733,6 +819,61 @@ fn replay_run(r: &Value, bounds: Option<&Value>, seen: &mut Seen) {
                                     // call takes it (no B17 anywhere in the full dump).
                                     assert_eq!(scan.total_overflow, ov3.total, "{at}: 2D and 3D overflow differ — the NDR-disable branch (R17) runs; the corpus never did");
                                     assert!(at_b("B17").is_none(), "{at}: B17 captured");
+                                    // R18 — costheight 3, via cost 1; with no congestion left, two
+                                    // mazeRouteMSMDOrder3D calls over the long then the short edges
+                                    // (every edge when resistance-aware), at run()'s enlarge_.
+                                    let b18a = at_b("B18a");
+                                    assert_eq!(b18a.is_some(), scan.total_overflow == 0, "{at}: the 3D passes run exactly when past_cong is 0");
+                                    if let Some(b18a) = b18a {
+                                        let (long, short) = if p.resistance_aware { (BIG_INT, BIG_INT) } else { (40, 12) };
+                                        let scan18 = Overflow2DScan { total_overflow: ov3.total, ..scan };
+                                        let mut order = order;
+                                        for (b, ub) in [(b18a, long), (at_b("B18b").expect("B18b follows B18a"), short)] {
+                                            let tag = b["tag"].as_str().expect("tag");
+                                            assert_eq!((b["logistic_coef"].as_f64().expect("enlarge") as i32, int(&b["t_usage"])), (loop_enlarge, ub), "{at} {tag}: (enlarge_, rip-up bound)");
+                                            let mp = Maze3dParams { layer: &p, expand: loop_enlarge, ripup_lb: 0, ripup_ub: ub, via_cost: 1 };
+                                            // ⛔ Asserted, not noted: in a resistance-aware call every net has
+                                            // slack >= 0 (a constrained net stops at R16), so the pass skips them
+                                            // ALL — its prelude, detour and slack reads are never exercised here.
+                                            if p.resistance_aware {
+                                                assert!(order.iter().all(|&id| state[id].slack >= 0.0), "{at} {tag}: a resistance-aware 3D pass with a negative-slack net");
+                                                seen.r18_ra_skipped += 1;
+                                            }
+                                            match maze_route_msmd_order_3d_all(&order, &nets, &attrs, &mut state, &mut g2d, &mut g3, &mp) {
+                                                Ok((o, _recovered)) => order = o,
+                                                Err(e) => panic!("{at} {tag}: {e}"),
+                                            }
+                                            check_boundary_3d(&at, b, &scan18, &g2d, &g3, &state, &nets, seen);
+                                            seen.r18_passes += 1;
+                                        }
+                                    }
+                                    // R19 — fillVIA, getOverflow3D, threeDVIA, checkRoute3D, ensurePinCoverage.
+                                    let b19 = at_b("B19").unwrap_or_else(|| panic!("{at}: B19 follows B16"));
+                                    let fin = finish_3d(&net_ids, &nets, &attrs, &mut state, &g2d, &g3).unwrap_or_else(|e| panic!("{at} B19: {e}"));
+                                    assert_eq!((b19["logistic_coef"].as_f64().expect("numVia") as i32, int(&b19["t_usage"])), (fin.num_via, fin.overflow.total_usage), "{at} B19: (numVia, finallength)");
+                                    check_boundary_3d(&at, b19, &Overflow2DScan { total_overflow: fin.overflow.total, ..scan }, &g2d, &g3, &state, &nets, seen);
+                                    seen.r19_checked += 1;
+                                    seen.r19_defects += fin.defects.len();
+                                    seen.r19_pin_stacks += fin.pin_stacks;
+                                    // ⛔ Asserted, not noted: no corpus route leaves a pin unreached, and the
+                                    // checker finds nothing — ensurePinCoverage's stacks and the checker's
+                                    // findings are witnessed by `tests/checks3d.rs` alone.
+                                    assert_eq!(fin.pin_stacks, 0, "{at} B19: ensurePinCoverage appended a via stack; the corpus never did");
+                                    assert!(fin.defects.is_empty(), "{at} B19: checkRoute3D found {:?}; the corpus never did", fin.defects);
+                                    // R20 — getRoutes, keyed here by net id (the database id in a real run).
+                                    if let Some(b20) = at_b("B20") {
+                                        let ids: Vec<u32> = (0..state.len() as u32).collect();
+                                        let origin = GridOrigin { tile_size: int(&dims["tile"]), x_corner: int(&dims["corner"][0]), y_corner: int(&dims["corner"][1]) };
+                                        let routes = get_routes_all(&net_ids, &state, &ids, origin);
+                                        let none = serde_json::Map::new();
+                                        for (id, segs) in b20["routes"].as_object().unwrap_or(&none) {
+                                            let want: Vec<[i32; 6]> = arr(segs).iter().map(|v| std::array::from_fn(|k| int(&v[k]))).collect();
+                                            let ours: Vec<[i32; 6]> = routes.get(&id.parse::<u32>().expect("id")).map(|r| r.iter().map(|g| [g.init_x, g.init_y, g.init_layer, g.final_x, g.final_y, g.final_layer]).collect()).unwrap_or_default();
+                                            assert_eq!(ours, want, "{at} B20: net {id} segments");
+                                            seen.r20_segments += want.len();
+                                        }
+                                        seen.r20_checked += 1;
+                                    }
                                     seen.r16_checked += 1;
                                     }
                                 }
@@ -772,7 +913,7 @@ fn add(a: Seen, b: Seen) -> Seen {
         runs: a.runs + b.runs, calls: a.calls + b.calls, nets: a.nets + b.nets, flute_nets: a.flute_nets + b.flute_nets,
         shifted: a.shifted + b.shifted, shifts: a.shifts + b.shifts, copied: a.copied + b.copied,
         routed_edges: a.routed_edges + b.routed_edges, usage_checked: a.usage_checked + b.usage_checked,
-        ndr_checked: a.ndr_checked + b.ndr_checked, r6_checked: a.r6_checked + b.r6_checked, r6_segs: a.r6_segs + b.r6_segs, boundaries: a.boundaries + b.boundaries, boundary_nets: a.boundary_nets + b.boundary_nets, incremental: a.incremental + b.incremental, gate_hvh: a.gate_hvh + b.gate_hvh, gate_vhv: a.gate_vhv + b.gate_vhv, maze_routes: a.maze_routes + b.maze_routes, maze_passes: a.maze_passes + b.maze_passes, usage_errors: a.usage_errors + b.usage_errors, loop_iterations: a.loop_iterations + b.loop_iterations, snapshot_batched: a.snapshot_batched + b.snapshot_batched, loops_removed: a.loops_removed + b.loops_removed, r15_checked: a.r15_checked + b.r15_checked, r16_checked: a.r16_checked + b.r16_checked, r16_widened: a.r16_widened + b.r16_widened, r16_res_aware: a.r16_res_aware + b.r16_res_aware, thinned: a.thinned + b.thinned, loop_partial_slack: a.loop_partial_slack + b.loop_partial_slack, loop_extra_stops: a.loop_extra_stops + b.loop_extra_stops, stacked_pins: a.stacked_pins + b.stacked_pins, htree: a.htree + b.htree,
+        ndr_checked: a.ndr_checked + b.ndr_checked, r6_checked: a.r6_checked + b.r6_checked, r6_segs: a.r6_segs + b.r6_segs, boundaries: a.boundaries + b.boundaries, boundary_nets: a.boundary_nets + b.boundary_nets, incremental: a.incremental + b.incremental, gate_hvh: a.gate_hvh + b.gate_hvh, gate_vhv: a.gate_vhv + b.gate_vhv, maze_routes: a.maze_routes + b.maze_routes, maze_passes: a.maze_passes + b.maze_passes, usage_errors: a.usage_errors + b.usage_errors, loop_iterations: a.loop_iterations + b.loop_iterations, snapshot_batched: a.snapshot_batched + b.snapshot_batched, loops_removed: a.loops_removed + b.loops_removed, r15_checked: a.r15_checked + b.r15_checked, r16_checked: a.r16_checked + b.r16_checked, r16_widened: a.r16_widened + b.r16_widened, r16_res_aware: a.r16_res_aware + b.r16_res_aware, r18_passes: a.r18_passes + b.r18_passes, r18_ra_skipped: a.r18_ra_skipped + b.r18_ra_skipped, emptied_routes: a.emptied_routes + b.emptied_routes, r19_checked: a.r19_checked + b.r19_checked, r19_defects: a.r19_defects + b.r19_defects, r19_pin_stacks: a.r19_pin_stacks + b.r19_pin_stacks, r20_checked: a.r20_checked + b.r20_checked, r20_segments: a.r20_segments + b.r20_segments, thinned: a.thinned + b.thinned, loop_partial_slack: a.loop_partial_slack + b.loop_partial_slack, loop_extra_stops: a.loop_extra_stops + b.loop_extra_stops, stacked_pins: a.stacked_pins + b.stacked_pins, htree: a.htree + b.htree,
     }
 }
 
@@ -858,6 +999,9 @@ fn check_3d(at: &str, b: &Value, g3: &Graph3d, state: &[NetState], nets: &[RsmtN
         }
     }
 }
+
+/// The reference's `BIG_INT`.
+const BIG_INT: i32 = 1_000_000_000;
 
 fn no_red(_: usize, _: usize) -> u16 {
     0
@@ -1470,4 +1614,24 @@ fn layer_assignment_keeps_a_widened_range_for_later_edges() {
     let (st, _) = la_case(&HVH, 5, 3, &spec(()), cap, &[0], false, true);
     assert_eq!(st[0].layer_range, None, "no widening under 2D overflow");
     assert!(la_layers(&st, 0, (4, 0), (2, 0)).contains(&2), "so the next edge climbs to layer 2");
+}
+
+/// ⛔ `ensurePinCoverage` appends each missing via stack as a DEFAULT `TreeEdge` — both ends node 0,
+/// length 0, a maze route — after the net's existing edges. No corpus route leaves a pin unreached
+/// (asserted at B19), so this is the append's only witness. A two-pin net whose second pin sits on
+/// layer 2 while its only edge arrives on layer 0: the stack 0 → 2 is appended at that pin.
+#[test]
+fn ensure_pin_coverage_appends_a_default_edge_per_unreached_pin() {
+    let (st, _) = la_case(&HVH, 4, 3, &[LaNet::two_pin((0, 0), (3, 0), 3)], |_, _, _, _| 5, &[0], false, false);
+    let mut st = st;
+    let t = st[0].tree3d.as_mut().expect("3D tree");
+    let far = (0..t.num_terminals).find(|&i| (t.nodes[i].x, t.nodes[i].y) == (3, 0)).expect("pin at (3, 0)");
+    t.nodes[far].conn.bot_layer = 2;
+    let before = t.edges.len();
+    assert_eq!(ensure_pin_coverage_all(&[0], &mut st, 3), 1, "one stack");
+    let t = st[0].tree3d.as_ref().expect("3D tree");
+    assert_eq!(t.edges.len(), before + 1, "appended after the existing edges");
+    let e = t.edges.last().expect("edge");
+    assert_eq!((e.n1, e.n2, e.n1a, e.n2a, e.len, e.route_type, e.routelen), (0, 0, 0, 0, 0, RouteType::MazeRoute, 2));
+    assert_eq!(e.grids.iter().map(|q| (q.x, q.y, q.layer)).collect::<Vec<_>>(), vec![(3, 0, 0), (3, 0, 1), (3, 0, 2)]);
 }

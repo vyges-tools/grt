@@ -239,11 +239,15 @@ pub struct NetState {
     /// while it is still the net's own. ⛔ The widening PERSISTS: later edges, and the 3D passes,
     /// read the widened range.
     pub layer_range: Option<(usize, usize)>,
+    /// The net's tree in three dimensions, as layer assignment (R16) leaves it — nodes with their
+    /// connection arrays (`eID`, `heights`), edges with layered grids. ⛔ From R16 on this is the
+    /// canonical tree: the 3D passes rewrite it, and [`tree`](Self::tree) stays as R16 left it.
+    pub tree3d: Option<crate::maze3d::Tree3D>,
 }
 
 impl Default for NetState {
     fn default() -> Self {
-        NetState { seglist: Vec::new(), sorted: None, tree: None, slack: crate::ripup::SLACK_SENTINEL, critical: false, layer_range: None }
+        NetState { seglist: Vec::new(), sorted: None, tree: None, slack: crate::ripup::SLACK_SENTINEL, critical: false, layer_range: None, tree3d: None }
     }
 }
 

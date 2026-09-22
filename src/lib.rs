@@ -98,7 +98,7 @@ pub mod maze_phase;
 pub mod maze_msmd;
 pub mod congestion_loop;
 pub mod finalize;
-pub use finalize::{get_overflow_3d_all, layer_assignment, remove_loops_all, Graph3d, LayerParams, NetLayerAttrs};
+pub use finalize::{ensure_pin_coverage_all, finish_3d, get_overflow_3d_all, get_routes_all, layer_assignment, maze_route_msmd_order_3d_all, Finish3d, remove_loops_all, Graph3d, LayerParams, Maze3dParams, NetLayerAttrs};
 pub use congestion_loop::{congestion_loop, copy_br, copy_rs, LoopEnd, LoopEvent, LoopStart, PassKind, LoopSchedule, RareBranches};
 pub use maze_msmd::{attach_path_end, corr_edge_at, maze_route_msmd_sequential, st_net_order, MsmdParams, MsmdResult};
 pub use maze_phase::{convert_to_mazeroute_all, init_for_congestion_loop, lv_rounds, route_monotonic_all, route_monotonic_edge, LvRound};

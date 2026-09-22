@@ -44,6 +44,12 @@ pub struct PassGrid {
     pub v2_usage: Vec<i32>,
     /// `corr_edge_3D` — only cells some seeding has written.
     pub corr: HashMap<Cell3, usize>,
+    /// When set, every 2D charge in the order made: (net index, horizontal, x, y, amount). The
+    /// reference charges 2D through `updateUsageH/V` — NDR-aware, and inserting into the used-grid
+    /// sets on a positive charge — which a caller holding the real 2D graph replays from this.
+    pub log_2d: Option<Vec<(usize, bool, i16, i16, i32)>>,
+    /// The net being routed (its index in the pass's net slice), for the log.
+    pub current_net: usize,
 }
 
 impl PassGrid {
@@ -91,10 +97,18 @@ impl UsageGrid for Charge<'_> {
     fn add_usage_v_2d(&mut self, x: i16, y: i16, d: i32) {
         let i = y as usize * self.grid.x_grid + x as usize;
         self.grid.v2_usage[i] += d;
+        let n = self.grid.current_net;
+        if let Some(log) = self.grid.log_2d.as_mut() {
+            log.push((n, false, x, y, d));
+        }
     }
     fn add_usage_h_2d(&mut self, x: i16, y: i16, d: i32) {
         let i = y as usize * (self.grid.x_grid - 1) + x as usize;
         self.grid.h2_usage[i] += d;
+        let n = self.grid.current_net;
+        if let Some(log) = self.grid.log_2d.as_mut() {
+            log.push((n, true, x, y, d));
+        }
     }
     fn add_usage_v_3d(&mut self, l: i16, x: i16, y: i16, d: i32) {
         let i = self.grid.v3(l as usize, y as usize, x as usize);
@@ -137,6 +151,7 @@ impl Maze3DEdgeWork for PassWork<'_> {
         self.nets[net].tree.edges[edge].len
     }
     fn route_edge(&mut self, net_id: usize, edge_id: usize) -> EdgeResult {
+        self.grid.current_net = net_id;
         route_one_edge_3d(self.grid, &mut self.nets[net_id], edge_id, self.params)
     }
 }

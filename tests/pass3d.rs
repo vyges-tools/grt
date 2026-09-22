@@ -80,6 +80,8 @@ fn replay(g: &Value) -> usize {
             h3_usage: h3u, h3_cap: h3c, v3_usage: v3u, v3_cap: v3c,
             h2_usage: grid2(&c["in"], "H2", yg), v2_usage: grid2(&c["in"], "V2", yg - 1),
             corr: HashMap::new(),
+            log_2d: None,
+            current_net: 0,
         };
         let net_ids: Vec<i64> = c["nets"].as_array().expect("nets").iter().map(|n| int(&n["id"])).collect();
         let mut nets: Vec<PassNet> = c["nets"].as_array().expect("nets").iter().map(|n| {
