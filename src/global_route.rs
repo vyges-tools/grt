@@ -46,6 +46,11 @@ pub struct RouteOptions {
     pub resistance_aware: bool,
     /// `-res_aware_nets_percentage` — once given, FIXED (`is_fixed_nets_percentage_`).
     pub res_aware_nets_percentage: Option<f32>,
+    /// `set_layer_rc -layer` — the ESTIMATOR's table: routing level → (ohm/m, F/m). The parasitics
+    /// read it in preference to the technology's own values.
+    pub layer_rc: std::collections::BTreeMap<i32, (f64, f64)>,
+    /// `set_layer_rc -via` — the estimator's table for a cut layer, by its name (ohms per cut).
+    pub via_rc: std::collections::BTreeMap<String, f64>,
     pub critical_nets_percentage: f32,
     /// `set_global_routing_layer_adjustment *`.
     pub adjustment: f32,
@@ -86,6 +91,8 @@ impl RouteOptions {
             captured_update_slacks: None,
             resistance_aware: false,
             res_aware_nets_percentage: None,
+            layer_rc: std::collections::BTreeMap::new(),
+            via_rc: std::collections::BTreeMap::new(),
             critical_nets_percentage: 10.0,
             adjustment: 0.0,
             grid_origin: (0, 0),
@@ -717,6 +724,12 @@ pub struct RouteResult {
     pub routes: std::collections::BTreeMap<u32, Vec<crate::GSegment>>,
     /// The nets `initClockNets` re-typed CLOCK (`findClkNets`), by name.
     pub clock_nets: std::collections::BTreeSet<String>,
+    /// `est::estimateAllGlobalRouteParasitics` at the router's FIRST partial-slack call: each
+    /// net's RC network, built from the planar routes as they stood then. Empty when the run
+    /// reached no such call.
+    pub parasitics: std::collections::BTreeMap<String, crate::parasitics::Network>,
+    /// The planar routes those networks were built from (`getPlanarRoutes`), by net.
+    pub planar_routes: std::collections::BTreeMap<String, Vec<crate::parasitics::Segment>>,
     pub log: Vec<String>,
 }
 
@@ -944,22 +957,89 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         origin: crate::routes::GridOrigin { tile_size: t.core.tile_size, x_corner: t.core.area.x_min, y_corner: t.core.area.y_min },
         db_id: &db_id,
     };
-    // The run's final overflow (after R19), for the congestion verdict.
-    struct Overflow(i32);
-    impl RunObserver for Overflow {
-        fn stage(&mut self, s: Stage<'_>, _: &crate::graph2d::Graph2d, _: Option<&Graph3d>, _: &[NetState]) -> bool {
-            if let Stage::B19(fin) = s {
-                self.0 = fin.overflow.total;
+    // ⛔ The parasitics read the estimator's table where it has a value, and the technology's own
+    // only where it has none (`MakeWireParasitics::layerRC`).
+    let layer_rc = |db: &Db| -> crate::parasitics::LayerRC {
+        let mut rc = crate::parasitics::LayerRC { dbu_per_micron: db.tech_get_db_units_per_micron(), ..Default::default() };
+        for l in &t.tech.routing_layers {
+            let (lvl, name) = (l.routing_level, &l.name);
+            rc.width.insert(lvl, db.layer_get_width(name) as i32);
+            rc.resistance.insert(lvl, db.layer_get_resistance(name));
+            rc.capacitance.insert(lvl, db.layer_get_capacitance(name));
+            rc.edge_capacitance.insert(lvl, db.layer_get_edge_capacitance(name));
+            if let Some(&(res, cap)) = opts.layer_rc.get(&lvl) {
+                rc.table_res.insert(lvl, res);
+                rc.table_cap.insert(lvl, cap);
+            }
+            let cut = db.layer_get_upper_layer(name);
+            if !cut.is_empty() {
+                rc.cut_resistance.insert(lvl, db.layer_get_resistance(&cut));
+                if let Some(&res) = opts.via_rc.get(&cut) {
+                    rc.cut_table_res.insert(lvl, res);
+                }
+            }
+        }
+        rc
+    };
+    // The run's final overflow (after R19), for the congestion verdict — and the 2D trees at the
+    // first partial-slack call, which is the state `estimateAllGlobalRouteParasitics` reads
+    // (`getPartialRoutes` → `getPlanarRoutes`) when the router asks the timer for slacks.
+    struct Observer {
+        overflow: i32,
+        cnp: f32,
+        trees: Option<Vec<Option<crate::brk_rsmt::StTree>>>,
+    }
+    impl RunObserver for Observer {
+        fn stage(&mut self, s: Stage<'_>, _: &crate::graph2d::Graph2d, _: Option<&Graph3d>, st: &[NetState]) -> bool {
+            match s {
+                Stage::B19(fin) => self.overflow = fin.overflow.total,
+                Stage::Loop(crate::congestion_loop::LoopEvent::Before { params, .. }) if params.ordering && self.cnp != 0.0 && self.trees.is_none() => {
+                    self.trees = Some(st.iter().map(|n| n.tree.clone()).collect());
+                }
+                _ => {}
             }
             true
         }
     }
     let mut state = vec![NetState::default(); nets.len()];
-    let mut ov = Overflow(0);
+    let mut ov = Observer { overflow: 0, cnp: t.config.critical_nets_percentage, trees: None };
     let routes = match fastroute_run(&inp, &mut state, &mut ov)? {
         RunEnd::Routed(r) => r,
         RunEnd::Stopped => return Err("run() stopped".into()),
     };
+    // est::estimateAllGlobalRouteParasitics, on the planar routes the first partial-slack call saw.
+    let mut parasitics = std::collections::BTreeMap::new();
+    let mut planar_routes: std::collections::BTreeMap<String, Vec<crate::parasitics::Segment>> = std::collections::BTreeMap::new();
+    if let Some(trees) = &ov.trees {
+        let rc = layer_rc(db);
+        let origin = crate::routes::GridOrigin { tile_size: t.core.tile_size, x_corner: t.core.area.x_min, y_corner: t.core.area.y_min };
+        for &id in &net_ids {
+            let n = &nets[id];
+            let Some(tree) = trees[id].as_ref() else { continue };
+            let edges: Vec<crate::planar_route::PlanarEdge<'_>> = tree
+                .edges
+                .iter()
+                .zip(&tree.routes)
+                .map(|(e, route)| crate::planar_route::PlanarEdge { len: e.len, routelen: route.routelen, grids: &route.grids })
+                .collect();
+            let route = crate::planar_route::planar_route(&edges, (n.min_layer - 1) as usize, &layer_dir, origin);
+            let pins: Vec<crate::parasitics::PinGridLocation> = n
+                .net_pins
+                .iter()
+                .map(|p| crate::parasitics::PinGridLocation { name: p.name.clone(), pt: p.position, grid_pt: p.on_grid, conn_layer: p.connection_layer })
+                .collect();
+            let np = crate::parasitics::NetParasitics {
+                name: &n.name,
+                route: &route,
+                pins: &pins,
+                net_min_layer: n.min_layer,
+                min_routing_layer: t.min_routing_layer,
+                ndr_width: None,
+            };
+            parasitics.insert(n.name.clone(), crate::parasitics::estimate_net(&np, &rc));
+            planar_routes.insert(n.name.clone(), route);
+        }
+    }
     // F — findRouting's post-processing: remaining guides, pad pins (inert), then each merge.
     let raw_routes = routes.clone();
     let mut by_name: std::collections::BTreeMap<String, Vec<crate::GSegment>> =
@@ -976,7 +1056,7 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         }
     }
     // X — saveGuides over the block's nets, in its order.
-    let total_overflow = ov.0;
+    let total_overflow = ov.overflow;
     let guide_is_congested = total_overflow > 0 && !opts.allow_congestion;
     let order = db.net_names();
     let net_routes: Vec<crate::NetRoute> = order
@@ -995,5 +1075,5 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     let save = crate::SaveOptions { guide_is_congested, origin_x: opts.grid_origin.0, origin_y: opts.grid_origin.1, min_routing_layer: t.min_routing_layer };
     let guides = crate::save_guides(&net_routes, &grid, &save).map_err(|e| format!("{e:?}"))?;
     let layer_names = t.tech.routing_layers.iter().map(|l| (l.routing_level, l.name.clone())).collect();
-    Ok(RouteResult { guides, layer_names, total_overflow, guide_is_congested, routes: raw_routes, clock_nets, log })
+    Ok(RouteResult { guides, layer_names, total_overflow, guide_is_congested, routes: raw_routes, clock_nets, parasitics, planar_routes, log })
 }

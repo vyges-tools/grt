@@ -34,12 +34,17 @@ struct Group {
     kind: String,
     args: Vec<String>,
     attrs: Vec<(String, String)>,
+    /// `name (a, b);` — a complex attribute, kept for `capacitive_load_unit`.
+    complex: Vec<(String, Vec<String>)>,
     groups: Vec<Group>,
 }
 
 impl Group {
     fn attr(&self, key: &str) -> Option<&str> {
         self.attrs.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+    fn complex_attr(&self, key: &str) -> Option<&[String]> {
+        self.complex.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_slice())
     }
     fn children<'a>(&'a self, kind: &'a str) -> impl Iterator<Item = &'a Group> + 'a {
         self.groups.iter().filter(move |g| g.kind == kind)
@@ -132,6 +137,8 @@ fn parse_body(t: &[Tok], mut i: usize, g: &mut Group) -> Result<usize, String> {
                     let mut child = Group { kind: name, args, ..Group::default() };
                     i = parse_body(t, i + 1, &mut child)?;
                     g.groups.push(child);
+                } else {
+                    g.complex.push((name, args));
                 }
             }
             _ => return Err(format!("liberty: '{name}' is neither an attribute nor a group")),
@@ -520,6 +527,8 @@ pub struct Units {
     pub resistance: f32,
     /// `distance_unit` (default 1 micron).
     pub distance: f32,
+    /// `capacitive_load_unit (<scale>, ff|pf)` (default 1 pF).
+    pub capacitance: f32,
 }
 
 /// `LibertyReader::readUnit`: `<1|10|100><scale char><suffix>`, the scale char one of k m u n p f.
@@ -546,6 +555,19 @@ fn read_unit(value: Option<&str>, suffix: &str, default: f32) -> f32 {
     scale_mult * mult
 }
 
+/// `capacitive_load_unit (<scale>, ff|pf)` — the scale times 1e-15 or 1e-12, in `float`.
+/// ⚠️ Anything else only warns in the reference; the default (1 pF) stands.
+fn read_cap_unit(values: Option<&[String]>) -> f32 {
+    let default = 1e-12f32;
+    let Some([scale, suffix]) = values else { return default };
+    let Ok(scale) = scale.parse::<f32>() else { return default };
+    match suffix.to_ascii_lowercase().as_str() {
+        "ff" => scale * 1e-15,
+        "pf" => scale * 1e-12,
+        _ => default,
+    }
+}
+
 /// The cells of every library read, by name. ⛔ A cell in two libraries resolves to the FIRST
 /// library read (the network's cell lookup walks the libraries in read order).
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -566,6 +588,7 @@ impl LibertyClocks {
                 self.units = Some(Units {
                     resistance: read_unit(lib.attr("pulling_resistance_unit"), "ohm", 1.0),
                     distance: read_unit(lib.attr("distance_unit"), "m", 1e-6),
+                    capacitance: read_cap_unit(lib.complex_attr("capacitive_load_unit")),
                 });
             }
             for cell in lib.children("cell") {
@@ -746,7 +769,7 @@ mod tests {
         let mut l = LibertyClocks::default();
         l.read(r#"library (a) { pulling_resistance_unit : "1kohm"; }"#).expect("parse");
         l.read(r#"library (b) { pulling_resistance_unit : "1ohm"; }"#).expect("parse");
-        assert_eq!(l.units, Some(Units { resistance: 1e3, distance: 1e-6 }), "the first library's units stand");
+        assert_eq!(l.units, Some(Units { resistance: 1e3, distance: 1e-6, capacitance: 1e-12 }), "the first library's units stand");
     }
 
     // A simple attribute without its `;` ends at its value: the next statement still parses.
@@ -757,6 +780,20 @@ mod tests {
             pin (Y) { function : "!A"; timing () { related_pin : "A"; } }"#);
         assert_eq!(c.arcs.len(), 1);
         assert!(c.ports.contains_key("A"));
+    }
+
+    // capacitive_load_unit is a COMPLEX attribute: `(scale, ff|pf)`.
+    #[test]
+    fn the_capacitance_unit_comes_from_capacitive_load_unit() {
+        let mut l = LibertyClocks::default();
+        l.read(r#"library (a) { capacitive_load_unit (1,ff); }"#).expect("parse");
+        assert_eq!(l.units.expect("units").capacitance, 1e-15);
+        let mut l = LibertyClocks::default();
+        l.read(r#"library (b) { capacitive_load_unit (10,pf); }"#).expect("parse");
+        assert_eq!(l.units.expect("units").capacitance, 10.0 * 1e-12);
+        let mut l = LibertyClocks::default();
+        l.read("library (c) { }").expect("parse");
+        assert_eq!(l.units.expect("units").capacitance, 1e-12, "the default");
     }
 
     #[test]

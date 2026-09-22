@@ -98,6 +98,8 @@ pub mod maze_phase;
 pub mod maze_msmd;
 pub mod congestion_loop;
 pub mod liberty_clk;
+pub mod parasitics;
+pub mod planar_route;
 pub mod clk_network;
 pub mod finalize;
 pub mod run;

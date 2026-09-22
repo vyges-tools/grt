@@ -160,6 +160,16 @@ pub fn set_dblayer_wire_r(res_ui: f64, r_scale: f32, d_scale: f32, width_dbu: i3
     wire_width * 1e-6 * res
 }
 
+/// `set_layer_rc -layer L -capacitance c` as it reaches the database (`set_dblayer_wire_rc`):
+/// the capacitance per length becomes capacitance per square at the layer's width —
+/// `cap * 1e6 / wire_width` — and ⛔ the layer's EDGE capacitance is zeroed, so the user's value
+/// is the whole of it.
+pub fn set_dblayer_wire_c(cap_ui: f64, c_scale: f32, d_scale: f32, width_dbu: i32, dbu_per_micron: i32) -> f64 {
+    let cap = (cap_ui * f64::from(c_scale)) / (1.0 * f64::from(d_scale));
+    let wire_width = f64::from(width_dbu) / f64::from(dbu_per_micron);
+    cap * 1e6 / wire_width
+}
+
 /// `set_layer_rc -via V -resistance r` (`set_dbvia_wire_r`): ohms per cut, `r * r_scale`.
 pub fn set_dbvia_wire_r(res_ui: f64, r_scale: f32) -> f64 {
     res_ui * f64::from(r_scale)

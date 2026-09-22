@@ -41,6 +41,7 @@ JOB (JSON):
     { \"cmd\": \"create_clock\", \"ports\": [..] }                        (clock network only)
     { \"cmd\": \"set_layer_rc\", \"layer\" | \"via\": name, \"resistance\": f } (user units)
     { \"cmd\": \"propagated_clock\" }
+    { \"cmd\": \"write_parasitics\", \"path\": \"..\" }       (the networks the slacks are read from)
     { \"cmd\": \"write_guides\", \"path\": \"..\" }
 
 EXIT STATUS:
@@ -175,6 +176,8 @@ fn run(job: &Value) -> Result<Value, Fail> {
         opts.captured_update_slacks = Some(update);
     }
     let mut guides: BTreeMap<String, Vec<(i32, i32, i32, i32, String)>> = BTreeMap::new();
+    let mut parasitics: BTreeMap<String, vyges_grt::parasitics::Network> = BTreeMap::new();
+    let mut planar_routes: BTreeMap<String, Vec<vyges_grt::parasitics::Segment>> = BTreeMap::new();
     let mut calls = Vec::new();
     let mut log = Vec::new();
     for step in job["steps"].as_array().ok_or_else(|| err("steps"))? {
@@ -267,6 +270,8 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 }
                 let res = route_design(&mut db, &opts, &stt, &flutes).map_err(|e| classify(e.to_string()))?;
                 // saveGuides replaces the guides of every net it routes; the others keep theirs.
+                parasitics = res.parasitics.clone();
+                planar_routes = res.planar_routes.clone();
                 for ng in &res.guides {
                     guides.insert(ng.net.clone(), ng.guides.iter().map(|g| (g.box_.x_min, g.box_.y_min, g.box_.x_max, g.box_.y_max, res.layer_names[&g.layer].clone())).collect());
                 }
@@ -287,9 +292,27 @@ fn run(job: &Value) -> Result<Value, Fail> {
                     // ⛔ No -resistance is 0.0, and set_dblayer_wire_rc still WRITES it.
                     let r = vyges_grt::pricing::set_dblayer_wire_r(res_ui.unwrap_or(0.0), units.resistance, units.distance, db.layer_get_width(layer) as i32, db.tech_get_db_units_per_micron());
                     db.layer_set_resistance(layer, r).map_err(err)?;
+                    // …and the ESTIMATOR's own table, which the parasitics read first: ohm/m and
+                    // F/m, the Tcl's `[unit_ui_sta $v] / [distance_ui_sta 1.0]`.
+                    let d = f64::from(units.distance);
+                    // ⛔ `set_layer_rc_cmd(layer, corner, float res, float cap)` — the Tcl's double
+                    // is NARROWED to a float on the way into the table (892900.0022543557 is stored
+                    // as 892900.0), which is why the table and the database hold different values.
+                    let res_per_m = f64::from(((res_ui.unwrap_or(0.0) * f64::from(units.resistance)) / (1.0 * d)) as f32);
+                    let cap_per_m = f64::from(((step["capacitance"].as_f64().unwrap_or(0.0) * f64::from(units.capacitance)) / (1.0 * d)) as f32);
+                    opts.layer_rc.insert(db.layer_get_routing_level(layer), (res_per_m, cap_per_m));
+                    // set_dblayer_wire_rc also writes the layer's capacitance and ZEROES its edge
+                    // capacitance, so a later fallback reads the user's value and nothing else.
+                    if let Some(c) = step["capacitance"].as_f64() {
+                        let per_square = vyges_grt::pricing::set_dblayer_wire_c(c, units.capacitance, units.distance, db.layer_get_width(layer) as i32, db.tech_get_db_units_per_micron());
+                        db.layer_set_capacitance(layer, per_square).map_err(err)?;
+                        db.layer_set_edge_capacitance(layer, 0.0).map_err(err)?;
+                    }
                 } else if let Some(via) = step["via"].as_str() {
-                    let r = vyges_grt::pricing::set_dbvia_wire_r(res_ui.ok_or_else(|| err("set_layer_rc -via needs -resistance"))?, units.resistance);
+                    let res_ui = res_ui.ok_or_else(|| err("set_layer_rc -via needs -resistance"))?;
+                    let r = vyges_grt::pricing::set_dbvia_wire_r(res_ui, units.resistance);
                     db.layer_set_resistance(via, r).map_err(err)?;
+                    opts.via_rc.insert(via.to_string(), res_ui * f64::from(units.resistance));
                 } else {
                     return Err(err("set_layer_rc needs a layer or via"));
                 }
@@ -303,6 +326,32 @@ fn run(job: &Value) -> Result<Value, Fail> {
             }
             // set_propagated_clock: only the slacks read it, and with a clock none are bound.
             "propagated_clock" => {}
+            // The parasitics the router's own slacks are read from, in the reference's dump shape:
+            // `<net>|node|<node>|<farads>` and `<net>|res|<n1>|<n2>|<ohms>`.
+            "write_parasitics" => {
+                let path = step["path"].as_str().ok_or_else(|| err("path"))?;
+                let mut text = String::new();
+                for (net, route) in &planar_routes {
+                    for sg in route {
+                        text.push_str(&format!("{net}|seg|{}|{}|{}|{}|{}|{}\n", sg.init_x, sg.init_y, sg.init_layer, sg.final_x, sg.final_y, sg.final_layer));
+                    }
+                }
+                for (net, g) in &parasitics {
+                    let name = |n: &vyges_grt::parasitics::NodeId| match n {
+                        vyges_grt::parasitics::NodeId::Pin(p) => p.clone(),
+                        // ⚠️ The reference names a net node from ONE: `ensureParasiticNode(…, node_map.size(), …)`
+                        // with a size of 0 prints as `<net>:1`.
+                        vyges_grt::parasitics::NodeId::Point(i) => format!("{net}:{}", i + 1),
+                    };
+                    for (node, cap) in &g.nodes {
+                        text.push_str(&format!("{net}|node|{}|{:.8e}\n", name(node), cap));
+                    }
+                    for (n1, n2, res) in &g.resistors {
+                        text.push_str(&format!("{net}|res|{}|{}|{:.8e}\n", name(n1), name(n2), res));
+                    }
+                }
+                std::fs::write(path, text).map_err(err)?;
+            }
             "write_guides" => write_guides(step["path"].as_str().ok_or_else(|| err("path"))?, &guides)?,
             other => return Err(Fail::Refused(format!("step {other:?} is not modelled"))),
         }
