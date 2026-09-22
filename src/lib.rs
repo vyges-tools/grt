@@ -36,6 +36,8 @@ pub mod adjust;
 pub mod pins;
 pub mod netlist;
 pub mod driver;
+pub mod findrouting;
+pub use findrouting::{add_guides_for_local_net, add_remaining_guides, connect_pad_pins, connect_top_level_pins, merge_segments, GridPin, NoRouteGuides, RemainingNet};
 pub use driver::{compute_max_routing_layer, get_min_max_layer, has_routable_nets, report_resources, ResourceLayer, GRT_7};
 pub use netlist::{add_resources_for_pin_access, compute_net_degree, compute_track_consumption, find_fastroute_pins, get_net_layer_range, has_stacked_vias, initial_net_order_is_kept, makes_fastroute_net, net_max_routing_layer, pin_access_edges, report_net_degree, AccessPinFacts, NdrConsumptionTooLarge, NdrLayerRule, NetlistGrid, RouterPinFacts};
 pub use pins::{check_pin_placement, InvalidPinPlacement, compute_pin_position_on_grid, determine_edge, find_nets, find_on_grid_positions, find_pin, is_pin_reachable, make_bterm_pin, make_iterm_pin, pin_overlaps_with_single_track, position_near_inst_edge, rect_middle, AccessPoint, MasterClass, NetCandidate, NetPin, PinEdge, PinError, PinGrid, TermBox};
