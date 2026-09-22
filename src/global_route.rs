@@ -731,6 +731,8 @@ pub struct RouteResult {
     /// net's RC network, built from the planar routes as they stood then. Empty when the run
     /// reached no such call.
     pub parasitics: std::collections::BTreeMap<String, crate::parasitics::Network>,
+    /// The same, over the routes the run SAVED (`estimate_parasitics -global_routing`).
+    pub routed_parasitics: std::collections::BTreeMap<String, crate::parasitics::Network>,
     /// Each net's pins as the parasitics saw them — for a SPEF `*CONN` section.
     pub parasitic_pins: std::collections::BTreeMap<String, Vec<crate::parasitics::PinGridLocation>>,
     /// The planar routes those networks were built from (`getPlanarRoutes`), by net.
@@ -1056,6 +1058,7 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
                 net_min_layer: n.min_layer,
                 min_routing_layer: t.min_routing_layer,
                 ndr_width: None,
+                attach: crate::parasitics::PinAttach::Planar,
             };
             parasitics.insert(n.name.clone(), crate::parasitics::estimate_net(&np, &rc));
             parasitic_pins.insert(n.name.clone(), pins.clone());
@@ -1085,6 +1088,37 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
             crate::findrouting::merge_segments(&grid_pins(n), route, block_min);
         }
     }
+    // `estimate_parasitics -global_routing` after the run: the same builder over the SAVED routes,
+    // where each pin attaches from its own connection layer.
+    let mut routed_parasitics = std::collections::BTreeMap::new();
+    if ov.trees.is_some() {
+        let rc = layer_rc(db);
+        for n in &nets {
+            let Some(segs) = by_name.get(&n.name) else { continue };
+            let route: Vec<crate::parasitics::Segment> = segs
+                .iter()
+                .map(|g| crate::parasitics::Segment { init_x: g.init_x, init_y: g.init_y, init_layer: g.init_layer, final_x: g.final_x, final_y: g.final_y, final_layer: g.final_layer })
+                .collect();
+            // ⛔ Over the SAVED routes, which include the local nets `getPartialRoutes` leaves out.
+            let pins: Vec<crate::parasitics::PinGridLocation> = n
+                .net_pins
+                .iter()
+                .zip(&n.pin_is_driver)
+                .map(|(p, &is_driver)| crate::parasitics::PinGridLocation { name: p.name.clone(), is_port: p.is_port, is_driver, pt: p.position, grid_pt: p.on_grid, conn_layer: p.connection_layer })
+                .collect();
+            parasitic_pins.entry(n.name.clone()).or_insert_with(|| pins.clone());
+            let np = crate::parasitics::NetParasitics {
+                name: &n.name,
+                route: &route,
+                pins: &pins,
+                net_min_layer: n.min_layer,
+                min_routing_layer: t.min_routing_layer,
+                ndr_width: None,
+                attach: crate::parasitics::PinAttach::Routed,
+            };
+            routed_parasitics.insert(n.name.clone(), crate::parasitics::estimate_net(&np, &rc));
+        }
+    }
     // X — saveGuides over the block's nets, in its order.
     let total_overflow = ov.overflow;
     let guide_is_congested = total_overflow > 0 && !opts.allow_congestion;
@@ -1105,5 +1139,5 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     let save = crate::SaveOptions { guide_is_congested, origin_x: opts.grid_origin.0, origin_y: opts.grid_origin.1, min_routing_layer: t.min_routing_layer };
     let guides = crate::save_guides(&net_routes, &grid, &save).map_err(|e| format!("{e:?}"))?;
     let layer_names = t.tech.routing_layers.iter().map(|l| (l.routing_level, l.name.clone())).collect();
-    Ok(RouteResult { guides, layer_names, total_overflow, guide_is_congested, routes: raw_routes, clock_nets, parasitics, parasitic_pins, planar_routes, snapshot_edges, log })
+    Ok(RouteResult { guides, layer_names, total_overflow, guide_is_congested, routes: raw_routes, clock_nets, parasitics, routed_parasitics, parasitic_pins, planar_routes, snapshot_edges, log })
 }

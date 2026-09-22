@@ -190,6 +190,19 @@ fn ensure_point_node(map: &mut NodeMap, x: i32, y: i32, layer: i32) -> NodeId {
     node
 }
 
+/// Which builder made the route, and so where a pin attaches to it.
+///
+/// ⛔ `makePartialParasiticsToPin` (the planar routes, mid-run) tries `net_min_layer + 1`;
+/// `makeParasiticsToPin` (the routes after layer assignment) tries the PIN's own
+/// `conn_layer + 1`. Everything else about the two is the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinAttach {
+    /// `estimateParasitics(net, route)` — a planar route.
+    Planar,
+    /// `estimateParasitics(net, route, spef_writer)` — a route with real layers.
+    Routed,
+}
+
 /// One net's inputs.
 #[derive(Debug, Clone)]
 pub struct NetParasitics<'a> {
@@ -203,6 +216,7 @@ pub struct NetParasitics<'a> {
     pub min_routing_layer: i32,
     /// The net's non-default rule width on a layer, when it has one.
     pub ndr_width: Option<&'a BTreeMap<i32, i32>>,
+    pub attach: PinAttach,
 }
 
 /// `makeRouteParasitics` then `makePartialParasiticsToPins` — the network for one net, as
@@ -244,16 +258,20 @@ fn make_route_parasitics(net: &NetParasitics<'_>, rc: &LayerRC, g: &mut Network,
     }
 }
 
-/// `makePartialParasiticsToPin`: the wire from the pin to the grid node it attaches to.
+/// `makePartialParasiticsToPin` / `makeParasiticsToPin`: the wire from the pin to the grid node it
+/// attaches to.
 ///
-/// ⛔ The layer tried FIRST is `net_min_layer + 1` — the net's minimum, not the pin's connection
-/// layer (the post-layer-assignment path uses the pin's). Finding a node there means the pin is
+/// ⛔ The layer tried FIRST is the net's minimum plus one on a planar route, the PIN's connection
+/// layer plus one on a routed one ([`PinAttach`]). Finding a node there means the pin is
 /// reached through a via, whose cut resistance (the layer BELOW that one) is lumped into the same
 /// resistor; otherwise the pin's own layer is used and there is no via.
 /// ⚠️ The resistance is floored at 1e-3 so a pin sitting on its grid node still has one.
 fn make_partial_parasitics_to_pin(net: &NetParasitics<'_>, pin: &PinGridLocation, rc: &LayerRC, g: &mut Network, map: &mut NodeMap) {
     let pin_node = NodeId::Pin(pin.name.clone());
-    let mut layer = net.net_min_layer + 1;
+    let mut layer = match net.attach {
+        PinAttach::Planar => net.net_min_layer + 1,
+        PinAttach::Routed => pin.conn_layer + 1,
+    };
     let mut via_res = 0.0f32;
     let mut grid_node = map.get(&(pin.grid_pt.0, pin.grid_pt.1, layer)).cloned();
     if grid_node.is_none() {
@@ -326,7 +344,7 @@ mod tests {
     fn a_wire_segment_splits_its_capacitance() {
         let rc = rc();
         let route = [seg(0, 0, 1, 1000, 0, 1)];
-        let net = NetParasitics { name: "n", route: &route, pins: &[], net_min_layer: 1, min_routing_layer: 1, ndr_width: None };
+        let net = NetParasitics { name: "n", route: &route, pins: &[], net_min_layer: 1, min_routing_layer: 1, ndr_width: None, attach: PinAttach::Planar };
         let g = estimate_net(&net, &rc);
         let (r, c) = rc.layer_rc(1000, 1, None);
         assert_eq!(g.nodes, vec![(NodeId::Point(0), c / 2.0), (NodeId::Point(1), c / 2.0)]);
@@ -338,7 +356,7 @@ mod tests {
     fn a_via_takes_the_cut_layer_resistance() {
         let rc = rc();
         let route = [seg(0, 0, 1, 0, 0, 2)];
-        let net = NetParasitics { name: "n", route: &route, pins: &[], net_min_layer: 1, min_routing_layer: 1, ndr_width: None };
+        let net = NetParasitics { name: "n", route: &route, pins: &[], net_min_layer: 1, min_routing_layer: 1, ndr_width: None, attach: PinAttach::Planar };
         let g = estimate_net(&net, &rc);
         assert_eq!(g.resistors, vec![(NodeId::Point(0), NodeId::Point(1), 4.5)]); // the table's, not 9.0
         assert!(g.nodes.iter().all(|(_, c)| *c == 0.0));
@@ -349,7 +367,7 @@ mod tests {
     fn a_segment_below_the_minimum_routing_layer_is_skipped() {
         let rc = rc();
         let route = [seg(0, 0, 1, 1000, 0, 1)];
-        let net = NetParasitics { name: "n", route: &route, pins: &[], net_min_layer: 2, min_routing_layer: 2, ndr_width: None };
+        let net = NetParasitics { name: "n", route: &route, pins: &[], net_min_layer: 2, min_routing_layer: 2, ndr_width: None, attach: PinAttach::Planar };
         let g = estimate_net(&net, &rc);
         assert!(g.nodes.is_empty() && g.resistors.is_empty());
     }
@@ -361,11 +379,29 @@ mod tests {
         let rc = rc();
         let route = [seg(0, 0, 2, 1000, 0, 2)];
         let pins = [PinGridLocation { name: "i/A".into(), is_port: false, is_driver: false, pt: (0, 500), grid_pt: (0, 0), conn_layer: 1 }];
-        let net = NetParasitics { name: "n", route: &route, pins: &pins, net_min_layer: 1, min_routing_layer: 1, ndr_width: None };
+        let net = NetParasitics { name: "n", route: &route, pins: &pins, net_min_layer: 1, min_routing_layer: 1, ndr_width: None, attach: PinAttach::Planar };
         let g = estimate_net(&net, &rc);
         let (r, c) = rc.layer_rc(500, 2, None);
         assert_eq!(g.resistors.last(), Some(&(NodeId::Pin("i/A".into()), NodeId::Point(0), r + 4.5)));
         assert_eq!(g.nodes.iter().find(|(n, _)| *n == NodeId::Pin("i/A".into())).map(|(_, c)| *c), Some(c / 2.0));
+    }
+
+    // ⛔ On a ROUTED route the pin attaches from its OWN connection layer, not the net's minimum.
+    #[test]
+    fn a_routed_pin_attaches_from_its_connection_layer() {
+        let rc = rc();
+        let route = [seg(0, 0, 2, 1000, 0, 2)];
+        let pins = [PinGridLocation { name: "i/A".into(), is_port: false, is_driver: false, pt: (0, 500), grid_pt: (0, 0), conn_layer: 1 }];
+        // Planar: net_min_layer 1 → tries layer 2, finds the node, so the via resistance is added.
+        let planar = NetParasitics { name: "n", route: &route, pins: &pins, net_min_layer: 1, min_routing_layer: 1, ndr_width: None, attach: PinAttach::Planar };
+        // Routed: conn_layer 1 → tries layer 2 as well here, so the two agree on this net.
+        let routed = NetParasitics { attach: PinAttach::Routed, ..planar.clone() };
+        assert_eq!(estimate_net(&planar, &rc), estimate_net(&routed, &rc));
+        // With the net's minimum a layer lower, only the planar one falls back to layer 1.
+        let pins2 = [PinGridLocation { conn_layer: 2, ..pins[0].clone() }];
+        let planar2 = NetParasitics { pins: &pins2, net_min_layer: 0, ..planar.clone() };
+        let routed2 = NetParasitics { attach: PinAttach::Routed, ..planar2.clone() };
+        assert_ne!(estimate_net(&planar2, &rc), estimate_net(&routed2, &rc));
     }
 
     // With nothing routed on that layer the pin's own layer is used, and there is no via.
@@ -374,7 +410,7 @@ mod tests {
         let rc = rc();
         let route = [seg(0, 0, 1, 1000, 0, 1)];
         let pins = [PinGridLocation { name: "i/A".into(), is_port: false, is_driver: false, pt: (0, 500), grid_pt: (0, 0), conn_layer: 1 }];
-        let net = NetParasitics { name: "n", route: &route, pins: &pins, net_min_layer: 1, min_routing_layer: 1, ndr_width: None };
+        let net = NetParasitics { name: "n", route: &route, pins: &pins, net_min_layer: 1, min_routing_layer: 1, ndr_width: None, attach: PinAttach::Planar };
         let g = estimate_net(&net, &rc);
         let (r, _) = rc.layer_rc(500, 1, None);
         assert_eq!(g.resistors.last(), Some(&(NodeId::Pin("i/A".into()), NodeId::Point(0), r)));
@@ -386,7 +422,7 @@ mod tests {
         let rc = rc();
         let route = [seg(0, 0, 1, 1000, 0, 1)];
         let pins = [PinGridLocation { name: "i/A".into(), is_port: false, is_driver: false, pt: (0, 0), grid_pt: (0, 0), conn_layer: 1 }];
-        let net = NetParasitics { name: "n", route: &route, pins: &pins, net_min_layer: 1, min_routing_layer: 1, ndr_width: None };
+        let net = NetParasitics { name: "n", route: &route, pins: &pins, net_min_layer: 1, min_routing_layer: 1, ndr_width: None, attach: PinAttach::Planar };
         let g = estimate_net(&net, &rc);
         assert_eq!(g.resistors.last(), Some(&(NodeId::Pin("i/A".into()), NodeId::Point(0), 1.0e-3)));
     }
@@ -397,7 +433,7 @@ mod tests {
         let rc = rc();
         let route = [seg(0, 0, 1, 1000, 0, 1)];
         let pins = [PinGridLocation { name: "i/A".into(), is_port: false, is_driver: false, pt: (9000, 9000), grid_pt: (9000, 9000), conn_layer: 1 }];
-        let net = NetParasitics { name: "n", route: &route, pins: &pins, net_min_layer: 1, min_routing_layer: 1, ndr_width: None };
+        let net = NetParasitics { name: "n", route: &route, pins: &pins, net_min_layer: 1, min_routing_layer: 1, ndr_width: None, attach: PinAttach::Planar };
         let g = estimate_net(&net, &rc);
         assert!(g.warnings.iter().any(|w| w.contains("EST-0350")), "{:?}", g.warnings);
         assert!(!g.nodes.iter().any(|(n, _)| *n == NodeId::Pin("i/A".into())));

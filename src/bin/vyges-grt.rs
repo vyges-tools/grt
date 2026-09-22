@@ -42,7 +42,7 @@ JOB (JSON):
     { \"cmd\": \"set_layer_rc\", \"layer\" | \"via\": name, \"resistance\": f } (user units)
     { \"cmd\": \"propagated_clock\" }
     { \"cmd\": \"write_parasitics\", \"path\": \"..\" }       (the networks the slacks are read from)
-    { \"cmd\": \"write_spef\", \"path\": \"..\" }             (the same networks, as SPEF)
+    { \"cmd\": \"write_spef\", \"path\": \"..\", \"source\": \"partial\" | \"routed\" }
     { \"cmd\": \"write_guides\", \"path\": \"..\" }
 
 EXIT STATUS:
@@ -179,6 +179,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
     let mut guides: BTreeMap<String, Vec<(i32, i32, i32, i32, String)>> = BTreeMap::new();
     let mut parasitics: BTreeMap<String, vyges_grt::parasitics::Network> = BTreeMap::new();
     let mut parasitic_pins: BTreeMap<String, Vec<vyges_grt::parasitics::PinGridLocation>> = BTreeMap::new();
+    let mut routed_parasitics: BTreeMap<String, vyges_grt::parasitics::Network> = BTreeMap::new();
     let mut planar_routes: BTreeMap<String, Vec<vyges_grt::parasitics::Segment>> = BTreeMap::new();
     let mut snapshot_edges: BTreeMap<String, Vec<vyges_grt::global_route::SnapshotEdge>> = BTreeMap::new();
     let mut calls = Vec::new();
@@ -275,6 +276,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 // saveGuides replaces the guides of every net it routes; the others keep theirs.
                 parasitics = res.parasitics.clone();
                 parasitic_pins = res.parasitic_pins.clone();
+                routed_parasitics = res.routed_parasitics.clone();
                 planar_routes = res.planar_routes.clone();
                 snapshot_edges = res.snapshot_edges.clone();
                 for ng in &res.guides {
@@ -335,6 +337,11 @@ fn run(job: &Value) -> Result<Value, Fail> {
             // `<net>|node|<node>|<farads>` and `<net>|res|<n1>|<n2>|<ohms>`.
             "write_parasitics" => {
                 let path = step["path"].as_str().ok_or_else(|| err("path"))?;
+                let parasitics: &BTreeMap<String, vyges_grt::parasitics::Network> = match step["source"].as_str().unwrap_or("partial") {
+                    "partial" => &parasitics,
+                    "routed" => &routed_parasitics,
+                    other => return Err(err(format!("write_parasitics source {other:?}: expected partial or routed"))),
+                };
                 let mut text = String::new();
                 for (net, edges) in &snapshot_edges {
                     for (e, ed) in edges.iter().enumerate() {
@@ -347,7 +354,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
                         text.push_str(&format!("{net}|seg|{}|{}|{}|{}|{}|{}\n", sg.init_x, sg.init_y, sg.init_layer, sg.final_x, sg.final_y, sg.final_layer));
                     }
                 }
-                for (net, g) in &parasitics {
+                for (net, g) in parasitics {
                     let name = |n: &vyges_grt::parasitics::NodeId| match n {
                         vyges_grt::parasitics::NodeId::Pin(p) => p.clone(),
                         // ⚠️ The reference names a net node from ONE: `ensureParasiticNode(…, node_map.size(), …)`
@@ -370,12 +377,19 @@ fn run(job: &Value) -> Result<Value, Fail> {
             // and no longer sums to its own `*D_NET` total (OpenROAD #11482).
             "write_spef" => {
                 let path = step["path"].as_str().ok_or_else(|| err("path"))?;
+                // "partial" (the default): the planar routes the router's own slacks were read
+                // from. "routed": the saved routes, as `estimate_parasitics -global_routing`.
+                let parasitics: &BTreeMap<String, vyges_grt::parasitics::Network> = match step["source"].as_str().unwrap_or("partial") {
+                    "partial" => &parasitics,
+                    "routed" => &routed_parasitics,
+                    other => return Err(err(format!("write_spef source {other:?}: expected partial or routed"))),
+                };
                 let mut text = String::from(
                     "*SPEF \"ieee 1481-1999\"\n*DESIGN \"vyges-grt\"\n*DATE \"\"\n*VENDOR \"Vyges\"\n*PROGRAM \"vyges-grt\"\n*VERSION \"1.0\"\n\
                      *DESIGN_FLOW \"NAME_SCOPE LOCAL\" \"PIN_CAP NONE\"\n*DIVIDER /\n*DELIMITER :\n*BUS_DELIMITER []\n\
                      *T_UNIT 1 NS\n*C_UNIT 1 PF\n*R_UNIT 1 KOHM\n*L_UNIT 1 HENRY\n\n",
                 );
-                for (net, g) in &parasitics {
+                for (net, g) in parasitics {
                     // A parasitic node is `<instance>:<terminal>` for a pin, `<net>:<id>` otherwise.
                     let pin_name = |p: &str| match p.rfind('/') {
                         Some(i) => format!("{}:{}", &p[..i], &p[i + 1..]),
@@ -392,7 +406,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
                     let pins = parasitic_pins.get(net).cloned().unwrap_or_default();
                     for (n, _) in &g.nodes {
                         if let vyges_grt::parasitics::NodeId::Pin(p) = n {
-                            let pin = pins.iter().find(|q| &q.name == p);
+                            let pin = pins.iter().find(|q| q.name == *p);
                             let dir = if pin.is_some_and(|q| q.is_driver) { "O" } else { "I" };
                             // A port is `*P`, an instance terminal `*I`; a port's direction is
                             // the other way round, since a driving port feeds the net.
