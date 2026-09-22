@@ -238,8 +238,28 @@ pub fn new_ripup_check<G: Usage2d + ?Sized>(
     grids: &[(i32, i32)],
     routelen: usize,
     ripup_threshold: i32,
-    (h_capacity, v_capacity): (i32, i32),
+    caps: (i32, i32),
     edge_cost: i8,
+    critical: Option<CriticalCheck>,
+    used_h: &dyn Fn(i32, i32) -> f64,
+    used_v: &dyn Fn(i32, i32) -> f64,
+) -> Option<RipupReason> {
+    let reason = needs_ripup_check(grids, routelen, ripup_threshold, caps, critical, used_h, used_v);
+    if reason.is_some() {
+        give_back_walked(grid, grids, routelen, f64::from(edge_cost), Layer::Committed);
+    }
+    reason
+}
+
+/// [`new_ripup_check`]'s decision alone: reads the committed demand, writes nothing.
+///
+/// ⚠️ Split out so a caller whose demand reads and writes go to the same grid can decide first and
+/// then give back through its own charge.
+pub fn needs_ripup_check(
+    grids: &[(i32, i32)],
+    routelen: usize,
+    ripup_threshold: i32,
+    (h_capacity, v_capacity): (i32, i32),
     critical: Option<CriticalCheck>,
     used_h: &dyn Fn(i32, i32) -> f64,
     used_v: &dyn Fn(i32, i32) -> f64,
@@ -266,11 +286,12 @@ pub fn new_ripup_check<G: Usage2d + ?Sized>(
             }
         }
     }
-
-    if reason.is_some() {
-        give_back_walked(grid, grids, routelen, f64::from(edge_cost), Layer::Committed);
-    }
     reason
+}
+
+/// Give back a walked route's COMMITTED demand — [`new_ripup_check`]'s undo, on its own.
+pub fn give_back_committed<G: Usage2d + ?Sized>(grid: &mut G, grids: &[(i32, i32)], routelen: usize, edge_cost: i8) {
+    give_back_walked(grid, grids, routelen, f64::from(edge_cost), Layer::Committed);
 }
 
 /// The critical-net arm of the maze gate.

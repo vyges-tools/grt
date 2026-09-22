@@ -91,6 +91,9 @@ struct Seen {
     incremental: usize,
     gate_hvh: usize,
     gate_vhv: usize,
+    maze_routes: usize,
+    maze_passes: usize,
+    usage_errors: usize,
     stacked_pins: usize,
     htree: usize,
 }
@@ -98,7 +101,8 @@ struct Seen {
 /// ⛔ Known limitation — INCREMENTAL passes. A pass that keeps other nets' routes
 /// (`is_incremental_grt_`) rebuilds the used-grid sets from the COMMITTED usage at run() entry
 /// (`rebuildUsedGrids`), which this replay does not carry: those runs match on the overflow outputs
-/// and estimated usage at B7 and diverge on the used grids. They must diverge exactly there, and every
+/// and estimated usage at B7 and diverge on the COMMITTED usage — the other nets' routes — which is
+/// what the used grids are rebuilt from. They must diverge exactly there, and every
 /// other run must match — so this list fails the day the incremental setup lands.
 const INCREMENTAL: [&str; 4] =
     ["repair_antennas_adjacent_jumpers-", "repair_antennas_allow_congestion-", "repair_antennas_from_odb-", "repair_antennas_only_diodes-"];
@@ -109,7 +113,7 @@ fn replay(g: &Value, bounds: &Value) -> Seen {
     let mut seen = Seen::default();
     let mut failed = Vec::new();
     let by_design: std::collections::HashMap<&str, &Value> =
-        arr(&bounds["runs"]).iter().map(|r| (r["design"].as_str().expect("design"), &r["boundaries"])).collect();
+        arr(&bounds["runs"]).iter().map(|r| (r["design"].as_str().expect("design"), r)).collect();
     for r in arr(&g["runs"]) {
         let who = r["design"].as_str().expect("design");
         let mut one = Seen::default();
@@ -119,7 +123,7 @@ fn replay(g: &Value, bounds: &Value) -> Seen {
             (Ok(()), false) => seen = add(seen, one),
             (Err(e), true) => {
                 let msg = e.downcast_ref::<String>().cloned().unwrap_or_default();
-                if msg.contains("B7: used grids") {
+                if msg.contains("B7: committed usage") {
                     seen.incremental += 1;
                 } else {
                     failed.push(format!("{who}: diverges, but not where the incremental setup does: {msg}"));
@@ -149,6 +153,18 @@ fn check_boundary(at: &str, b: &Value, scan: &Overflow2DScan, g2d: &Graph2d, sta
             }
         }
     }
+    for (dir, rows) in [("H", &b["usage"]["H"]), ("V", &b["usage"]["V"])] {
+        for (y, row) in arr(rows).iter().enumerate() {
+            let flat: Vec<i32> = arr(row).iter().flat_map(|p| std::iter::repeat(int(&p[0])).take(int(&p[1]) as usize)).collect();
+            for (x, &want) in flat.iter().enumerate() {
+                let ours = if dir == "H" { g2d.est.usage_h(x, y) } else { g2d.est.usage_v(x, y) };
+                assert_eq!(ours as i32, want, "{at}: committed usage {dir} ({x}, {y})");
+            }
+        }
+    }
+    if tag.starts_with("B12_") {
+        assert_eq!(scan.total_usage, int(&b["t_usage"]), "{at}: getOverflow2Dmaze tUsage");
+    }
     for (dir, ours) in [("H", &g2d.used_h), ("V", &g2d.used_v)] {
         let want: Vec<(i32, i32)> = arr(&b["used"][dir]).iter().map(|p| (int(&p[0]), int(&p[1]))).collect();
         assert_eq!(ours.iter().copied().collect::<Vec<_>>(), want, "{at}: used grids {dir}");
@@ -165,6 +181,14 @@ fn check_boundary(at: &str, b: &Value, scan: &Overflow2DScan, g2d: &Graph2d, sta
         }).collect();
         assert_eq!(ours, edges, "{at}: net {id} edges (n1, n2, len, type, xFirst, HVH, Zpoint)");
         seen.boundary_nets += 1;
+        for (eid, r) in t.routes.iter().enumerate().filter(|(_, r)| r.kind == RouteKind::MazeRoute) {
+            let g = &b["grids"][format!("{id},{eid}")];
+            assert!(!g.is_null(), "{at}: net {id} edge {eid}: a maze route the reference does not have");
+            let pts: Vec<(i32, i32)> = arr(&g["points"]).iter().map(|p| (int(&p[0]), int(&p[1]))).collect();
+            assert_eq!((r.routelen, r.last_routelen, &r.grids[..=r.routelen as usize]), (int(&g["routelen"]), int(&g["last"]), &pts[..]),
+                       "{at}: net {id} edge {eid} maze route (routelen, last_routelen, grids)");
+            seen.maze_routes += 1;
+        }
         if tag == "B10" && t.num_terminals > 2 {
             // A Z route on a net of more than two terminals came through the congestion gate.
             for r in t.routes.iter().filter(|r| r.kind == RouteKind::ZRoute) {
@@ -431,7 +455,10 @@ fn replay_run(r: &Value, bounds: Option<&Value>, seen: &mut Seen) {
                 chain = Some(g2d);
             } else if chained {
                 // Past R7, from our own state: B7, then R8 (`newrouteLAll(false, true)`) and B8.
-                let group: Vec<&Value> = bounds.map(|b| arr(b).iter().collect()).unwrap_or_default();
+                let group: Vec<&Value> = bounds.map(|b| arr(&b["boundaries"]).iter().collect()).unwrap_or_default();
+                // The budget can strip a committed run's maze-phase boundaries; otherwise a missing
+                // B11 means the reference stopped in convertToMazeroute.
+                let maze_stripped = bounds.and_then(|b| b["maze_stripped"].as_bool()).unwrap_or(false);
                 let at_b = |tag: &str| group.iter().filter(|x| x["tag"] == tag).nth(pass).copied();
                 if let Some(b7) = at_b("B7") {
                     for (d, cap) in [("H", &mut g2d.cap_h), ("V", &mut g2d.cap_v)] {
@@ -482,6 +509,38 @@ fn replay_run(r: &Value, bounds: Option<&Value>, seen: &mut Seen) {
                     newroute_z_all(10, &net_ids, &nets, &mut state, &mut grid10);
                     let scan = g2d.get_overflow_2d();
                     check_boundary(&at, at_b("B10").expect("B10 follows B9"), &scan, &g2d, &state, seen);
+                    // The maze phase, where the committed sample keeps it: R11, three R12 rounds, R13.
+                    let (hcap, vcap) = (int(&c["hcap"]), int(&c["vcap"]));
+                    let b11 = at_b("B11");
+                    let viol = if maze_stripped { Vec::new() } else { convert_to_mazeroute_all(&net_ids, &mut state, &mut g2d, hcap, vcap) };
+                    if b11.is_none() && !maze_stripped {
+                        // ⛔ The reference raised GRT-0228/0229 in check2DEdgesUsage and stopped here.
+                        assert!(!viol.is_empty(), "{at}: the reference stopped in convertToMazeroute, but check2DEdgesUsage found nothing");
+                        seen.usage_errors += 1;
+                    }
+                    if let Some(b11) = b11 {
+                        assert!(viol.is_empty(), "{at}: check2DEdgesUsage {viol:?}");
+                        check_boundary(&at, b11, &scan, &g2d, &state, seen);
+                        let mut grid12 = BrkGrid {
+                            g: &mut g2d,
+                            red_h: &red_h_f,
+                            red_v: &red_v_f,
+                            caps: &caps,
+                            h_capacity: hcap,
+                            v_capacity: vcap,
+                            via_cost: 0.0,
+                        };
+                        let mut last = scan;
+                        lv_rounds(scan.max_overflow, &net_ids, &nets, &mut state, &mut grid12, &mut |k, round, g, st| {
+                            let b = at_b(&format!("B12_{k}")).unwrap_or_else(|| panic!("B12_{k} follows B11"));
+                            assert_eq!(round.logistic_coef as f64, b["logistic_coef"].as_f64().expect("f"), "{at} B12_{k}: logistic_coef");
+                            check_boundary(&at, b, &round.scan, g, st, seen);
+                            last = round.scan;
+                        });
+                        init_for_congestion_loop(&net_ids, &mut state, &mut g2d);
+                        check_boundary(&at, at_b("B13").expect("B13 follows B12"), &last, &g2d, &state, seen);
+                        seen.maze_passes += 1;
+                    }
                 }
                 pass += 1;
             }
@@ -497,7 +556,7 @@ fn gen_brk_rsmt_matches_the_reference() {
     let s = replay(&read(&format!("{dir}/brk_rsmt.json")), &read(&format!("{dir}/boundaries.json")));
     eprintln!("{s:?}");
     assert!(s.runs >= 40 && s.flute_nets >= 990 && s.shifted >= 70 && s.shifts > 0 && s.copied >= 900
-            && s.routed_edges >= 1000 && s.usage_checked >= 60 && s.ndr_checked >= 2 && s.r6_checked >= 40 && s.boundaries >= 160 && s.gate_hvh > 0 && s.gate_vhv > 0 && s.htree > 0,
+            && s.routed_edges >= 1000 && s.usage_checked >= 60 && s.ndr_checked >= 2 && s.r6_checked >= 40 && s.boundaries >= 160 && s.gate_hvh > 0 && s.gate_vhv > 0 && s.maze_passes >= 18 && s.htree > 0,
             "{s:?}");
 }
 
@@ -515,7 +574,7 @@ fn add(a: Seen, b: Seen) -> Seen {
         runs: a.runs + b.runs, calls: a.calls + b.calls, nets: a.nets + b.nets, flute_nets: a.flute_nets + b.flute_nets,
         shifted: a.shifted + b.shifted, shifts: a.shifts + b.shifts, copied: a.copied + b.copied,
         routed_edges: a.routed_edges + b.routed_edges, usage_checked: a.usage_checked + b.usage_checked,
-        ndr_checked: a.ndr_checked + b.ndr_checked, r6_checked: a.r6_checked + b.r6_checked, r6_segs: a.r6_segs + b.r6_segs, boundaries: a.boundaries + b.boundaries, boundary_nets: a.boundary_nets + b.boundary_nets, incremental: a.incremental + b.incremental, gate_hvh: a.gate_hvh + b.gate_hvh, gate_vhv: a.gate_vhv + b.gate_vhv, stacked_pins: a.stacked_pins + b.stacked_pins, htree: a.htree + b.htree,
+        ndr_checked: a.ndr_checked + b.ndr_checked, r6_checked: a.r6_checked + b.r6_checked, r6_segs: a.r6_segs + b.r6_segs, boundaries: a.boundaries + b.boundaries, boundary_nets: a.boundary_nets + b.boundary_nets, incremental: a.incremental + b.incremental, gate_hvh: a.gate_hvh + b.gate_hvh, gate_vhv: a.gate_vhv + b.gate_vhv, maze_routes: a.maze_routes + b.maze_routes, maze_passes: a.maze_passes + b.maze_passes, usage_errors: a.usage_errors + b.usage_errors, stacked_pins: a.stacked_pins + b.stacked_pins, htree: a.htree + b.htree,
     }
 }
 
@@ -783,4 +842,52 @@ fn the_z_route_marks_the_alias_nodes() {
     assert_eq!(t.routes[1].kind, RouteKind::ZRoute, "edge S3-p1 was Z-routed");
     let bump = |i: usize| (t.walk[i].h_id - before[i].0) + (t.walk[i].l_id - before[i].1);
     assert_eq!((bump(0), bump(3)), (1, 0), "the Z counts on the alias, not on S3");
+}
+
+/// ⛔ The monotonic cost table's HEIGHT (`costheight_`) weighs congestion against length. Edge
+/// (0,0)–(4,0) on row 0 (usage 8 after its rip-up) against a detour through row 1 (usage 4), columns
+/// free, logistic coefficient 0.2: at height 4 the straight route stays; at height 8 the congestion
+/// term outweighs two extra edges and it detours. The expected routes come from an independent model
+/// of the reference's search, not from this engine. The corpus never raises the height (it takes
+/// `maxOverflow > 700`).
+#[test]
+fn the_monotonic_cost_height_trades_congestion_for_length() {
+    let route_with = |height: i32| -> Vec<(i32, i32)> {
+        let pins = [(0, 0), (4, 0)];
+        let mut state = vec![st_tree(2, &[(0, 0, 1), (4, 0, 1)], &pins)];
+        {
+            let r = &mut state[0].tree.as_mut().expect("tree").routes[0];
+            (r.kind, r.grids, r.routelen) = (RouteKind::MazeRoute, (0..=4).map(|x| (x, 0)).collect(), 4);
+        }
+        let (px, py): (Vec<i32>, Vec<i32>) = pins.iter().copied().unzip();
+        let nets = [RsmtNet { layer_edge_cost: &[1], ..net(&px, &py) }];
+        let mut g2d = Graph2d::new(7, 3, 1);
+        for x in 0..6 {
+            // Row 0 carries the net's own route (+1) on x < 4; rows 1 and 2 are fixed load.
+            g2d.est.update_usage_h(x, 0, if x < 4 { 9.0 } else { 8.0 });
+            g2d.est.update_usage_h(x, 1, 4.0);
+            g2d.est.update_usage_h(x, 2, 30.0);
+        }
+        let caps = grid_caps(7, 3, 10);
+        let mut grid = BrkGrid { g: &mut g2d, red_h: &no_red, red_v: &no_red, caps: &caps, h_capacity: 10, v_capacity: 10, via_cost: 0.0 };
+        route_monotonic_all(1, 2, 0.2, height, &[0], &nets, &mut state, &mut grid);
+        state[0].tree.as_ref().expect("tree").routes[0].grids.clone()
+    };
+    assert_eq!(route_with(4), (0..=4).map(|x| (x, 0)).collect::<Vec<_>>(), "height 4: straight along row 0");
+    assert_eq!(route_with(8), vec![(0, 0), (0, 1), (1, 1), (2, 1), (3, 1), (4, 1), (4, 0)], "height 8: through row 1");
+}
+
+/// ⛔ The LV rounds' schedule: `newTH` 10, 5, then floored at 1; `enlarge_` 10, 15, 20; and the
+/// logistic coefficient from the PREVIOUS scan's max overflow (`2 / (1 + ln 0)` is -0 on an empty grid).
+#[test]
+fn the_lv_rounds_follow_the_reference_schedule() {
+    let mut g2d = Graph2d::new(4, 4, 1);
+    let caps = grid_caps(4, 4, 10);
+    let mut grid = BrkGrid { g: &mut g2d, red_h: &no_red, red_v: &no_red, caps: &caps, h_capacity: 10, v_capacity: 10, via_cost: 0.0 };
+    let (height, rounds) = lv_rounds(701, &[], &[], &mut [], &mut grid, &mut |_, _, _, _| {});
+    assert_eq!(height, 8, "maxOverflow > 700 raises the cost height");
+    let schedule: Vec<(i32, i32)> = rounds.iter().map(|r| (r.threshold, r.enlarge)).collect();
+    assert_eq!(schedule, vec![(10, 10), (5, 15), (1, 20)]);
+    assert_eq!(rounds[0].logistic_coef, (2.0 / (1.0 + 701f64.ln())) as f32, "round 0 reads the pattern phase's max overflow");
+    assert_eq!(rounds[1].logistic_coef.to_bits(), (-0.0f32).to_bits(), "round 1 reads round 0's scan: nothing routed, ln 0");
 }

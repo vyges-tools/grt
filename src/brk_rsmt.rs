@@ -160,20 +160,27 @@ pub enum RouteKind {
     MazeRoute = 3,
 }
 
-/// The symbolic part of a tree edge's route (`TreeEdge::route`): the type and the fields the L and Z
-/// shapes read. ⚠️ Defaults are the reference's: `NoRoute`, `xFirst` false, `HVH` false, `Zpoint -1`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A tree edge's route (`TreeEdge::route`): the type, the fields the L and Z shapes read, and the
+/// walked-out maze route. ⚠️ Defaults are the reference's: `NoRoute`, `xFirst` false, `HVH` false,
+/// `Zpoint -1`, no grids, `routelen` and `last_routelen` 0.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeRoute {
     pub kind: RouteKind,
     pub x_first: bool,
     pub hvh: bool,
     /// ⛔ `int16_t`.
     pub z_point: i16,
+    /// The route's grid points, `routelen + 1` of them (valid for `MazeRoute`).
+    pub grids: Vec<(i32, i32)>,
+    /// The number of steps in `grids` (valid for `MazeRoute`).
+    pub routelen: i32,
+    /// `routelen` as `SaveLastRouteLen` last recorded it.
+    pub last_routelen: i32,
 }
 
 impl Default for TreeRoute {
     fn default() -> Self {
-        TreeRoute { kind: RouteKind::NoRoute, x_first: false, hvh: false, z_point: -1 }
+        TreeRoute { kind: RouteKind::NoRoute, x_first: false, hvh: false, z_point: -1, grids: Vec::new(), routelen: 0, last_routelen: 0 }
     }
 }
 
@@ -184,7 +191,7 @@ impl TreeRoute {
             RouteKind::NoRoute => RoutedShape::None,
             RouteKind::LRoute => RoutedShape::L { x_first: self.x_first },
             RouteKind::ZRoute => RoutedShape::Z { hvh: self.hvh, z_point: self.z_point as i32 },
-            RouteKind::MazeRoute => unimplemented!("maze routes are not held on the pattern-phase tree"),
+            RouteKind::MazeRoute => RoutedShape::Maze { grids: self.grids.clone(), routelen: self.routelen as usize },
         }
     }
 }

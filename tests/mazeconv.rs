@@ -158,15 +158,15 @@ fn folding_the_estimate_adds_and_does_not_move_it() {
     grid.update_h(1, 3, 2, 4.0);
     grid.update_v(2, 1, 4, 7.0);
 
-    assert_eq!(grid.usage_h(1, 2), 0.0, "committed demand starts empty");
+    assert_eq!(grid.usage_h(1, 2), 0, "committed demand starts empty");
     grid.add_est_usage_to_usage();
-    assert_eq!(grid.usage_h(1, 2), 4.0);
-    assert_eq!(grid.usage_v(2, 1), 7.0);
+    assert_eq!(grid.usage_h(1, 2), 4);
+    assert_eq!(grid.usage_v(2, 1), 7);
     assert_eq!(grid.h(1, 2), 4.0, "the estimate is left in place, not moved");
 
     // A second fold adds the same estimate again, which is exactly what "add" means here.
     grid.add_est_usage_to_usage();
-    assert_eq!(grid.usage_h(1, 2), 8.0);
+    assert_eq!(grid.usage_h(1, 2), 8);
     assert_eq!(grid.h(1, 2), 4.0);
 }
 
@@ -182,13 +182,20 @@ fn the_usage_check_fires_only_strictly_above_the_limit() {
     grid.add_est_usage_to_usage();
     assert_eq!(check_2d_edges_usage(&grid, 2, 2), vec![], "exactly on the limit passes");
 
-    grid.update_h(1, 2, 3, 0.5);
-    grid.add_est_usage_to_usage();
-    let found = check_2d_edges_usage(&grid, 2, 2);
+    // ⛔ Committed usage is `uint16_t`: the fold truncates a fractional estimate, so 200.5 is still
+    // exactly on the limit — the smallest excess committed usage can hold is one whole unit.
+    let mut half = EstimateGrid::new(5, 5);
+    half.update_h(1, 2, 3, 200.5);
+    half.add_est_usage_to_usage();
+    assert_eq!(check_2d_edges_usage(&half, 2, 2), vec![], "200.5 folds to 200: on the limit");
+
+    let mut over = EstimateGrid::new(5, 5);
+    over.update_h(1, 2, 3, 201.0);
+    over.add_est_usage_to_usage();
     assert_eq!(
-        found,
-        vec![UsageViolation { x: 1, y: 3, horizontal: true, usage: 400.5, limit: 200 }],
-        "a hair over the limit is reported"
+        check_2d_edges_usage(&over, 2, 2),
+        vec![UsageViolation { x: 1, y: 3, horizontal: true, usage: 201.0, limit: 200 }],
+        "one unit over the limit is reported"
     );
 
     // ⚠️ The two directions are checked against their own capacities, not a shared one.

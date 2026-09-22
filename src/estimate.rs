@@ -28,8 +28,11 @@ pub struct EstimateGrid {
     /// ⚠️ The two are separate all the way through the estimating stages; the estimate is folded
     /// into this one only when the router switches to maze routing, and it is **added**, not
     /// moved — the estimate is left in place.
-    usage_h: Vec<f64>,
-    usage_v: Vec<f64>,
+    ///
+    /// ⛔ **`uint16_t`, as the reference's `Edge::usage`.** Every charge is `usage += double`: the sum
+    /// is formed in double and converted back, truncating toward zero — see [`charge_u16`].
+    usage_h: Vec<u16>,
+    usage_v: Vec<u16>,
     /// Demand carried over from the previous round, and how many rounds an edge has been
     /// congested. Both feed the congestion history the maze router consults.
     ///
@@ -47,8 +50,8 @@ impl EstimateGrid {
             y_grids,
             h: vec![0.0; x_grids.saturating_sub(1) * y_grids],
             v: vec![0.0; x_grids * y_grids.saturating_sub(1)],
-            usage_h: vec![0.0; x_grids.saturating_sub(1) * y_grids],
-            usage_v: vec![0.0; x_grids * y_grids.saturating_sub(1)],
+            usage_h: vec![0; x_grids.saturating_sub(1) * y_grids],
+            usage_v: vec![0; x_grids * y_grids.saturating_sub(1)],
             last_usage_h: vec![0; x_grids.saturating_sub(1) * y_grids],
             last_usage_v: vec![0; x_grids * y_grids.saturating_sub(1)],
             cong_cnt_h: vec![0; x_grids.saturating_sub(1) * y_grids],
@@ -104,12 +107,12 @@ impl EstimateGrid {
         }
     }
 
-    /// Committed horizontal demand on the edge leaving cell `(x, y)`.
-    pub fn usage_h(&self, x: usize, y: usize) -> f64 {
+    /// Committed horizontal demand on the edge leaving cell `(x, y)` — `getUsageH`, a `uint16_t`.
+    pub fn usage_h(&self, x: usize, y: usize) -> u16 {
         self.usage_h[y * self.h_columns() + x]
     }
-    /// Committed vertical demand on the edge leaving cell `(x, y)`.
-    pub fn usage_v(&self, x: usize, y: usize) -> f64 {
+    /// Committed vertical demand on the edge leaving cell `(x, y)` — `getUsageV`.
+    pub fn usage_v(&self, x: usize, y: usize) -> u16 {
         self.usage_v[y * self.x_grids + x]
     }
 
@@ -118,12 +121,12 @@ impl EstimateGrid {
     /// ⚠️ A single edge, not a run: the walk that uses this charges each step as it takes it.
     pub fn update_usage_h(&mut self, x: i32, y: i32, amount: f64) {
         let i = y as usize * self.h_columns() + x as usize;
-        self.usage_h[i] += amount;
+        self.usage_h[i] = charge_u16(self.usage_h[i], amount);
     }
     /// Charge one vertical edge's committed demand — the reference's `updateUsageV`.
     pub fn update_usage_v(&mut self, x: i32, y: i32, amount: f64) {
         let i = y as usize * self.x_grids + x as usize;
-        self.usage_v[i] += amount;
+        self.usage_v[i] = charge_u16(self.usage_v[i], amount);
     }
 
     /// Fold the estimate into the committed demand — the reference's `addEstUsageToUsage`.
@@ -132,10 +135,10 @@ impl EstimateGrid {
     /// including ones no net ever reached.
     pub fn add_est_usage_to_usage(&mut self) {
         for (u, e) in self.usage_h.iter_mut().zip(self.h.iter()) {
-            *u += *e;
+            *u = charge_u16(*u, *e);
         }
         for (u, e) in self.usage_v.iter_mut().zip(self.v.iter()) {
-            *u += *e;
+            *u = charge_u16(*u, *e);
         }
     }
     /// Number of horizontal edges across: one fewer than the cell columns.
@@ -203,6 +206,15 @@ pub trait Usage2d {
     fn update_usage_h(&mut self, x: i32, y: i32, amount: f64);
     /// Charge ONE vertical edge's committed usage — `updateUsageV(x, y, net, usage)`.
     fn update_usage_v(&mut self, x: i32, y: i32, amount: f64);
+}
+
+/// `uint16_t usage += double amount` — the sum formed in double, then converted back.
+///
+/// ⛔ The conversion truncates toward zero. Outside `0..65536` it is undefined in C++; x86-64 compiles
+/// it as a 32-bit truncating convert whose low 16 bits are kept, so a sum that goes negative WRAPS.
+/// That is what this does (Rust's own `as u16` on a float would saturate instead).
+pub fn charge_u16(usage: u16, amount: f64) -> u16 {
+    (f64::from(usage) + amount) as i32 as u16
 }
 
 impl Usage2d for EstimateGrid {
@@ -400,7 +412,7 @@ pub fn check_2d_edges_usage(
     let (h_limit, v_limit) = (MAX_USAGE_MULTIPLIER * h_capacity, MAX_USAGE_MULTIPLIER * v_capacity);
     for y in 0..grid.y_grids {
         for x in 0..grid.h_columns() {
-            let usage = grid.usage_h(x, y);
+            let usage = f64::from(grid.usage_h(x, y));
             if usage > f64::from(h_limit) {
                 out.push(UsageViolation { x, y, horizontal: true, usage, limit: h_limit });
             }
@@ -408,7 +420,7 @@ pub fn check_2d_edges_usage(
     }
     for y in 0..grid.v_rows() {
         for x in 0..grid.x_grids {
-            let usage = grid.usage_v(x, y);
+            let usage = f64::from(grid.usage_v(x, y));
             if usage > f64::from(v_limit) {
                 out.push(UsageViolation { x, y, horizontal: false, usage, limit: v_limit });
             }

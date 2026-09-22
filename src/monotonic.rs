@@ -196,8 +196,8 @@ impl Grid2D {
 ///
 /// ⚠️ Each run stops **before** its destination; the destination is emitted by the run that
 /// follows, and the final endpoint is appended once at the end. So no corner is emitted twice.
-fn walk(
-    grid: &mut EstimateGrid,
+fn walk<G: crate::estimate::Usage2d + ?Sized>(
+    grid: &mut G,
     points: &mut Vec<(i32, i32)>,
     (x1, y1): (i32, i32),
     (px, py): (i32, i32),
@@ -206,8 +206,8 @@ fn walk(
     bl2: bool,
     edge_cost: f64,
 ) {
-    fn walk_h(
-        grid: &mut EstimateGrid,
+    fn walk_h<G: crate::estimate::Usage2d + ?Sized>(
+        grid: &mut G,
         points: &mut Vec<(i32, i32)>,
         from_x: i32,
         to_x: i32,
@@ -223,8 +223,8 @@ fn walk(
             i += step;
         }
     }
-    fn walk_v(
-        grid: &mut EstimateGrid,
+    fn walk_v<G: crate::estimate::Usage2d + ?Sized>(
+        grid: &mut G,
         points: &mut Vec<(i32, i32)>,
         x: i32,
         from_y: i32,
@@ -240,7 +240,7 @@ fn walk(
             i += step;
         }
     }
-    let segment = |grid: &mut EstimateGrid,
+    let segment = |grid: &mut G,
                        points: &mut Vec<(i32, i32)>,
                        h_first: bool,
                        (fx, fy): (i32, i32),
@@ -272,6 +272,27 @@ pub fn route_monotonic(
     used_h: &dyn Fn(i32, i32) -> f64,
     used_v: &dyn Fn(i32, i32) -> f64,
 ) -> MonotonicRoute {
+    let (px, py, bl1, bl2, best) =
+        monotonic_search((x1, y1), (x2, y2), (xmin, xmax, ymin, ymax), cost_table, via_cost, used_h, used_v);
+    let mut points = Vec::new();
+    walk(grid, &mut points, (x1, y1), (px, py), (x2, y2), bl1, bl2, f64::from(edge_cost));
+    let routelen = points.len() as i32 - 1;
+
+    MonotonicRoute { px, py, bl1, bl2, best, points, routelen }
+}
+
+/// [`route_monotonic`]'s search alone: the running costs over the box and the chosen midpoint and
+/// orientations `(px, py, bl1, bl2, best)`. Reads the demand, writes nothing.
+#[allow(clippy::too_many_arguments)]
+pub fn monotonic_search(
+    (x1, y1): (i32, i32),
+    (x2, y2): (i32, i32),
+    (xmin, xmax, ymin, ymax): (i32, i32, i32, i32),
+    cost_table: &[f64],
+    via_cost: f64,
+    used_h: &dyn Fn(i32, i32) -> f64,
+    used_v: &dyn Fn(i32, i32) -> f64,
+) -> (i32, i32, bool, bool, f64) {
     let mut d1 = Grid2D::new(xmin, xmax, ymin, ymax);
     let mut d2 = Grid2D::new(xmin, xmax, ymin, ymax);
 
@@ -287,15 +308,7 @@ pub fn route_monotonic(
             d2.set(i, j + 1, d2.at(i, j) + cost_of(cost_table, used_v(i, j)));
         }
     }
-
-    let (px, py, bl1, bl2, best) =
-        choose_midpoint((x1, y1), (x2, y2), (xmin, xmax, ymin, ymax), &d1, &d2, via_cost);
-
-    let mut points = Vec::new();
-    walk(grid, &mut points, (x1, y1), (px, py), (x2, y2), bl1, bl2, f64::from(edge_cost));
-    let routelen = points.len() as i32 - 1;
-
-    MonotonicRoute { px, py, bl1, bl2, best, points, routelen }
+    choose_midpoint((x1, y1), (x2, y2), (xmin, xmax, ymin, ymax), &d1, &d2, via_cost)
 }
 
 /// Walk a route whose midpoint and orientations are already known.
@@ -303,8 +316,8 @@ pub fn route_monotonic(
 /// Exposed so the walk can be replayed on every routed edge, where carrying the whole search box
 /// would not fit. It is the same code the full routine runs.
 #[allow(clippy::too_many_arguments)]
-pub fn walk_monotonic_route(
-    grid: &mut EstimateGrid,
+pub fn walk_monotonic_route<G: crate::estimate::Usage2d + ?Sized>(
+    grid: &mut G,
     (x1, y1): (i32, i32),
     (px, py): (i32, i32),
     (x2, y2): (i32, i32),

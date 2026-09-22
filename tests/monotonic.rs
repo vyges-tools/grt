@@ -140,7 +140,7 @@ fn midpoint_and_orientations_match_the_reference() {
         let mut charged: Vec<(i32, i32, f64, bool)> = Vec::new();
         for y in 0..grid.y_grids {
             for x in 0..grid.h_columns() {
-                let u = grid.usage_h(x, y);
+                let u = f64::from(grid.usage_h(x, y));
                 if u != 0.0 {
                     charged.push((x as i32, y as i32, u, true));
                 }
@@ -148,7 +148,7 @@ fn midpoint_and_orientations_match_the_reference() {
         }
         for y in 0..grid.v_rows() {
             for x in 0..grid.x_grids {
-                let u = grid.usage_v(x, y);
+                let u = f64::from(grid.usage_v(x, y));
                 if u != 0.0 {
                     charged.push((x as i32, y as i32, u, false));
                 }

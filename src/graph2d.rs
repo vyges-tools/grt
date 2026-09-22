@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 
 use crate::estimate::{Usage2d, EstimateGrid};
 use crate::ndr_cost::{NdrCostNet, NdrLedger};
-use crate::overflow2d::{get_overflow_2d, Overflow2DScan, UsedCell};
+use crate::overflow2d::{get_overflow_2d, get_overflow_2d_maze, Overflow2DScan, UsedCell};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Graph2d {
@@ -55,6 +55,24 @@ impl Graph2d {
         let h: Vec<UsedCell> = self.used_h.iter().map(|&(x, y)| cell(x, y, self.est.h(x as usize, y as usize), self.cap_h[y as usize * xg + x as usize])).collect();
         let v: Vec<UsedCell> = self.used_v.iter().map(|&(x, y)| cell(x, y, self.est.v(x as usize, y as usize), self.cap_v[y as usize * xg + x as usize])).collect();
         get_overflow_2d(&h, &v)
+    }
+
+    /// `getOverflow2Dmaze`'s scan — COMMITTED usage over the used grids, in set order.
+    pub fn get_overflow_2d_maze(&self) -> Overflow2DScan {
+        let xg = self.est.x_grids;
+        let cell = |x: i32, y: i32, usage: u16, cap: u16| UsedCell { x, y, usage, est_usage: 0.0, cap };
+        let h: Vec<UsedCell> = self.used_h.iter().map(|&(x, y)| cell(x, y, self.est.usage_h(x as usize, y as usize), self.cap_h[y as usize * xg + x as usize])).collect();
+        let v: Vec<UsedCell> = self.used_v.iter().map(|&(x, y)| cell(x, y, self.est.usage_v(x as usize, y as usize), self.cap_v[y as usize * xg + x as usize])).collect();
+        get_overflow_2d_maze(&h, &v)
+    }
+
+    /// `getUsageRedH` — committed usage plus the edge's reduction, ⛔ as `uint16_t` (the sum wraps).
+    pub fn usage_red_h(&self, x: i32, y: i32, red: u16) -> u16 {
+        (u32::from(self.est.usage_h(x as usize, y as usize)) + u32::from(red)) as u16
+    }
+    /// `getUsageRedV`.
+    pub fn usage_red_v(&self, x: i32, y: i32, red: u16) -> u16 {
+        (u32::from(self.est.usage_v(x as usize, y as usize)) + u32::from(red)) as u16
     }
 }
 

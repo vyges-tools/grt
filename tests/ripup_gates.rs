@@ -171,11 +171,11 @@ fn the_walked_gate_matches_the_reference() {
             let ((ax, ay), (bx, by)) = (points[k], points[k + 1]);
             let after = c["used_after"].as_array().expect("after")[k][1]
                 .as_f64().expect("f64");
-            let got_now = if dir == "V" {
+            let got_now = f64::from(if dir == "V" {
                 grid.usage_v(ax as usize, ay.min(by) as usize)
             } else {
                 grid.usage_h(ax.min(bx) as usize, ay as usize)
-            };
+            });
             assert_eq!(got_now, after, "demand at step {k} on {}", c["design"]);
         }
 
@@ -217,7 +217,7 @@ fn check(steps: usize, usage: f64, critical: CriticalCheck) -> (Option<RipupReas
     let got = new_ripup_check(
         &mut grid, &points, steps, 0, (10, 10), 1, Some(critical), &zero, &used,
     );
-    (got, grid.usage_v(1, 1))
+    (got, f64::from(grid.usage_v(1, 1)))
 }
 
 /// A net inside the critical band but with a route that has not grown.

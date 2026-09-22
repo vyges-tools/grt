@@ -23,14 +23,14 @@ fn seeded() -> EstimateGrid {
 fn clearing_the_estimate_leaves_committed_demand() {
     let mut g = seeded();
     assert_eq!(g.h(1, 2), 3.0);
-    assert_eq!(g.usage_h(1, 2), 3.0);
+    assert_eq!(g.usage_h(1, 2), 3);
 
     g.init_est_usage();
 
     assert_eq!(g.h(1, 2), 0.0, "the estimate is cleared");
     assert_eq!(g.v(2, 1), 0.0);
-    assert_eq!(g.usage_h(1, 2), 3.0, "the committed demand is not");
-    assert_eq!(g.usage_v(2, 1), 5.0);
+    assert_eq!(g.usage_h(1, 2), 3, "the committed demand is not");
+    assert_eq!(g.usage_v(2, 1), 5);
 }
 
 /// Only the first pass clears the congestion counts.

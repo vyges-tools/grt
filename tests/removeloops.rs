@@ -105,12 +105,12 @@ fn a_loop_is_cut_and_its_demand_given_back() {
 
     // ⛔ Exactly the square's four edges are given back — the final step is not.
     assert_ne!(grid, charged);
-    assert_eq!(grid.usage_v(1, 0), 1.0, "the step beyond the loop keeps its demand");
-    assert_eq!(grid.usage_h(1, 1), 0.0, "and the loop's own edges are back to nothing");
-    assert_eq!(grid.usage_v(2, 1), 0.0);
-    assert_eq!(grid.usage_h(1, 2), 0.0);
+    assert_eq!(grid.usage_v(1, 0), 1, "the step beyond the loop keeps its demand");
+    assert_eq!(grid.usage_h(1, 1), 0, "and the loop's own edges are back to nothing");
+    assert_eq!(grid.usage_v(2, 1), 0);
+    assert_eq!(grid.usage_h(1, 2), 0);
     // ⛔ Including the step that closes the loop — the last one, which is easy to leave charged.
-    assert_eq!(grid.usage_v(1, 1), 0.0, "the closing step must be given back too");
+    assert_eq!(grid.usage_v(1, 1), 0, "the closing step must be given back too");
 }
 
 /// ⚠️ A zero-length step charges nothing, so nothing is given back for it either.
