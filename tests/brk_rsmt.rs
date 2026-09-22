@@ -98,6 +98,9 @@ struct Seen {
     snapshot_batched: usize,
     loops_removed: usize,
     r15_checked: usize,
+    r16_checked: usize,
+    r16_widened: usize,
+    r16_res_aware: usize,
     thinned: usize,
     loop_partial_slack: usize,
     loop_extra_stops: usize,
@@ -635,6 +638,7 @@ fn replay_run(r: &Value, bounds: Option<&Value>, seen: &mut Seen) {
                         };
                         let mut befores = 0usize;
                         let mut final_ready = false;
+                        let mut has_2d_overflow = false;
                         let mut prev_scan = last;
                         let outcome = congestion_loop(&start, &net_ids, &nets, &mut state, &mut grid14, &mut |ev, g, st| match ev {
                             LoopEvent::Before { params: p, schedule: sc } => {
@@ -673,6 +677,7 @@ fn replay_run(r: &Value, bounds: Option<&Value>, seen: &mut Seen) {
                                 // that does fails here and points at the constructed-only coverage.
                                 assert_eq!(end.rare, RareBranches::default(), "{at}: a loop branch the corpus never reached fired: {:?}", end.rare);
                                 final_ready = true;
+                                has_2d_overflow = end.has_2d_overflow;
                             }
                             Err(e) if e.contains("CalculatePartialSlack") => {
                                 assert!(cnp != 0, "{at}: partial slack refused with cnp 0");
@@ -696,6 +701,36 @@ fn replay_run(r: &Value, bounds: Option<&Value>, seen: &mut Seen) {
                                 let scan = g2d.get_overflow_2d_maze();
                                 check_boundary(&at, b15, &scan, &g2d, &state, seen);
                                 seen.r15_checked += 1;
+                                // R16 — layerAssignment, then getOverflow3D. The 3D capacity is set up
+                                // before routing and nothing in 2D touches it: an INPUT, from B15.
+                                if let Some(b16) = at_b("B16") {
+                                    let mut g3 = graph3d_from(b15, xg, yg);
+                                    assert!(g3.h_usage.iter().chain(&g3.v_usage).all(|l| l.iter().all(|&u| u == 0)), "{at}: 3D usage before layer assignment");
+                                    let dims = &b15["dims"];
+                                    let dirs: Vec<LayerDir> = arr(&dims["dirs"]).iter().map(|d| match d.as_str() { Some("H") => LayerDir::Horizontal, Some("V") => LayerDir::Vertical, _ => LayerDir::Other }).collect();
+                                    let attrs = layer_attrs(b15, b16, max_id + 1);
+                                    let p = LayerParams { layer_dir: &dirs, resistance_aware: int(&dims["resaware"]) == 1, liberty: int(&dims["liberty"]) == 1, has_2d_overflow };
+                                    let assigned = match layer_assignment(&net_ids, &nets, &attrs, &mut state, &mut g3, &p) {
+                                        Ok(()) => true,
+                                        // ⛔ Resistance-aware with a liberty library: updateSlacks keeps a net
+                                        // (an unconstrained CLOCK net is not skipped) and reads its resistance
+                                        // from the database — not wired. A declared stop, counted.
+                                        Err(e) if e.contains("needs its resistance") => {
+                                            assert!(p.liberty && p.resistance_aware, "{at}: {e} without liberty + resistance-aware");
+                                            seen.r16_res_aware += 1;
+                                            false
+                                        }
+                                        Err(e) => panic!("{at}: {e}"),
+                                    };
+                                    if assigned {
+                                    let ov3 = get_overflow_3d_all(&g2d, &g3);
+                                    assert_eq!((b16["logistic_coef"].as_f64().expect("past_cong") as i32, int(&b16["total_overflow"]), int(&b16["t_usage"])), (scan.total_overflow, ov3.total, ov3.total_usage),
+                                               "{at} B16: (past_cong, getOverflow3D overflow, 3D usage)");
+                                    check_boundary(&at, b16, &Overflow2DScan { total_overflow: ov3.total, ..scan }, &g2d, &state, seen);
+                                    check_3d(&at, b16, &g3, &state, &nets, seen);
+                                    seen.r16_checked += 1;
+                                    }
+                                }
                             }
                         }
                     }
@@ -732,13 +767,92 @@ fn add(a: Seen, b: Seen) -> Seen {
         runs: a.runs + b.runs, calls: a.calls + b.calls, nets: a.nets + b.nets, flute_nets: a.flute_nets + b.flute_nets,
         shifted: a.shifted + b.shifted, shifts: a.shifts + b.shifts, copied: a.copied + b.copied,
         routed_edges: a.routed_edges + b.routed_edges, usage_checked: a.usage_checked + b.usage_checked,
-        ndr_checked: a.ndr_checked + b.ndr_checked, r6_checked: a.r6_checked + b.r6_checked, r6_segs: a.r6_segs + b.r6_segs, boundaries: a.boundaries + b.boundaries, boundary_nets: a.boundary_nets + b.boundary_nets, incremental: a.incremental + b.incremental, gate_hvh: a.gate_hvh + b.gate_hvh, gate_vhv: a.gate_vhv + b.gate_vhv, maze_routes: a.maze_routes + b.maze_routes, maze_passes: a.maze_passes + b.maze_passes, usage_errors: a.usage_errors + b.usage_errors, loop_iterations: a.loop_iterations + b.loop_iterations, snapshot_batched: a.snapshot_batched + b.snapshot_batched, loops_removed: a.loops_removed + b.loops_removed, r15_checked: a.r15_checked + b.r15_checked, thinned: a.thinned + b.thinned, loop_partial_slack: a.loop_partial_slack + b.loop_partial_slack, loop_extra_stops: a.loop_extra_stops + b.loop_extra_stops, stacked_pins: a.stacked_pins + b.stacked_pins, htree: a.htree + b.htree,
+        ndr_checked: a.ndr_checked + b.ndr_checked, r6_checked: a.r6_checked + b.r6_checked, r6_segs: a.r6_segs + b.r6_segs, boundaries: a.boundaries + b.boundaries, boundary_nets: a.boundary_nets + b.boundary_nets, incremental: a.incremental + b.incremental, gate_hvh: a.gate_hvh + b.gate_hvh, gate_vhv: a.gate_vhv + b.gate_vhv, maze_routes: a.maze_routes + b.maze_routes, maze_passes: a.maze_passes + b.maze_passes, usage_errors: a.usage_errors + b.usage_errors, loop_iterations: a.loop_iterations + b.loop_iterations, snapshot_batched: a.snapshot_batched + b.snapshot_batched, loops_removed: a.loops_removed + b.loops_removed, r15_checked: a.r15_checked + b.r15_checked, r16_checked: a.r16_checked + b.r16_checked, r16_widened: a.r16_widened + b.r16_widened, r16_res_aware: a.r16_res_aware + b.r16_res_aware, thinned: a.thinned + b.thinned, loop_partial_slack: a.loop_partial_slack + b.loop_partial_slack, loop_extra_stops: a.loop_extra_stops + b.loop_extra_stops, stacked_pins: a.stacked_pins + b.stacked_pins, htree: a.htree + b.htree,
     }
 }
 
 // ─── Constructed cases: branches the corpus never reaches ───────────────────────────────────
 
 use std::cell::RefCell;
+
+/// The 3D capacity (B15's `c3`) and usage (`u3`) as the router holds them: H rows over `x < xg-1`,
+/// V rows over `y < yg-1`, both indexed `y * xg + x`.
+fn graph3d_from(b: &Value, xg: usize, yg: usize) -> Graph3d {
+    // ⚠️ A single-row grid has no vertical edges, so its V rows are absent, not empty.
+    let nl = arr(&b["c3"]["H"]).len();
+    let layers = |key: &str, d: &str| -> Vec<Vec<u16>> {
+        if b[key][d].is_null() {
+            return vec![vec![0u16; xg * yg]; nl];
+        }
+        arr(&b[key][d]).iter().map(|l| {
+            let mut v = vec![0u16; xg * yg];
+            for (y, row) in arr(l).iter().enumerate() {
+                for (x, val) in unrle(row).into_iter().enumerate() {
+                    v[y * xg + x] = val[0] as u16;
+                }
+            }
+            v
+        }).collect()
+    };
+    let h_cap = layers("c3", "H");
+    Graph3d { x_grid: xg, num_layers: h_cap.len(), v_cap: layers("c3", "V"), h_usage: layers("u3", "H"), v_usage: layers("u3", "V"), h_cap }
+}
+
+/// Per net: pin layers (B15's `pin_layers`) and B15's `BA` — the NDR rule, the clock flag,
+/// `isResAware` on entry, `getLayerEdgeCost` over every layer — and the timer's slack, which
+/// `updateSlacks` writes when it runs: an INPUT, read from B16 after it ran.
+fn layer_attrs(b15: &Value, b16: &Value, n: usize) -> Vec<NetLayerAttrs> {
+    let mut out = vec![NetLayerAttrs { pin_layers: Vec::new(), has_ndr: false, is_clock: false, is_res_aware: false, layer_edge_cost: Vec::new(), sta_slack: 0.0 }; n];
+    // A call with no routed nets writes no pin layers at all.
+    let none = serde_json::Map::new();
+    for (id, pl) in b15["pin_layers"].as_object().unwrap_or(&none) {
+        let id: usize = id.parse().expect("id");
+        let a = arr(&b15["attrs"][id.to_string()]);
+        let sta_slack = f32::from_bits(int(&b16["netstate"][id.to_string()]["slack_bits"]) as u32);
+        out[id] = NetLayerAttrs {
+            pin_layers: arr(pl).iter().map(|v| int(v) as i16).collect(),
+            has_ndr: int(&a[0]) == 1,
+            is_clock: int(&a[1]) == 1,
+            is_res_aware: int(&a[2]) == 1,
+            layer_edge_cost: arr(&a[6]).iter().map(|v| int(v) as i8).collect(),
+            sta_slack,
+        };
+    }
+    out
+}
+
+/// The 3D half of a boundary from B16 on: per-layer usage, each node's layer extremes, each net's
+/// (possibly widened) layer range, and each maze route's layers.
+fn check_3d(at: &str, b: &Value, g3: &Graph3d, state: &[NetState], nets: &[RsmtNet<'_>], seen: &mut Seen) {
+    let at = format!("{at} {}", b["tag"].as_str().expect("tag"));
+    let (xg, yg) = (int(&b["xg"]) as usize, int(&b["yg"]) as usize);
+    let want = graph3d_from(&serde_json::json!({ "c3": b["u3"], "u3": b["u3"] }), xg, yg);
+    for l in 0..g3.num_layers {
+        assert_eq!(g3.h_usage[l], want.h_usage[l], "{at}: 3D usage H layer {l}");
+        assert_eq!(g3.v_usage[l], want.v_usage[l], "{at}: 3D usage V layer {l}");
+    }
+    for (id, nodes) in b["layers"].as_object().unwrap_or(&serde_json::Map::new()) {
+        let id: usize = id.parse().expect("id");
+        let t = state[id].tree.as_ref().expect("tree");
+        let ours: Vec<[i32; 6]> = t.walk.iter().map(|w| [i32::from(w.top_layer), i32::from(w.bot_layer), w.h_id, w.l_id, w.edges.len() as i32, i32::from(w.assigned)]).collect();
+        let want: Vec<[i32; 6]> = arr(nodes).iter().map(|v| std::array::from_fn(|k| int(&v[k]))).collect();
+        assert_eq!(ours, want, "{at}: net {id} nodes (topL, botL, hID, lID, conCNT, assigned)");
+        let a = arr(&b["attrs"][id.to_string()]);
+        let range = state[id].layer_range.unwrap_or((nets[id].min_layer, nets[id].max_layer));
+        assert_eq!((range.0 as i32, range.1 as i32), (int(&a[3]), int(&a[4])), "{at}: net {id} layer range");
+        // ⛔ Asserted, not noted: no corpus net widens its layer range (every such run either has
+        // room in range or 2D overflow). The widening rules are witnessed by `tests/layertable.rs`;
+        // its persistence across edges by a constructed case alone.
+        assert!(state[id].layer_range.is_none(), "{at}: net {id} widened its layer range; the corpus never did");
+        seen.r16_widened += usize::from(state[id].layer_range.is_some());
+        for (eid, r) in t.routes.iter().enumerate().filter(|(_, r)| r.kind == RouteKind::MazeRoute) {
+            let pts: Vec<i16> = arr(&b["grids"][format!("{id},{eid}")]["points"]).iter().map(|p| int(&p[2]) as i16).collect();
+            // ⚠️ A zero-length edge is never assigned: its points keep `GPoint3D`'s default layer, 0.
+            let ours = if r.layers.is_empty() { vec![0; r.routelen as usize + 1] } else { r.layers[..=r.routelen as usize].to_vec() };
+            assert_eq!(ours, pts, "{at}: net {id} edge {eid} layers");
+        }
+    }
+}
 
 fn no_red(_: usize, _: usize) -> u16 {
     0
@@ -1207,4 +1321,148 @@ fn remove_loops_all_cuts_the_detour_and_gives_back_its_usage() {
     assert_eq!((removed, routelen, grids), (2, 4, straight), "the same cut");
     assert_eq!(row0, vec![400, 0, 400, 400], "(1,0) charged once per net, given back whole though the path still crosses it");
     assert_eq!(detour, (0, 0, 0), "the detour given back");
+}
+
+/// One net of a constructed layer-assignment case: its pins, flute branches, layer range and
+/// `getLayerEdgeCost` over every layer.
+struct LaNet {
+    pins: Vec<(i32, i32)>,
+    branches: Vec<(i32, i32, usize)>,
+    range: (usize, usize),
+    lec: Vec<i8>,
+    ndr: bool,
+    clock: bool,
+}
+
+impl LaNet {
+    fn two_pin(a: (i32, i32), b: (i32, i32), nl: usize) -> LaNet {
+        LaNet { pins: vec![a, b], branches: vec![(a.0, a.1, 1), (b.0, b.1, 1)], range: (0, nl - 1), lec: vec![1; nl], ndr: false, clock: false }
+    }
+}
+
+/// Run R16 on constructed nets: each edge routed straight from its `n1` to its `n2`, every pin on
+/// layer 0, the 3D capacity from `cap(horizontal, layer, x, y)` and no usage.
+fn la_case(dirs: &[LayerDir], xg: usize, yg: usize, spec: &[LaNet], cap: impl Fn(bool, usize, usize, usize) -> u16, ids: &[usize], resistance_aware: bool, has_2d_overflow: bool) -> (Vec<NetState>, Graph3d) {
+    let nl = dirs.len();
+    let mut state: Vec<NetState> = spec.iter().map(|n| st_tree(n.pins.len(), &n.branches, &n.pins)).collect();
+    for ns in &mut state {
+        let t = ns.tree.as_mut().expect("tree");
+        for e in 0..t.edges.len() {
+            let (a, b) = (t.nodes[t.edges[e].n1], t.nodes[t.edges[e].n2]);
+            let (a, b) = ((i32::from(a.x), i32::from(a.y)), (i32::from(b.x), i32::from(b.y)));
+            assert!(a.0 == b.0 || a.1 == b.1, "constructed edges are straight");
+            let n = (b.0 - a.0).abs() + (b.1 - a.1).abs();
+            let r = &mut t.routes[e];
+            r.kind = RouteKind::MazeRoute;
+            r.routelen = n;
+            r.grids = (0..=n).map(|k| (a.0 + (b.0 - a.0).signum() * k, a.1 + (b.1 - a.1).signum() * k)).collect();
+        }
+    }
+    let pins: Vec<(Vec<i32>, Vec<i32>)> = spec.iter().map(|n| n.pins.iter().copied().unzip()).collect();
+    let nets: Vec<RsmtNet<'_>> = spec.iter().zip(&pins).map(|(n, p)| RsmtNet {
+        edge_cost: *n.lec.iter().max().expect("lec"),
+        min_layer: n.range.0,
+        max_layer: n.range.1,
+        layer_edge_cost: &n.lec[n.range.0..=n.range.1],
+        ..net(&p.0, &p.1)
+    }).collect();
+    let attrs: Vec<NetLayerAttrs> = spec.iter().map(|n| NetLayerAttrs { pin_layers: vec![0; n.pins.len()], has_ndr: n.ndr, is_clock: n.clock, is_res_aware: false, layer_edge_cost: n.lec.clone(), sta_slack: 0.0 }).collect();
+    let layers = |h: bool| -> Vec<Vec<u16>> { (0..nl).map(|l| (0..xg * yg).map(|i| cap(h, l, i % xg, i / xg)).collect()).collect() };
+    let mut g3 = Graph3d { x_grid: xg, num_layers: nl, h_cap: layers(true), v_cap: layers(false), h_usage: vec![vec![0; xg * yg]; nl], v_usage: vec![vec![0; xg * yg]; nl] };
+    let p = LayerParams { layer_dir: dirs, resistance_aware, liberty: false, has_2d_overflow };
+    layer_assignment(ids, &nets, &attrs, &mut state, &mut g3, &p).expect("layer assignment");
+    (state, g3)
+}
+
+/// The layers of net `id`'s edge running between the nodes at `a` and `b`, after R16.
+fn la_layers(state: &[NetState], id: usize, a: (i16, i16), b: (i16, i16)) -> Vec<i16> {
+    let t = state[id].tree.as_ref().expect("tree");
+    let e = (0..t.edges.len()).find(|&e| {
+        let (p, q) = (t.nodes[t.edges[e].n1], t.nodes[t.edges[e].n2]);
+        ((p.x, p.y) == a && (q.x, q.y) == b) || ((p.x, p.y) == b && (q.x, q.y) == a)
+    }).expect("edge");
+    t.routes[e].layers.clone()
+}
+
+const HVH: [LayerDir; 3] = [LayerDir::Horizontal, LayerDir::Vertical, LayerDir::Horizontal];
+
+/// ⛔ `netpinOrderInc` decides who is assigned first, and the first net takes the scarce layer. Two
+/// identical nets on row 0, room for ONE on layer 0: the winner stays on its pins' layer, the
+/// loser climbs to layer 2. Keys in order: NDR first, then (resistance-aware only) clocks first,
+/// then … the net id — NOT the order the nets are listed in.
+#[test]
+fn layer_assignment_gives_the_scarce_layer_to_the_first_net_in_order() {
+    let cap = |h: bool, l: usize, _x: usize, _y: usize| if h && l == 0 { 1 } else { 5 };
+    let winner = |ndr1: bool, clock1: bool, ra: bool| {
+        let mut b = LaNet::two_pin((0, 0), (3, 0), 3);
+        (b.ndr, b.clock) = (ndr1, clock1);
+        let spec = [LaNet::two_pin((0, 0), (3, 0), 3), b];
+        let (st, _) = la_case(&HVH, 4, 3, &spec, cap, &[1, 0], ra, false);
+        let on0 = |id: usize| la_layers(&st, id, (0, 0), (3, 0)).iter().all(|&l| l == 0);
+        assert_ne!(on0(0), on0(1), "exactly one net stays on layer 0");
+        if on0(0) { 0 } else { 1 }
+    };
+    assert_eq!(winner(false, false, false), 0, "a tie falls to the lower net id, whatever the listing order");
+    assert_eq!(winner(true, false, false), 1, "an NDR net goes first");
+    assert_eq!(winner(false, true, true), 1, "a clock net goes first when resistance-aware");
+    assert_eq!(winner(false, true, false), 0, "the clock key does not exist otherwise");
+}
+
+/// ⛔ `assignEdge` charges each step `getLayerEdgeCost(layer)`, not 1: a cost-2 net fills a
+/// capacity-2 layer on its own, and the next net must climb.
+#[test]
+fn layer_assignment_charges_each_step_its_layer_edge_cost() {
+    let cap = |h: bool, l: usize, _x: usize, _y: usize| if h && l == 0 { 2 } else { 5 };
+    let mut wide = LaNet::two_pin((0, 0), (3, 0), 3);
+    wide.lec = vec![2; 3];
+    let spec = [wide, LaNet::two_pin((0, 0), (3, 0), 3)];
+    let (st, g3) = la_case(&HVH, 4, 3, &spec, cap, &[0, 1], false, false);
+    assert!(la_layers(&st, 0, (0, 0), (3, 0)).iter().all(|&l| l == 0), "the wide net takes layer 0");
+    assert!(la_layers(&st, 1, (0, 0), (3, 0)).contains(&2), "and leaves the narrow one no room there");
+    assert_eq!((0..3).map(|x| (g3.h_usage[0][x], g3.h_usage[2][x])).collect::<Vec<_>>(), vec![(2, 1); 3], "usage charged at each net's cost");
+}
+
+/// ⛔ A vertical step reads the edge at the LOWER of its two rows, whichever way the route runs.
+/// Downward from row 2: layer 1 has room on rows 0–1 only, layer 3 on every row; read correctly
+/// the net stays on layer 1, the nearer.
+#[test]
+fn layer_assignment_reads_a_downward_step_at_its_lower_row() {
+    let dirs = [LayerDir::Horizontal, LayerDir::Vertical, LayerDir::Horizontal, LayerDir::Vertical];
+    let cap = |h: bool, l: usize, _x: usize, y: usize| if h { 5 } else if l == 3 || (l == 1 && y < 2) { 1 } else { 0 };
+    // The edge runs from the tree's root: root the tree at the top pin.
+    let net = LaNet { branches: vec![(0, 2, 0), (0, 0, 0)], ..LaNet::two_pin((0, 2), (0, 0), 4) };
+    let (st, _) = la_case(&dirs, 3, 4, &[net], cap, &[0], false, false);
+    let t = st[0].tree.as_ref().expect("tree");
+    assert_eq!(t.routes[0].grids.first(), Some(&(0, 2)), "the route runs downward");
+    assert_eq!(la_layers(&st, 0, (0, 2), (0, 0)), vec![1, 1, 1]);
+}
+
+/// ⛔ The walk continues THROUGH Steiner nodes: an edge between two of them is reached only once
+/// one of its ends has been expanded. An H-shaped net whose bar (row 1) has no room on layer 0.
+#[test]
+fn layer_assignment_reaches_an_edge_between_two_steiner_nodes() {
+    let pins = vec![(1, 0), (1, 2), (3, 0), (3, 2)];
+    let spec = [LaNet { pins, branches: vec![(1, 0, 4), (1, 2, 4), (3, 0, 5), (3, 2, 5), (1, 1, 5), (3, 1, 5)], range: (0, 2), lec: vec![1; 3], ndr: false, clock: false }];
+    let cap = |h: bool, l: usize, _x: usize, y: usize| if h && l == 0 && y == 1 { 0 } else { 5 };
+    let (st, g3) = la_case(&HVH, 5, 3, &spec, cap, &[0], false, false);
+    assert!(la_layers(&st, 0, (1, 1), (3, 1)).contains(&2), "the bar is assigned, on layer 2");
+    assert_eq!((g3.h_usage[2][5 + 1], g3.h_usage[2][5 + 2]), (1, 1), "and charged there");
+}
+
+/// ⛔ `assignEdge` WIDENS a net's layer range (`setMinLayer`) when no layer in it has room — unless
+/// the design has 2D overflow — and the widening STAYS for the net's later edges. A net confined
+/// to layers 1–2 whose first edge finds layer 2 full: it reaches down to layer 0, and its second
+/// edge, which layer 2 could carry, then stays on layer 0 beside its pins as well.
+#[test]
+fn layer_assignment_keeps_a_widened_range_for_later_edges() {
+    let spec = |_: ()| [LaNet { pins: vec![(0, 0), (4, 0), (2, 2)], branches: vec![(0, 0, 3), (4, 0, 3), (2, 2, 3), (2, 0, 3)], range: (1, 2), lec: vec![1; 3], ndr: false, clock: false }];
+    let cap = |h: bool, l: usize, x: usize, _y: usize| if h && l == 2 && x < 2 { 0 } else { 5 };
+    let (st, _) = la_case(&HVH, 5, 3, &spec(()), cap, &[0], false, false);
+    assert_eq!(st[0].layer_range, Some((0, 2)), "widened down to layer 0");
+    assert_eq!(la_layers(&st, 0, (0, 0), (2, 0)), vec![0, 0, 0], "the full edge on layer 0");
+    assert_eq!(la_layers(&st, 0, (4, 0), (2, 0)), vec![0, 0, 0], "the next edge still may use it");
+    // With 2D overflow the range is never widened, and layer 0 stays barred.
+    let (st, _) = la_case(&HVH, 5, 3, &spec(()), cap, &[0], false, true);
+    assert_eq!(st[0].layer_range, None, "no widening under 2D overflow");
+    assert!(la_layers(&st, 0, (4, 0), (2, 0)).contains(&2), "so the next edge climbs to layer 2");
 }

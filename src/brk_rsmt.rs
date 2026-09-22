@@ -176,11 +176,14 @@ pub struct TreeRoute {
     pub routelen: i32,
     /// `routelen` as `SaveLastRouteLen` last recorded it.
     pub last_routelen: i32,
+    /// Each grid point's layer (`GPoint3D::layer`), parallel to `grids` — empty until layer
+    /// assignment (R16) writes it.
+    pub layers: Vec<i16>,
 }
 
 impl Default for TreeRoute {
     fn default() -> Self {
-        TreeRoute { kind: RouteKind::NoRoute, x_first: false, hvh: false, z_point: -1, grids: Vec::new(), routelen: 0, last_routelen: 0 }
+        TreeRoute { kind: RouteKind::NoRoute, x_first: false, hvh: false, z_point: -1, grids: Vec::new(), routelen: 0, last_routelen: 0, layers: Vec::new() }
     }
 }
 
@@ -232,11 +235,15 @@ pub struct NetState {
     pub slack: f32,
     /// `FrNet::is_critical_` — set by the rip-up gate's critical arm, never cleared.
     pub critical: bool,
+    /// The net's layer range as `assignEdge` leaves it (`setMinLayer`/`setMaxLayer`), or `None`
+    /// while it is still the net's own. ⛔ The widening PERSISTS: later edges, and the 3D passes,
+    /// read the widened range.
+    pub layer_range: Option<(usize, usize)>,
 }
 
 impl Default for NetState {
     fn default() -> Self {
-        NetState { seglist: Vec::new(), sorted: None, tree: None, slack: crate::ripup::SLACK_SENTINEL, critical: false }
+        NetState { seglist: Vec::new(), sorted: None, tree: None, slack: crate::ripup::SLACK_SENTINEL, critical: false, layer_range: None }
     }
 }
 
