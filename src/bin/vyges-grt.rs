@@ -569,8 +569,16 @@ fn repair_antennas(db: &mut Db, step: &Value, state: &mut vyges_grt::global_rout
     };
     second.sort_by_key(|(n, ..)| order.iter().position(|m| m == n).unwrap_or(usize::MAX));
     if !second.is_empty() && !jumper_only {
-        insert_diodes(db, &second, padding, step["diode_trace"].as_str(), log)?;
-        return Err(Fail::Refused(format!("detailed placement after diode insertion is not modelled ({} nets got diodes)", second.iter().map(|v| &v.0).collect::<std::collections::BTreeSet<_>>().len())));
+        let mut text = String::new();
+        let diodes = insert_diodes(db, &second, padding, &mut text, log)?;
+        let gates: Vec<String> = second.iter().flat_map(|v| v.2.iter().map(|g| g.rsplit_once('/').map_or(g.clone(), |p| p.0.to_string()))).collect();
+        let legalized = legalize_placed_cells(db, padding, &diodes, &gates, &mut text);
+        if let Some(path) = step["diode_trace"].as_str() {
+            std::fs::write(path, &text).map_err(err)?;
+        }
+        legalized?;
+        log.push(format!("GRT-0015: Inserted {} diodes.", diodes.len()));
+        return Err(Fail::Refused(format!("the incremental re-route after diode insertion is not modelled ({} diodes placed and legalized)", diodes.len())));
     }
     if !second.is_empty() && iterations > 1 {
         return Err(Fail::Refused("a second repair iteration is not modelled".into()));
@@ -582,7 +590,7 @@ fn repair_antennas(db: &mut Db, step: &Value, state: &mut vyges_grt::global_rout
 /// fixed instances and hard blockages collected, then per violation, per gate, per diode needed, a
 /// diode created beside the gate (`insertDiode`), placed, marked, connected — and itself added to
 /// the fixed set the next one avoids.
-fn insert_diodes(db: &mut Db, violations: &[Viol], padding: (i32, i32), trace: Option<&str>, log: &mut Vec<String>) -> Result<(), Fail> {
+fn insert_diodes(db: &mut Db, violations: &[Viol], padding: (i32, i32), text: &mut String, log: &mut Vec<String>) -> Result<Vec<String>, Fail> {
     use vyges_grt::repair_antennas::{place_diode, DiodeFloor, DiodeGate, DiodeRow};
     let r = |v: &[i32]| vyges_grt::Rect { x_min: v[0], y_min: v[1], x_max: v[2], y_max: v[3] };
     // findDiodeMTerm
@@ -644,7 +652,7 @@ fn insert_diodes(db: &mut Db, violations: &[Viol], padding: (i32, i32), trace: O
             fixed.push(vyges_grt::Rect { x_min: b.0, y_min: b.1, x_max: b.2, y_max: b.3 });
         }
     }
-    let mut text = String::new();
+    let mut diodes_made = Vec::new();
     for (i, f) in fixed.iter().enumerate() {
         text.push_str(&format!("VYGD|fixed|{i}|{},{},{},{}\n", f.x_min, f.y_min, f.x_max, f.y_max));
     }
@@ -681,6 +689,7 @@ fn insert_diodes(db: &mut Db, violations: &[Viol], padding: (i32, i32), trace: O
                 db.inst_set_placement_status(&name, p.status).map_err(err)?;
                 db.connect(&name, &diode_term, net).map_err(err)?;
                 fixed.push(r(&db.inst_bbox(&name).map_err(err)?));
+                diodes_made.push(name.clone());
                 for (k, (x, y, o, legal)) in p.tries.iter().enumerate() {
                     text.push_str(&format!("VYGD|try|{name}|{g}|{k}|{x},{y}|{o}|legal={}\n", i32::from(*legal)));
                 }
@@ -695,8 +704,47 @@ fn insert_diodes(db: &mut Db, violations: &[Viol], padding: (i32, i32), trace: O
     if failures {
         log.push("GRT-0243: Unable to repair antennas on net with diodes.".into());
     }
-    if let Some(path) = trace {
-        std::fs::write(path, text).map_err(err)?;
+    Ok(diodes_made)
+}
+
+/// Every instance as the stage-4 trace prints it: `VYGD|inst|<tag>|<name>|<x>,<y>|<orient>|<status>`.
+fn dump_insts(db: &Db, tag: &str, text: &mut String) {
+    for inst in db.inst_names() {
+        let (x, y) = db.inst_location(&inst);
+        text.push_str(&format!("VYGD|inst|{tag}|{inst}|{x},{y}|{}|{}\n", db.inst_get_orient(&inst), db.inst_get_placement_status(&inst)));
+    }
+}
+
+/// `legalizePlacedCells`: `opendp_->detailedPlacement(0, 0, "")` — the negotiation legalizer at its
+/// default tunables, with the padding in force — written back as `updateDbInstLocations` does
+/// (orientation, then location, each only where it changed; status untouched), and then the
+/// diodes and the gates they protect back to PLACED.
+fn legalize_placed_cells(db: &mut Db, padding: (i32, i32), diodes: &[String], gates: &[String], text: &mut String) -> Result<(), Fail> {
+    dump_insts(db, "pre", text);
+    let pad = vyges_dpl::negotiate::Padding { global: padding, ..Default::default() };
+    let res = vyges_dpl::negotiate::legalize_padded(db, vyges_dpl::negotiate::Options::default(), &pad).map_err(|e| Fail::Error(format!("detailed placement: {e}")))?;
+    if !res.failures.is_empty() {
+        return Err(Fail::Error(format!("DPL-0036: Detailed placement failed on {} instances", res.failures.len())));
+    }
+    for p in &res.placed {
+        if let Some(orient) = &p.orient {
+            if db.inst_get_orient(&p.name) != *orient {
+                db.set_inst_orient(&p.name, orient).map_err(err)?;
+            }
+        }
+        if db.inst_location(&p.name) != (p.x, p.y) {
+            db.set_inst_location(&p.name, p.x, p.y).map_err(err)?;
+        }
+    }
+    dump_insts(db, "post", text);
+    // setDiodesAndGatesPlacementStatus(PLACED)
+    for g in gates {
+        if !db.master_get_type(&db.inst_master(g)).map_err(err)?.starts_with("BLOCK") {
+            db.inst_set_placement_status(g, "PLACED").map_err(err)?;
+        }
+    }
+    for d in diodes {
+        db.inst_set_placement_status(d, "PLACED").map_err(err)?;
     }
     Ok(())
 }

@@ -20,7 +20,9 @@ repository = "https://github.com/vyges-tools/grt"
 odb = ["dep:vyges-opendb", "vyges-opendb/gen-write"]
 # The `vyges-grt` command: the database, plus the Steiner-tree engine the router calls for real
 # (R5/R7 take it as an injected function) and JSON for the job file and the report.
-cli = ["odb", "dep:vyges-stt", "dep:serde_json", "dep:flate2"]
+# `repair_antennas` legalizes the diodes it inserts with the detailed placer, as the reference's
+# `legalizePlacedCells` calls `opendp_->detailedPlacement`.
+cli = ["odb", "dep:vyges-stt", "dep:serde_json", "dep:flate2", "dep:vyges-dpl"]
 
 [dev-dependencies]
 # Test-only: the end-to-end corpus is JSON. The library itself stays dependency-free.
@@ -34,6 +36,7 @@ vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "ma
 vyges-stt = { git = "https://github.com/vyges-tools/stt.git", branch = "main", optional = true }
 serde_json = { version = "1", optional = true }
 flate2 = { version = "1", optional = true }
+vyges-dpl = { git = "https://github.com/vyges-tools/dpl.git", branch = "main", optional = true }
 
 # Local development against the sibling checkouts. Patches are only honored from the root
 # manifest, so this is a no-op for downstream consumers pulling us by git.
@@ -42,6 +45,9 @@ vyges-opendb = { path = "../vyges-tools-opendb" }
 
 [patch."https://github.com/vyges-tools/opendb-lib.git"]
 vyges-opendb-lib = { path = "../vyges-tools-opendb-lib" }
+
+[patch."https://github.com/vyges-tools/dpl.git"]
+vyges-dpl = { path = "../vyges-tools-dpl" }
 
 [patch."https://github.com/vyges-tools/loom.git"]
 vyges-loom = { path = "../vyges-tools-loom" }
