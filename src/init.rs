@@ -253,7 +253,9 @@ pub enum AbsentStage {
     MirrorGridToFastRoute,
     /// I9 — per-edge capacity from the track counts. Implemented ([`crate::set_capacities`]).
     SetCapacities,
-    /// I10 — obstructions, blockages and the user's layer/region adjustments.
+    /// I10 — obstructions, blockages and the user's layer/region adjustments. The adjustments
+    /// themselves are implemented ([`crate::adjust`]); the database walk that PRODUCES the
+    /// obstruction rectangles (instances, pins, wires, macros) is not.
     ApplyAdjustments,
     /// I11 — seeded capacity perturbation. ⚠️ Inert unless a seed is set, and no published case
     /// exercises it; the distributions it draws through are implementation-defined besides.

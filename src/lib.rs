@@ -32,6 +32,8 @@ pub mod maze3d;
 pub mod maze3d_pass;
 pub mod pricing;
 pub mod tracks;
+pub mod adjust;
+pub use adjust::{adjust_tile_set, apply_obstruction_adjustment, compute_region_adjustments, compute_tile_reduce, compute_tile_reduce_interval, compute_user_global_adjustments, compute_user_layer_adjustments, init_blocked_intervals, save_resources_before_adjustments, EdgeState, IntervalSet, RegionOutsideDie, RouterEdges};
 pub use tracks::{calc_layer_pitches, get_average_track_spacing, get_default_vias, get_via_dims, init_routing_tracks, PitchLayer, RoutingTracks, SpacingLookup, TechVia, TrackError, TrackGrid, TrackLayer, TrackPattern, V54Rule};
 pub use pricing::{get_maze_route_cost_3d, get_via_cost, get_via_resistance, get_wire_cost, get_wire_resistance, MoveCost, TechLayers, WireNet};
 pub use maze3d_pass::{counts_for_grt183, maze_route_3d_pass, route_one_edge_3d, PassGrid, PassNet, PassParams};
