@@ -272,6 +272,21 @@ impl vyges_grt::wire_codec::CodecTech for DbCodec {
     }
 }
 
+/// Every ROUTING-layer pin box of the net's instance terminals, placed, by tech layer index — in
+/// `getITerms()` → MPin → geometry order (`avoidPinIntersection`).
+fn net_pin_boxes(db: &Db, net: &str, tech_names: &[String]) -> Result<Vec<(usize, vyges_grt::polygon90::R)>, Fail> {
+    let mut out = Vec::new();
+    for it in db.net_iterms(net) {
+        let (inst, pin) = it.rsplit_once('/').ok_or_else(|| err(format!("iterm {it}")))?;
+        for w in db.iterm_pin_boxes(inst, pin) {
+            let layer = db.layer_name_by_number(w.layer);
+            let t = tech_names.iter().position(|m| *m == layer).ok_or_else(|| err(format!("layer {layer}")))?;
+            out.push((t, (w.x0, w.y0, w.x1, w.y1)));
+        }
+    }
+    Ok(out)
+}
+
 /// `dbTech`'s layer stack as the jumper graph walks it: every layer, cut layers included, with
 /// `getUpperLayer` / `getLowerLayer` resolved to positions.
 fn tech_layers(db: &Db) -> Result<vyges_grt::repair_antennas::TechLayers, Fail> {
@@ -776,6 +791,26 @@ fn run(job: &Value) -> Result<Value, Fail> {
                                         text.push_str(&format!("VYGC|{}|vbox|{}|{}\n", w.net, codec.tech_names[t], r(&b)));
                                     }
                                 }
+                            }
+                        }
+                    }
+                    std::fs::write(out, text).map_err(err)?;
+                }
+                // With "nodes": the checker's polygons per layer (`buildLayerMaps`), `VYGC|<net>|node|…`.
+                if let Some(out) = step["nodes"].as_str() {
+                    let codec = DbCodec::read(&db, &vias)?;
+                    let tech = tech_layers(&db)?;
+                    let mut text = String::new();
+                    for w in &wires {
+                        let ops = vyges_grt::wire_codec::encode(&w.ops, &codec).map_err(|e| Fail::Refused(format!("net {}: {e}", w.net)))?;
+                        let shapes = vyges_grt::wire_codec::decode(&ops, &codec);
+                        let pins = net_pin_boxes(&db, &w.net, &codec.tech_names)?;
+                        let nodes = vyges_grt::antenna_check::build_layer_maps(&shapes, &pins, &tech).map_err(Fail::Refused)?;
+                        for (t, list) in &nodes {
+                            for n in list {
+                                let pts: String = n.pol.iter().map(|(x, y)| format!("{x},{y};")).collect();
+                                let low: String = n.low_adj.iter().map(|l| format!("{l},")).collect();
+                                text.push_str(&format!("VYGC|{}|node|{}|{}|{pts}|low={low}\n", w.net, tech.0[*t].name, n.id));
                             }
                         }
                     }
