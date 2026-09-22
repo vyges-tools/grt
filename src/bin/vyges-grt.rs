@@ -276,7 +276,7 @@ impl vyges_grt::wire_codec::CodecTech for DbCodec {
 /// each wired net checked — its violations as `(net, routing level, gate names)`, nets in block
 /// order (the violation map's order), each net's in the checker's order.
 #[allow(clippy::type_complexity)]
-fn check_design(db: &Db, db_guides: &BTreeMap<String, Vec<vyges_grt::Guide>>, with_diode: bool, ratio_margin: f32) -> Result<Vec<(String, i32, Vec<String>)>, Fail> {
+fn check_design(db: &Db, db_guides: &BTreeMap<String, Vec<vyges_grt::Guide>>, with_diode: bool, ratio_margin: f32) -> Result<Vec<Viol>, Fail> {
     let (nets, wtech, vias) = ant_nets(db, db_guides)?;
     let wires = vyges_grt::wire_builder::make_net_wires_from_guides(&nets, db.block_get_g_cell_tile_size(), &wtech).map_err(|e| Fail::Refused(format!("{e:?}")))?;
     let codec = DbCodec::read(db, &vias)?;
@@ -290,8 +290,8 @@ fn check_design(db: &Db, db_guides: &BTreeMap<String, Vec<vyges_grt::Guide>>, wi
         let boxes: Vec<(usize, vyges_grt::polygon90::R)> = pins.iter().flat_map(|p| p.boxes.iter().copied()).collect();
         let mut nodes = vyges_grt::antenna_check::build_layer_maps(&shapes, &boxes, &tech).map_err(Fail::Refused)?;
         vyges_grt::antenna_check::save_gates(&mut nodes, &pins, &tech);
-        for (level, gates) in checker.check(db, &w.net, &nodes, &tech)? {
-            out.push((w.net.clone(), level, gates));
+        for (level, gates, diodes) in checker.check(db, &w.net, &nodes, &tech)? {
+            out.push((w.net.clone(), level, gates, diodes));
         }
     }
     Ok(out)
@@ -355,7 +355,7 @@ impl Checker {
     }
 
     /// `checkNet` after the layer maps: areas, PAR, CAR, then the gates.
-    fn check(&mut self, db: &Db, net: &str, nodes: &vyges_grt::antenna_check::LayerNodes, tech: &vyges_grt::repair_antennas::TechLayers) -> Result<Vec<(i32, Vec<String>)>, Fail> {
+    fn check(&mut self, db: &Db, net: &str, nodes: &vyges_grt::antenna_check::LayerNodes, tech: &vyges_grt::repair_antennas::TechLayers) -> Result<Vec<(i32, Vec<String>, i32)>, Fail> {
         use vyges_grt::antenna_check::{calculate_areas, calculate_car, calculate_par, check_gates, fmt_g17, GateFacts};
         let mut gates = Vec::new();
         for it in db.net_iterms(net) {
@@ -392,7 +392,7 @@ impl Checker {
         for v in violations {
             let g: String = v.gates.iter().map(|&g| format!("{},", gates[g].name)).collect();
             self.text.push_str(&format!("VYGC|{net}|viol|level={}|excess={}|diodes={}|gates={g}\n", v.routing_level, fmt_g17(v.excess_ratio), v.diode_count_per_gate));
-            out.push((v.routing_level, v.gates.iter().map(|&g| gates[g].name.clone()).collect()));
+            out.push((v.routing_level, v.gates.iter().map(|&g| gates[g].name.clone()).collect(), v.diode_count_per_gate));
         }
         Ok(out)
     }
@@ -437,8 +437,11 @@ fn tech_layers(db: &Db) -> Result<vyges_grt::repair_antennas::TechLayers, Fail> 
 
 /// Captured violations: `VYGA|viol|<net>|level=<n>|excess=<r>|diodes=<n>|gates=<inst>/<pin>,…`, in
 /// blocks — one per checker call, each ended by any other line.
-fn read_violation_blocks(path: &str) -> Result<Vec<Vec<(String, i32, Vec<String>)>>, Fail> {
-    let mut blocks: Vec<Vec<(String, i32, Vec<String>)>> = Vec::new();
+/// One violation as the repair reads it: `(net, routing level, gate names, diodes per gate)`.
+type Viol = (String, i32, Vec<String>, i32);
+
+fn read_violation_blocks(path: &str) -> Result<Vec<Vec<Viol>>, Fail> {
+    let mut blocks: Vec<Vec<Viol>> = Vec::new();
     let mut open = false;
     for line in std::fs::read_to_string(path).map_err(err)?.lines() {
         let Some(rest) = line.strip_prefix("VYGA|viol|") else {
@@ -453,7 +456,8 @@ fn read_violation_blocks(path: &str) -> Result<Vec<Vec<(String, i32, Vec<String>
             blocks.push(Vec::new());
             open = true;
         }
-        blocks.last_mut().expect("a block").push((f[0].to_string(), level, gates));
+        let diodes = f.get(3).and_then(|v| v.strip_prefix("diodes=")).and_then(|v| v.parse().ok()).ok_or_else(bad)?;
+        blocks.last_mut().expect("a block").push((f[0].to_string(), level, gates, diodes));
     }
     Ok(blocks)
 }
@@ -463,7 +467,8 @@ fn read_violation_blocks(path: &str) -> Result<Vec<Vec<(String, i32, Vec<String>
 /// One iteration: the violations of the first check → `jumperInsertion` (unless `-diode_only`) →
 /// `saveGuides` over the nets that got jumpers → the second check. Diode insertion, and a second
 /// iteration with violations left, are refused.
-fn repair_antennas(db: &Db, step: &Value, state: &mut vyges_grt::global_route::AfterRoute, total_overflow: i32, db_guides: &BTreeMap<String, Vec<vyges_grt::Guide>>, from_db: bool, log: &mut Vec<String>) -> Result<Vec<vyges_grt::NetGuides>, Fail> {
+#[allow(clippy::too_many_arguments)]
+fn repair_antennas(db: &mut Db, step: &Value, state: &mut vyges_grt::global_route::AfterRoute, total_overflow: i32, db_guides: &BTreeMap<String, Vec<vyges_grt::Guide>>, from_db: bool, padding: (i32, i32), log: &mut Vec<String>) -> Result<Vec<vyges_grt::NetGuides>, Fail> {
     use vyges_grt::repair_antennas::{jumper_insertion, AntViolation, FastRouteJumpers, GatePin, JumperInputs, NetViolations};
     let jumper_only = step["jumper_only"].as_bool().unwrap_or(false);
     let diode_only = step["diode_only"].as_bool().unwrap_or(false);
@@ -500,7 +505,7 @@ fn repair_antennas(db: &Db, step: &Value, state: &mut vyges_grt::global_route::A
     let tech = tech_layers(db)?;
     let number_to_index: BTreeMap<i64, usize> = tech.0.iter().enumerate().map(|(i, l)| (i64::from(db.layer_get_number(&l.name)), i)).collect();
     let mut by_net: Vec<NetViolations> = Vec::new();
-    for (net, level, gates) in first {
+    for (net, level, gates, _) in first.clone() {
         let mut pins = Vec::new();
         for g in gates {
             let (inst, pin) = g.rsplit_once('/').ok_or_else(|| err(format!("gate {g}: expected <inst>/<pin>")))?;
@@ -547,9 +552,12 @@ fn repair_antennas(db: &Db, step: &Value, state: &mut vyges_grt::global_route::A
         }
         saved = vyges_grt::save_guides(&modified, &state.jumper_grid.grid, &opts).map_err(|e| err(format!("{e:?}")))?;
     }
-    let second = match &oracle {
-        Some(blocks) => if diode_only { blocks.first() } else { blocks.get(1) }.cloned().unwrap_or_default(),
-        None if diode_only || by_net.is_empty() => by_net.iter().map(|n| (n.net.clone(), 0, Vec::new())).collect(),
+    // antenna_violations_ as the diodes see it: the first check's when no jumper pass ran, else the
+    // second check's, on the guides the jumpers left.
+    let jumpers_ran = !diode_only && !by_net.is_empty();
+    let mut second: Vec<Viol> = match &oracle {
+        Some(blocks) => if jumpers_ran { blocks.get(1) } else { blocks.first() }.cloned().unwrap_or_default(),
+        None if !jumpers_ran => first,
         None => {
             // The second check, on the guides as the jumpers left them.
             let mut after = db_guides.clone();
@@ -559,13 +567,138 @@ fn repair_antennas(db: &Db, step: &Value, state: &mut vyges_grt::global_route::A
             check_design(db, &after, true, ratio_margin)?
         }
     };
+    second.sort_by_key(|(n, ..)| order.iter().position(|m| m == n).unwrap_or(usize::MAX));
     if !second.is_empty() && !jumper_only {
-        return Err(Fail::Refused(format!("diode insertion is not modelled ({} nets still violate)", second.len())));
+        insert_diodes(db, &second, padding, step["diode_trace"].as_str(), log)?;
+        return Err(Fail::Refused(format!("detailed placement after diode insertion is not modelled ({} nets got diodes)", second.iter().map(|v| &v.0).collect::<std::collections::BTreeSet<_>>().len())));
     }
     if !second.is_empty() && iterations > 1 {
         return Err(Fail::Refused("a second repair iteration is not modelled".into()));
     }
     Ok(saved)
+}
+
+/// `RepairAntennas::repairAntennas` up to `legalizePlacedCells`: the violating gates made FIRM, the
+/// fixed instances and hard blockages collected, then per violation, per gate, per diode needed, a
+/// diode created beside the gate (`insertDiode`), placed, marked, connected — and itself added to
+/// the fixed set the next one avoids.
+fn insert_diodes(db: &mut Db, violations: &[Viol], padding: (i32, i32), trace: Option<&str>, log: &mut Vec<String>) -> Result<(), Fail> {
+    use vyges_grt::repair_antennas::{place_diode, DiodeFloor, DiodeGate, DiodeRow};
+    let r = |v: &[i32]| vyges_grt::Rect { x_min: v[0], y_min: v[1], x_max: v[2], y_max: v[3] };
+    // findDiodeMTerm
+    let mut diode = None;
+    'm: for (m, t) in db.masters_with_types().map_err(err)? {
+        if t == "CORE ANTENNACELL" {
+            for (term, _) in db.master_mterms(&m).map_err(err)? {
+                if db.mterm_antenna_diff_area(&m, &term) > 0.0 {
+                    diode = Some((m.clone(), term));
+                    break 'm;
+                }
+            }
+        }
+    }
+    let (diode_master, diode_term) = diode.ok_or_else(|| err("no diode master"))?;
+    let mut rows = Vec::new();
+    let mut site_width = -1;
+    for i in 0..db.num_rows().map_err(err)? {
+        let Some((bbox, site, orient)) = db.nth_row(i).map_err(err)? else { continue };
+        if db.site_get_class(&site).map_err(err)? != "PAD" {
+            let w = db.site_get_width(&site);
+            if site_width == -1 {
+                site_width = w;
+            } else if site_width != w {
+                log.push("GRT-0027: Design has rows with different site widths.".into());
+            }
+        }
+        rows.push(DiodeRow { bbox: r(&bbox), orient });
+    }
+    let floor = DiodeFloor {
+        rows,
+        core: vyges_grt::Rect { x_min: db.block_get_core_area_x_min(), y_min: db.block_get_core_area_y_min(), x_max: db.block_get_core_area_x_max(), y_max: db.block_get_core_area_y_max() },
+        site_width,
+        pad_left: padding.0,
+        pad_right: padding.1,
+        diode_width: db.master_get_width(&diode_master) as i32,
+        diode_height: db.master_get_height(&diode_master) as i32,
+    };
+    let is_block = |db: &Db, inst: &str| -> Result<bool, Fail> { Ok(db.master_get_type(&db.inst_master(inst)).map_err(err)?.starts_with("BLOCK")) };
+    // setDiodesAndGatesPlacementStatus(FIRM)
+    for (_, _, gates, _) in violations {
+        for g in gates {
+            let inst = g.rsplit_once('/').map(|p| p.0).unwrap_or(g);
+            if !is_block(db, inst)? {
+                db.inst_set_placement_status(inst, "FIRM").map_err(err)?;
+            }
+        }
+    }
+    // getFixedInstances, getPlacementBlockages
+    let mut fixed = Vec::new();
+    for inst in db.inst_names() {
+        let st = db.inst_get_placement_status(&inst);
+        if st == "FIRM" || st == "LOCKED" {
+            fixed.push(r(&db.inst_bbox(&inst).map_err(err)?));
+        }
+    }
+    for (i, b) in db.blockage_boxes().map_err(err)?.into_iter().enumerate() {
+        if !db.blockage_is_soft(i) {
+            fixed.push(vyges_grt::Rect { x_min: b.0, y_min: b.1, x_max: b.2, y_max: b.3 });
+        }
+    }
+    let mut text = String::new();
+    for (i, f) in fixed.iter().enumerate() {
+        text.push_str(&format!("VYGD|fixed|{i}|{},{},{},{}\n", f.x_min, f.y_min, f.x_max, f.y_max));
+    }
+    let mut index = 1;
+    let names: std::collections::BTreeSet<String> = db.inst_names().into_iter().collect();
+    while names.contains(&format!("ANTENNA_{index}")) {
+        index += 1;
+    }
+    let mut failures = false;
+    let tech = tech_layers(db)?;
+    let dirs: BTreeMap<String, String> = db.layers_with_direction().map_err(err)?.into_iter().collect();
+    for (net, level, gates, diodes) in violations {
+        if *diodes <= 0 {
+            failures = true;
+            continue;
+        }
+        let layer = tech.find_routing_layer(*level).ok_or_else(|| Fail::Refused(format!("a violation on routing level {level}: the reference dereferences a null layer")))?;
+        let place_vertically = dirs.get(&tech.0[layer].name).is_some_and(|d| d == "VERTICAL");
+        for g in gates {
+            let inst = g.rsplit_once('/').map(|p| p.0).unwrap_or(g);
+            let master = db.inst_master(inst);
+            let ty = db.master_get_type(&master).map_err(err)?;
+            if ty.starts_with("BLOCK") {
+                return Err(Fail::Refused(format!("gate {g} is on a block: getInstRect's pin-box rule is not modelled")));
+            }
+            let gate = DiodeGate { rect: r(&db.inst_bbox(inst).map_err(err)?), orient: db.inst_get_orient(inst), block_or_pad: ty.starts_with("PAD"), is_block: false };
+            for _ in 0..*diodes {
+                let name = format!("ANTENNA_{index}");
+                index += 1;
+                let p = place_diode(&gate, place_vertically, &floor, &fixed);
+                db.create_inst(&diode_master, &name).map_err(err)?;
+                db.set_inst_orient(&name, &p.orient).map_err(err)?;
+                db.set_inst_location(&name, p.x, p.y).map_err(err)?;
+                db.inst_set_placement_status(&name, p.status).map_err(err)?;
+                db.connect(&name, &diode_term, net).map_err(err)?;
+                fixed.push(r(&db.inst_bbox(&name).map_err(err)?));
+                for (k, (x, y, o, legal)) in p.tries.iter().enumerate() {
+                    text.push_str(&format!("VYGD|try|{name}|{g}|{k}|{x},{y}|{o}|legal={}\n", i32::from(*legal)));
+                }
+                text.push_str(&format!("VYGD|pad|{name}|{}|{}\n", padding.0, padding.1));
+                text.push_str(&format!(
+                    "VYGD|diode|{name}|{diode_master}|{},{}|{}|legal={}|inrow={}|status={}|net={net}|gate={g}\n",
+                    p.x, p.y, p.orient, i32::from(p.legal), i32::from(p.in_row), p.status
+                ));
+            }
+        }
+    }
+    if failures {
+        log.push("GRT-0243: Unable to repair antennas on net with diodes.".into());
+    }
+    if let Some(path) = trace {
+        std::fs::write(path, text).map_err(err)?;
+    }
+    Ok(())
 }
 
 fn run(job: &Value) -> Result<Value, Fail> {
@@ -631,6 +764,8 @@ fn run(job: &Value) -> Result<Value, Fail> {
     let mut log = Vec::new();
     // The router as a later command finds it: the last global_route's state.
     let mut after: Option<(vyges_grt::global_route::AfterRoute, i32)> = None;
+    // set_placement_padding -global: opendp's padding, in sites, left and right.
+    let mut padding = (0, 0);
     for step in job["steps"].as_array().ok_or_else(|| err("steps"))? {
         match step["cmd"].as_str().unwrap_or("") {
             "set_routing_layers" => {
@@ -981,11 +1116,14 @@ fn run(job: &Value) -> Result<Value, Fail> {
                     }
                 }
             }
+            "placement_padding" => {
+                padding = (step["left"].as_i64().unwrap_or(0) as i32, step["right"].as_i64().unwrap_or(0) as i32);
+            }
             "repair_antennas" => {
                 // ⚠️ Not GRT-45: the reference also repairs from routes a database brought with it
                 // (`have_routes` after read_db). That path is not modelled.
                 let (state, total_overflow) = after.as_mut().ok_or_else(|| Fail::Refused("repair_antennas without a global_route in this session: routes read from a database are not modelled".into()))?;
-                let repaired = repair_antennas(&db, step, state, *total_overflow, &db_guides, from_db, &mut log)?;
+                let repaired = repair_antennas(&mut db, step, state, *total_overflow, &db_guides, from_db, padding, &mut log)?;
                 for ng in repaired {
                     guides.insert(ng.net.clone(), ng.guides.iter().map(|g| (g.box_.x_min, g.box_.y_min, g.box_.x_max, g.box_.y_max, db_layer_name(&db, g.layer))).collect());
                     db_guides.insert(ng.net.clone(), ng.guides);

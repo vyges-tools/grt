@@ -880,3 +880,156 @@ fn dump_graph(graph: &SegmentGraph, tech: &TechLayers, t: &mut Vec<String>) {
         }
     }
 }
+
+// ---- stage 4a: diode placement (`insertDiode`, `setDiodeLoc`) ----
+
+/// A row as the diode placement reads it: its box and orientation.
+#[derive(Debug, Clone)]
+pub struct DiodeRow {
+    pub bbox: Rect,
+    pub orient: String,
+}
+
+/// What the diode placement reads of the block, fixed for one repair.
+#[derive(Debug, Clone)]
+pub struct DiodeFloor {
+    /// In `getRows()` order.
+    pub rows: Vec<DiodeRow>,
+    pub core: Rect,
+    /// The first non-PAD row's site width.
+    pub site_width: i32,
+    /// `opendp_->padLeft` / `padRight` of a diode, in sites.
+    pub pad_left: i32,
+    pub pad_right: i32,
+    /// The diode master's size (its bbox at R0).
+    pub diode_width: i32,
+    pub diode_height: i32,
+}
+
+/// The gate a diode protects: `getInstancePlacementData`.
+#[derive(Debug, Clone)]
+pub struct DiodeGate {
+    /// `getInstRect`: the instance box (a block's pin box).
+    pub rect: Rect,
+    pub orient: String,
+    /// `isBlock() || isPad()`: the diode takes the ROW's orientation.
+    pub block_or_pad: bool,
+    /// The master itself is a block (the FIRM test reads only this).
+    pub is_block: bool,
+}
+
+/// Where a diode ended up.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiodePlacement {
+    pub x: i32,
+    pub y: i32,
+    pub orient: String,
+    /// `setDiodeLoc` found a spot clear of the fixed cells, AND it lies in a row.
+    pub legal: bool,
+    pub in_row: bool,
+    /// FIRM when legal, inside the core and not beside a block; PLACED for dpl to move.
+    pub status: &'static str,
+    /// Every attempt: `(x, y, orient, clear)`.
+    pub tries: Vec<(i32, i32, String, bool)>,
+}
+
+/// `getRowOrient`: the orientation of the LAST row whose box strictly contains the point; `R0`
+/// (the default `dbOrientType`) when none does.
+pub fn row_orient(rows: &[DiodeRow], p: (i32, i32)) -> String {
+    let mut orient = "R0".to_string();
+    for r in rows {
+        let b = &r.bbox;
+        if p.0 > b.x_min && p.0 < b.x_max && p.1 > b.y_min && p.1 < b.y_max {
+            orient = r.orient.clone();
+        }
+    }
+    orient
+}
+
+/// A box's width and height at an orientation: a quarter turn swaps them.
+fn oriented(w: i32, h: i32, orient: &str) -> (i32, i32) {
+    if orient.contains("90") {
+        (h, w)
+    } else {
+        (w, h)
+    }
+}
+
+/// `checkDiodeLoc`: the diode's box, widened by BOTH paddings on EACH side and shrunk by one unit
+/// all round, must touch no fixed box (`bgi::intersects` — edges count), and the diode must lie
+/// inside the core (edges included).
+pub fn check_diode_loc(bbox: &Rect, floor: &DiodeFloor, fixed: &[Rect]) -> bool {
+    let pad = (floor.pad_left + floor.pad_right) * floor.site_width;
+    let q = (bbox.x_min - pad + 1, bbox.y_min + 1, bbox.x_max + pad - 1, bbox.y_max - 1);
+    let clear = !fixed.iter().any(|f| f.x_min <= q.2 && q.0 <= f.x_max && f.y_min <= q.3 && q.1 <= f.y_max);
+    let c = &floor.core;
+    clear && bbox.x_min >= c.x_min && bbox.y_min >= c.y_min && bbox.x_max <= c.x_max && bbox.y_max <= c.y_max
+}
+
+/// `diodeInRow`: some row's box contains the diode and is exactly as tall.
+pub fn diode_in_row(bbox: &Rect, rows: &[DiodeRow]) -> bool {
+    rows.iter().any(|r| {
+        let b = &r.bbox;
+        bbox.x_min >= b.x_min && bbox.y_min >= b.y_min && bbox.x_max <= b.x_max && bbox.y_max <= b.y_max && (bbox.y_max - bbox.y_min) == (b.y_max - b.y_min)
+    })
+}
+
+/// `setDiodeLoc` and the rest of `insertDiode`: up to 50 tries, alternating sides — beside the
+/// gate (left first, then right, each a site further out every time) for a horizontal violation
+/// layer, above and below it (below first, starting ON the gate, each a gate height further) for a
+/// vertical one.
+///
+/// ⛔ Every try takes the GATE's orientation — and a block or pad gate, or a vertical violation
+/// layer, the orientation of the row under the diode's centre instead.
+///
+/// ⚠️ The diode's size is read once, before any orientation is set.
+pub fn place_diode(gate: &DiodeGate, place_vertically: bool, floor: &DiodeFloor, fixed: &[Rect]) -> DiodePlacement {
+    const MAX_LEGALIZE_ITR: usize = 50;
+    let (inst_x, inst_y) = (gate.rect.x_min, gate.rect.y_min);
+    let (inst_w, inst_h) = (gate.rect.x_max - gate.rect.x_min, gate.rect.y_max - gate.rect.y_min);
+    let (dw, dh) = (floor.diode_width, floor.diode_height);
+    let (mut place_at_left, mut place_at_top) = (true, false);
+    let (mut left_offset, mut right_offset, mut top_offset, mut bottom_offset) = (0, 0, 0, 0);
+    let (mut h_off, mut v_off) = (0, 0);
+    let mut tries = Vec::new();
+    let mut legal = false;
+    let (mut x, mut y, mut orient) = (0, 0, String::new());
+    while !legal && tries.len() < MAX_LEGALIZE_ITR {
+        if place_vertically {
+            if place_at_top {
+                v_off = top_offset * inst_h;
+                top_offset += 1;
+                place_at_top = false;
+            } else {
+                v_off = -(bottom_offset * inst_h);
+                bottom_offset += 1;
+                place_at_top = true;
+            }
+        } else if place_at_left {
+            h_off = -(dw + left_offset * floor.site_width);
+            left_offset += 1;
+            place_at_left = false;
+        } else {
+            h_off = inst_w + right_offset * floor.site_width;
+            right_offset += 1;
+            place_at_left = true;
+        }
+        orient = gate.orient.clone();
+        if gate.block_or_pad || place_vertically {
+            let centre = (inst_x + h_off + dw / 2, inst_y + v_off + dh / 2);
+            orient = row_orient(&floor.rows, centre);
+        }
+        (x, y) = (inst_x + h_off, inst_y + v_off);
+        let (w, h) = oriented(dw, dh, &orient);
+        legal = check_diode_loc(&Rect { x_min: x, y_min: y, x_max: x + w, y_max: y + h }, floor, fixed);
+        tries.push((x, y, orient.clone(), legal));
+    }
+    let (w, h) = oriented(dw, dh, &orient);
+    let bbox = Rect { x_min: x, y_min: y, x_max: x + w, y_max: y + h };
+    let in_row = diode_in_row(&bbox, &floor.rows);
+    let legal = legal && in_row;
+    let c = &floor.core;
+    let in_core = bbox.x_min >= c.x_min && bbox.y_min >= c.y_min && bbox.x_max <= c.x_max && bbox.y_max <= c.y_max;
+    let status = if in_core && !gate.is_block && legal { "FIRM" } else { "PLACED" };
+    DiodePlacement { x, y, orient, legal, in_row, status, tries }
+}
