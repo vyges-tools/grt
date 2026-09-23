@@ -1278,6 +1278,180 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
 /// `VYGI|<tag>|…` — FastRoute's whole state in the format `grt-incr-trace.py` patches into
 /// `FastRouteCore::run` (`end` at a full run's exit, `incr` / `incrend` at an incremental run's
 /// entry and exit): every 2D edge, the used-grid sets, every 3D edge, then `net_ids_` in order.
+/// `updateNetResources(net, release)` → `updateResources` per wire segment →
+/// `updateEdge2DAnd3DUsage(x0, y0, x1, y1, layer, used, net)`: the segment's span in TILES
+/// (`dbuToTile` of its min and max corners), walked `x0..x1` (or `y0..y1`) exclusive; each edge
+/// charged `used × edge cost` in 2D through the NDR-aware cost and `used × the layer's edge cost` in
+/// 3D. A via is skipped.
+///
+/// ⚠️ Horizontal is tested first (`y1 == y2`), so a span inside one tile is "horizontal" and
+/// charges nothing. The 3D usage is `uint16_t` charged by `int8_t` products — it wraps.
+fn update_net_resources(g2: &mut crate::graph2d::Graph2d, g3: &mut Graph3d, grid: &crate::repair_antennas::JumperGrid, n: &RouterNet, id: usize, lec: &[i8], segments: &[crate::GSegment], used: i32) {
+    let (lo, hi) = ((n.min_layer - 1).max(0) as usize, (n.max_layer - 1).max(0) as usize);
+    let nn = crate::ndr_cost::NdrCostNet { id, edge_cost: n.edge_cost, min_layer: lo, max_layer: hi, layer_edge_cost: Some(net_range_edge_costs(n)), soft_ndr: false };
+    let xg = g3.x_grid;
+    for s in segments.iter().filter(|s| !s.is_via()) {
+        let x0 = grid.dbu_to_tile(s.init_x.min(s.final_x), true);
+        let y0 = grid.dbu_to_tile(s.init_y.min(s.final_y), false);
+        let x1 = grid.dbu_to_tile(s.final_x.max(s.init_x), true);
+        let y1 = grid.dbu_to_tile(s.final_y.max(s.init_y), false);
+        let k = (s.final_layer - 1) as usize;
+        let d3 = (used * i32::from(lec[k])) as u16;
+        let d2 = f64::from(used * i32::from(n.edge_cost));
+        let mut u = g2.for_net(&nn);
+        if y0 == y1 {
+            for x in x0..x1 {
+                crate::estimate::Usage2d::update_usage_h(&mut u, x, y0, d2);
+                let c = &mut g3.h_usage[k][y0 as usize * xg + x as usize];
+                *c = c.wrapping_add(d3);
+            }
+        } else if x0 == x1 {
+            for y in y0..y1 {
+                crate::estimate::Usage2d::update_usage_v(&mut u, x0, y, d2);
+                let c = &mut g3.v_usage[k][y as usize * xg + x0 as usize];
+                *c = c.wrapping_add(d3);
+            }
+        }
+    }
+}
+
+/// `repairAntennas` with no route in the session (`!initialized_`): the routes come from the
+/// database's guides and the router is set up around them — the state antenna repair then starts
+/// from. In the reference's order:
+///
+/// 1. `loadGuidesFromDB` (reached through `check_antennas` → `haveRoutes`): per net in block order,
+///    each guide [`box_to_global_routing`](crate::restore::box_to_global_routing), then
+///    `dedupViaSegments`, `addImplicitVias`, `mergeSegments`, and `ensurePinsPositions`;
+/// 2. `initFastRoute` — the same setup a route makes (layers, tracks, grid, capacities,
+///    adjustments, the nets), with EMPTY usage: `fastroute_->clear()` drops the 3D usage
+///    `updateEdgesUsage` charged in step 1, so that charge is not modelled;
+/// 3. per net of `routes_` (odb-id order) that is not detail-routed, `updateNetResources`: every
+///    wire segment's tiles charged once — 2D through the NDR-aware cost at the net's edge cost, 3D
+///    at the layer's edge cost — and the net marked `areSegmentsRestored`.
+///
+/// ⛔ Refused rather than guessed: a pin no restored segment covers (`ensurePinsPositions`' repair
+/// of pin positions is not modelled), a detail-routed net, an NDR net
+/// (`disableCongestedNDRNetsFromRoutes`), a congested guide, and a guide on a net the router does
+/// not know (GRT-0127).
+pub fn restore_for_repair(db: &mut Db, opts: &RouteOptions) -> Res<AfterRoute> {
+    use crate::brk_rsmt::{CapLayer, Caps3D, NetState};
+    let t = setup_tech(db, opts)?;
+    let mut log = t.log.clone();
+    let adj = setup_adjust(db, &t, opts, &mut log)?;
+    let mut e = adj.edges;
+    if let Some(lib) = &opts.liberty {
+        for net in crate::clk_network::find_clk_nets(db, lib, &opts.clock_sources)? {
+            db.net_set_sig_type(&net, "CLOCK")?;
+        }
+    }
+    let nets = setup_nets(db, &t, &mut e, adj.has_macros_or_pads, opts, &mut log)?;
+    let (xg, yg) = (e.x_grid as usize, e.y_grid as usize);
+    // The router's grid, as route_design lays it out.
+    let (mut red_h, mut red_v, mut cap_h, mut cap_v) = (vec![0u16; xg * yg], vec![0u16; xg * yg], vec![0u16; xg * yg], vec![0u16; xg * yg]);
+    for y in 0..yg {
+        for x in 0..xg {
+            if x + 1 < xg {
+                let s = e.h2[y * (xg - 1) + x];
+                (red_h[y * xg + x], cap_h[y * xg + x]) = (s.red, s.cap);
+            }
+            if y + 1 < yg {
+                let s = e.v2[y * xg + x];
+                (red_v[y * xg + x], cap_v[y * xg + x]) = (s.red, s.cap);
+            }
+        }
+    }
+    let layer_of = |v: &[crate::adjust::EdgeState], l: usize| -> Vec<i32> { (0..xg * yg).map(|i| i32::from(v[l * xg * yg + i].cap)).collect() };
+    let caps = Caps3D { x_grid: xg, layers: (0..e.num_layers as usize).map(|l| CapLayer { h: layer_of(&e.h3, l), v: layer_of(&e.v3, l) }).collect() };
+    let num_layers = e.num_layers as usize;
+    let max_layer = nets.iter().filter(|n| !n.is_local).map(|n| (n.max_layer - 1) as usize).max().unwrap_or(0);
+    let mut g2 = crate::run::initial_graph_2d(xg, yg, &caps, &cap_h, &cap_v, num_layers.max(max_layer + 1));
+    let mut g3 = crate::run::graph_3d(&caps, xg, yg);
+
+    // 1. loadGuidesFromDB — routes_ per net, in block order.
+    let tile = t.core.tile_size;
+    let block_min = db.block_get_min_routing_layer();
+    let pins_of = |n: &RouterNet| -> Vec<crate::Pin> { n.net_pins.iter().map(|p| crate::Pin { connection_layer: p.connection_layer, on_grid_x: p.on_grid.0, on_grid_y: p.on_grid.1 }).collect() };
+    let mut routes: std::collections::BTreeMap<String, Vec<crate::GSegment>> = std::collections::BTreeMap::new();
+    let order = db.net_names();
+    for name in &order {
+        for k in 0..db.num_net_get_guides(name) {
+            if db.guide_is_congested(name, k) {
+                return Err(format!("net {name}: a congested guide — restoring a congested routing is not modelled").into());
+            }
+            let bx = (db.guide_get_box_x_min(name, k), db.guide_get_box_y_min(name, k), db.guide_get_box_x_max(name, k), db.guide_get_box_y_max(name, k));
+            let layer = db.layer_get_routing_level(&db.guide_get_layer(name, k));
+            let via_layer = db.layer_get_routing_level(&db.guide_get_via_layer(name, k));
+            crate::restore::box_to_global_routing(bx, layer, via_layer, tile, routes.entry(name.clone()).or_default());
+        }
+    }
+    for (name, route) in routes.iter_mut() {
+        let n = nets.iter().find(|n| &n.name == name).ok_or_else(|| format!("[ERROR GRT-0127] net_id for db_net {name} not found — not modelled"))?;
+        crate::restore::dedup_via_segments(route);
+        crate::restore::add_implicit_vias(route);
+        let grid_pins: Vec<crate::findrouting::GridPin> = n.net_pins.iter().map(|p| (p.on_grid.0, p.on_grid.1, p.connection_layer)).collect();
+        crate::findrouting::merge_segments(&grid_pins, route, block_min);
+        // ensurePinsPositions: only a net some pin of which no segment covers has anything to do.
+        let uncovered = crate::restore::net_is_covered(route, &pins_of(n));
+        if !uncovered.is_empty() {
+            return Err(format!("net {name}: {} pin(s) not covered by the restored guides — ensurePinsPositions is not modelled", uncovered.len()).into());
+        }
+    }
+
+    // 3. updateNetResources per net of routes_, in odb-id (block) order.
+    let jumper_grid = crate::repair_antennas::JumperGrid { grid: crate::Grid { tile_size: tile, area: t.core.area }, x_grids: t.core.x_grids, y_grids: t.core.y_grids };
+    let mut state = vec![NetState::default(); nets.len()];
+    for name in order.iter().filter(|n| routes.contains_key(*n)) {
+        if db.net_get_wire_type(name) == "ROUTED" && !db.net_is_special(name) && db.net_has_wire(name) {
+            return Err(format!("net {name}: detail-routed — its usage from wires is not modelled").into());
+        }
+        let id = nets.iter().position(|n| &n.name == name).expect("checked above");
+        let n = &nets[id];
+        if n.has_ndr {
+            return Err(format!("net {name}: an NDR net restored from guides — disableCongestedNDRNetsFromRoutes is not modelled").into());
+        }
+        update_net_resources(&mut g2, &mut g3, &jumper_grid, n, id, &all_layer_edge_costs(n, num_layers), &routes[name], 1);
+        state[id].segments_restored = true;
+    }
+
+    let layer_dir: Vec<crate::layertable::LayerDir> = (1..=num_layers as i32)
+        .map(|l| match t.tech.routing_layers.iter().find(|r| r.routing_level == l).and_then(|r| r.direction) {
+            Some(crate::capacity::Direction::Horizontal) => crate::layertable::LayerDir::Horizontal,
+            Some(crate::capacity::Direction::Vertical) => crate::layertable::LayerDir::Vertical,
+            None => crate::layertable::LayerDir::Other,
+        })
+        .collect();
+    let net_routes: Vec<crate::NetRoute> = order
+        .iter()
+        .filter_map(|name| {
+            let n = nets.iter().find(|n| &n.name == name)?;
+            Some(crate::NetRoute { name: name.clone(), segments: routes.get(name).cloned().unwrap_or_default(), pins: pins_of(n), is_local: n.is_local })
+        })
+        .collect();
+    let save_options = crate::SaveOptions { guide_is_congested: false, origin_x: opts.grid_origin.0, origin_y: opts.grid_origin.1, min_routing_layer: t.min_routing_layer };
+    let layer_edge_cost = nets.iter().map(|n| (n.name.clone(), all_layer_edge_costs(n, num_layers))).collect();
+    let net_ids: Vec<usize> = (0..nets.len()).filter(|&k| !nets[k].is_local).collect();
+    Ok(AfterRoute {
+        final_3d: Some(g3),
+        final_2d: Some(g2),
+        final_state: state,
+        red_h,
+        red_v,
+        caps,
+        edges_3d: (e.h3.clone(), e.v3.clone()),
+        router_nets: nets,
+        net_ids,
+        h_capacity: t.capacities.h_capacity,
+        v_capacity: t.capacities.v_capacity,
+        layer_dir,
+        total_overflow: 0,
+        net_routes,
+        jumper_grid,
+        save_options,
+        layer_edge_cost,
+        max_routing_layer: t.max_routing_layer,
+    })
+}
+
 pub fn router_state_text(tag: &str, a: &AfterRoute) -> Result<String, String> {
     use std::fmt::Write;
     let (g2, g3) = match (&a.final_2d, &a.final_3d) {
@@ -1385,7 +1559,18 @@ fn update_dirty_nets(a: &mut AfterRoute, fresh: &[RouterNet], dirty: &[String]) 
         let Some(id) = a.router_nets.iter().position(|n| &n.name == name) else { continue }; // not in db_net_map_
         let key = |n: &RouterNet| n.net_pins.iter().map(|p| (p.on_grid.0, p.on_grid.1, p.connection_layer)).collect::<Vec<_>>();
         if crate::netlist::pin_positions_changed(&key(&a.router_nets[id]), &key(&fresh[id])) {
-            clear_net_route(a, id);
+            // A net restored from guides has no tree: `updateNetResources(net, true)` over its
+            // current routes_ releases it, and it is restored no longer.
+            if a.final_state[id].segments_restored {
+                let segs = a.net_routes.iter().find(|r| &r.name == name).map(|r| r.segments.clone()).unwrap_or_default();
+                let lec = a.layer_edge_cost.get(name).cloned().unwrap_or_default();
+                if let (Some(g2), Some(g3)) = (a.final_2d.as_mut(), a.final_3d.as_mut()) {
+                    update_net_resources(g2, g3, &a.jumper_grid, &a.router_nets[id], id, &lec, &segs, -1);
+                }
+                a.final_state[id].segments_restored = false;
+            } else {
+                clear_net_route(a, id);
+            }
             if let Some(r) = a.net_routes.iter_mut().find(|r| &r.name == name) {
                 r.segments.clear();
             }

@@ -288,9 +288,16 @@ pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn 
 /// capacities as `initEdgesCapacityPerLayer` leaves them (horizontal edges to `x < xg-1`, vertical
 /// to `y < yg-1`, no NDR net anywhere).
 fn graph_2d(inp: &RunInputs<'_>, num_layers: usize) -> Graph2d {
-    let (xg, yg) = (inp.x_grid, inp.y_grid);
+    let mut g = initial_graph_2d(inp.x_grid, inp.y_grid, inp.caps, inp.cap_h, inp.cap_v, num_layers);
+    g.est = inp.entry.clone();
+    g
+}
+
+/// The 2D graph as `initFastRoute` leaves it: capacities, the NDR ledger's per-layer capacities,
+/// no usage. (`run()` starts from it; so does a repair that restores routes from guides.)
+pub fn initial_graph_2d(xg: usize, yg: usize, caps: &Caps3D, cap_h: &[u16], cap_v: &[u16], num_layers: usize) -> Graph2d {
     let mut ledger = NdrLedger::new(xg, yg, num_layers);
-    for (l, cl) in inp.caps.layers.iter().enumerate() {
+    for (l, cl) in caps.layers.iter().enumerate() {
         for y in 0..yg {
             for x in 0..xg {
                 if x + 1 < xg {
@@ -303,10 +310,10 @@ fn graph_2d(inp: &RunInputs<'_>, num_layers: usize) -> Graph2d {
         }
     }
     let mut g = Graph2d::new(xg, yg, 1);
-    g.est = inp.entry.clone();
+    g.est = crate::estimate::EstimateGrid::new(xg, yg);
     g.ndr = ledger;
-    g.cap_h = inp.cap_h.to_vec();
-    g.cap_v = inp.cap_v.to_vec();
+    g.cap_h = cap_h.to_vec();
+    g.cap_v = cap_v.to_vec();
     g
 }
 
@@ -334,7 +341,7 @@ pub fn resumed_graph_2d(g: &Graph2d) -> Graph2d {
 }
 
 /// The 3D edges at layer assignment: the setup's capacities, no usage.
-fn graph_3d(caps: &Caps3D, xg: usize, yg: usize) -> Graph3d {
+pub fn graph_3d(caps: &Caps3D, xg: usize, yg: usize) -> Graph3d {
     let layer = |v: &[i32]| -> Vec<u16> { v.iter().map(|&c| c as u16).collect() };
     Graph3d {
         x_grid: xg,

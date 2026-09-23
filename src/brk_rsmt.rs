@@ -253,6 +253,9 @@ pub struct NetState {
     pub net_length: i32,
     /// `FrNet::is_soft_ndr_` — set by the congestion loop's soft-NDR demotion, never cleared.
     pub soft_ndr: bool,
+    /// `Net::areSegmentsRestored()` — the net's usage was charged from its guides
+    /// (`updateNetResources`), not by a routed tree, so releasing it walks the same segments.
+    pub segments_restored: bool,
 }
 
 impl Default for NetState {
@@ -269,6 +272,7 @@ impl Default for NetState {
             resistance: 0.0,
             net_length: 0,
             soft_ndr: false,
+            segments_restored: false,
         }
     }
 }

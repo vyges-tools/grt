@@ -468,7 +468,7 @@ fn read_violation_blocks(path: &str) -> Result<Vec<Vec<Viol>>, Fail> {
 /// `saveGuides` over the nets that got jumpers → the second check. Diode insertion, and a second
 /// iteration with violations left, are refused.
 #[allow(clippy::too_many_arguments)]
-fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, state: &mut vyges_grt::global_route::AfterRoute, total_overflow: i32, db_guides: &BTreeMap<String, Vec<vyges_grt::Guide>>, from_db: bool, padding: (i32, i32), log: &mut Vec<String>) -> Result<Vec<vyges_grt::NetGuides>, Fail> {
+fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, state: &mut vyges_grt::global_route::AfterRoute, total_overflow: i32, db_guides: &BTreeMap<String, Vec<vyges_grt::Guide>>, has_access_points: bool, padding: (i32, i32), log: &mut Vec<String>) -> Result<Vec<vyges_grt::NetGuides>, Fail> {
     use vyges_grt::repair_antennas::{jumper_insertion, AntViolation, FastRouteJumpers, GatePin, JumperInputs, NetViolations};
     let jumper_only = step["jumper_only"].as_bool().unwrap_or(false);
     let diode_only = step["diode_only"].as_bool().unwrap_or(false);
@@ -492,8 +492,8 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, state: &mut v
     let ratio_margin = step["ratio_margin"].as_f64().unwrap_or(0.0) as f32;
     // The checker's answers: ours, or — with "violations" — the reference's, captured.
     let oracle = step["violations"].as_str().map(read_violation_blocks).transpose()?;
-    if oracle.is_none() && from_db {
-        return Err(Fail::Refused("antenna checking a database: its terminals may carry access points, which are not modelled".into()));
+    if oracle.is_none() && has_access_points {
+        return Err(Fail::Refused("antenna checking a database whose terminals carry access points: not modelled".into()));
     }
     // antenna_violations_ is a PtrMap: by net ID, which is the block's net order.
     let order = db.net_names();
@@ -910,6 +910,9 @@ fn run(job: &Value) -> Result<Value, Fail> {
     } else if let Some(odb) = job["db"].as_str() {
         db = Db::open(odb).map_err(err)?;
     }
+    // ⛔ A database may carry pin access points, which grt's pin positions and the antenna checker
+    // read and which are not modelled — refused wherever they would be read, but only when present.
+    let has_access_points = from_db && db.block_access_point_count().map_err(err)? > 0;
     let mut opts = RouteOptions::new();
     // read_liberty — the libraries in read order; a cell in two resolves to the first.
     for lib in job["liberty"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
@@ -950,8 +953,34 @@ fn run(job: &Value) -> Result<Value, Fail> {
         opts.captured_update_slacks = Some(update);
     }
     let mut guides: BTreeMap<String, Vec<(i32, i32, i32, i32, String)>> = BTreeMap::new();
+    // A database brings its guides with it: they are what `write_guides` writes and what the antenna
+    // checker reads until a command in this session replaces a net's.
+    let mut db_guides_seed: BTreeMap<String, Vec<vyges_grt::Guide>> = BTreeMap::new();
+    if from_db {
+        for net in db.net_names() {
+            let n = db.num_net_get_guides(&net);
+            if n == 0 {
+                continue;
+            }
+            let mut v = Vec::with_capacity(n);
+            for k in 0..n {
+                let (layer, via) = (db.guide_get_layer(&net, k), db.guide_get_via_layer(&net, k));
+                let box_ = vyges_grt::Rect { x_min: db.guide_get_box_x_min(&net, k), y_min: db.guide_get_box_y_min(&net, k), x_max: db.guide_get_box_x_max(&net, k), y_max: db.guide_get_box_y_max(&net, k) };
+                guides.entry(net.clone()).or_default().push((box_.x_min, box_.y_min, box_.x_max, box_.y_max, layer.clone()));
+                v.push(vyges_grt::Guide {
+                    layer: db.layer_get_routing_level(&layer),
+                    via_layer: db.layer_get_routing_level(&via),
+                    box_,
+                    is_congested: db.guide_is_congested(&net, k),
+                    is_jumper: db.guide_is_jumper(&net, k),
+                    is_connected_to_term: db.guide_is_connected_to_term(&net, k),
+                });
+            }
+            db_guides_seed.insert(net, v);
+        }
+    }
     // The same guides whole — via layer and pin flags included — for antenna checking.
-    let mut db_guides: BTreeMap<String, Vec<vyges_grt::Guide>> = BTreeMap::new();
+    let mut db_guides: BTreeMap<String, Vec<vyges_grt::Guide>> = db_guides_seed;
     let mut parasitics: BTreeMap<String, vyges_grt::parasitics::Network> = BTreeMap::new();
     let mut parasitic_pins: BTreeMap<String, Vec<vyges_grt::parasitics::PinGridLocation>> = BTreeMap::new();
     let mut routed_parasitics: BTreeMap<String, vyges_grt::parasitics::Network> = BTreeMap::new();
@@ -1220,8 +1249,8 @@ fn run(job: &Value) -> Result<Value, Fail> {
             // With "encoder": that path gets the encoder calls, `VYGW|<net>|…` as the reference's
             // stage-2 trace prints them (less its pass number).
             "antenna_wires" => {
-                if from_db {
-                    return Err(Fail::Refused("antenna wires from a database: its terminals may carry access points, which are not modelled".into()));
+                if has_access_points {
+                    return Err(Fail::Refused("antenna wires from a database whose terminals carry access points: not modelled".into()));
                 }
                 let path = step["path"].as_str().ok_or_else(|| err("path"))?;
                 let (nets, tech, vias) = ant_nets(&db, &db_guides)?;
@@ -1354,10 +1383,21 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 padding = (step["left"].as_i64().unwrap_or(0) as i32, step["right"].as_i64().unwrap_or(0) as i32);
             }
             "repair_antennas" => {
-                // ⚠️ Not GRT-45: the reference also repairs from routes a database brought with it
-                // (`have_routes` after read_db). That path is not modelled.
-                let (state, total_overflow) = after.as_mut().ok_or_else(|| Fail::Refused("repair_antennas without a global_route in this session: routes read from a database are not modelled".into()))?;
-                let repaired = repair_antennas(&mut db, &opts, step, state, *total_overflow, &db_guides, from_db, padding, &mut log)?;
+                // No route in this session: the routes a database brought with it (`haveRoutes` →
+                // `loadGuidesFromDB`), and the router set up around them (`repairAntennas`,
+                // `!initialized_`). A design from DEF has none — GRT-45.
+                if after.is_none() {
+                    if !from_db {
+                        return Err(Fail::Error("[ERROR GRT-0045] Run global_route before repair_antennas.".into()));
+                    }
+                    let restored = vyges_grt::global_route::restore_for_repair(&mut db, &opts).map_err(|e| classify(e.to_string()))?;
+                    if let Some(path) = step["restore_trace"].as_str() {
+                        std::fs::write(path, vyges_grt::global_route::router_state_text("restore", &restored).map_err(Fail::Refused)?).map_err(err)?;
+                    }
+                    after = Some((restored, 0));
+                }
+                let (state, total_overflow) = after.as_mut().expect("set above");
+                let repaired = repair_antennas(&mut db, &opts, step, state, *total_overflow, &db_guides, has_access_points, padding, &mut log)?;
                 for ng in repaired {
                     guides.insert(ng.net.clone(), ng.guides.iter().map(|g| (g.box_.x_min, g.box_.y_min, g.box_.x_max, g.box_.y_max, db_layer_name(&db, g.layer))).collect());
                     db_guides.insert(ng.net.clone(), ng.guides);

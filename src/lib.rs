@@ -24,6 +24,7 @@ pub mod netpinorder;
 pub mod full3d;
 pub mod slacks;
 pub mod softndr;
+pub mod restore;
 pub mod checks3d;
 pub mod fillvia;
 pub mod routes;
