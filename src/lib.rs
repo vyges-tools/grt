@@ -6,7 +6,7 @@
 //! next stage consumes. This crate turns a routed net's segments into those guide records.
 //!
 //! Reimplemented from behaviour published by the OpenROAD project's global router, not
-//! transliterated from it. Where the two disagree the presumption is that this engine is wrong.
+//! transliterated from it.
 //!
 //! # Shape
 //!

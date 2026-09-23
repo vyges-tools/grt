@@ -162,8 +162,7 @@ Each of these is pinned by a test that states the rule.
 
 This engine reimplements behaviour published by the [OpenROAD](https://github.com/The-OpenROAD-Project/OpenROAD)
 project's global router. It is a reimplementation from published behaviour, not a transliteration,
-and carries no OpenROAD source. Where the two disagree, the presumption is that this engine is
-wrong: OpenROAD has carried a great many tapeouts and this has not.
+and carries no OpenROAD source.
 
 ## Licence
 
