@@ -17,7 +17,7 @@ repository = "https://github.com/vyges-tools/grt"
 # ⛔ It must pull in `gen-write` too: `net_clear_guides` is a GENERATED setter and the database
 # crate keeps its whole generated write surface behind that feature. Depending on the crate
 # without it compiles the read half only, and the applier needs to clear before it writes.
-odb = ["dep:vyges-opendb", "vyges-opendb/gen-write"]
+odb = ["dep:vyges-opendb", "vyges-opendb/gen-write", "vyges-est/odb"]
 # The `vyges-grt` command: the database, plus the Steiner-tree engine the router calls for real
 # (R5/R7 take it as an injected function) and JSON for the job file and the report.
 # `repair_antennas` legalizes the diodes it inserts with the detailed placer, as the reference's

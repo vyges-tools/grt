@@ -98,11 +98,13 @@ pub mod route_l;
 pub mod maze_phase;
 pub mod maze_msmd;
 pub mod congestion_loop;
-pub mod liberty_clk;
+/// The liberty facts global routing reads — in the estimator crate, which needs them too.
+pub use vyges_est::liberty as liberty_clk;
 /// `est::MakeWireParasitics`, which lives in the estimator crate (`vyges-est`) as upstream's does.
 pub use vyges_est::wire as parasitics;
 pub mod planar_route;
-pub mod clk_network;
+#[cfg(feature = "odb")]
+pub use vyges_est::clk_network;
 pub mod finalize;
 pub mod run;
 pub mod wire_builder;

@@ -123,39 +123,9 @@ pub fn is_routable(
     !is_supply && !is_special && !has_special_wires && !connected_by_abutment
 }
 
-/// What the liberty lookup says about one instance terminal on a net.
-///
-/// ⚠️ These are **inputs**, not something this crate derives: they come from the timing library,
-/// which is a different substrate entirely.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ITermClockFacts {
-    /// Whether the terminal resolves to a liberty port at all.
-    pub has_liberty_port: bool,
-    /// Whether that port is a register's clock input.
-    pub is_reg_clk: bool,
-    /// Whether the cell it belongs to is a pad.
-    pub cell_is_pad: bool,
-}
-
-/// Whether a terminal counts as a clock terminal.
-///
-/// ⚠️ **A pad terminal counts even when it is not a register clock pin.** The two conditions are
-/// an OR, and both are gated on the port existing at all — a terminal with no liberty port is
-/// never a clock terminal, whatever its cell.
-pub fn is_clk_term(f: ITermClockFacts) -> bool {
-    f.has_liberty_port && (f.is_reg_clk || f.cell_is_pad)
-}
-
-/// Whether a net is a clock net **above the leaves**.
-///
-/// ⛔ **"Clock net" is not the same as "clock-typed net".** A net typed as clock that reaches any
-/// clock terminal is a LEAF and answers false; only one that reaches none of them is a non-leaf
-/// clock. Getting this backwards puts the leaf nets at the front of the routing order.
-///
-/// ⚠️ A net that is not clock-typed answers false without looking at its terminals.
-pub fn is_non_leaf_clock(sig_type_is_clock: bool, iterms: &[ITermClockFacts]) -> bool {
-    sig_type_is_clock && !iterms.iter().copied().any(is_clk_term)
-}
+// `ITermClockFacts`, `is_clk_term` and `is_non_leaf_clock` live in the estimator crate
+// (`vyges_est::liberty`), which needs them too and which this crate links.
+pub use vyges_est::liberty::{is_clk_term, is_non_leaf_clock, ITermClockFacts};
 
 /// A net as net discovery sees it, before ordering.
 #[derive(Debug, Clone, PartialEq, Eq)]
