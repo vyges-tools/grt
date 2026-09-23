@@ -261,7 +261,7 @@ pub fn read_nets(db: &Db) -> Vec<NetFacts> {
             has_special_wires: db.num_net_get_s_wires(&name) > 0,
             connected_by_abutment: db.net_is_connected_by_abutment(&name),
             has_wire: db.net_has_wire(&name),
-            iterms: db.net_iterms(&name).into_iter().filter_map(|it| it.split_once('/').map(|(i, t)| (i.to_string(), t.to_string()))).collect(),
+            iterms: db.net_iterms(&name).into_iter().filter_map(|it| it.rsplit_once('/').map(|(i, t)| (i.to_string(), t.to_string()))).collect(),
             bterms: db.net_bterms(&name),
             name,
         })

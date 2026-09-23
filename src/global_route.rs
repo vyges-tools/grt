@@ -858,7 +858,8 @@ fn compute_hpwl(db: &Db, net: &str) -> Result<i32, String> {
         (x0, x1, y0, y1) = (x0.min(x), x1.max(x), y0.min(y), y1.max(y));
     };
     for it in &iterms {
-        let (inst, term) = it.split_once('/').ok_or("an instance terminal without a '/'")?;
+        // ⛔ The LAST '/': a flattened hierarchical instance name contains '/' itself.
+        let (inst, term) = it.rsplit_once('/').ok_or("an instance terminal without a '/'")?;
         let status = db.inst_get_placement_status(inst);
         if status == "NONE" || status == "UNPLACED" {
             return Err(format!("STT-0004: connected to unplaced instance {inst}"));
