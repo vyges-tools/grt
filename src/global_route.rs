@@ -1243,7 +1243,15 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     let guides = crate::save_guides(&net_routes, &grid, &save).map_err(|e| format!("{e:?}"))?;
     let layer_names = t.tech.routing_layers.iter().map(|l| (l.routing_level, l.name.clone())).collect();
     let jumper_grid = crate::repair_antennas::JumperGrid { grid, x_grids: t.core.x_grids, y_grids: t.core.y_grids };
-    let layer_edge_cost = nets.iter().zip(&attrs).map(|(n, a)| (n.name.clone(), a.layer_edge_cost.clone())).collect();
+    // A net the run demoted to soft NDR (`setSoftNDR`) carries edge cost 1 and per-layer cost 1 into
+    // every later command that re-routes or releases it.
+    let soft = |k: usize| state.get(k).is_some_and(|s| s.soft_ndr);
+    let layer_edge_cost = nets.iter().zip(&attrs).enumerate()
+        .map(|(k, (n, a))| (n.name.clone(), if soft(k) { vec![1; a.layer_edge_cost.len()] } else { a.layer_edge_cost.clone() }))
+        .collect();
+    let router_nets: Vec<RouterNet> = nets.iter().enumerate()
+        .map(|(k, n)| if soft(k) { RouterNet { edge_cost: 1, ..n.clone() } } else { n.clone() })
+        .collect();
     let after = AfterRoute {
         final_3d: ov.g3,
         final_2d: ov.g2d,
@@ -1252,7 +1260,7 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         red_v,
         caps,
         edges_3d: (e.h3.clone(), e.v3.clone()),
-        router_nets: nets.clone(),
+        router_nets,
         net_ids,
         h_capacity: t.capacities.h_capacity,
         v_capacity: t.capacities.v_capacity,

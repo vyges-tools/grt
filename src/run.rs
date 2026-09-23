@@ -134,8 +134,11 @@ pub enum RunEnd {
 /// loop's partial slack, a resistance-aware net layer assignment would price, and R17.
 pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn RunObserver) -> Result<RunEnd, String> {
     let (xg, yg) = (inp.x_grid, inp.y_grid);
-    let (ids, nets) = (inp.net_ids, inp.nets);
-    let max_layer = ids.iter().map(|&id| nets[id].max_layer).max().unwrap_or(0);
+    // ⛔ The run's OWN copy of the nets: soft-NDR demotion (R14) rewrites a net's edge cost and
+    // per-layer costs, as `setSoftNDR` rewrites the `FrNet`, and every stage after it reads them.
+    let ids = inp.net_ids;
+    let mut nets_own: Vec<RsmtNet<'_>> = inp.nets.to_vec();
+    let max_layer = ids.iter().map(|&id| nets_own[id].max_layer).max().unwrap_or(0);
     let num_layers = inp.caps.layers.len().max(max_layer + 1);
     let mut g2d = match inp.resume {
         Some((g, _)) => resumed_graph_2d(g),
@@ -162,28 +165,28 @@ pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn 
     }
     let no_adj = false;
     // R5
-    let sum = gen_brk_rsmt(BrkFlags { congestion_driven: false, re_route: false, gen_tree: false, no_adj }, ids, nets, state, &mut grid!(), inp.stt, inp.flutes)
+    let sum = gen_brk_rsmt(BrkFlags { congestion_driven: false, re_route: false, gen_tree: false, no_adj }, ids, &nets_own, state, &mut grid!(), inp.stt, inp.flutes)
         .map_err(|e| format!("R5: {e:?}"))?;
     stop_unless!(Stage::R5(&sum), None);
     // R6
-    route_l_all(ids, nets, state, &mut grid!());
+    route_l_all(ids, &nets_own, state, &mut grid!());
     stop_unless!(Stage::R6, None);
     // R7
-    let sum = gen_brk_rsmt(BrkFlags { congestion_driven: true, re_route: true, gen_tree: true, no_adj }, ids, nets, state, &mut grid!(), inp.stt, inp.flutes)
+    let sum = gen_brk_rsmt(BrkFlags { congestion_driven: true, re_route: true, gen_tree: true, no_adj }, ids, &nets_own, state, &mut grid!(), inp.stt, inp.flutes)
         .map_err(|e| format!("R7: {e:?}"))?;
     stop_unless!(Stage::R7(&sum), None);
     let scan = g2d.get_overflow_2d();
     stop_unless!(Stage::Scan { tag: "B7", scan: &scan }, None);
     // R8
-    newroute_l_all(false, true, ids, nets, state, &mut grid!());
+    newroute_l_all(false, true, ids, &nets_own, state, &mut grid!());
     let scan = g2d.get_overflow_2d();
     stop_unless!(Stage::Scan { tag: "B8", scan: &scan }, None);
     // R9 — no overflow scan follows it.
     let pin_layer = |id: usize, pin: usize| inp.attrs[id].pin_layers.get(pin).copied().unwrap_or(0);
-    spiral_route_all(ids, nets, state, &mut grid!(), num_layers as i16, &pin_layer);
+    spiral_route_all(ids, &nets_own, state, &mut grid!(), num_layers as i16, &pin_layer);
     stop_unless!(Stage::Scan { tag: "B9", scan: &scan }, None);
     // R10
-    newroute_z_all(10, ids, nets, state, &mut grid!());
+    newroute_z_all(10, ids, &nets_own, state, &mut grid!());
     let scan = g2d.get_overflow_2d();
     stop_unless!(Stage::Scan { tag: "B10", scan: &scan }, None);
     // R11
@@ -195,7 +198,7 @@ pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn 
     // R12
     let pattern_scan = scan;
     let (mut last, mut last_lc) = (scan, 0.0f32);
-    lv_rounds(scan.max_overflow, ids, nets, state, &mut grid!(), &mut |k, round, g, st| {
+    lv_rounds(scan.max_overflow, ids, &nets_own, state, &mut grid!(), &mut |k, round, g, st| {
         let _ = obs.stage(Stage::Lv { k, round }, g, None, st);
         (last, last_lc) = (round.scan, round.logistic_coef);
     });
@@ -209,10 +212,26 @@ pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn 
         scan: last,
         overflow_iterations: inp.overflow_iterations,
         critical_nets_percentage: inp.critical_nets_percentage,
+        has_ndr: inp.attrs.iter().map(|a| a.has_ndr).collect(),
     };
-    let end = congestion_loop(&start, ids, nets, state, &mut grid!(), inp.timer_slack, &mut |ev, g, st| {
+    let end = congestion_loop(&start, ids, &mut nets_own, state, &mut grid!(), inp.timer_slack, &mut |ev, g, st| {
         let _ = obs.stage(Stage::Loop(ev), g, None, st);
     })?;
+    let nets = &nets_own[..];
+    // A demoted net's `getLayerEdgeCost` is 1 on every layer from here on (`has_ndr`, the rule, stays).
+    let attrs_own: Vec<NetLayerAttrs>;
+    let attrs: &[NetLayerAttrs] = if end.soft_ndr.is_empty() {
+        inp.attrs
+    } else {
+        attrs_own = inp.attrs.iter().enumerate().map(|(id, a)| {
+            let mut a = a.clone();
+            if state[id].soft_ndr {
+                a.layer_edge_cost = vec![1; a.layer_edge_cost.len()];
+            }
+            a
+        }).collect();
+        &attrs_own
+    };
     stop_unless!(Stage::LoopEnd(&end), None);
     // R15 — freeRR drops the loop's own backup; nothing is left here to free.
     remove_loops_all(ids, nets, state, &mut g2d);
@@ -236,7 +255,7 @@ pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn 
         })
     });
     let layer = LayerParams { layer_dir: inp.layer_dir, resistance_aware: inp.resistance_aware, liberty: inp.liberty, has_2d_overflow: end.has_2d_overflow, ra: ra.as_ref() };
-    let mut order = layer_assignment(ids, nets, inp.attrs, state, &mut g3, &layer)?;
+    let mut order = layer_assignment(ids, nets, attrs, state, &mut g3, &layer)?;
     let overflow = get_overflow_3d_all(&g2d, &g3);
     let past_cong = scan.total_overflow;
     stop_unless!(Stage::B16 { past_cong, overflow: &overflow }, Some(&g3));
@@ -246,15 +265,20 @@ pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn 
     }
     // R18 — costheight_ 3, via_cost_ 1; run()'s local enlarge_ as the loop left it.
     if past_cong == 0 {
-        let (long, short) = if inp.resistance_aware { (BIG_INT, BIG_INT) } else { (40, 12) };
+        // long_edge_len: 40, raised to BIG_INT by a soft-NDR demotion in R14 (and, with short_edge_len,
+        // by resistance awareness).
+        // ⚠️ The soft-NDR half is UNWITNESSED: both scripts that demote end congested, so this pass
+        // (`past_cong == 0`) never runs after a demotion — a mutant leaving 40 survives them.
+        let long = if inp.resistance_aware || !end.soft_ndr.is_empty() { BIG_INT } else { 40 };
+        let short = if inp.resistance_aware { BIG_INT } else { 12 };
         for (tag, ub) in [("B18a", long), ("B18b", short)] {
             let mp = Maze3dParams { layer: &layer, expand: end.enlarge, ripup_lb: 0, ripup_ub: ub, via_cost: 1 };
-            order = maze_route_msmd_order_3d_all(&order, nets, inp.attrs, state, &mut g2d, &mut g3, &mp)?.0;
+            order = maze_route_msmd_order_3d_all(&order, nets, attrs, state, &mut g2d, &mut g3, &mp)?.0;
             stop_unless!(Stage::B18 { tag, expand: end.enlarge, ripup_ub: ub }, Some(&g3));
         }
     }
     // R19
-    let fin = finish_3d(ids, nets, inp.attrs, state, &g2d, &g3)?;
+    let fin = finish_3d(ids, nets, attrs, state, &g2d, &g3)?;
     stop_unless!(Stage::B19(&fin), Some(&g3));
     // R20
     Ok(RunEnd::Routed(get_routes_all(ids, state, inp.db_id, inp.origin)))

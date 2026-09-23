@@ -251,6 +251,8 @@ pub struct NetState {
     pub resistance: f32,
     /// `FrNet::net_length_` — written by every `updateSlacks` call, for every net.
     pub net_length: i32,
+    /// `FrNet::is_soft_ndr_` — set by the congestion loop's soft-NDR demotion, never cleared.
+    pub soft_ndr: bool,
 }
 
 impl Default for NetState {
@@ -266,6 +268,7 @@ impl Default for NetState {
             res_aware: false,
             resistance: 0.0,
             net_length: 0,
+            soft_ndr: false,
         }
     }
 }

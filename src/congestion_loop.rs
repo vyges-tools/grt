@@ -6,8 +6,10 @@
 //! it computed and the state after — so a replay can check the schedule itself.
 //!
 //! ⚠️ Not transcribed, refused rather than guessed: the snapshot-batched convergence (the sequential
-//! kernel keeps `snapshot_cleanup_active_` false), and soft-NDR demotion on a design with NDR nets
-//! (reported as an error when reached).
+//! kernel keeps `snapshot_cleanup_active_` false).
+//!
+//! Soft-NDR demotion IS transcribed ([`soft_ndr_demotion`]): witnessed by `soft_ndr_4w_6s` (2 nets
+//! demoted at iteration 16) and `soft_ndr_escalation` (6 at iteration 12), each firing once.
 
 use crate::brk_rsmt::{BrkGrid, NetState, RouteKind, RsmtNet, StTree};
 use crate::estimate::Usage2d;
@@ -42,7 +44,7 @@ impl<'a> TimerSlack<'a> {
 }
 
 /// What run() carries into the loop from the pattern and monotonic phases.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct LoopStart {
     /// `maxOverflow` after R10 — the `> 700` switch in the LV prologue reads it.
     pub pattern_max_overflow: i32,
@@ -53,6 +55,9 @@ pub struct LoopStart {
     pub overflow_iterations: i32,
     /// `critical_nets_percentage_` — a `float` in the reference.
     pub critical_nets_percentage: f32,
+    /// Per net id, `getDbNet()->getNonDefaultRule() != nullptr` — the RULE, which the soft-NDR scan
+    /// filters on (a net demoted keeps it; `NetState::soft_ndr` says it was demoted).
+    pub has_ndr: Vec<bool>,
 }
 
 /// The schedule's values at one maze pass, beside the parameters it passed.
@@ -88,7 +93,7 @@ pub enum LoopEvent {
 }
 
 /// What the loop leaves for the finalisation.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LoopEnd {
     pub iterations: i32,
     pub scan: Overflow2DScan,
@@ -99,6 +104,9 @@ pub struct LoopEnd {
     /// How often each branch no corpus loop reaches actually fired — so a replay can ASSERT the
     /// limitation instead of noting it.
     pub rare: RareBranches,
+    /// The nets soft-NDR demotion demoted, in its order. ⚠️ Non-empty also means run()'s local
+    /// `long_edge_len` became `BIG_INT` — the first 3D maze pass after layer assignment reads it.
+    pub soft_ndr: Vec<usize>,
 }
 
 /// The loop's branches the corpus never exercises.
@@ -122,7 +130,7 @@ pub struct RareBranches {
 pub fn congestion_loop(
     start: &LoopStart,
     net_ids: &[usize],
-    nets: &[RsmtNet<'_>],
+    nets: &mut [RsmtNet<'_>],
     state: &mut [NetState],
     grid: &mut BrkGrid<'_>,
     timer_slack: TimerSlack<'_>,
@@ -178,7 +186,8 @@ pub fn congestion_loop(
     // LOCAL `int enlarge_` that shadows it, so the pass never changes the schedule's value.
     // The partial-slack calls so far: each reads the timer afresh.
     let partial_calls = std::cell::Cell::new(0usize);
-    let pass = |grid: &mut BrkGrid<'_>, state: &mut [NetState], p: &MsmdParams| -> Result<(), String> {
+    let mut soft_ndr = Vec::new();
+    let pass = |grid: &mut BrkGrid<'_>, nets: &[RsmtNet<'_>], state: &mut [NetState], p: &MsmdParams| -> Result<(), String> {
         let k = partial_calls.get();
         if p.ordering && p.critical_nets_percentage != 0.0 {
             partial_calls.set(k + 1);
@@ -261,7 +270,7 @@ pub fn congestion_loop(
         };
         let p = params(i, enlarge, ripup_threshold, via, l, logistic_coef, costheight, slope);
         on(&LoopEvent::Before { params: p, schedule: LoopSchedule { up_type, stop_dec, thresh_m, cost_step, max_adj, history_args } }, grid.g, state);
-        pass(grid, state, &p)?;
+        pass(grid, nets, state, &p)?;
         let mut last_cong = past_cong;
         scan = grid.g.get_overflow_2d_maze();
         (past_cong, max_overflow, total_overflow) = (scan.total_overflow, scan.max_overflow, scan.total_overflow);
@@ -289,7 +298,7 @@ pub fn congestion_loop(
                 l = 0;
                 slope = 5;
                 let p = params(i, enlarge, ripup_threshold, via, l, logistic_coef, costheight, slope);
-                pass(grid, state, &p)?;
+                pass(grid, nets, state, &p)?;
                 last_cong = past_cong;
                 scan = grid.g.get_overflow_2d_maze();
                 (past_cong, max_overflow, total_overflow) = (scan.total_overflow, scan.max_overflow, scan.total_overflow);
@@ -332,7 +341,7 @@ pub fn congestion_loop(
                 bmfl = past_cong;
                 l = 0;
                 let p = params(i, enlarge, ripup_threshold, via, l, logistic_coef, costheight, slope);
-                pass(grid, state, &p)?;
+                pass(grid, nets, state, &p)?;
                 last_cong = past_cong;
                 scan = grid.g.get_overflow_2d_maze();
                 (past_cong, max_overflow, total_overflow) = (scan.total_overflow, scan.max_overflow, scan.total_overflow);
@@ -365,12 +374,24 @@ pub fn congestion_loop(
         }
         last_total_overflow = total_overflow;
 
-        // Soft-NDR demotion: only NDR nets can be demoted, so a design without them computes an
-        // empty list and nothing happens.
+        // Soft-NDR demotion when the loop stops making progress: every congested NDR net, then the
+        // loop restarts. Only NDR nets can be demoted, so a design without them computes an empty
+        // list and nothing happens.
         if total_overflow > 0 && (minofl_stagnant > SOFT_NDR_STAGNANT_TH || i > SOFT_NDR_MAX_ITER) {
-            let has_ndr = net_ids.iter().any(|&id| nets[id].edge_cost > 1);
-            if has_ndr {
-                return Err("soft-NDR demotion on a design with NDR nets: not wired into the loop".into());
+            let demoted = soft_ndr_demotion(net_ids, nets, &start.has_ndr, state, grid)?;
+            if !demoted.is_empty() {
+                soft_ndr.extend(demoted);
+                overflow_increases = 0;
+                minofl_stagnant = 0;
+                i = 1;
+                costheight = COSHEIGHT;
+                enlarge = ENLARGE;
+                ripup_threshold = RIPVALUE;
+                minofl = total_overflow;
+                bmfl = minofl;
+                stop_dec = false;
+                slope = 20;
+                l = 1;
             }
         }
     }
@@ -379,7 +400,102 @@ pub fn congestion_loop(
     if minofl > 0 {
         copy_br(net_ids, nets, state, grid, backup.as_deref());
     }
-    Ok(LoopEnd { iterations: i - 1, scan, minofl, minoflrnd, has_2d_overflow, enlarge, rare })
+    Ok(LoopEnd { iterations: i - 1, scan, minofl, minoflrnd, has_2d_overflow, enlarge, rare, soft_ndr })
+}
+
+/// `getLayerEdgeCost` of a soft-NDR net: 1 on every layer (the per-layer table is bypassed).
+static SOFT_LAYER_EDGE_COST: [i8; 256] = [1; 256];
+
+/// The congestion loop's soft-NDR step, in the reference's order: `computeCongestedNDRnets`,
+/// `getCongestedNDRnetsByFraction(1.0)`, then `applySoftNDR` on each — refund the net's planar
+/// usage at its edge cost, `setSoftNDR` (edge cost 1, per-layer cost 1), charge it again at 1.
+/// Returns the demoted ids, in order; empty when no NDR net is congested.
+///
+/// ⛔ Both usage passes go through the NDR-aware charge (`Graph2D::updateUsageV/H` →
+/// `getCostNDRAware`): the refund removes the net from each edge's NDR set and gives back its cost
+/// — ×100 while the edge is in NDR overflow — and the re-charge at cost 1 passes straight through.
+///
+/// ⛔ `sortCongestedNDRnets` is an UNSTABLE `std::ranges::sort` on the congested-edge count alone.
+/// Two nets with the same count would be ordered by libc++'s algorithm, which is not modelled: a
+/// tie is REFUSED. The two witnesses have none (counts 25/10, and 25/22/16/15/14/10).
+pub fn soft_ndr_demotion(
+    net_ids: &[usize],
+    nets: &mut [RsmtNet<'_>],
+    has_ndr: &[bool],
+    state: &mut [NetState],
+    grid: &mut BrkGrid<'_>,
+) -> Result<Vec<usize>, String> {
+    use crate::full3d::Point3D;
+    use crate::softndr::{compute_congested_ndr_nets, congested_ndr_nets_by_fraction, sort_congested_ndr_nets, NdrEdge, NdrNet, Overflow2D};
+    struct View<'a>(&'a crate::graph2d::Graph2d);
+    impl Overflow2D for View<'_> {
+        fn overflow_v(&self, x: i16, y: i16) -> i32 {
+            let (x, y) = (x as usize, y as usize);
+            i32::from(self.0.est.usage_v(x, y)) - i32::from(self.0.cap_v[y * self.0.est.x_grids + x])
+        }
+        fn overflow_h(&self, x: i16, y: i16) -> i32 {
+            let (x, y) = (x as usize, y as usize);
+            i32::from(self.0.est.usage_h(x, y)) - i32::from(self.0.cap_h[y * self.0.est.x_grids + x])
+        }
+    }
+    // computeCongestedNDRnets over net_ids_, in order: the 2D trees as they stand.
+    let scan_nets: Vec<NdrNet> = net_ids
+        .iter()
+        .map(|&id| NdrNet {
+            net_id: id,
+            has_ndr: has_ndr.get(id).copied().unwrap_or(false),
+            is_soft_ndr: state[id].soft_ndr,
+            edge_cost: nets[id].edge_cost,
+            layer_edge_cost: None,
+            edges: state[id].tree.as_ref().map_or_else(Vec::new, |t| {
+                t.edges
+                    .iter()
+                    .zip(&t.routes)
+                    .map(|(e, r)| NdrEdge {
+                        len: e.len,
+                        routelen: r.routelen,
+                        grids: r.grids.iter().map(|&(x, y)| Point3D { x: x as i16, y: y as i16, layer: 0 }).collect(),
+                    })
+                    .collect()
+            }),
+        })
+        .collect();
+    let mut congested = compute_congested_ndr_nets(&scan_nets, &View(grid.g));
+    sort_congested_ndr_nets(&mut congested);
+    if congested.windows(2).any(|w| w[0].num_edges == w[1].num_edges) {
+        return Err("soft-NDR: two congested NDR nets tie on their count — libc++'s unstable sort order is not modelled".into());
+    }
+    let ids = congested_ndr_nets_by_fraction(&congested, 1.0);
+    // applySoftNDR: updateSoftNDRNetUsage(-edge cost), setSoftNDR, updateSoftNDRNetUsage(+edge cost).
+    let charge = |grid: &mut BrkGrid<'_>, net: &RsmtNet<'_>, id: usize, t: &StTree, amount: f64| {
+        let nn = net.ndr_net(id);
+        let mut g = grid.g.for_net(&nn);
+        for r in &t.routes {
+            if r.routelen <= 0 || r.grids.is_empty() {
+                continue;
+            }
+            for k in 0..r.routelen as usize {
+                let ((ax, ay), (bx, by)) = (r.grids[k], r.grids[k + 1]);
+                if (ax, ay) == (bx, by) {
+                    continue;
+                }
+                if ax == bx {
+                    g.update_usage_v(ax, ay.min(by), amount);
+                } else if ay == by {
+                    g.update_usage_h(ax.min(bx), ay, amount);
+                }
+            }
+        }
+    };
+    for &id in &ids {
+        let t = state[id].tree.clone().ok_or_else(|| format!("soft-NDR: net {id} has no 2D tree"))?;
+        charge(grid, &nets[id], id, &t, -f64::from(nets[id].edge_cost));
+        nets[id].edge_cost = 1;
+        nets[id].layer_edge_cost = &SOFT_LAYER_EDGE_COST[..nets[id].layer_edge_cost.len()];
+        state[id].soft_ndr = true;
+        charge(grid, &nets[id], id, &t, f64::from(nets[id].edge_cost));
+    }
+    Ok(ids)
 }
 
 /// `copyRS` — save every net's tree (topology and routes) as the best so far.

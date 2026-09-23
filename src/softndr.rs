@@ -6,9 +6,11 @@
 //! edge to "soft NDR": their edge cost drops to one, and the usage they had charged is
 //! re-accounted at the new cost.
 //!
-//! ⛔ **The gate above this never fires on any shipped design** — see the tests. A design with NDR
-//! nets has no congestion, and a congested design has no NDR nets. The rules below are therefore
-//! transcribed from the reference and pinned by constructed cases, not by a corpus.
+//! ⚠️ **Only the congestion loop's selection and `applySoftNDR` fire in the corpus**
+//! ([`crate::congestion_loop::soft_ndr_demotion`]): `soft_ndr_4w_6s` demotes 2 nets and
+//! `soft_ndr_escalation` 6, each once, both exact end to end. R17's
+//! [`disable_ndr_for_congested_nets`] (GRT-0297, 2D and 3D overflow disagreeing) fires on neither
+//! and stays pinned by constructed cases only.
 //!
 //! ⛔ **The re-accounting is a BRACKET, and the order inside it is the behaviour.** Usage is
 //! removed at the old cost, the net is demoted, and usage is re-added at the new one. Both the

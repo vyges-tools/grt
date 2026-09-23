@@ -1355,9 +1355,10 @@ fn the_congestion_loop_steps_enlarge_until_the_clamp() {
     let mut grid = BrkGrid { g: &mut g2d, red_h: &no_red, red_v: &no_red, caps: &caps, h_capacity: 10, v_capacity: 10, via_cost: 0.0 };
     let scan = grid.g.get_overflow_2d_maze();
     assert!(scan.total_overflow > 0 && scan.total_overflow < 500);
-    let start = LoopStart { pattern_max_overflow: 0, logistic_coef: 0.0, scan, overflow_iterations: 4, critical_nets_percentage: 0.0 };
+    let start = LoopStart { pattern_max_overflow: 0, logistic_coef: 0.0, scan, overflow_iterations: 4, critical_nets_percentage: 0.0, has_ndr: vec![false] };
     let mut expands = Vec::new();
-    let _ = congestion_loop(&start, &[0], &nets, &mut state, &mut grid, vyges_grt::congestion_loop::TimerSlack::None, &mut |ev, _, _| {
+    let mut nets = nets;
+    let _ = congestion_loop(&start, &[0], &mut nets, &mut state, &mut grid, vyges_grt::congestion_loop::TimerSlack::None, &mut |ev, _, _| {
         if let LoopEvent::Before { params, .. } = ev {
             expands.push(params.expand);
         }
