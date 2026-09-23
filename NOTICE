@@ -21,5 +21,10 @@ This engine reimplements behaviour published by the OpenROAD project's global ro
 (https://github.com/The-OpenROAD-Project/OpenROAD, BSD-3-Clause). It is a reimplementation from
 published behaviour, not a transliteration, and carries no OpenROAD source.
 
+The CUGR router (`src/cugr/`, `global_route -use_cugr`) reimplements the behaviour of CUGR 2.0,
+the global router of the EDGE paper by researchers at The Chinese University of Hong Kong, as the
+OpenROAD project embeds it. The algorithm is theirs; this crate carries none of its source. The
+credit is attribution only and implies no endorsement by the authors or their university.
+
 The library in this crate is self-contained: it computes guide geometry from route segments and
 carries no runtime data files.

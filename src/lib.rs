@@ -14,6 +14,7 @@
 //! stage runs, so a divergence can be pointed at one line rather than bisected. The per-segment
 //! rules live in [`guides_for_segment`], the geometry in [`global_routing_to_box`].
 
+pub mod cugr;
 pub mod estimate;
 pub mod lroute;
 pub mod spiral;

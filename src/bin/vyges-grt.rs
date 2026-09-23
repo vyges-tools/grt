@@ -37,7 +37,9 @@ JOB (JSON):
     { \"cmd\": \"nets_to_route\", \"patterns\": [..] }                        (Tcl globs)
     { \"cmd\": \"global_route\", \"verbose\": b, \"allow_congestion\": b, \"grid_origin\": [x, y],
       \"skip_large_fanout\": n, \"congestion_iterations\": n, \"critical_nets_percentage\": f,
-      \"resistance_aware\": b, \"res_aware_nets_percentage\": f }
+      \"resistance_aware\": b, \"res_aware_nets_percentage\": f, \"use_cugr\": b }
+      (use_cugr: CUGR's model is built — and written to the file $VYGC_OUT names — then the
+       command is REFUSED, exit 1: CUGR routing is not modelled yet)
     { \"cmd\": \"create_clock\", \"ports\": [..] }                        (clock network only)
     { \"cmd\": \"set_layer_rc\", \"layer\" | \"via\": name, \"resistance\": f } (user units)
     { \"cmd\": \"propagated_clock\" }
@@ -1079,6 +1081,17 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 }
                 if let Some(p) = step["critical_nets_percentage"].as_f64() {
                     opts.critical_nets_percentage = if opts.liberty.is_some() { p as f32 } else { 0.0 };
+                }
+                if step["use_cugr"].as_bool() == Some(true) {
+                    // `-use_cugr`: the model (stage 0) is built and, when `VYGC_OUT` names a file,
+                    // written to it; routing is not modelled yet, so the command is refused after.
+                    let c = vyges_grt::cugr::route::init_cugr(&mut db, &opts).map_err(|e| classify(e.to_string()))?;
+                    if let Ok(path) = std::env::var("VYGC_OUT") {
+                        let lines = vyges_grt::cugr::trace::model(&c.cugr, c.min_routing_layer, c.max_routing_layer, c.clock_nets.len());
+                        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(err)?;
+                        std::io::Write::write_all(&mut f, (lines.join("\n") + "\n").as_bytes()).map_err(err)?;
+                    }
+                    return Err(Fail::Refused("cugr: routing is not modelled yet (the model only)".into()));
                 }
                 let res = route_design(&mut db, &opts, &stt, &flutes).map_err(|e| classify(e.to_string()))?;
                 // saveGuides replaces the guides of every net it routes; the others keep theirs.
