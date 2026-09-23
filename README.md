@@ -9,9 +9,14 @@ guide records.
 
 ## Status
 
-⬜ **Early.** The guide writer is implemented and tested; the router that produces the segments is
-not. The crate is useful today as the guide-geometry half of a routing flow, and as a reference
-for exactly how guide rectangles are derived from grid coordinates.
+**The router runs end to end** (`vyges-grt`, feature `cli`): FastRoute's full sequence from a
+placed design, pattern and maze routing, 3D layer assignment, rip-up and reroute, non-default
+rules, incremental routing and antenna repair, writing route guides to the design database.
+Against OpenROAD at pin `da9f29f1`, over the reference's own global-routing regression suite, the
+guide files of 43 of 85 cases match exactly, and 6 more match once the timer's slacks are taken
+from the reference (those are timing-driven, and the timer does not yet reproduce the slacks bit
+for bit). Most of the remaining cases run CUGR, a second router this crate does not implement, or
+need detailed-routing pin access.
 
 ✅ **Validated end to end, over five designs.** On the main one — 563 nets, 3,770 segments —
 every one of the 3,848 guides matches the output of a published global router, per net and in
