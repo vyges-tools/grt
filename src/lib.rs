@@ -99,7 +99,8 @@ pub mod maze_phase;
 pub mod maze_msmd;
 pub mod congestion_loop;
 pub mod liberty_clk;
-pub mod parasitics;
+/// `est::MakeWireParasitics`, which lives in the estimator crate (`vyges-est`) as upstream's does.
+pub use vyges_est::wire as parasitics;
 pub mod planar_route;
 pub mod clk_network;
 pub mod finalize;
