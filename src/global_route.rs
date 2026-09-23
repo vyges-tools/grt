@@ -20,7 +20,7 @@ use crate::adjust::{
     save_resources_before_adjustments, EdgeState, RouterEdges,
 };
 use crate::init::{is_non_leaf_clock, order_nets, DiscoveredNet, ITermClockFacts};
-use crate::netlist::{compute_track_consumption, find_fastroute_pins, get_net_layer_range, makes_fastroute_net, net_max_routing_layer, NetlistGrid, RouterPinFacts};
+use crate::netlist::{compute_track_consumption, find_fastroute_pins, get_net_layer_range, makes_fastroute_net, net_max_routing_layer, NdrLayerRule, NetlistGrid, RouterPinFacts};
 use crate::pins::{find_nets, find_pin, is_pin_reachable, make_bterm_pin, make_iterm_pin, MasterClass, NetCandidate, NetPin, PinGrid, TermBox};
 use crate::read::{read_bterm, read_master_shapes, read_nets, read_tech, read_tile_size, transform_rect, DbSpacing, MasterShapes, NetFacts, TechFacts};
 use crate::finalize::{Graph3d, NetLayerAttrs};
@@ -540,7 +540,14 @@ pub struct RouterNet {
     pub min_layer: i32,
     pub max_layer: i32,
     pub edge_cost: i8,
+    /// `computeTrackConsumption`'s per-layer costs, indexed by `level - 1` (`num_layers + 1`
+    /// entries); `None` without an NDR.
     pub layer_edge_cost: Option<Vec<i8>>,
+    /// `getNonDefaultRule() != nullptr` — the RULE, which a soft-NDR demotion keeps.
+    pub has_ndr: bool,
+    /// The NDR's layer-rule width per routing level (`getLayerResistance` reads it); `None` without
+    /// an NDR.
+    pub ndr_widths: Option<std::collections::BTreeMap<i32, i32>>,
     /// `stt_builder_->getAlpha(net)`.
     pub alpha: f32,
     /// Each pin as `updateNetPins` left it, in the net's order.
@@ -549,6 +556,21 @@ pub struct RouterNet {
     pub pin_is_driver: Vec<bool>,
     /// `dbNet::getTermCount()` — the Steiner builder's min-fanout test reads it.
     pub term_count: i32,
+}
+
+/// `getLayerEdgeCost(l)` over the net's own range `min_layer..=max_layer` — what the NDR-aware
+/// charge reads (`RsmtNet::layer_edge_cost`). 1 throughout without an NDR.
+fn net_range_edge_costs(n: &RouterNet) -> Vec<i8> {
+    let (lo, hi) = ((n.min_layer - 1).max(0) as usize, (n.max_layer - 1).max(0) as usize);
+    match &n.layer_edge_cost {
+        Some(v) if n.max_layer >= n.min_layer => v[lo..=hi].to_vec(),
+        _ => vec![1; (n.max_layer - n.min_layer + 1).max(0) as usize],
+    }
+}
+
+/// `getLayerEdgeCost(l)` for every layer `0..num_layers` (layer assignment's view).
+fn all_layer_edge_costs(n: &RouterNet, num_layers: usize) -> Vec<i8> {
+    n.layer_edge_cost.as_ref().map_or_else(|| vec![1; num_layers], |v| v[..num_layers].to_vec())
 }
 
 /// I13 `initNets` (`findNets`: discovery, pins, the order) and I14 `initNetlist`.
@@ -669,8 +691,28 @@ pub fn setup_nets(db: &Db, t: &TechSetup, e: &mut RouterEdges, has_macros_or_pad
         }
         let facts: Vec<RouterPinFacts> = pins.iter().map(|(p, d)| RouterPinFacts { on_grid: p.on_grid, connection_layer: p.connection_layer, is_driver: *d }).collect();
         let (on_grid, root) = find_fastroute_pins(&facts, grid, net_max_routing_layer(n.sig_type == "CLOCK", clk_max, max));
-        // No NDR on any tier-A net: the edge cost is 1 and there is no per-layer vector.
-        let (edge_cost, lec) = compute_track_consumption(None, min, max, t.core.num_layers).map_err(|e| format!("{e:?}"))?;
+        // computeTrackConsumption: the net's NDR (`getNonDefaultRule`), each layer rule read with
+        // its layer's default width and the track pitch of that routing level. No NDR: cost 1.
+        let ndr = db.net_get_non_default_rule(&n.name);
+        let ndr_layer_rules = if ndr.is_empty() { Vec::new() } else { db.ndr_layer_rules(&ndr)? };
+        let ndr_widths = (!ndr.is_empty())
+            .then(|| ndr_layer_rules.iter().map(|(layer, width, _)| (db.layer_get_routing_level(layer), *width)).collect());
+        let rules: Option<Vec<NdrLayerRule>> = if ndr.is_empty() {
+            None
+        } else {
+            Some(ndr_layer_rules.iter().cloned().map(|(layer, width, spacing)| {
+                let level = db.layer_get_routing_level(&layer);
+                NdrLayerRule {
+                    level,
+                    default_width: db.layer_get_width(&layer) as i32,
+                    default_pitch: t.tracks.iter().find(|r| r.layer_index == level).map_or(0, |r| r.track_pitch),
+                    ndr_spacing: spacing,
+                    ndr_width: width,
+                }
+            }).collect())
+        };
+        let (edge_cost, lec) = compute_track_consumption(rules.as_deref(), min, max, t.core.num_layers)
+            .map_err(|e| format!("[ERROR GRT-0272] NDR consumption {} exceeds 127 and is unsupported", e.0))?;
         out.push(RouterNet {
             name: n.name.clone(),
             pins: on_grid,
@@ -681,6 +723,8 @@ pub fn setup_nets(db: &Db, t: &TechSetup, e: &mut RouterEdges, has_macros_or_pad
             max_layer: hi,
             edge_cost,
             layer_edge_cost: lec,
+            has_ndr: !ndr.is_empty(),
+            ndr_widths,
             // getAlpha: the net's own alpha, else the global one — FastRoute's path gate reads it.
             alpha: opts.net_alpha.get(&n.name).copied().unwrap_or(opts.alpha),
             net_pins: pins.iter().map(|(p, _)| p.clone()).collect(),
@@ -881,7 +925,7 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     let caps = Caps3D { x_grid: xg, layers: (0..e.num_layers as usize).map(|l| CapLayer { h: layer_of(&e.h3, l), v: layer_of(&e.v3, l) }).collect() };
     // The nets, indexed by FastRoute id; the routed ones exclude local nets.
     let pins: Vec<(Vec<i32>, Vec<i32>)> = nets.iter().map(|n| n.pins.iter().map(|p| (p.0, p.1)).unzip()).collect();
-    let lecs: Vec<Vec<i8>> = nets.iter().map(|n| vec![1; (n.max_layer - n.min_layer + 1).max(0) as usize]).collect();
+    let lecs: Vec<Vec<i8>> = nets.iter().map(net_range_edge_costs).collect();
     let rnets: Vec<RsmtNet<'_>> = nets
         .iter()
         .enumerate()
@@ -901,10 +945,10 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         .iter()
         .map(|n| NetLayerAttrs {
             pin_layers: n.pins.iter().map(|p| (p.2 - 1) as i16).collect(),
-            has_ndr: false,
+            has_ndr: n.has_ndr,
             is_clock: n.is_clock,
             is_res_aware: false,
-            layer_edge_cost: vec![1; num_layers],
+            layer_edge_cost: all_layer_edge_costs(n, num_layers),
             sta_slack: 0.0,
         })
         .collect();
@@ -952,6 +996,12 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     // preProcessTechLayers: each routing layer (by level, up to the router's layers) and the cut
     // layer above it — their widths and resistances as the database holds them now (after any
     // set_layer_rc).
+    // ⬜ Resistance-aware pricing reads an NDR net's width PER LAYER (`getWireResistance`); the
+    // pricing's `WireNet` carries one width, so the pair is refused rather than priced at the
+    // default width. No upstream case combines them.
+    if opts.resistance_aware && nets.iter().any(|n| n.has_ndr) {
+        return Err("resistance-aware routing of a net with an NDR: the per-layer NDR width is not wired".into());
+    }
     let res_aware = if opts.resistance_aware {
         let mut tech = crate::pricing::TechLayers { dbu_per_micron: db.tech_get_db_units_per_micron(), width: Vec::new(), resistance: Vec::new(), via_resistance: Vec::new() };
         for level in 1..=num_layers as i32 {
@@ -1110,7 +1160,7 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
                 pins: &pins,
                 net_min_layer: n.min_layer,
                 min_routing_layer: t.min_routing_layer,
-                ndr_width: None,
+                ndr_width: n.ndr_widths.as_ref(),
                 attach: crate::parasitics::PinAttach::Planar,
             };
             parasitics.insert(n.name.clone(), crate::parasitics::estimate_net(&np, &rc));
@@ -1166,7 +1216,7 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
                 pins: &pins,
                 net_min_layer: n.min_layer,
                 min_routing_layer: t.min_routing_layer,
-                ndr_width: None,
+                ndr_width: n.ndr_widths.as_ref(),
                 attach: crate::parasitics::PinAttach::Routed,
             };
             routed_parasitics.insert(n.name.clone(), crate::parasitics::estimate_net(&np, &rc));
@@ -1401,7 +1451,7 @@ fn find_routing(db: &Db, opts: &RouteOptions, a: &mut AfterRoute, dirty_nets: &[
     let (xg, yg) = (a.jumper_grid.x_grids as usize, a.jumper_grid.y_grids as usize);
     let num_layers = a.caps.layers.len();
     let pins: Vec<(Vec<i32>, Vec<i32>)> = nets.iter().map(|n| n.pins.iter().map(|p| (p.0, p.1)).unzip()).collect();
-    let lecs: Vec<Vec<i8>> = nets.iter().map(|n| vec![1; (n.max_layer - n.min_layer + 1).max(0) as usize]).collect();
+    let lecs: Vec<Vec<i8>> = nets.iter().map(net_range_edge_costs).collect();
     let rnets: Vec<RsmtNet<'_>> = nets
         .iter()
         .enumerate()
@@ -1409,7 +1459,7 @@ fn find_routing(db: &Db, opts: &RouteOptions, a: &mut AfterRoute, dirty_nets: &[
         .collect();
     let attrs: Vec<NetLayerAttrs> = nets
         .iter()
-        .map(|n| NetLayerAttrs { pin_layers: n.pins.iter().map(|p| (p.2 - 1) as i16).collect(), has_ndr: false, is_clock: n.is_clock, is_res_aware: false, layer_edge_cost: vec![1; num_layers], sta_slack: 0.0 })
+        .map(|n| NetLayerAttrs { pin_layers: n.pins.iter().map(|p| (p.2 - 1) as i16).collect(), has_ndr: n.has_ndr, is_clock: n.is_clock, is_res_aware: false, layer_edge_cost: all_layer_edge_costs(n, num_layers), sta_slack: 0.0 })
         .collect();
     let slack = vec![(0.0f32, false); nets.len()];
     // The min-HPWL rule reads the instances where the legalization left them.

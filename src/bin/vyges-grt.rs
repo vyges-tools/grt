@@ -800,6 +800,104 @@ fn legalize_placed_cells(db: &mut Db, padding: (i32, i32), diodes: &[String], ga
     Ok(())
 }
 
+/// `create_ndr` (odb.tcl): the block rule, then `set_ndr_rules` for `-spacing` and `-width` (in that
+/// order), then every ROUTING layer whose rule has no width yet gets `*1` — the layer's own width
+/// (ODB-1003). Values are a single value for every routing layer, or `layer value` pairs where a
+/// layer may be a `first:last` range walked in the technology's layer order. A value is microns
+/// (`microns_to_dbu`: `std::round`) or `*N`: N times the layer's own spacing or width.
+/// ⬜ `-via` (`addUseVia`) is not modelled: the router never reads it.
+fn create_ndr(db: &mut Db, name: &str, spacing: &[String], width: &[String], log: &mut Vec<String>) -> Result<(), Fail> {
+    if !db.ndr_create(name).map_err(err)? {
+        return Err(Fail::Error(format!("[ERROR ODB-1005] NonDefaultRule {name} already exists")));
+    }
+    let routing: Vec<String> = db.tech_get_layers().into_iter().filter(|l| db.layer_get_type(l).is_ok_and(|t| t == "ROUTING")).collect();
+    let dbu = f64::from(db.tech_get_db_units_per_micron());
+    // set_ndr_layer_rule
+    let set_one = |db: &mut Db, layer: &str, input: &str, is_spacing: bool, log: &mut Vec<String>| -> Result<(), Fail> {
+        if !db.tech_get_layers().iter().any(|l| l == layer) {
+            log.push(format!("[WARNING ODB-1000] Layer {layer} not found, skipping NDR for this layer"));
+            return Ok(());
+        }
+        if db.layer_get_type(layer).map_err(err)? != "ROUTING" {
+            return Ok(());
+        }
+        let input = input.trim();
+        let value = if let Ok(um) = input.parse::<f64>() {
+            (um * dbu).round() as i32
+        } else if let Some(n) = input.strip_prefix('*') {
+            // `expr N * [$layer getWidth]`: an integer N stays integer; a real one would reach
+            // `setWidth(int)` as a double, which the binding rejects.
+            let n: i32 = n.trim().parse().map_err(|_| Fail::Refused(format!("create_ndr: a non-integer multiplier {input}")))?;
+            n * if is_spacing { db.layer_get_spacing(layer) } else { db.layer_get_width(layer) as i32 }
+        } else {
+            log.push("[WARNING ODB-1009] Invalid input in create_ndr cmd".into());
+            return Ok(());
+        };
+        let ok = if is_spacing { db.ndr_set_layer_spacing(name, layer, value) } else { db.ndr_set_layer_width(name, layer, value) };
+        ok.map_err(err)?;
+        Ok(())
+    };
+    // set_ndr_rules
+    let set_rules = |db: &mut Db, values: &[String], is_spacing: bool, log: &mut Vec<String>| -> Result<(), Fail> {
+        if values.len() == 1 {
+            for l in &routing {
+                set_one(db, l, &values[0], is_spacing, log)?;
+            }
+            return Ok(());
+        }
+        if values.len() % 2 == 1 {
+            return Err(Fail::Error(format!("[ERROR ODB-{}] values are malformed", if is_spacing { 1006 } else { 1007 })));
+        }
+        for pair in values.chunks(2) {
+            let (layers, value) = (&pair[0], &pair[1]);
+            match layers.split_once(':') {
+                None => set_one(db, layers, value, is_spacing, log)?,
+                Some((first, last)) => {
+                    let (mut found_first, mut found_last) = (false, false);
+                    for l in &routing {
+                        if !found_first {
+                            if l == first {
+                                found_first = true;
+                            } else {
+                                continue;
+                            }
+                        }
+                        set_one(db, l, value, is_spacing, log)?;
+                        if l == last {
+                            found_last = true;
+                            break;
+                        }
+                    }
+                    if !found_first {
+                        log.push(format!("[WARNING ODB-1001] Layer {first} not found"));
+                    }
+                    if !found_last {
+                        log.push(format!("[WARNING ODB-1002] Layer {last} not found"));
+                    }
+                }
+            }
+        }
+        Ok(())
+    };
+    if !spacing.is_empty() {
+        set_rules(db, spacing, true, log)?;
+    }
+    if !width.is_empty() {
+        set_rules(db, width, false, log)?;
+    }
+    // "inintialize layers": a routing layer with no rule, or a rule of width 0, gets `*1`.
+    let rules = db.ndr_layer_rules(name).map_err(err)?;
+    for l in &routing {
+        if rules.iter().any(|(rl, w, _)| rl == l && *w != 0) {
+            continue;
+        }
+        let w = db.layer_get_width(l);
+        log.push(format!("[WARNING ODB-1003] ({l}) layer's width from ({name}) NDR is not defined. Using the default value {}", f64::from(w) / dbu));
+        set_one(db, l, "*1", false, log)?;
+    }
+    Ok(())
+}
+
 fn run(job: &Value) -> Result<Value, Fail> {
     let mut db = Db::new();
     // A design from a database may carry pin access points; one from DEF carries none.
@@ -1228,6 +1326,30 @@ fn run(job: &Value) -> Result<Value, Fail> {
             // route or guide. A job may therefore drop it when nothing after it reads the placement.
             // ⛔ Followed by a route, a repair or a legalization it is NOT inert (the fillers occupy
             // sites the diode placer and the legalizer would avoid): such a job must be refused.
+            "create_ndr" => {
+                let list = |k: &str| -> Vec<String> { step[k].as_array().map(|v| v.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default() };
+                create_ndr(&mut db, step["name"].as_str().ok_or_else(|| err("name"))?, &list("spacing"), &list("width"), &mut log)?;
+            }
+            // assign_ndr -net: the BLOCK's rule (`findNonDefaultRule`) onto the net. `sig_type`
+            // instead of `net` is the suite's `foreach net [$block getNets] { if sigtype == X }`.
+            "assign_ndr" => {
+                let ndr = step["ndr"].as_str().ok_or_else(|| err("ndr"))?;
+                if !db.block_get_non_default_rules().iter().any(|r| r == ndr) {
+                    return Err(Fail::Error(format!("[ERROR ORD-1011] No NDR named {ndr} found.")));
+                }
+                let nets: Vec<String> = if let Some(n) = step["net"].as_str() {
+                    if !db.net_names().iter().any(|m| m == n) {
+                        return Err(Fail::Error(format!("[ERROR ORD-1012] No net named {n} found.")));
+                    }
+                    vec![n.to_string()]
+                } else {
+                    let sig = step["sig_type"].as_str().ok_or_else(|| err("net or sig_type"))?;
+                    db.block_get_nets().into_iter().filter(|n| db.net_sigtype(n) == sig).collect()
+                };
+                for n in nets {
+                    db.net_set_non_default_rule(&n, ndr).map_err(err)?;
+                }
+            }
             "placement_padding" => {
                 padding = (step["left"].as_i64().unwrap_or(0) as i32, step["right"].as_i64().unwrap_or(0) as i32);
             }
