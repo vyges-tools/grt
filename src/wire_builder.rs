@@ -269,8 +269,9 @@ pub fn add_wire_terms(
 /// `WireBuilder::makeWireToTerm`: the stub from a grid point to a terminal's pin.
 ///
 /// The target is the grid point itself when the pin already covers it (or a same-layer segment of
-/// the route touches the pin); otherwise the CENTRE of the pin shape nearest the grid point
-/// (Manhattan, first strictly smaller wins).
+/// the route touches the pin); otherwise a pin shape's CENTRE, found by a RUNNING comparison: each
+/// shape's Manhattan distance is taken from the best centre so far (starting at the grid point), and
+/// only a strictly smaller one replaces it — so it is not simply the shape nearest the grid point.
 ///
 /// ⛔ A pin at or above the min routing layer gets an L on the SEGMENT's layer (x first). A pin
 /// below it gets: when connecting to a segment above the min layer, a via stack down to it (vias

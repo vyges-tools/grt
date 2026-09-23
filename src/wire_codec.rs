@@ -133,8 +133,9 @@ pub enum Shape {
 /// half-width. A via resets the half-width to its exit layer's.
 ///
 /// ⛔ A COLINEAR point (the same point twice) makes a zero-length segment — a square of the
-/// half-width — once the path has more than one point; as a path's second point it counts but
-/// makes nothing.
+/// half-width — once the path has more than one point. The count starts at the path's first
+/// point, so a colinear SECOND point already makes one; it can never be a path's first point (the
+/// encoder writes that one as X and Y).
 pub fn decode(ops: &[Op], tech: &dyn CodecTech) -> Vec<Shape> {
     let mut shapes = Vec::new();
     let (mut prev_x, mut prev_y) = (0, 0);

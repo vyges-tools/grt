@@ -123,3 +123,19 @@ fn diodes_added_below_are_not_asked_for_again() {
     let (_, v) = check_gates(&mut info, &gates, &layers, &tech(), Some(0.5), 0.0);
     assert_eq!(v.iter().map(|x| x.diode_count_per_gate).collect::<Vec<_>>(), vec![1, 0]);
 }
+
+/// ⛔ Each diode added in the repair pass is added for EVERY gate of the group: the group's
+/// diffusion area grows by `diode × gates` per step. Golden-blind — every violating group in the
+/// captures has one gate. Two gates here, a rule whose limit is the diffusion curve (flat at 100)
+/// and whose ratio falls by 10 per unit of diffusion: 1000 − 10·(2·10)·k ≤ 100 at k = 5 — not the
+/// 9 one diode per step would take.
+#[test]
+fn a_diode_is_added_for_every_gate_of_the_group() {
+    let r = AntennaRule { area_factor: 1.0, side_area_factor: 1.0, par: 100.0, area_minus_diff_factor: 10.0, diff_par: vec![(0.0, 100.0)], ..AntennaRule::default() };
+    let layers = vec![LayerAntenna::default(), LayerAntenna::default(), LayerAntenna { rule: Some(r), thickness_dbu: 0 }];
+    let gates = vec![gate(1, "u/A", false), gate(2, "v/A", false)];
+    let rec = NodeInfo { par: 1000.0, diff_par: 1000.0, area: 1000.0, iterm_gate_area: 1.0, iterms: vec![0, 1], ..NodeInfo::default() };
+    let mut info: GateInfo = BTreeMap::from([(1, BTreeMap::from([(2, rec)]))]);
+    let (_, v) = check_gates(&mut info, &gates, &layers, &tech(), Some(10.0), 0.0);
+    assert_eq!(v[0].diode_count_per_gate, 5);
+}

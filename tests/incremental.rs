@@ -7,7 +7,7 @@
 //! merged routes — on the three suite scripts that insert diodes, all exact. The rules below are
 //! the ones those designs reach without testing their edges, each on a constructed case.
 
-use vyges_grt::global_route::pin_positions_changed;
+use vyges_grt::netlist::pin_positions_changed;
 use vyges_grt::graph2d::Graph2d;
 use vyges_grt::run::resumed_graph_2d;
 

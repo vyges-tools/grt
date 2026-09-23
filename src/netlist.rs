@@ -49,6 +49,18 @@ pub fn has_stacked_vias(wire_cnt: u32, via_cnt: u32, via_points: usize, bterm_bo
     via_points == above
 }
 
+/// `pinPositionsChanged` (the incremental re-route's filter, `updateDirtyNets`): the pins' `(on-grid x, y, connection layer)` against the last positions,
+/// as MULTISETS (`std::map<RoutePt, int>` counts up, then down) — order is ignored, multiplicity is
+/// not.
+pub fn pin_positions_changed(last: &[(i32, i32, i32)], now: &[(i32, i32, i32)]) -> bool {
+    let sorted = |v: &[(i32, i32, i32)]| {
+        let mut v = v.to_vec();
+        v.sort_unstable();
+        v
+    };
+    sorted(last) != sorted(now)
+}
+
 /// The gate: a net reaches the router with more than one pin and either no wires, or only the via
 /// stacks of [`has_stacked_vias`]. ⚠️ A net with ordinary pre-routed wires is silently absent.
 pub fn makes_fastroute_net(pin_count: usize, has_wires: bool, stacked_vias: impl FnOnce() -> bool) -> bool {

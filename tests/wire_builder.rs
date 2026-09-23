@@ -221,6 +221,7 @@ fn stub_target_stays_on_the_grid_when_the_pin_covers_it() {
     let pin = [Rect::new(0, 0, 200, 200)];
     assert!(pin_overlaps_g_segment((100, 100), 3, &pin, &[]));
     assert!(!pin_overlaps_g_segment((200, 100), 3, &pin, &[]));
+    assert!(!pin_overlaps_g_segment((0, 100), 3, &pin, &[])); // the left edge too
     let touching = [seg(pt(200, 100, 3), pt(900, 100, 3))];
     assert!(pin_overlaps_g_segment((5000, 5000), 3, &pin, &touching));
     let other_layer = [seg(pt(200, 100, 4), pt(900, 100, 4))];
@@ -230,4 +231,73 @@ fn stub_target_stays_on_the_grid_when_the_pin_covers_it() {
     let mut ops = Vec::new();
     make_wire_to_term(&[], 3, 3, &pin, (100, 100), &mut ops, true, &tech).unwrap();
     assert_eq!(ops, vec![WireOp::Path(3), WireOp::Point(100, 100), WireOp::Point(100, 100), WireOp::Point(100, 100)]);
+}
+
+// ---- corners the corpus never reaches (each found by a surviving mutation) ----
+
+use std::collections::BTreeMap;
+use vyges_grt::wire_builder::{add_wire_terms, check_guide_term_connection, make_net_wire, GuidePtPins, TermFacts};
+
+fn term(name: &str, top_level: i32, bbox: Rect, top_rects: Vec<Rect>) -> TermFacts {
+    TermFacts { name: name.into(), top_level, bbox, top_rects }
+}
+
+/// The binding window is tested with `Rect::overlaps` — STRICT: a terminal box that only touches
+/// the window's edge is not bound.
+#[test]
+fn binding_ignores_a_terminal_touching_the_window_edge() {
+    let p = pt(G / 2, G / 2, 2);
+    let limit = (G, G); // the window's own upper corner: no clipping
+    let inside = term("in", 2, Rect::new(G - 10, 100, G + 50, 200), vec![]);
+    let touching = term("edge", 2, Rect::new(G, 100, G + 50, 200), vec![]);
+    assert!(check_guide_term_connection(&p, &inside, limit, G));
+    assert!(!check_guide_term_connection(&p, &touching, limit, G));
+}
+
+/// ⛔ `makeNetWire` encodes each segment ONCE: `wire_segments` is keyed on all six coordinates, so
+/// a guide written twice contributes its segment twice to the route but once to the encoder.
+#[test]
+fn a_segment_given_twice_is_encoded_once() {
+    let cell = Rect::new(0, 0, G, G);
+    let w = make_net_wire(&net("n", 2, vec![guide(2, 3, cell), guide(2, 3, cell)]), G, &TECH).unwrap();
+    assert_eq!(w.route.len(), 2);
+    assert_eq!(w.ops, vec![WireOp::Path(2), WireOp::Point(G / 2, G / 2), WireOp::Via(2)]);
+}
+
+/// ⛔ A via that joins neither end of the previous path starts on its bottom layer and leaves
+/// `prev_conn_layer` UNCHANGED — only a joined via or a wire moves it. Three vias at three cells:
+/// the third (2→3) joins nothing the first two left, so it starts on its bottom layer, 2.
+#[test]
+fn an_unjoined_via_does_not_move_the_connection_layer() {
+    let cell = |i: i32| Rect::new(i * G, 0, (i + 1) * G, G);
+    let w = make_net_wire(&net("n", 2, vec![guide(2, 3, cell(0)), guide(3, 4, cell(1)), guide(2, 3, cell(2))]), G, &TECH).unwrap();
+    let paths: Vec<i32> = w.ops.iter().filter_map(|o| if let WireOp::Path(l) = o { Some(*l) } else { None }).collect();
+    assert_eq!(paths, vec![2, 3, 2]);
+}
+
+/// `addWireTerms` stubs a point's BLOCK terminals first, then its instance terminals.
+#[test]
+fn a_point_stubs_block_terminals_before_instance_terminals() {
+    let mut n = net("n", 2, vec![]);
+    n.iterms = vec![term("u/A", 2, Rect::new(0, 0, 10, 10), vec![Rect::new(1000, 1000, 1200, 1200)])];
+    n.bterms = vec![term("port", 2, Rect::new(0, 0, 10, 10), vec![Rect::new(2000, 2000, 2200, 2200)])];
+    let key = pt(G / 2, G / 2, 2);
+    let mut pins = BTreeMap::from([(key, GuidePtPins { bterms: vec![0], iterms: vec![0], connected: false })]);
+    let mut ops = Vec::new();
+    add_wire_terms(&n, &[], key.x, key.y, 2, &mut pins, &mut ops, true, &WireTech { min_routing_layer: 1, min_layer_vertical: false }).unwrap();
+    let targets: Vec<WireOp> = ops.chunks(4).map(|c| c[3]).collect();
+    assert_eq!(targets, vec![WireOp::Point(2100, 2100), WireOp::Point(1100, 1100)]);
+}
+
+/// ⛔ The pin target is chosen by a RUNNING comparison: each shape's distance is measured from the
+/// best centre so far, not from the grid point, and only a strictly smaller one replaces it. From
+/// (0, 0): the first centre (1000, 0) is 1000 away and taken; the second (2000, 0) is then measured
+/// from (1000, 0) — also 1000, a tie — so the first stays. (A shape at (−1000, 0) would be 2000 from
+/// the running point and never compete, though it is as near the grid point as the first.)
+#[test]
+fn the_nearest_pin_shape_keeps_the_first_of_a_tie() {
+    let shapes = [Rect::new(900, -100, 1100, 100), Rect::new(1900, -100, 2100, 100)];
+    let mut ops = Vec::new();
+    make_wire_to_term(&[], 3, 3, &shapes, (0, 0), &mut ops, true, &TECH).unwrap();
+    assert_eq!(ops.last(), Some(&WireOp::Point(1000, 0)));
 }

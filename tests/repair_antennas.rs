@@ -325,6 +325,10 @@ fn positions_on_one_segment_skip_and_stop() {
     let mut route = fresh();
     let n = add_jumper_on_segments(&BTreeMap::from([(0, BTreeSet::from([150, 300]))]), &mut route, "n", &s, &mut router, None);
     assert_eq!(n, 1);
+    // ⛔ Exactly one jumper length (200) apart is still "within": skipped.
+    let mut route = fresh();
+    let n = add_jumper_on_segments(&BTreeMap::from([(0, BTreeSet::from([150, 350]))]), &mut route, "n", &s, &mut router, None);
+    assert_eq!(n, 1);
 
     // 150 then 1650: after the first jumper the segment is 350..2050 (1700 ≥ 500) → both land;
     // after the second it is 1850..2050.
@@ -404,4 +408,92 @@ fn padded_query_is_inclusive_at_its_edge() {
     assert!(check_diode_loc(&diode, &f, &[Rect::new(4000, 1000, 4600, 2000)]));
     assert_eq!(row_orient(&f.rows, (5100, 1500)), "R0");
     assert_eq!(row_orient(&f.rows, (5100, 1000)), "R0"); // on the row's edge: no row strictly contains it → default R0
+    // … and that is visible only on a row that is NOT R0: its edge still reads the default.
+    assert_eq!(row_orient(&[row(1000, "MX")], (5100, 1000)), "R0");
+    assert_eq!(row_orient(&[row(1000, "MX")], (5100, 1500)), "MX");
+}
+
+// ---- stage 3 corners the corpus never reaches (each found by a surviving mutation) ----
+
+use vyges_grt::repair_antennas::select_jumper_position;
+
+/// The pin under a via stack at (50, 50) to a wire on met2 (level 3), violating there.
+fn net_with(wires: &[GSegment]) -> (Vec<NetViolations>, BTreeMap<String, Vec<GSegment>>) {
+    let mut route = vec![GSegment::new(50, 50, 1, 50, 50, 2), GSegment::new(50, 50, 2, 50, 50, 3)];
+    route.extend_from_slice(wires);
+    let gate = GatePin { name: "u1/A".into(), inst_rect: Rect::new(0, 0, 100, 100), pin_boxes: vec![(0, Rect::new(40, 40, 60, 60))] };
+    let v = vec![NetViolations { net: "n".into(), violations: vec![AntViolation { routing_level: 3, gates: vec![gate] }] }];
+    (v, BTreeMap::from([("n".to_string(), route)]))
+}
+
+fn jumpers_on(wires: &[GSegment], blocked_tile: Option<usize>) -> (usize, Vec<GSegment>) {
+    let tech = tech();
+    let (v, mut routes) = net_with(wires);
+    let mut g = g3(10);
+    if let Some(x) = blocked_tile {
+        g.h_cap[4][x] = 0; // level 5 — two up from the violation layer — on row 0
+    }
+    let lec = BTreeMap::new();
+    let inp = JumperInputs { tech: &tech, grid: grid(), max_routing_layer: 6 };
+    let (mut trees, ids) = (Vec::new(), BTreeMap::new());
+    let mut router = FastRouteJumpers { g3: &mut g, grid: grid(), layer_edge_cost: &lec, trees: &mut trees, ids: &ids };
+    let res = jumper_insertion(&v, &mut routes, &inp, &mut router, None).unwrap();
+    (res.total_jumpers, routes.remove("n").unwrap())
+}
+
+/// `findPosToJumper` skips a wire SHORTER than five tiles; one of exactly five is a candidate.
+#[test]
+fn a_wire_of_exactly_the_minimum_length_takes_a_jumper() {
+    assert_eq!(jumpers_on(&[GSegment::new(50, 50, 3, 550, 50, 3)], None).0, 1);
+}
+
+/// A free window must hold the jumper (two tiles) plus ONE TILE OF CLEARANCE AT EACH END — four
+/// tiles. A headroom block at tile 3 leaves two windows of three: no jumper at all. Unblocked, the
+/// same wire takes one.
+#[test]
+fn a_window_needs_a_tile_of_clearance_at_both_ends() {
+    let wire = [GSegment::new(50, 50, 3, 650, 50, 3)];
+    assert_eq!(jumpers_on(&wire, None).0, 1);
+    assert_eq!(jumpers_on(&wire, Some(3)).0, 0);
+}
+
+/// ⛔ The parent position is SNAPPED to its cell centre before it steers the jumper. A three-tile
+/// met2 wire (too short for a jumper) passes its MIDPOINT (200, 50) — on a cell boundary — to the
+/// overlapping wire beyond it; snapped to (250, 50), the jumper goes one tile past it, at 350 —
+/// not at 300.
+#[test]
+fn the_parent_position_is_snapped_to_the_grid() {
+    let (n, route) = jumpers_on(&[GSegment::new(50, 50, 3, 350, 50, 3), GSegment::new(150, 50, 3, 1150, 50, 3)], None);
+    assert_eq!(n, 1);
+    let jumper = route.iter().find(|s| s.init_layer == 5 && s.final_layer == 5).expect("a jumper wire");
+    assert_eq!((jumper.init_x, jumper.final_x), (350, 550));
+}
+
+/// ⛔ Candidates are ordered by `|pos + tile − target|` — the distance from the jumper's first TILE
+/// past its start, not from its start: target 300, candidates 150 (50 by that measure, 150 by the
+/// plain one) and 400 (200, 100) — 150 wins.
+#[test]
+fn candidates_are_ordered_by_the_distance_one_tile_in() {
+    let s = JumperSizes::new(T);
+    let mut router = Refusing { no_fit: BTreeSet::new(), reject_update: false, restored: 0 };
+    let pos = select_jumper_position(&mut [150, 400], &[], true, (300, 50), (50, 50), 3, "n", &s, &mut router);
+    assert_eq!(pos, 150);
+}
+
+/// `updateJumperedRoute` hands `updateRouteGridsLayer` the span in TILES and both layers 0-BASED:
+/// a jumper from level 3 to level 5 moves the tree's grid points on layer 2 to layer 4.
+#[test]
+fn a_jumper_relayers_the_nets_tree_zero_based() {
+    use vyges_grt::brk_rsmt::NetState;
+    use vyges_grt::full3d::{Point3D, RouteType};
+    use vyges_grt::maze3d::{Edge3D, Tree3D};
+    let grids: Vec<Point3D> = (0..5).map(|x| Point3D { x, y: 0, layer: 2 }).collect();
+    let e = Edge3D { n1: 0, n2: 1, n1a: 0, n2a: 1, len: 4, route_type: RouteType::MazeRoute, routelen: 4, grids };
+    let mut trees = vec![NetState { tree3d: Some(Tree3D { num_terminals: 2, num_layers: 6, pin_layers: vec![0, 0], nodes: Vec::new(), edges: vec![e] }), ..NetState::default() }];
+    let ids = BTreeMap::from([("n".to_string(), 0usize)]);
+    let (mut g, lec) = (g3(10), BTreeMap::new());
+    let mut router = FastRouteJumpers { g3: &mut g, grid: grid(), layer_edge_cost: &lec, trees: &mut trees, ids: &ids };
+    assert!(router.update_jumpered_route((150, 50), (350, 50), 3, 5, "n"));
+    let got: Vec<(i16, i16)> = trees[0].tree3d.as_ref().unwrap().edges[0].grids.iter().map(|p| (p.x, p.layer)).collect();
+    assert_eq!(got, vec![(0, 2), (1, 2), (1, 4), (2, 4), (3, 4), (3, 2), (4, 2)]);
 }

@@ -1326,7 +1326,7 @@ fn update_dirty_nets(a: &mut AfterRoute, fresh: &[RouterNet], dirty: &[String]) 
     for name in dirty {
         let Some(id) = a.router_nets.iter().position(|n| &n.name == name) else { continue }; // not in db_net_map_
         let key = |n: &RouterNet| n.net_pins.iter().map(|p| (p.on_grid.0, p.on_grid.1, p.connection_layer)).collect::<Vec<_>>();
-        if pin_positions_changed(&key(&a.router_nets[id]), &key(&fresh[id])) {
+        if crate::netlist::pin_positions_changed(&key(&a.router_nets[id]), &key(&fresh[id])) {
             clear_net_route(a, id);
             if let Some(r) = a.net_routes.iter_mut().find(|r| &r.name == name) {
                 r.segments.clear();
@@ -1335,18 +1335,6 @@ fn update_dirty_nets(a: &mut AfterRoute, fresh: &[RouterNet], dirty: &[String]) 
         }
     }
     Ok(out)
-}
-
-/// `pinPositionsChanged`: the pins' `(on-grid x, y, connection layer)` against the last positions,
-/// as MULTISETS (`std::map<RoutePt, int>` counts up, then down) — order is ignored, multiplicity is
-/// not.
-pub fn pin_positions_changed(last: &[(i32, i32, i32)], now: &[(i32, i32, i32)]) -> bool {
-    let sorted = |v: &[(i32, i32, i32)]| {
-        let mut v = v.to_vec();
-        v.sort_unstable();
-        v
-    };
-    sorted(last) != sorted(now)
 }
 
 /// `clearNetRoute` → `releaseNetResources`: walk the net's 3D tree and take back, per unit step on

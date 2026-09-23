@@ -18,7 +18,11 @@ fn rects(s: &str) -> Vec<R> {
 
 #[test]
 fn formation_matches_boost() {
-    let text = include_str!("data/boost-polygon90-fracture.txt");
+    assert_eq!(replay(include_str!("data/boost-polygon90-fracture.txt")), (408, 1025));
+}
+
+/// Every `CASE add|sub` of a probe corpus, compared polygon by polygon: `(cases, polygons)`.
+fn replay(text: &str) -> (usize, usize) {
     let (mut cases, mut polys) = (0, 0);
     let mut lines = text.lines();
     while let Some(head) = lines.next() {
@@ -47,5 +51,19 @@ fn formation_matches_boost() {
         cases += 1;
         polys += want.len();
     }
-    assert_eq!((cases, polys), (408, 1025));
+    (cases, polys)
+}
+
+/// `GRT_POLYGON90_STRESS=/path/to/stress.txt cargo test --release --test polygon90 -- --ignored`
+///
+/// The same comparison over a generated corpus in the committed file's format (dense small grids,
+/// one outline with many holes, tie-heavy coordinates), each case answered by the probe. Too large
+/// to commit; the cases that kill a mutation the committed corpus let through are copied into it.
+#[test]
+#[ignore = "needs a generated corpus; the committed one is what CI runs"]
+fn formation_matches_boost_on_a_stress_corpus() {
+    let path = std::env::var("GRT_POLYGON90_STRESS").expect("set GRT_POLYGON90_STRESS");
+    let text = std::fs::read_to_string(&path).expect("a readable corpus");
+    let (cases, polys) = replay(&text);
+    eprintln!("stress: {cases} cases, {polys} polygons");
 }
