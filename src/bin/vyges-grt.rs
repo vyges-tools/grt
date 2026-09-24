@@ -622,10 +622,6 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, router: Repai
     };
     second.sort_by_key(|(n, ..)| order.iter().position(|m| m == n).unwrap_or(usize::MAX));
     if !second.is_empty() && !jumper_only {
-        let Some((state, total_overflow)) = fast.as_mut() else {
-            return Err(Fail::Refused("cugr: diode insertion after a CUGR route — its incremental reroute is not modelled".into()));
-        };
-        let (state, total_overflow): (&mut vyges_grt::global_route::AfterRoute, i32) = (state, *total_overflow);
         let mut text = String::new();
         // What the router's callbacks will see move: every instance's location and orientation.
         let placed_before: BTreeMap<String, ((i32, i32), String)> = db.inst_names().into_iter().map(|i| (i.clone(), (db.inst_location(&i), db.inst_get_orient(&i)))).collect();
@@ -652,8 +648,33 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, router: Repai
                 }
             }
         }
-        let known: BTreeSet<&str> = state.router_nets.iter().map(|n| n.name.as_str()).collect();
-        let nets_to_repair: Vec<String> = order.iter().filter(|n| dirty.contains(*n) && known.contains(n.as_str())).cloned().collect();
+        // addDirtyNet ignores a net the global router does not hold.
+        let known: BTreeSet<String> = match (&fast, &cugr) {
+            (Some((state, _)), _) => state.router_nets.iter().map(|n| n.name.clone()).collect(),
+            (None, Some((_, cg))) => cg.pins.keys().cloned().collect(),
+            (None, None) => BTreeSet::new(),
+        };
+        let nets_to_repair: Vec<String> = order.iter().filter(|n| dirty.contains(*n) && known.contains(*n)).cloned().collect();
+        if let Some((c, cg)) = cugr.as_mut() {
+            // IncrementalGRoute::updateRoutes → updateDirtyRoutesCugr.
+            let branches = |x: &[i32], y: &[i32], d: usize, a: f32| stt(x, y, d, a).branch.iter().map(|b| (b.x, b.y, b.n)).collect::<Vec<_>>();
+            let mut trace = std::env::var("VYGC_OUT").ok().map(|_| Vec::new());
+            let res = vyges_grt::cugr::route::update_dirty_routes_cugr(db, opts, c, cg, &nets_to_repair, &branches, log, trace.as_mut());
+            if let (Ok(path), Some(t)) = (std::env::var("VYGC_OUT"), &trace) {
+                let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(err)?;
+                std::io::Write::write_all(&mut f, (t.join("\n") + "\n").as_bytes()).map_err(err)?;
+            }
+            saved.extend(res.map_err(|e| classify(e.to_string()))?);
+            if let Some(path) = step["diode_trace"].as_str() {
+                std::fs::write(path, &text).map_err(err)?;
+            }
+            if iterations > 1 {
+                return Err(Fail::Refused("a second repair iteration is not modelled".into()));
+            }
+            return Ok(saved);
+        }
+        let Some((state, total_overflow)) = fast.as_mut() else { return Err(Fail::Refused("no router state".into())) };
+        let (state, total_overflow): (&mut vyges_grt::global_route::AfterRoute, i32) = (state, *total_overflow);
         // IncrementalGRoute::updateRoutes → updateDirtyRoutesFastRoute, with this command's
         // allow_congestion.
         let mut ropts = opts.clone();
@@ -1184,7 +1205,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
                         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(err)?;
                         std::io::Write::write_all(&mut f, (lines.join("\n") + "\n").as_bytes()).map_err(err)?;
                     }
-                    let g = vyges_grt::cugr::route::cugr_guides(&mut db, &opts, &r.init.cugr, &mut log).map_err(|e| classify(e.to_string()))?;
+                    let g = vyges_grt::cugr::route::cugr_guides(&mut db, &opts, &r.init.cugr, &r.init.clock_nets, &r.alphas, r.slack, &mut log).map_err(|e| classify(e.to_string()))?;
                     // saveGuides replaces the guides of every net it routes; the others keep theirs.
                     for ng in &g.guides {
                         db_guides.insert(ng.net.clone(), ng.guides.clone());

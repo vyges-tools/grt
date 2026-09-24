@@ -962,7 +962,7 @@ pub(crate) mod tests {
         c.nets.push(n);
         let stt = |x: &[i32], y: &[i32], _: usize, _: f32| vec![(x[0], y[0], 1), (x[1], y[1], 1)];
         let mut log = Vec::new();
-        c.pattern_route(&[0.3], &stt, &mut log, None).unwrap();
+        c.pattern_route(&mut vec![0], &[0.3], &stt, &mut log, None).unwrap();
         let t = c.nets[0].routing_tree.as_ref().unwrap();
         let s: Vec<(i32, i32, i32)> = t.preorder().iter().map(|&i| (t.nodes[i].layer, t.nodes[i].p.x, t.nodes[i].p.y)).collect();
         assert_eq!(s, vec![(0, 1, 2), (2, 1, 2), (2, 4, 2), (0, 4, 2)]);

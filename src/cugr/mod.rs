@@ -122,6 +122,9 @@ pub struct Cugr {
     /// Captured slacks per net-order sort, where the timer's are needed; the next sort's index.
     pub sort_slacks: Option<Vec<std::collections::BTreeMap<String, f32>>>,
     pub sorts_done: usize,
+    /// `incremental_candidates_`: during an incremental route, the nets it re-routes (its
+    /// congested-set scans and RRR rounds are scoped to them).
+    pub incremental_candidates: Option<Vec<usize>>,
 }
 
 /// A stage that stopped where the reference would have gone on to something not modelled, or
@@ -162,13 +165,15 @@ impl Cugr {
     /// pattern-routed and its tree's usage committed before the next is routed.
     ///
     /// `alphas[k]` is net `k`'s Steiner alpha. With `trace`, the stage's records are appended.
-    pub fn pattern_route(&mut self, alphas: &[f32], stt: pattern_route::SteinerBuilder<'_>, log: &mut Vec<String>, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
-        let mut order: Vec<usize> = (0..self.nets.len()).collect();
-        self.sort_net_indices(&mut order)?;
+    ///
+    /// ⚠️ The list is sorted IN PLACE, as upstream's is: an incremental route hands the sorted
+    /// list on to stages 3 and 4.
+    pub fn pattern_route(&mut self, order: &mut Vec<usize>, alphas: &[f32], stt: pattern_route::SteinerBuilder<'_>, log: &mut Vec<String>, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
+        self.sort_net_indices(order)?;
         if let Some(t) = trace.as_deref_mut() {
-            trace::order(t, self, &order, 1);
+            trace::order(t, self, order, 1);
         }
-        for &k in &order {
+        for &k in order.iter() {
             if self.nets[k].num_pins() < 2 {
                 continue;
             }
@@ -191,7 +196,12 @@ impl Cugr {
     /// crosses an edge with more demand than capacity. Empty means stages 3 to 5 have nothing to
     /// do. `tag` is the stage the trace records it under.
     pub fn congested_nets(&self, tag: i32, trace: Option<&mut Vec<String>>) -> Vec<usize> {
-        let out: Vec<usize> = (0..self.nets.len())
+        let scope: Vec<usize> = match &self.incremental_candidates {
+            Some(c) => c.clone(),
+            None => (0..self.nets.len()).collect(),
+        };
+        let out: Vec<usize> = scope
+            .into_iter()
             .filter(|&k| self.nets[k].routing_tree.as_ref().is_some_and(|t| self.grid.check_congestion(t, 1.0) > 0))
             .collect();
         if let Some(t) = trace {
@@ -224,10 +234,15 @@ impl Cugr {
             if self.nets[k].num_pins() < 2 {
                 continue;
             }
-            let mut commits = Vec::new();
-            self.commit_net(k, true, &mut commits)?;
+            // The rip-up is recorded before the route, as the reference's trace has it.
+            let mut ripped = Vec::new();
+            self.commit_net(k, true, &mut ripped)?;
+            if let Some(t) = trace.as_deref_mut() {
+                trace::commits(t, &ripped, 3);
+            }
             let cx = pattern_route::CostContext { grid: &self.grid, design: &self.design, constants: &self.constants, cost_multiplier: self.cost_multiplier };
             let route = pattern_route::pattern_route_net(&mut self.nets[k], alphas[k], stt, &cx, Some(&view), log).map_err(StageError::Pattern)?;
+            let mut commits = Vec::new();
             self.commit_net(k, false, &mut commits)?;
             if let Some(t) = trace.as_deref_mut() {
                 trace::net_route(t, &self.nets[k], &route, &commits, 3);
@@ -279,8 +294,15 @@ impl Cugr {
             let tree = self.nets[k].routing_tree.clone().expect("set by the route");
             self.grid.update_wire_cost_view(&mut view, &tree, &self.constants, self.cost_multiplier);
             if let Some(t) = trace.as_deref_mut() {
-                trace::net_route(t, &self.nets[k], &route, &commits, stage);
-                trace::maze(t, &self.nets[k], &route, &grid);
+                // The reference's order: the access points (chosen by the sparse graph), the maze
+                // (graph, paths, tree), then the DAG, the tree and the commits.
+                let mut lines = Vec::new();
+                trace::net_route(&mut lines, &self.nets[k], &route, &commits, stage);
+                let split = lines.iter().position(|l| !(l.starts_with("VYGC|odbap|") || l.starts_with("VYGC|shapeap|"))).unwrap_or(lines.len());
+                let mut maze = Vec::new();
+                trace::maze(&mut maze, &self.nets[k], &route, &grid);
+                lines.splice(split..split, maze);
+                t.extend(lines);
             }
             grid.step();
         }
@@ -337,11 +359,15 @@ impl Cugr {
                 trace::commits(t, &commits, 5);
                 t.push(format!("VYGC|rrr|{i}|{multiplier}|{}|{}|demoted={}", nets.len(), trace::list(nets.iter()), demoted.iter().map(|d| format!("{d},")).collect::<String>()));
             }
-            self.maze_route(nets, 5, log, trace.as_deref_mut())?;
+            // Incremental re-mazes every candidate each round, in the candidates' own order.
+            match self.incremental_candidates.clone() {
+                Some(mut all) => self.maze_route(&mut all, 5, log, trace.as_deref_mut())?,
+                None => self.maze_route(nets, 5, log, trace.as_deref_mut())?,
+            }
         }
         self.cost_multiplier = 1.0;
         let residual = self.grid.total_overflow();
-        if residual > 0 {
+        if residual > 0 && self.incremental_candidates.is_none() {
             log.push(format!("[WARNING GRT-0118] Iterative RRR finished with congestion remaining ({residual})."));
         }
         Ok(())
@@ -414,6 +440,51 @@ impl Cugr {
     }
 }
 
+impl Cugr {
+    /// `CUGR::updateNet(net)` for a net the router holds: its tree's demand released (with its
+    /// adopted flag), the net rebuilt from `net_facts` as new — no preferred access points, slack
+    /// 0 — with its rule's factors, kept at 1 if it was soft-demoted; queued for the next route.
+    pub fn update_net(&mut self, k: usize, pins: Vec<design::CugrPin>, layer_range: design::LayerRange, driver_term: &str, ndr_costs: Vec<f64>, queue: &mut Vec<usize>) -> Result<(), StageError> {
+        let was_soft = self.nets[k].soft_ndr;
+        if self.nets[k].routing_tree.is_some() {
+            let mut commits = Vec::new();
+            self.commit_net(k, true, &mut commits)?;
+        }
+        self.design.nets[k].pins = pins;
+        self.design.nets[k].layer_range = layer_range;
+        let mut n = grnet::GrNet::new(&self.design.nets[k], driver_term, &self.grid).map_err(|e| StageError::Maze(format!("{e:?}")))?;
+        n.ndr_costs = ndr_costs;
+        if was_soft {
+            n.set_soft_ndr();
+        }
+        self.nets[k] = n;
+        queue.push(k);
+        Ok(())
+    }
+
+    /// `CUGR::route(true)`: the queued nets only — stage 1 on them (sorted in place), then stages
+    /// 3 and 4 on ALL of them (no congested-set narrowing), then RRR scoped to them; no GRT-0118.
+    pub fn route_incremental(&mut self, queued: Vec<usize>, iterations: i32, alphas: &[f32], stt: pattern_route::SteinerBuilder<'_>, log: &mut Vec<String>, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
+        if queued.is_empty() {
+            return Ok(());
+        }
+        if let Some(t) = trace.as_deref_mut() {
+            t.push("VYGC|route|1".into());
+        }
+        self.incremental_candidates = Some(queued.clone());
+        let mut nets = queued;
+        self.pattern_route(&mut nets, alphas, stt, log, trace.as_deref_mut())?;
+        self.pattern_route_with_detours(&mut nets, alphas, stt, log, trace.as_deref_mut())?;
+        self.maze_route(&mut nets, 4, log, trace.as_deref_mut())?;
+        self.iterative_rrr(&mut nets, iterations, log, trace.as_deref_mut())?;
+        self.incremental_candidates = None;
+        if let Some(t) = trace {
+            t.push("VYGC|routed".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InitError {
     Design(DesignError),
@@ -434,7 +505,7 @@ pub fn init(facts: &DesignFacts, driver_terms: &[String], min_routing_layer: i32
         .map(|n| GrNet::new(n, &driver_terms[n.facts_index], &grid))
         .collect::<Result<Vec<_>, _>>()
         .map_err(InitError::Grid)?;
-    Ok(Cugr { constants, design, grid, nets, cost_multiplier: 1.0, sort_slacks: None, sorts_done: 0 })
+    Ok(Cugr { constants, design, grid, nets, cost_multiplier: 1.0, sort_slacks: None, sorts_done: 0, incremental_candidates: None })
 }
 
 #[cfg(test)]
@@ -548,5 +619,53 @@ mod tests {
         t.nodes[a].children.push(b);
         assert!(c.net_route(&net_with(t.clone(), &[(0, Point::new(2, 2)), (1, Point::new(2, 2))])).is_empty());
         assert_eq!(c.net_route(&net_with(t, &[(0, Point::new(2, 2)), (1, Point::new(2, 3))])).len(), 1);
+    }
+
+    /// A net on m3 (horizontal) from cell (1,1) to (3,1), every edge on its way overfull.
+    fn congested(c: &mut Cugr) -> GrNet {
+        let mut t = GrTree::default();
+        let a = t.add(2, Point::new(1, 1));
+        let b = t.add(2, Point::new(3, 1));
+        t.nodes[a].children.push(b);
+        for x in 1..3 {
+            let e = &mut c.grid.graph_edges[2][x][1];
+            e.demand = e.capacity + 5.0;
+        }
+        net_with(t, &[(0, Point::new(1, 1)), (1, Point::new(3, 1))])
+    }
+
+    // Upstream rule (CUGR `route(true)` → `getCongestedNets`): an incremental route looks for
+    // congestion ONLY among its candidates (`incremental_candidates_`), never over every net. In
+    // the corpus the diode reroute has no congested net outside its candidates.
+    #[test]
+    fn incremental_congestion_is_scoped_to_the_candidates() {
+        let mut c = router();
+        let n = congested(&mut c);
+        c.nets = vec![n.clone(), n];
+        assert_eq!(c.congested_nets(0, None), vec![0, 1]);
+        c.incremental_candidates = Some(vec![1]);
+        assert_eq!(c.congested_nets(0, None), vec![1]);
+    }
+
+    // Upstream rule (CUGR `updateNet`): the net is rebuilt from its new pins with its rule's
+    // factors, but a net marked soft-NDR STAYS soft (its factors back to 1), and it is queued.
+    // No corpus net is soft-NDR when diodes land.
+    #[test]
+    fn update_net_keeps_soft_ndr() {
+        let mut c = router();
+        let range = design::LayerRange { min_layer: 1, max_layer: 2 };
+        c.design.nets.push(design::CugrNet { index: 0, name: "n".into(), pins: Vec::new(), layer_range: range, facts_index: 0 });
+        let mut n = net_with(GrTree::default(), &[]);
+        n.routing_tree = None;
+        n.set_soft_ndr();
+        c.nets = vec![n];
+        let mut queue = Vec::new();
+        c.update_net(0, Vec::new(), range, "", vec![2.0; 3], &mut queue).unwrap();
+        assert!(c.nets[0].soft_ndr);
+        assert_eq!(c.nets[0].ndr_costs, vec![1.0; 3]);
+        assert_eq!(queue, vec![0]);
+        c.nets[0].soft_ndr = false;
+        c.update_net(0, Vec::new(), range, "", vec![2.0; 3], &mut queue).unwrap();
+        assert_eq!(c.nets[0].ndr_costs, vec![2.0; 3], "a hard-NDR net keeps its factors");
     }
 }
