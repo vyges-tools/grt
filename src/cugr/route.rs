@@ -171,9 +171,6 @@ pub struct CugrRoute {
 /// stage 3 (detours), stage 4 (maze), stage 5 (rip-up and re-route). Stage 2 (resistance-aware,
 /// `-resistance_aware` with critical nets) is refused.
 pub fn route_cugr(db: &mut Db, opts: &RouteOptions, call: usize, stt: SteinerBuilder<'_>, trace: Option<&mut Vec<String>>) -> Res<CugrRoute> {
-    if db.block_access_point_count()? > 0 {
-        return Err("cugr: pin access points in the database — findODBAccessPoints is not modelled".into());
-    }
     let timed = opts.liberty.is_some() && !opts.clock_sources.is_empty();
     let oracle = opts.cugr_slacks.as_ref().map(|calls| calls.get(call));
     if timed && oracle.is_none() {

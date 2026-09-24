@@ -66,6 +66,16 @@ pub struct PinFacts {
     /// Every box: a block terminal's `getBPins()`/`getBoxes()`, an instance terminal's
     /// `getMPins()`/`getGeometry()` transformed by the instance.
     pub shapes: Vec<Shape>,
+    /// The detailed router's access points as `findODBAccessPoints` gathers them, `(x, y,
+    /// routing level)` in absolute DBU: a block terminal's pins' in order, an instance terminal's
+    /// preferred ones offset by its location. Empty without them.
+    pub access_points: Vec<(i32, i32, i32)>,
+}
+
+/// `findODBAccessPoints` for a port: every block pin's access points APPENDED in pin order
+/// (FastRoute's pin positions prepend instead).
+pub fn port_access_points(per_pin: Vec<Vec<(i32, i32, i32)>>) -> Vec<(i32, i32, i32)> {
+    per_pin.into_iter().flatten().collect()
 }
 
 /// One block net in `dbBlock::getNets()` order.
@@ -125,6 +135,8 @@ pub struct CugrPin {
     pub name: String,
     pub is_port: bool,
     pub shapes: Vec<BoxOnLayer>,
+    /// [`PinFacts::access_points`].
+    pub access_points: Vec<(i32, i32, i32)>,
 }
 
 /// `LayerRange`, 0-based.
@@ -255,7 +267,7 @@ impl Design {
                 } else {
                     Vec::new()
                 };
-                CugrPin { index, name: p.name.clone(), is_port: p.is_port, shapes }
+                CugrPin { index, name: p.name.clone(), is_port: p.is_port, shapes, access_points: p.access_points.clone() }
             })
             .collect()
     }
@@ -651,7 +663,7 @@ mod tests {
     }
 
     fn pin(name: &str, is_port: bool, has_location: bool, shapes: &[(Option<ShapeLayer>, Rect)]) -> PinFacts {
-        PinFacts { name: name.into(), is_port, has_location, shapes: shapes.iter().map(|&(layer, rect)| Shape { layer, rect }).collect() }
+        PinFacts { name: name.into(), is_port, has_location, shapes: shapes.iter().map(|&(layer, rect)| Shape { layer, rect }).collect(), access_points: Vec::new() }
     }
 
     fn net(name: &str, pins: Vec<PinFacts>) -> NetFacts {
@@ -719,5 +731,13 @@ mod tests {
         assert_eq!(d.num_special_nets, 1, "a zero wire count skips the net");
         assert_eq!(d.obstacles.len(), 2);
         assert_eq!(d.obstacles[1].b, BoxT::new(0, 0, 99, 10));
+    }
+
+    // Upstream rule (`findODBAccessPoints`, a port): the block pins' access points in pin order —
+    // FastRoute's positions put the last pin's first. No port of the corpus has two pins with
+    // access points.
+    #[test]
+    fn a_ports_access_points_keep_pin_order() {
+        assert_eq!(port_access_points(vec![vec![(0, 0, 1), (5, 5, 1)], vec![(9, 9, 2)]]), vec![(0, 0, 1), (5, 5, 1), (9, 9, 2)]);
     }
 }

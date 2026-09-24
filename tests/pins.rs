@@ -445,3 +445,13 @@ fn cugr_never_asks_a_pad_pin_whether_it_is_reachable() {
         assert_eq!(asked, !use_cugr, "use_cugr = {use_cugr}");
     }
 }
+
+// Upstream rule (`findPinAccessPointPositions`, a port): each block pin's access points are
+// inserted at the front, so the LAST pin's come first — CUGR appends. No port of the corpus has
+// two pins with access points.
+#[test]
+fn a_ports_access_points_put_the_last_pin_first() {
+    let got = vyges_grt::pins::port_access_points(vec![vec![(1, 0, 0), (1, 5, 5)], vec![(2, 9, 9)]]);
+    assert_eq!(got, vec![(2, 9, 9), (1, 0, 0), (1, 5, 5)]);
+}
+

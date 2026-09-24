@@ -798,6 +798,8 @@ mod tests {
             resistance: 0.0,
             net_length: 0,
             is_clock_sig: false,
+            odb_aps: Vec::new(),
+            odb_ap_choices: Vec::new(),
         }
     }
 

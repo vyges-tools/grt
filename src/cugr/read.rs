@@ -128,7 +128,10 @@ fn read_nets(db: &Db, clock_nets: &BTreeSet<String>, masters: &mut BTreeMap<Stri
                     }
                 }
             }
-            pins.push(PinFacts { name: bterm, is_port: true, has_location, shapes });
+            // findODBAccessPoints: every block pin's access points, APPENDED in pin order.
+            let per_pin = (0..db.num_bterm_get_b_pins(&bterm)).map(|p| db.bpin_access_points(&bterm, p)).collect::<Result<Vec<_>, _>>()?;
+            let access_points = super::design::port_access_points(per_pin);
+            pins.push(PinFacts { name: bterm, is_port: true, has_location, shapes, access_points });
         }
         for iterm in db.net_iterms(&name) {
             let (inst, term) = iterm.rsplit_once('/').ok_or("an instance terminal without a slash")?;
@@ -138,7 +141,15 @@ fn read_nets(db: &Db, clock_nets: &BTreeSet<String>, masters: &mut BTreeMap<Stri
             }
             let (orient, origin) = (db.inst_get_orient(inst), (db.inst_get_origin_x(inst), db.inst_get_origin_y(inst)));
             let shapes = masters[&master].pins.get(term).map(|v| v.iter().map(|&b| transformed(&orient, origin, b, db)).collect()).unwrap_or_default();
-            pins.push(PinFacts { name: iterm.clone(), is_port: false, has_location: true, shapes });
+            // findODBAccessPoints: the preferred access points, offset by the instance's location
+            // (orientation R0). ⛔ A non-core instance without them reads EVERY access point,
+            // pointer-ordered by master pin — refused when there are any.
+            let (ix, iy) = db.inst_location(inst);
+            let access_points: Vec<(i32, i32, i32)> = db.iterm_pref_access_points(inst, term)?.into_iter().map(|(x, y, l)| (x + ix, y + iy, l)).collect();
+            if access_points.is_empty() && !db.master_is_core(&master) && db.iterm_access_point_count(inst, term)? > 0 {
+                return Err(format!("cugr: {iterm}: a non-core terminal's access points (every master pin's, pointer-ordered) are not modelled").into());
+            }
+            pins.push(PinFacts { name: iterm.clone(), is_port: false, has_location: true, shapes, access_points });
         }
         let swire_boxes = db.net_swire_expanded_boxes(&name)?.into_iter().map(|(n, via, x0, y0, x1, y1)| (Shape { layer: shape_layer(db, n), rect: (x0, y0, x1, y1) }, via)).collect();
         drivers.push(db.net_first_driver_term(&name)?);

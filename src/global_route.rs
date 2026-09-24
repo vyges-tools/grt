@@ -21,7 +21,7 @@ use crate::adjust::{
 };
 use crate::init::{is_non_leaf_clock, order_nets, DiscoveredNet, ITermClockFacts};
 use crate::netlist::{compute_track_consumption, find_fastroute_pins, get_net_layer_range, makes_fastroute_net, net_max_routing_layer, NdrLayerRule, NetlistGrid, RouterPinFacts};
-use crate::pins::{find_nets, find_pin, is_pin_reachable, make_bterm_pin, make_iterm_pin, MasterClass, NetCandidate, NetPin, PinGrid, TermBox};
+use crate::pins::{find_nets, find_pin, is_pin_reachable, make_bterm_pin, make_iterm_pin, AccessPoint, MasterClass, NetCandidate, NetPin, PinGrid, TermBox};
 use crate::read::{read_bterm, read_master_shapes, read_nets, read_tech, read_tile_size, transform_rect, DbSpacing, MasterShapes, NetFacts, TechFacts};
 use crate::finalize::{Graph3d, NetLayerAttrs};
 use crate::Rect;
@@ -588,6 +588,23 @@ fn all_layer_edge_costs(n: &RouterNet, num_layers: usize) -> Vec<i8> {
 /// `edge_capacity` is FastRoute's: a pad or macro pin that cannot reach its on-grid position is
 /// moved toward its instance's edge. `None` is CUGR's side, which has no FastRoute capacities and
 /// skips that heuristic (`findOnGridPositions`, `!use_cugr_`).
+/// `findPinAccessPointPositions` for an instance terminal: a core pin's PREFERRED access points
+/// (`getPrefAccessPoints`), offset by the instance's location (orientation R0 — the router stores
+/// them oriented), as `(routing level, x, y)`.
+///
+/// ⛔ A non-core pin reads EVERY access point, from a map keyed by master-pin pointer — an order
+/// not reproduced here: refused when it has any.
+fn iterm_access_points(db: &Db, inst: &str, term: &str, is_core: bool) -> Res<Vec<AccessPoint>> {
+    if !is_core {
+        if db.iterm_access_point_count(inst, term)? > 0 {
+            return Err(format!("{inst}/{term}: a non-core terminal's access points (every master pin's, pointer-ordered) are not modelled").into());
+        }
+        return Ok(Vec::new());
+    }
+    let (ix, iy) = db.inst_location(inst);
+    Ok(db.iterm_pref_access_points(inst, term)?.into_iter().map(|(x, y, l)| (l, x + ix, y + iy)).collect())
+}
+
 pub(crate) fn discover_net_pins<'a>(
     db: &Db,
     t: &TechSetup,
@@ -620,6 +637,8 @@ pub(crate) fn discover_net_pins<'a>(
         let is_clock = n.sig_type == "CLOCK";
         let max_for_pins = if is_clock && clk_max > 0 { clk_max } else { max };
         let mut pins = Vec::new();
+        // `findPinAccessPointPositions`: each pin's detailed-router access points, as `(layer, x, y)`.
+        let mut aps: Vec<Vec<AccessPoint>> = Vec::new();
         for (inst, term) in &n.iterms {
             let master = db.inst_master(inst);
             if !masters.contains_key(&master) {
@@ -644,18 +663,21 @@ pub(crate) fn discover_net_pins<'a>(
             let pin = make_iterm_pin(&name, class, db.master_is_core(&master), db.inst_is_placed(inst), inst_box, &boxes, die, max_for_pins, &directions, opts.verbose, log)
                 .map_err(|e| format!("{e:?}"))?;
             let io = db.mterm_get_io_type(&master, term);
+            aps.push(iterm_access_points(db, inst, term, pin.is_core)?);
             pins.push((pin, io == "OUTPUT" || io == "INOUT"));
         }
         for bterm in &n.bterms {
             let (placed, bx) = read_bterm(db, bterm)?;
             let boxes: Vec<TermBox> = bx.into_iter().map(|(level, routing, rect)| TermBox { pin: 0, level, routing, rect }).collect();
             if let Some(pin) = make_bterm_pin(bterm, placed, &boxes, die, &directions, false, opts.verbose, log).map_err(|e| format!("{e:?}"))? {
+                let per_pin = (0..db.num_bterm_get_b_pins(bterm)).map(|b| Ok(db.bpin_access_points(bterm, b)?.into_iter().map(|(x, y, l)| (l, x, y)).collect())).collect::<Res<Vec<Vec<AccessPoint>>>>()?;
+                aps.push(crate::pins::port_access_points(per_pin));
                 pins.push((pin, db.bterm_get_io_type(bterm) == "INPUT"));
             }
         }
-        for (pin, _) in &mut pins {
+        for ((pin, _), aps) in pins.iter_mut().zip(&aps) {
             // With no capacities (CUGR) `find_pin` never asks: `use_cugr` skips the reachability test.
-            find_pin(&pin_grid, pin, &[], &mut |p, pos| edge_capacity.is_some_and(|cap| is_pin_reachable(&pin_grid, p, pos, cap)));
+            find_pin(&pin_grid, pin, aps, &mut |p, pos| edge_capacity.is_some_and(|cap| is_pin_reachable(&pin_grid, p, pos, cap)));
         }
         nets.push((n, pins));
     }

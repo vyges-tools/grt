@@ -1668,6 +1668,16 @@ fn run(job: &Value) -> Result<Value, Fail> {
                         }
                     }
                     "inst_create" => db.create_inst(s("master")?, s("inst")?).map_err(err)?,
+                    // `dbInst::setLocation` / `setPlacementStatus`. Inside a bracket the move would
+                    // reach `inDbPostMoveInst`, which is not modelled here.
+                    "inst_set_location" | "inst_set_placement_status" if incremental.is_some() => {
+                        return Err(Fail::Refused(format!("odb {op} inside an incremental bracket is not modelled")));
+                    }
+                    "inst_set_location" => {
+                        let (x, y) = (step["x"].as_i64().ok_or_else(|| err("x"))? as i32, step["y"].as_i64().ok_or_else(|| err("y"))? as i32);
+                        db.inst_set_location(s("inst")?, x, y).map_err(err)?;
+                    }
+                    "inst_set_placement_status" => db.inst_set_placement_status(s("inst")?, s("status")?).map_err(err)?,
                     "iterm_disconnect" => {
                         let (inst, pin) = (s("inst")?, s("pin")?);
                         let net = db.iterm_get_net(inst, pin);

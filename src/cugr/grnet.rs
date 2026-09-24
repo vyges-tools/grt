@@ -47,6 +47,10 @@ pub struct GrNet {
     pub net_length: i32,
     /// The database net's signal type is CLOCK (`markResAwareNets` asks it, leaf clocks included).
     pub is_clock_sig: bool,
+    /// Per pin, the detailed router's access points (`x, y, routing level`, absolute DBU).
+    pub odb_aps: Vec<Vec<(i32, i32, i32)>>,
+    /// Per pin, the cells they mapped to as `findODBAccessPoints` saw them (for the trace).
+    pub odb_ap_choices: Vec<Vec<(Point, Interval)>>,
 }
 
 impl GrNet {
@@ -104,6 +108,8 @@ impl GrNet {
             resistance: 0.0,
             net_length: 0,
             is_clock_sig: false,
+            odb_aps: net.pins.iter().map(|p| p.access_points.clone()).collect(),
+            odb_ap_choices: Vec::new(),
         })
     }
 

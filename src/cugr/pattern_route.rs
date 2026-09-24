@@ -27,6 +27,8 @@ pub type AccessPointMap = BTreeMap<(i32, i32), Interval>;
 /// What went wrong where the reference would log an error or index out of range.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PatternError {
+    /// A point the grid cannot place (`rangeSearchCells`).
+    Grid(String),
     /// GRT-0283: a pin with no shape-derived cell.
     NoAccessPoint { net: String, pin: usize },
     /// A layer with no finite cost: the reference would read a best path of `(-1, -1)`.
@@ -89,12 +91,50 @@ fn select_shape_access_point(net: &mut GrNet, pin: usize, grid: &GridGraph, map:
     Ok(())
 }
 
-/// `selectAccessPoints(net)`. Only the shape path is modelled: the caller refuses a design whose
-/// database carries detailed-router access points (`findODBAccessPoints`' path).
+/// `selectAccessPoint`: of a pin's access points on the grid, the FIRST with strictly the most
+/// identical copies (cell and layers alike). `aps` is not empty.
+pub fn select_access_point(aps: &[(Point, Interval)]) -> (Point, Interval) {
+    let (mut best, mut votes) = (aps[0], -1);
+    for ap in aps {
+        let equals = aps.iter().filter(|a| *a == ap).count() as i32;
+        if equals > votes {
+            (votes, best) = (equals, *ap);
+        }
+    }
+    best
+}
+
+/// `selectAccessPoints(net)`: the detailed router's access points first (`findODBAccessPoints`),
+/// then the shape-derived cells for every pin without any.
+///
+/// Upstream rules (`findODBAccessPoints`, pins in index order — block terminals, then instance
+/// terminals): each access point maps to the gcell holding it (the gridline search, a point ON a
+/// gridline taking the upper cell's low; clamped to the grid) on its layer (level − 1, clamped);
+/// the pin takes the FIRST of those with strictly the most identical copies (`selectAccessPoint`),
+/// its layers unioned into the cell's entry.
 pub fn select_access_points(net: &mut GrNet, grid: &GridGraph, log: &mut Log) -> Result<AccessPointMap, PatternError> {
     let mut map = AccessPointMap::new();
     net.shape_ap_choices.clear();
+    net.odb_ap_choices.clear();
+    let mut without = Vec::new();
     for pin in 0..net.num_pins() {
+        let mut on_grid: Vec<(Point, Interval)> = Vec::new();
+        for &(x, y, level) in net.odb_aps.get(pin).map(Vec::as_slice).unwrap_or(&[]) {
+            let cells = grid.range_search_cells(&super::geo::BoxT::new(x, y, x, y)).map_err(|e| PatternError::Grid(format!("{e:?}")))?;
+            let p = Point::new(cells.lx().clamp(0, grid.x_size as i32 - 1), cells.ly().clamp(0, grid.y_size as i32 - 1));
+            on_grid.push((p, Interval::point((level - 1).clamp(0, grid.num_layers as i32 - 1))));
+        }
+        net.odb_ap_choices.push(on_grid.clone());
+        if on_grid.is_empty() {
+            without.push(pin);
+            continue;
+        }
+        let best = select_access_point(&on_grid);
+        let layers = map.entry((best.0.x, best.0.y)).or_default();
+        *layers = layers.union_with(&best.1);
+        net.preferred_aps.insert(pin, best);
+    }
+    for pin in without {
         select_shape_access_point(net, pin, grid, &mut map, log)?;
     }
     Ok(map)
@@ -824,6 +864,8 @@ pub(crate) mod tests {
             resistance: 0.0,
             net_length: 0,
             is_clock_sig: false,
+            odb_aps: Vec::new(),
+            odb_ap_choices: Vec::new(),
         };
         for p in &n.pin_access_points.clone() {
             for g in p {
@@ -983,5 +1025,16 @@ pub(crate) mod tests {
         assert_eq!(s, vec![(0, 1, 2), (2, 1, 2), (2, 4, 2), (0, 4, 2)]);
         // committed: 3 m3 edges of one track each, plus the via flank deposits
         assert!((0..3).all(|x| c.grid.edge(2, 1 + x, 2).demand >= 1.0));
+    }
+
+    // Upstream rule (`GridGraph::selectAccessPoint`): the most frequent access point wins, the
+    // FIRST of equals on a tie. Every pin of the corpus has one preferred access point, so none
+    // is ever outvoted.
+    #[test]
+    fn the_most_frequent_access_point_wins_the_first_on_a_tie() {
+        let (a, b) = ((Point::new(1, 1), Interval::point(1)), (Point::new(2, 1), Interval::point(1)));
+        assert_eq!(select_access_point(&[a, b, b]), b);
+        assert_eq!(select_access_point(&[a, b]), a, "a tie keeps the first");
+        assert_eq!(select_access_point(&[b, a, a, b]), b, "a tie keeps the first");
     }
 }

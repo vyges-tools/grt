@@ -340,6 +340,16 @@ pub fn position_near_inst_edge(edge: PinEdge, b: Rect, middle: (i32, i32)) -> (i
 /// the position already moved to the instance's location.
 pub type AccessPoint = (i32, i32, i32);
 
+/// `findPinAccessPointPositions` for a port: each block pin's access points inserted at the FRONT,
+/// so the last pin's lead (CUGR's `findODBAccessPoints` appends instead).
+pub fn port_access_points(per_pin: Vec<Vec<AccessPoint>>) -> Vec<AccessPoint> {
+    let mut out = Vec::new();
+    for these in per_pin {
+        out.splice(0..0, these);
+    }
+    out
+}
+
 /// `findOnGridPositions` → `(positions on grid as (x, y, level), has_access_points, pos_on_grid)`.
 ///
 /// With access points: every one, by LEVEL ascending (a `std::map`), each in its order; the last

@@ -196,7 +196,9 @@ pub fn maze(out: &mut Vec<String>, n: &GrNet, r: &NetRoute, grid: &super::maze_r
 pub fn net_route(out: &mut Vec<String>, n: &GrNet, r: &NetRoute, commits: &[Commit], stage: i32) {
     let k = n.index;
     for pin in 0..n.num_pins() {
-        out.push(format!("VYGC|odbap|{k}|{pin}|0|"));
+        let aps = n.odb_ap_choices.get(pin).map(Vec::as_slice).unwrap_or(&[]);
+        let s: String = aps.iter().map(|(p, l)| format!("{},{},{},{};", p.x, p.y, l.low, l.high)).collect();
+        out.push(format!("VYGC|odbap|{k}|{pin}|{}|{s}", aps.len()));
     }
     for &(pin, best, acc, dist, center) in &n.shape_ap_choices {
         out.push(format!("VYGC|shapeap|{k}|{pin}|{best}|{acc}|{dist}|center={},{}", center.x, center.y));
