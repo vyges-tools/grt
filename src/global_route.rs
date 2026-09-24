@@ -47,6 +47,9 @@ pub struct RouteOptions {
     pub timing: Option<crate::timer::Timing>,
     /// Where to write every computed read (`<P|U> <call> <net> <f32 bits>`), if anywhere.
     pub timer_trace: Option<String>,
+    /// `estimate_parasitics -placement` ran: a timer read with no route estimate of its own sees
+    /// those parasitics.
+    pub placement_parasitics: bool,
     /// `global_route -resistance_aware`.
     pub resistance_aware: bool,
     /// `-res_aware_nets_percentage` — once given, FIXED (`is_fixed_nets_percentage_`).
@@ -103,6 +106,7 @@ impl RouteOptions {
             captured_update_slacks: None,
             timing: None,
             timer_trace: None,
+            placement_parasitics: false,
             resistance_aware: false,
             res_aware_nets_percentage: None,
             cugr_raw_slacks: None,

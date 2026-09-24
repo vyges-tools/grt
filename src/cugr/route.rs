@@ -173,7 +173,30 @@ pub struct CugrRoute {
 pub fn route_cugr(db: &mut Db, opts: &RouteOptions, call: usize, stt: SteinerBuilder<'_>, trace: Option<&mut Vec<String>>) -> Res<CugrRoute> {
     let timed = opts.liberty.is_some() && !opts.clock_sources.is_empty();
     let oracle = opts.cugr_slacks.as_ref().map(|calls| calls.get(call));
-    if timed && oracle.is_none() {
+    // ⛔ CUGR reads the timer only with critical nets (`setInitialNetSlacks` and `updateNetSlacks`
+    // are both behind `critical_nets_percentage_ != 0`): without them a clock changes nothing.
+    // With no capture but the timer's inputs, stage 1's read (`setInitialNetSlacks`) is timed here:
+    // on no parasitics — the script estimated none — so every net is lumped at its pin caps.
+    // Later reads (after `updateNetSlacks` re-estimates on CUGR's routes) are not modelled yet.
+    let computed_stage1 = match (&opts.timing, oracle.is_none() && timed && opts.critical_nets_percentage != 0.0) {
+        // ⛔ After `estimate_parasitics -placement` stage 1 reads THOSE parasitics: not modelled.
+        (Some(_), true) if opts.placement_parasitics => {
+            return Err("cugr: stage 1's slacks on placement parasitics are not modelled".into());
+        }
+        (Some(timing), true) => {
+            let nl = crate::timer::netlist(db);
+            let by_name = crate::timer::net_slacks(timing, &nl, &std::collections::BTreeMap::new())?;
+            let m: std::collections::BTreeMap<String, f32> = by_name.into_iter().collect();
+            if let Some(path) = &opts.timer_trace {
+                // `C <call> <sort> <net> <bits>`, as the CUGR capture writes its reads.
+                let text: String = m.iter().map(|(n, v)| format!("C {call} 0 {n} {:08x}\n", v.to_bits())).collect();
+                std::fs::write(path, text)?;
+            }
+            Some(m)
+        }
+        _ => None,
+    };
+    if timed && opts.critical_nets_percentage != 0.0 && oracle.is_none() && computed_stage1.is_none() {
         return Err("cugr: a clock with a liberty library — the critical-net slacks are not modelled".into());
     }
     let mut ci = init_cugr(db, opts)?;
@@ -197,8 +220,9 @@ pub fn route_cugr(db: &mut Db, opts: &RouteOptions, call: usize, stt: SteinerBui
     // With a clock the slacks are the timer's, refreshed and demoted before each later sort, and
     // come from the capture — per sort, at the sort (`sort_net_indices`).
     if timed && opts.critical_nets_percentage != 0.0 {
-        match oracle {
-            Some(Some(sorts)) => ci.cugr.sort_slacks = Some(sorts.clone()),
+        match (oracle, computed_stage1) {
+            (Some(Some(sorts)), _) => ci.cugr.sort_slacks = Some(sorts.clone()),
+            (_, Some(stage1)) => ci.cugr.sort_slacks = Some(vec![stage1]),
             _ => return Err(format!("cugr: no captured slacks for CUGR call {call} — not modelled").into()),
         }
     }
@@ -209,7 +233,13 @@ pub fn route_cugr(db: &mut Db, opts: &RouteOptions, call: usize, stt: SteinerBui
     if let Some(t) = trace.as_deref_mut() {
         t.extend(super::trace::model(&ci.cugr, ci.min_routing_layer, ci.max_routing_layer, ci.clock_nets.len()));
     }
-    let fail = |e: StageError| format!("cugr: {e:?}");
+    // A computed stage-1 read has no later sort to give: a sort after `updateNetSlacks` (which
+    // re-estimates on CUGR's routes) is refused, not an error.
+    let computed = ci.cugr.sort_slacks.as_ref().is_some_and(|v| v.len() == 1) && oracle.is_none();
+    let fail = |e: StageError| match e {
+        StageError::Slacks(m) if computed => format!("cugr: the timer's read after updateNetSlacks on CUGR's routes is not modelled ({m})"),
+        e => format!("cugr: {e:?}"),
+    };
     if let Some(t) = trace.as_deref_mut() {
         t.push("VYGC|route|0".into());
     }

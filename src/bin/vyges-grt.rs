@@ -45,6 +45,7 @@ JOB (JSON):
       \"ports\": [..] | \"inputs_except_clocks\" | \"outputs\" }      (relative to the clock's rise edge)
     { \"cmd\": \"set_layer_rc\", \"layer\" | \"via\": name, \"resistance\": f } (user units)
     { \"cmd\": \"propagated_clock\" }
+    { \"cmd\": \"estimate_parasitics\", \"placement\": b }            (what a timer read with no estimate of its own sees)
     { \"cmd\": \"write_parasitics\", \"path\": \"..\" }       (the networks the slacks are read from)
     { \"cmd\": \"write_spef\", \"path\": \"..\", \"source\": \"partial\" | \"routed\" }
     { \"cmd\": \"write_guides\", \"path\": \"..\" }
@@ -1370,6 +1371,12 @@ fn run(job: &Value) -> Result<Value, Fail> {
                         None => None,
                     };
                     timing.constraints.clock = Some((name, period, ports, waveform));
+                }
+            }
+            // estimate_parasitics -placement: parasitics a timer read with no estimate of its own sees.
+            "estimate_parasitics" => {
+                if step["placement"].as_bool() == Some(true) {
+                    opts.placement_parasitics = true;
                 }
             }
             // set_propagated_clock: the timer propagates the clock through its network.
