@@ -330,6 +330,229 @@ impl GridGraph {
     }
 }
 
+/// A routing tree (`GRTreeNode`), as an arena: node 0 is the root.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GrTree {
+    pub nodes: Vec<GrTreeNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrTreeNode {
+    pub layer: i32,
+    pub p: Point,
+    pub children: Vec<usize>,
+}
+
+impl GrTree {
+    pub fn add(&mut self, layer: i32, p: Point) -> usize {
+        self.nodes.push(GrTreeNode { layer, p, children: Vec::new() });
+        self.nodes.len() - 1
+    }
+    /// `GRTreeNode::preorder`: a node, then each child's subtree in order.
+    pub fn preorder(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        if self.nodes.is_empty() {
+            return out;
+        }
+        let mut stack = vec![0];
+        while let Some(n) = stack.pop() {
+            out.push(n);
+            stack.extend(self.nodes[n].children.iter().rev());
+        }
+        out
+    }
+}
+
+/// A native tree the reference would reject (`logger_->error`), refused rather than committed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitError {
+    /// GRT-0307: a wire below the min routing layer.
+    WireBelowMinLayer { layer: i32 },
+    /// GRT-1252/1253: a wire whose ends are not aligned across its layer's direction.
+    WrongWayWire { layer: i32 },
+    /// GRT-1250/1251: a via above the top layer.
+    ViaAboveTop { layer: i32 },
+}
+
+impl GridGraph {
+    /// `logistic(input, slope)`: `1 / (1 + exp(input × slope))`.
+    pub fn logistic(input: f64, slope: f64) -> f64 {
+        1.0 / (1.0 + (input * slope).exp())
+    }
+
+    /// `getWireCost(layer, lower, demand, net_factor)`: one edge at `demand` tracks.
+    ///
+    /// Upstream rule: the demand's length (`demand × factor × edge length`) at the unit wire
+    /// cost, plus the same length at the layer's short cost scaled by the logistic of the edge's
+    /// free capacity — or by 1 on an edge with less than one track. A wire (demand ≥ 1) that does
+    /// not fit a usable edge pays the congestion gate on top. Each `+=` is evaluated left to right
+    /// as the reference writes it; the double sums are order-sensitive.
+    pub fn wire_cost_at(&self, layer: usize, lower: Point, demand: f64, net_factor: f64, c: &super::Constants, cost_multiplier: f64) -> f64 {
+        let direction = self.layer_directions[layer];
+        let edge_length = self.edge_length(direction, lower.get(direction) as usize);
+        let demand_length = demand * net_factor * f64::from(edge_length);
+        let edge = &self.graph_edges[layer][lower.x as usize][lower.y as usize];
+        let mut cost = demand_length * self.unit_length_wire_cost;
+        cost += demand_length
+            * self.unit_length_short_costs[layer]
+            * if edge.capacity < 1.0 { 1.0 } else { GridGraph::logistic(edge.capacity - edge.demand, c.cost_logistic_slope * cost_multiplier) };
+        if c.congestion_gate_penalty > 0.0 && demand >= 1.0 && edge.capacity >= 1.0 && edge.capacity - edge.demand < demand * net_factor {
+            cost += demand_length * self.unit_length_wire_cost * c.congestion_gate_penalty;
+        }
+        cost
+    }
+
+    /// `getWireCost(layer, u, v, net_factor)`: every edge of a straight wire, one track each, in
+    /// ascending order. `None` where the ends are not aligned (GRT-1249).
+    pub fn wire_cost(&self, layer: usize, u: Point, v: Point, net_factor: f64, c: &super::Constants, cost_multiplier: f64) -> Option<f64> {
+        let direction = self.layer_directions[layer];
+        if u.get(1 - direction) != v.get(1 - direction) {
+            return None;
+        }
+        let mut cost = 0.0;
+        let (l, h) = (u.get(direction).min(v.get(direction)), u.get(direction).max(v.get(direction)));
+        for i in l..h {
+            let mut lower = u;
+            lower.set(direction, i);
+            cost += self.wire_cost_at(layer, lower, 1.0, net_factor, c, cost_multiplier);
+        }
+        Some(cost)
+    }
+
+    /// `forEachFlankEdge(layer, loc)`: the edge below `loc` along the layer's direction and the
+    /// edge at it, each where it exists, with their summed length.
+    fn flank_edges(&self, layer: usize, loc: Point) -> Vec<(Point, i32)> {
+        let direction = self.layer_directions[layer];
+        let at = loc.get(direction);
+        let mut lower_loc = loc;
+        lower_loc.set(direction, at - 1);
+        let lower = if at > 0 { self.edge_length(direction, (at - 1) as usize) } else { 0 };
+        let higher = if (at as usize) < self.size(direction) - 1 { self.edge_length(direction, at as usize) } else { 0 };
+        let sum = lower + higher;
+        let mut out = Vec::new();
+        if sum == 0 {
+            return out;
+        }
+        if lower > 0 {
+            out.push((lower_loc, sum));
+        }
+        if higher > 0 {
+            out.push((loc, sum));
+        }
+        out
+    }
+
+    /// `forEachViaFlankEdgeImpl(layer_index, loc, net_costs)`: a via between `layer_index` and the
+    /// layer above deposits, on each of the two layers' flank edges, that layer's via demand length
+    /// spread over the flank span: `(layer, edge, demand, the layer's NDR factor)`.
+    pub fn via_flank_edges(&self, layer_index: usize, loc: Point, via_demand_lower: f64, via_demand_upper: f64, net_costs: &[f64]) -> Vec<(usize, Point, f64, f64)> {
+        let mut out = Vec::new();
+        for l in layer_index..=(layer_index + 1).min(self.num_layers - 1) {
+            let factor = net_costs.get(l).copied().unwrap_or(1.0);
+            let length = if l == layer_index { via_demand_lower } else { via_demand_upper };
+            for (edge, sum) in self.flank_edges(l, loc) {
+                out.push((l, edge, if sum > 0 { length / f64::from(sum) } else { 0.0 }, factor));
+            }
+        }
+        out
+    }
+
+    /// `getViaCost(layer_index, loc, net_costs)`: the unit via cost times the larger NDR factor of
+    /// the two layers, plus the wire cost of every flank deposit at its demand.
+    pub fn via_cost(&self, design: &Design, layer_index: usize, loc: Point, net_costs: &[f64], c: &super::Constants, cost_multiplier: f64) -> f64 {
+        let lower = net_costs.get(layer_index).copied().unwrap_or(1.0);
+        let upper = net_costs.get(layer_index + 1).copied().unwrap_or(1.0);
+        let mut cost = self.unit_via_cost * lower.max(upper);
+        for (l, edge, demand, factor) in self.via_flank_edges(layer_index, loc, design.via_demand_length_lower[layer_index], design.via_demand_length_upper[layer_index], net_costs) {
+            cost += self.wire_cost_at(l, edge, demand, factor, c, cost_multiplier);
+        }
+        cost
+    }
+
+    /// `commit`: demand += demand × factor.
+    fn commit(&mut self, layer: usize, lower: Point, demand: f64, net_factor: f64, log: &mut Vec<Commit>) {
+        self.graph_edges[layer][lower.x as usize][lower.y as usize].demand += demand * net_factor;
+        log.push(Commit { layer, p: lower, delta: demand * net_factor });
+    }
+
+    /// `commitTree(tree, rip_up, net_costs, adopted=false)`: a native tree, in preorder — each
+    /// same-layer child a wire (one track per edge crossed), each layer change a via per layer
+    /// crossed at the parent's cell.
+    pub fn commit_tree(&mut self, design: &Design, tree: &GrTree, rip_up: bool, net_costs: &[f64], log: &mut Vec<Commit>) -> Result<(), CommitError> {
+        let sign = if rip_up { -1.0 } else { 1.0 };
+        for n in tree.preorder() {
+            let node = &tree.nodes[n];
+            for &ch in &node.children {
+                let child = &tree.nodes[ch];
+                if node.layer == child.layer {
+                    // Wrong way first; GRT-0307 per edge committed (`commitWire`), so a
+                    // zero-length wire never trips it.
+                    let layer = node.layer as usize;
+                    let direction = self.layer_directions[layer];
+                    if node.p.get(1 - direction) != child.p.get(1 - direction) {
+                        return Err(CommitError::WrongWayWire { layer: node.layer });
+                    }
+                    let factor = net_costs.get(layer).copied().unwrap_or(1.0);
+                    let (lo, hi) = (node.p.get(direction).min(child.p.get(direction)), node.p.get(direction).max(child.p.get(direction)));
+                    for i in lo..hi {
+                        if layer < self.min_routing_layer {
+                            return Err(CommitError::WireBelowMinLayer { layer: node.layer });
+                        }
+                        let mut lower = node.p;
+                        lower.set(direction, i);
+                        self.commit(layer, lower, sign, factor, log);
+                    }
+                } else {
+                    for l in node.layer.min(child.layer)..node.layer.max(child.layer) {
+                        let l = l as usize;
+                        if l + 1 >= self.num_layers {
+                            return Err(CommitError::ViaAboveTop { layer: l as i32 });
+                        }
+                        for (fl, edge, demand, factor) in self.via_flank_edges(l, node.p, design.via_demand_length_lower[l], design.via_demand_length_upper[l], net_costs) {
+                            self.commit(fl, edge, sign * demand, factor, log);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `checkCongestion(tree, threshold)`: the tree's wire edges with demand > capacity × threshold.
+    pub fn check_congestion(&self, tree: &GrTree, threshold: f64) -> usize {
+        let mut num = 0;
+        for n in tree.preorder() {
+            let node = &tree.nodes[n];
+            for &ch in &node.children {
+                let child = &tree.nodes[ch];
+                if node.layer != child.layer {
+                    continue;
+                }
+                let layer = node.layer as usize;
+                let d = self.layer_directions[layer];
+                let (lo, hi) = (node.p.get(d).min(child.p.get(d)), node.p.get(d).max(child.p.get(d)));
+                let r = node.p.get(1 - d);
+                for c in lo..hi {
+                    let (x, y) = if d == H { (c, r) } else { (r, c) };
+                    let e = &self.graph_edges[layer][x as usize][y as usize];
+                    if e.demand > e.capacity * threshold {
+                        num += 1;
+                    }
+                }
+            }
+        }
+        num
+    }
+}
+
+/// One `commit`, as the reference's trace records it: `(layer, lower cell, demand × factor)`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Commit {
+    pub layer: usize,
+    pub p: Point,
+    pub delta: f64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

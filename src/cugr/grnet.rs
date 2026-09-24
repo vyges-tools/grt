@@ -2,11 +2,11 @@
 //! One net as the router holds it (`GRNet`): the gcells each pin's shapes touch, the net's
 //! bounding box over them, and which pin drives it.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use super::design::{CugrNet, LayerRange};
-use super::geo::{BoxT, Point};
-use super::grid_graph::{GridError, GridGraph};
+use super::geo::{BoxT, Interval, Point};
+use super::grid_graph::{GrTree, GridError, GridGraph};
 
 /// A gcell on a layer (`GRPoint`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +26,14 @@ pub struct GrNet {
     pub driver_pin_index: i32,
     pub layer_range: LayerRange,
     pub slack: f32,
+    /// `preferred_aps_`: per pin, the chosen cell and the pin's own layers (a `std::map`: pin order).
+    pub preferred_aps: BTreeMap<usize, (Point, Interval)>,
+    /// Per-layer NDR demand factor (`computeNdrCosts`); all 1 for a net without a rule.
+    pub ndr_costs: Vec<f64>,
+    pub routing_tree: Option<GrTree>,
+    /// The last `selectShapeAccessPoint` choices, for the trace: `(pin, index, accessibility,
+    /// distance, bbox centre)`.
+    pub shape_ap_choices: Vec<(usize, i32, i32, i32, Point)>,
 }
 
 impl GrNet {
@@ -64,7 +72,34 @@ impl GrNet {
                 bounding_box.update(g.p);
             }
         }
-        Ok(GrNet { index: net.index, name: net.name.clone(), pin_access_points, bounding_box, driver_pin_index, layer_range: net.layer_range, slack: 0.0 })
+        Ok(GrNet {
+            index: net.index,
+            name: net.name.clone(),
+            pin_access_points,
+            bounding_box,
+            driver_pin_index,
+            layer_range: net.layer_range,
+            slack: 0.0,
+            preferred_aps: BTreeMap::new(),
+            ndr_costs: vec![1.0; grid.num_layers],
+            routing_tree: None,
+            shape_ap_choices: Vec::new(),
+        })
+    }
+
+    /// `isInsideLayerRange`.
+    pub fn is_inside_layer_range(&self, layer: i32) -> bool {
+        layer >= self.layer_range.min_layer && layer <= self.layer_range.max_layer
+    }
+
+    /// `getNdrCost(layer)`: 1 outside the vector.
+    pub fn ndr_cost(&self, layer: usize) -> f64 {
+        self.ndr_costs.get(layer).copied().unwrap_or(1.0)
+    }
+
+    /// `getDriverAccessPoint`: the driver pin's chosen cell, if it has one.
+    pub fn driver_access_point(&self) -> Option<Point> {
+        usize::try_from(self.driver_pin_index).ok().and_then(|d| self.preferred_aps.get(&d)).map(|&(p, _)| p)
     }
 
     pub fn num_pins(&self) -> usize {

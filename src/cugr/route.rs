@@ -6,8 +6,9 @@ use std::collections::BTreeSet;
 
 use vyges_opendb::Db;
 
+use super::pattern_route::SteinerBuilder;
 use super::read::read_design_facts;
-use super::{init, Cugr};
+use super::{init, Cugr, StageError};
 use crate::driver::get_min_max_layer;
 use crate::global_route::RouteOptions;
 use crate::init::{is_non_leaf_clock, ITermClockFacts};
@@ -83,4 +84,47 @@ pub fn init_cugr(db: &mut Db, opts: &RouteOptions) -> Res<CugrInit> {
     let (facts, drivers) = read_design_facts(db, &clock_nets)?;
     let cugr = init(&facts, &drivers, min, max).map_err(|e| format!("{e:?}"))?;
     Ok(CugrInit { cugr, min_routing_layer: min, max_routing_layer: max, clock_nets })
+}
+
+/// How far `route_cugr` got.
+pub struct CugrRoute {
+    pub init: CugrInit,
+    /// Stage 1's log lines (GRT-0274).
+    pub log: Vec<String>,
+    /// Nets whose stage-1 tree is congested; non-empty means stage 3 would run.
+    pub congested: Vec<usize>,
+}
+
+/// `CUGR::route(false)` as far as it is modelled: `initCUGR`, then stage 1.
+///
+/// Refused up front, where stage 1 would read what is not modelled:
+/// - detailed-router ACCESS POINTS in the database (`findODBAccessPoints`' path);
+/// - a net with a NON-DEFAULT RULE (`computeNdrCosts`);
+/// - a CLOCK defined with a liberty library: the stage-1 order then reads the timer's slacks.
+///   Without one every net is unconstrained — `1e+30` with a library (the critical-net
+///   percentage defaults to 10), `0` without (forced to 0) — one constant, so the order is the
+///   bounding boxes'.
+pub fn route_cugr(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, trace: Option<&mut Vec<String>>) -> Res<CugrRoute> {
+    if db.block_access_point_count()? > 0 {
+        return Err("cugr: pin access points in the database — findODBAccessPoints is not modelled".into());
+    }
+    if opts.liberty.is_some() && !opts.clock_sources.is_empty() {
+        return Err("cugr: a clock with a liberty library — the critical-net slacks are not modelled".into());
+    }
+    let mut ci = init_cugr(db, opts)?;
+    for n in &ci.cugr.nets {
+        if !db.net_get_non_default_rule(&n.name).is_empty() {
+            return Err(format!("cugr: net {} has a non-default rule — computeNdrCosts is not modelled", n.name).into());
+        }
+    }
+    let slack = if opts.liberty.is_some() && opts.critical_nets_percentage != 0.0 { 1.0e30f32 } else { 0.0 };
+    let mut alphas = Vec::with_capacity(ci.cugr.nets.len());
+    for n in &mut ci.cugr.nets {
+        n.slack = slack;
+        alphas.push(crate::global_route::net_steiner_alpha(db, opts, &n.name)?);
+    }
+    let mut log = Vec::new();
+    ci.cugr.pattern_route(&alphas, stt, &mut log, trace).map_err(|e: StageError| format!("cugr: {e:?}"))?;
+    let congested = ci.cugr.congested_nets();
+    Ok(CugrRoute { init: ci, log, congested })
 }

@@ -843,6 +843,22 @@ fn steiner_alpha(opts: &RouteOptions, n: &RouterNet, hpwl: Option<i32>) -> f32 {
     }
 }
 
+/// `makeSteinerTree(net, …)`'s alpha for a net by name, as CUGR's pattern route asks it: the same
+/// precedence as [`steiner_alpha`] — the net's own, else the min-HPWL rule when set, else the
+/// min-fanout rule — over the global alpha.
+pub(crate) fn net_steiner_alpha(db: &Db, opts: &RouteOptions, net: &str) -> Result<f32, String> {
+    if let Some(&a) = opts.net_alpha.get(net) {
+        return Ok(a);
+    }
+    if let Some((min, a)) = opts.min_hpwl_alpha.filter(|&(h, _)| h > 0) {
+        return Ok(if compute_hpwl(db, net)? >= min { a } else { opts.alpha });
+    }
+    Ok(match opts.min_fanout_alpha {
+        Some((min_fanout, a)) if min_fanout > 0 && db.net_get_term_count(net) as i32 - 1 >= min_fanout => a,
+        _ => opts.alpha,
+    })
+}
+
 /// `SteinerTreeBuilder::computeHPWL`: the bounding box of every instance terminal's average pin
 /// location (`getAvgXY`) and every block terminal's first pin location.
 ///

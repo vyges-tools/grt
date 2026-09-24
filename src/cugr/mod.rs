@@ -9,14 +9,16 @@
 //! | stage | reference | here |
 //! | --- | --- | --- |
 //! | 0 · the model | `Design`, `GridGraph`, `GRNet` construction | [`init`] |
+//! | 1 · pattern routing | `CUGR::patternRoute` | [`Cugr::pattern_route`] |
 //!
-//! [`init`] is `CUGR::init`'s call sequence and does no work of its own.
+//! [`init`] is `CUGR::init`'s call sequence and does no work of its own; so is each stage.
 
 pub mod design;
 pub mod geo;
 pub mod grid_graph;
 pub mod grnet;
 pub mod layers;
+pub mod pattern_route;
 pub mod trace;
 #[cfg(feature = "odb")]
 pub mod read;
@@ -72,6 +74,62 @@ pub struct Cugr {
     pub grid: GridGraph,
     /// Indexed by net index (every design net is valid at `init`).
     pub nets: Vec<GrNet>,
+}
+
+/// A stage that stopped where the reference would have gone on to something not modelled, or
+/// would have raised an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StageError {
+    Pattern(pattern_route::PatternError),
+    Commit(grid_graph::CommitError),
+}
+
+impl Cugr {
+    /// `sortNetIndices(nets, res_aware_order=false)`: a STABLE sort by `(slack, bbox half
+    /// perimeter)`, from index order.
+    pub fn sort_net_indices(&self, indices: &mut [usize]) {
+        indices.sort_by(|&a, &b| {
+            let (na, nb) = (&self.nets[a], &self.nets[b]);
+            (na.slack, na.bounding_box.hp()).partial_cmp(&(nb.slack, nb.bounding_box.hp())).unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
+    /// `patternRoute` (stage 1): every net in the neutral order; a net of two or more pins is
+    /// pattern-routed and its tree's usage committed before the next is routed.
+    ///
+    /// `alphas[k]` is net `k`'s Steiner alpha. With `trace`, the stage's records are appended.
+    pub fn pattern_route(&mut self, alphas: &[f32], stt: pattern_route::SteinerBuilder<'_>, log: &mut Vec<String>, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
+        let mut order: Vec<usize> = (0..self.nets.len()).collect();
+        self.sort_net_indices(&mut order);
+        if let Some(t) = trace.as_deref_mut() {
+            trace::order(t, self, &order);
+        }
+        for &k in &order {
+            if self.nets[k].num_pins() < 2 {
+                continue;
+            }
+            let cx = pattern_route::CostContext { grid: &self.grid, design: &self.design, constants: &self.constants, cost_multiplier: 1.0 };
+            let route = pattern_route::pattern_route_net(&mut self.nets[k], alphas[k], stt, &cx, log).map_err(StageError::Pattern)?;
+            let mut commits = Vec::new();
+            let tree = self.nets[k].routing_tree.clone().expect("set by the route");
+            self.grid.commit_tree(&self.design, &tree, false, &self.nets[k].ndr_costs, &mut commits).map_err(StageError::Commit)?;
+            if let Some(t) = trace.as_deref_mut() {
+                trace::net_route(t, &self.nets[k], &route, &commits, 1);
+            }
+        }
+        if let Some(t) = trace {
+            trace::demand(t, &self.grid, 1);
+        }
+        Ok(())
+    }
+
+    /// `updateCongestedNets(threshold 1)` over every routed net: those whose tree crosses an edge
+    /// with more demand than capacity. Empty means stages 3 to 5 have nothing to do.
+    pub fn congested_nets(&self) -> Vec<usize> {
+        (0..self.nets.len())
+            .filter(|&k| self.nets[k].routing_tree.as_ref().is_some_and(|t| self.grid.check_congestion(t, 1.0) > 0))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

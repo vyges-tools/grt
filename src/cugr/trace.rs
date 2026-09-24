@@ -19,7 +19,10 @@
 
 use std::fmt::Write;
 
+use super::grid_graph::{Commit, GridGraph};
+use super::grnet::GrNet;
 use super::layers::MetalLayer;
+use super::pattern_route::NetRoute;
 use super::Cugr;
 
 fn list<T: std::fmt::Display>(v: impl IntoIterator<Item = T>) -> String {
@@ -116,4 +119,79 @@ pub fn model(c: &Cugr, min_routing_layer: i32, max_routing_layer: i32, clock_net
         }
     }
     out
+}
+
+/// `order|stage|pos|idx|name|slack|hp`: the nets in routing order.
+pub fn order(out: &mut Vec<String>, c: &Cugr, order: &[usize]) {
+    for (pos, &k) in order.iter().enumerate() {
+        let n = &c.nets[k];
+        out.push(format!("VYGC|order|1|{pos}|{k}|{}|{}|{}", n.name, n.slack, n.bounding_box.hp()));
+    }
+}
+
+/// One net's stage records, in the reference's order: per pin the (empty) detailed-router access
+/// points and the shape choice, the preferred and selected cells, the Steiner input and tree, the
+/// costed DAG, the chosen tree, and every demand committed.
+pub fn net_route(out: &mut Vec<String>, n: &GrNet, r: &NetRoute, commits: &[Commit], stage: i32) {
+    let k = n.index;
+    for pin in 0..n.num_pins() {
+        out.push(format!("VYGC|odbap|{k}|{pin}|0|"));
+    }
+    for &(pin, best, acc, dist, center) in &n.shape_ap_choices {
+        out.push(format!("VYGC|shapeap|{k}|{pin}|{best}|{acc}|{dist}|center={},{}", center.x, center.y));
+    }
+    for (pin, (p, layers)) in &n.preferred_aps {
+        out.push(format!("VYGC|pref|{k}|{pin}|{}|{}|{}|{}", p.x, p.y, layers.low, layers.high));
+    }
+    for (&(x, y), layers) in &r.selected {
+        out.push(format!("VYGC|sel|{k}|{x}|{y}|{}|{}", layers.low, layers.high));
+    }
+    if let Some((xs, ys, driver)) = &r.steiner.input {
+        let input: String = xs.iter().zip(ys).map(|(x, y)| format!("{x},{y};")).collect();
+        out.push(format!("VYGC|sttin|{k}|{driver}|{input}"));
+        let branches: String = r.steiner.branches.iter().enumerate().map(|(i, (x, y, b))| format!("{i}:{x},{y},{b};")).collect();
+        out.push(format!("VYGC|stt|{k}|{branches}"));
+        let st: String = r
+            .steiner
+            .preorder()
+            .into_iter()
+            .map(|i| {
+                let s = &r.steiner.nodes[i];
+                format!("{},{},{},{},{};", s.p.x, s.p.y, s.fixed.low, s.fixed.high, s.children.len())
+            })
+            .collect();
+        out.push(format!("VYGC|steiner|{k}|{}|{st}", r.steiner.root_branch));
+    }
+    let mut seen = vec![false; r.dag.nodes.len()];
+    let mut stack = vec![r.dag.root];
+    while let Some(i) = stack.pop() {
+        if seen[i] {
+            continue;
+        }
+        seen[i] = true;
+        let d = &r.dag.nodes[i];
+        let paths: String = d.paths.iter().map(|cp| format!("{};", list(cp))).collect();
+        out.push(format!("VYGC|dag|{k}|{i}|{}|{}|opt={}|fix={},{}|paths={paths}|cost={}", d.p.x, d.p.y, d.optional, d.fixed.low, d.fixed.high, list(&d.costs)));
+        for cp in d.paths.iter().rev() {
+            for &p in cp.iter().rev() {
+                stack.push(p);
+            }
+        }
+    }
+    if let Some(t) = &n.routing_tree {
+        let s: String = t.preorder().into_iter().map(|i| format!("{}:{}:{}:{};", t.nodes[i].layer, t.nodes[i].p.x, t.nodes[i].p.y, t.nodes[i].children.len())).collect();
+        out.push(format!("VYGC|tree|{stage}|{k}|{s}"));
+    }
+    for c in commits {
+        out.push(format!("VYGC|cm|{stage}|{}|{}|{}|{}", c.layer, c.p.x, c.p.y, c.delta));
+    }
+}
+
+/// `dem|stage|l|x|d(y=0),…`: every edge's demand after the stage.
+pub fn demand(out: &mut Vec<String>, g: &GridGraph, stage: i32) {
+    for (l, columns) in g.graph_edges.iter().enumerate() {
+        for (x, column) in columns.iter().enumerate() {
+            out.push(format!("VYGC|dem|{stage}|{l}|{x}|{}", list(column.iter().map(|e| e.demand))));
+        }
+    }
 }
