@@ -973,6 +973,31 @@ pub type SteinerBuilder<'a> = &'a dyn Fn(&[i32], &[i32], usize, f32) -> crate::b
 
 /// `globalRoute` end to end over the database: setup (I) → `run()` (R) → `findRouting`'s
 /// post-processing (F) → `saveGuides` (X). The Steiner tree builder and FLUTE are injected.
+/// `MakeWireParasitics::layerRC`: the estimator's table where it has a value, the technology's
+/// own only where it has none.
+pub(crate) fn layer_rc_for(db: &Db, t: &TechSetup, opts: &RouteOptions) -> crate::parasitics::LayerRC {
+    let mut rc = crate::parasitics::LayerRC { dbu_per_micron: db.tech_get_db_units_per_micron(), ..Default::default() };
+    for l in &t.tech.routing_layers {
+        let (lvl, name) = (l.routing_level, &l.name);
+        rc.width.insert(lvl, db.layer_get_width(name) as i32);
+        rc.resistance.insert(lvl, db.layer_get_resistance(name));
+        rc.capacitance.insert(lvl, db.layer_get_capacitance(name));
+        rc.edge_capacitance.insert(lvl, db.layer_get_edge_capacitance(name));
+        if let Some(&(res, cap)) = opts.layer_rc.get(&lvl) {
+            rc.table_res.insert(lvl, res);
+            rc.table_cap.insert(lvl, cap);
+        }
+        let cut = db.layer_get_upper_layer(name);
+        if !cut.is_empty() {
+            rc.cut_resistance.insert(lvl, db.layer_get_resistance(&cut));
+            if let Some(&res) = opts.via_rc.get(&cut) {
+                rc.cut_table_res.insert(lvl, res);
+            }
+        }
+    }
+    rc
+}
+
 /// `estimateAllGlobalRouteParasitics` for one net on its planar route: the route's segments, the
 /// pins where they attach, and the RC network.
 fn planar_net_network(
@@ -1123,28 +1148,7 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     };
     // ⛔ The parasitics read the estimator's table where it has a value, and the technology's own
     // only where it has none (`MakeWireParasitics::layerRC`).
-    let layer_rc = |db: &Db| -> crate::parasitics::LayerRC {
-        let mut rc = crate::parasitics::LayerRC { dbu_per_micron: db.tech_get_db_units_per_micron(), ..Default::default() };
-        for l in &t.tech.routing_layers {
-            let (lvl, name) = (l.routing_level, &l.name);
-            rc.width.insert(lvl, db.layer_get_width(name) as i32);
-            rc.resistance.insert(lvl, db.layer_get_resistance(name));
-            rc.capacitance.insert(lvl, db.layer_get_capacitance(name));
-            rc.edge_capacitance.insert(lvl, db.layer_get_edge_capacitance(name));
-            if let Some(&(res, cap)) = opts.layer_rc.get(&lvl) {
-                rc.table_res.insert(lvl, res);
-                rc.table_cap.insert(lvl, cap);
-            }
-            let cut = db.layer_get_upper_layer(name);
-            if !cut.is_empty() {
-                rc.cut_resistance.insert(lvl, db.layer_get_resistance(&cut));
-                if let Some(&res) = opts.via_rc.get(&cut) {
-                    rc.cut_table_res.insert(lvl, res);
-                }
-            }
-        }
-        rc
-    };
+    let layer_rc = |db: &Db| -> crate::parasitics::LayerRC { layer_rc_for(db, &t, opts) };
     let layer_dir: Vec<crate::layertable::LayerDir> = (1..=num_layers as i32)
         .map(|l| match t.tech.routing_layers.iter().find(|r| r.routing_level == l).and_then(|r| r.direction) {
             Some(crate::capacity::Direction::Horizontal) => crate::layertable::LayerDir::Horizontal,

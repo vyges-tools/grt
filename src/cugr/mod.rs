@@ -140,6 +140,28 @@ pub struct Cugr {
     /// `worst_slack_`, `worst_resistance_`, `worst_fanout_`, `worst_net_length_`: the res-aware
     /// score's normalisers, as the last marking left them.
     pub worst: (f32, f32, i32, i32),
+    /// The timer itself, asked at each `updateNetSlacks` on the routes as they stand (instead of a
+    /// capture).
+    pub slack_source: SlackSource,
+}
+
+/// Every net's slack, by name, from the timer at one `updateNetSlacks`.
+pub type SlackFn = dyn FnMut(&Cugr) -> Result<std::collections::BTreeMap<String, f32>, String>;
+
+/// The timer as the router holds it: shared, and invisible to the router's own comparisons.
+#[derive(Clone, Default)]
+pub struct SlackSource(pub Option<std::rc::Rc<std::cell::RefCell<SlackFn>>>);
+
+impl std::fmt::Debug for SlackSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SlackSource({})", if self.0.is_some() { "timer" } else { "none" })
+    }
+}
+
+impl PartialEq for SlackSource {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
 }
 
 /// `kDemotedSlack`: a non-critical net's slack after demotion.
@@ -166,7 +188,8 @@ impl Cugr {
     /// sorts read the slacks the engine refreshed and demoted itself.
     pub fn sort_net_indices(&mut self, indices: &mut [usize], res_aware_order: bool, stage: i32, trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
         if let Some(sorts) = &self.sort_slacks {
-            if self.raw_slacks.is_none() || self.sorts_done == 0 {
+            // Later sorts read what the refresh left — captured raw slacks, or the timer's own.
+            if (self.raw_slacks.is_none() && self.slack_source.0.is_none()) || self.sorts_done == 0 {
                 let m = sorts.get(self.sorts_done).ok_or_else(|| StageError::Slacks(format!("no captured slacks for sort {}", self.sorts_done)))?;
                 for &k in indices.iter() {
                     self.nets[k].slack = *m.get(&self.nets[k].name).ok_or_else(|| StageError::Slacks(format!("net {} has no captured slack in sort {}", self.nets[k].name, self.sorts_done)))?;
@@ -219,7 +242,13 @@ impl Cugr {
                 }
             }
             (None, Some(constant)) => self.nets.iter_mut().for_each(|n| n.slack = constant),
-            (None, None) => return Ok(()),
+            (None, None) => {
+                let Some(src) = self.slack_source.0.clone() else { return Ok(()) };
+                let m = (src.borrow_mut())(self).map_err(StageError::Slacks)?;
+                for n in &mut self.nets {
+                    n.slack = *m.get(&n.name).ok_or_else(|| StageError::Slacks(format!("net {} is not in the timing netlist", n.name)))?;
+                }
+            }
         }
         self.raw_done += 1;
         self.mark_res_aware_nets(stage, trace.as_deref_mut());
@@ -725,7 +754,7 @@ pub fn init(facts: &DesignFacts, driver_terms: &[String], min_routing_layer: i32
         .map(|n| GrNet::new(n, &driver_terms[n.facts_index], &grid))
         .collect::<Result<Vec<_>, _>>()
         .map_err(InitError::Grid)?;
-    Ok(Cugr { constants, design, grid, nets, cost_multiplier: 1.0, sort_slacks: None, sorts_done: 0, incremental_candidates: None, resistance_aware: false, critical_nets_percentage: 0.0, res_aware_percentage: 15.0, raw_slacks: None, raw_done: 0, constant_slack: None, worst: (1.0, 1.0, 1, 1) })
+    Ok(Cugr { constants, design, grid, nets, cost_multiplier: 1.0, sort_slacks: None, sorts_done: 0, incremental_candidates: None, resistance_aware: false, critical_nets_percentage: 0.0, res_aware_percentage: 15.0, raw_slacks: None, raw_done: 0, constant_slack: None, worst: (1.0, 1.0, 1, 1), slack_source: SlackSource::default() })
 }
 
 #[cfg(test)]

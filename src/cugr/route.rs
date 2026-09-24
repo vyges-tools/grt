@@ -222,7 +222,10 @@ pub fn route_cugr(db: &mut Db, opts: &RouteOptions, call: usize, stt: SteinerBui
     if timed && opts.critical_nets_percentage != 0.0 {
         match (oracle, computed_stage1) {
             (Some(Some(sorts)), _) => ci.cugr.sort_slacks = Some(sorts.clone()),
-            (_, Some(stage1)) => ci.cugr.sort_slacks = Some(vec![stage1]),
+            (_, Some(stage1)) => {
+                ci.cugr.sort_slacks = Some(vec![stage1]);
+                ci.cugr.slack_source = timer_slack_source(db, opts)?;
+            }
             _ => return Err(format!("cugr: no captured slacks for CUGR call {call} — not modelled").into()),
         }
     }
@@ -526,6 +529,109 @@ pub fn restore_cugr_for_repair(db: &mut Db, opts: &RouteOptions, mut trace: Opti
 
 /// `updatePinAccessPoints`, one pin: CUGR's chosen access point replaces the pin's grid position,
 /// and its layer too unless the pin sits above the max routing layer.
+/// The timer at each `updateNetSlacks`: `estimateAllGlobalRouteParasitics` over CUGR's routes,
+/// then every net's slack.
+///
+/// Rules:
+/// - the routes are `getRoutes`: every net of two or more pins that is not local, its
+///   `buildNetRoute` segments — all 3D, so each is estimated with its pins attached by their real
+///   layers; a net with no route gets no network (it is timed lumped);
+/// - the pins are the global router's own (`initNets(true)`), moved to CUGR's access points by
+///   `updatePinAccessPoints` at the FIRST estimate (`getPartialRoutes`), and kept moved;
+/// - every net is re-estimated at every read. The reference re-estimates only the nets re-routed
+///   since the last read; a net not re-routed has the same route and pins, so the same network.
+///
+/// ⚠️ Known divergence after the first read: the reference then times INCREMENTALLY — only the
+/// re-estimated nets' pins are invalidated, and a load slew that changed by less than the fuzzy
+/// tolerance does not re-time its fanout — so a few downstream delays stay stale where a full
+/// timing (this one) moves them by an ulp or two. Measured: exact at every read of four of the
+/// five reads-after-a-refresh witnessed; one read of one script off in the last bits on 14 of 411
+/// nets, with its guides still exact.
+fn timer_slack_source(db: &mut Db, opts: &RouteOptions) -> Res<super::SlackSource> {
+    use crate::parasitics::{estimate_net, NetParasitics, PinAttach, PinGridLocation, Segment};
+    let timing = opts.timing.clone().ok_or("cugr: no timer")?;
+    let t = crate::global_route::setup_tech(db, opts)?;
+    let db: &Db = db;
+    let all = read_nets(db);
+    let db_nets: Vec<&crate::read::NetFacts> = all.iter().collect();
+    let candidates: Vec<NetCandidate> = db_nets
+        .iter()
+        .map(|n| NetCandidate {
+            name: n.name.clone(),
+            is_supply: n.is_supply(),
+            is_special: n.is_special,
+            term_count: n.term_count,
+            has_special_wires: n.has_special_wires,
+            connected_by_abutment: n.connected_by_abutment,
+        })
+        .collect();
+    let mut log = Vec::new();
+    let found = crate::global_route::discover_net_pins(db, &t, &db_nets, &candidates, opts, None, &mut log)?;
+    // Each net's pins (with whether each drives) and its NDR widths by routing level.
+    let mut nets: std::collections::HashMap<String, (Vec<(crate::pins::NetPin, bool)>, Option<std::collections::BTreeMap<i32, i32>>)> = std::collections::HashMap::new();
+    for (n, pins) in found {
+        let ndr = db.net_get_non_default_rule(&n.name);
+        let widths = if ndr.is_empty() { None } else { Some(db.ndr_layer_rules(&ndr)?.iter().map(|(layer, width, _)| (db.layer_get_routing_level(layer), *width)).collect()) };
+        nets.insert(n.name.clone(), (pins, widths));
+    }
+    let netlist = crate::timer::netlist(db);
+    let rc = crate::global_route::layer_rc_for(db, &t, opts);
+    let pin_grid = crate::pins::PinGrid {
+        die: t.core.area,
+        tile_size: t.core.tile_size,
+        x_grids: t.core.x_grids,
+        y_grids: t.core.y_grids,
+        directions: t.tech.routing_layers.iter().map(|l| (l.routing_level, l.direction)).collect(),
+        tracks: t.tracks.iter().map(|r| (r.layer_index, (r.location, r.track_pitch))).collect(),
+        use_cugr: true,
+    };
+    let (max_routing_layer, min_routing_layer) = (t.max_routing_layer, t.min_routing_layer);
+    let mut moved = false;
+    // `timer_trace`: each read appended as `C <read> 0 <net> <bits>` (stage 1 is read 0).
+    let (trace, mut reads) = (opts.timer_trace.clone(), 1usize);
+    let read = move |cugr: &Cugr| -> Result<std::collections::BTreeMap<String, f32>, String> {
+        if !moved {
+            for net in &cugr.nets {
+                if let Some((pins, _)) = nets.get_mut(&net.name) {
+                    for (pin, _) in pins.iter_mut() {
+                        update_pin_access_point(cugr, net, pin, &pin_grid, max_routing_layer);
+                    }
+                }
+            }
+            moved = true;
+        }
+        let mut par = std::collections::BTreeMap::new();
+        for net in &cugr.nets {
+            if net.num_pins() < 2 || Cugr::is_local(net) {
+                continue;
+            }
+            let route = cugr.net_route(net);
+            let Some((pins, widths)) = nets.get(&net.name) else { continue };
+            if route.is_empty() {
+                continue;
+            }
+            let segs: Vec<Segment> = route.iter().map(|g| Segment::new(g.init_x, g.init_y, g.init_layer, g.final_x, g.final_y, g.final_layer)).collect();
+            let pins: Vec<PinGridLocation> = pins
+                .iter()
+                .map(|(p, d)| PinGridLocation { name: p.name.clone(), is_port: p.is_port, is_driver: *d, pt: p.position, grid_pt: p.on_grid, conn_layer: p.connection_layer })
+                .collect();
+            let np = NetParasitics { name: &net.name, route: &segs, pins: &pins, net_min_layer: min_routing_layer, min_routing_layer, ndr_width: widths.as_ref(), attach: PinAttach::Routed };
+            par.insert(net.name.clone(), estimate_net(&np, &rc));
+        }
+        let m: std::collections::BTreeMap<String, f32> = crate::timer::net_slacks(&timing, &netlist, &par)?.into_iter().collect();
+        if let Some(path) = &trace {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).create(true).open(path).map_err(|e| e.to_string())?;
+            for (n, v) in &m {
+                writeln!(f, "C {reads} 0 {n} {:08x}", v.to_bits()).map_err(|e| e.to_string())?;
+            }
+        }
+        reads += 1;
+        Ok(m)
+    };
+    Ok(super::SlackSource(Some(std::rc::Rc::new(std::cell::RefCell::new(read)))))
+}
+
 fn update_pin_access_point(cugr: &Cugr, net: &super::grnet::GrNet, pin: &mut crate::pins::NetPin, pin_grid: &crate::pins::PinGrid, max_routing_layer: i32) {
     if let Some((x, y, z)) = cugr.pin_access_point(net, &pin.name, pin.is_port) {
         if pin.connection_layer <= max_routing_layer {
