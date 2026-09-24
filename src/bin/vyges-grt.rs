@@ -1375,6 +1375,21 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 // `"bits": true` — every value as its f32 bits, and each net's pins with what they
                 // are (an instance's master and terminal, a port's direction): a timer's input.
                 let bits = step["bits"].as_bool().unwrap_or(false);
+                // Every net's pins — a net without a network (a local net) still loads its driver.
+                if bits {
+                    for net in db.net_names() {
+                        if db.net_is_special(&net) {
+                            continue;
+                        }
+                        for iterm in db.net_iterms(&net) {
+                            let (inst, term) = iterm.rsplit_once('/').unwrap_or((&iterm, ""));
+                            text.push_str(&format!("{net}|pin|{iterm}|{}|{term}\n", db.inst_master(inst)));
+                        }
+                        for bterm in db.net_bterms(&net) {
+                            text.push_str(&format!("{net}|port|{bterm}|{}\n", db.bterm_get_io_type(&bterm)));
+                        }
+                    }
+                }
                 for (net, g) in parasitics {
                     let name = |n: &vyges_grt::parasitics::NodeId| match n {
                         vyges_grt::parasitics::NodeId::Pin(p) => p.clone(),
@@ -1382,15 +1397,6 @@ fn run(job: &Value) -> Result<Value, Fail> {
                         // with a size of 0 prints as `<net>:1`.
                         vyges_grt::parasitics::NodeId::Point(i) => format!("{net}:{}", i + 1),
                     };
-                    if bits {
-                        for iterm in db.net_iterms(net) {
-                            let (inst, term) = iterm.rsplit_once('/').unwrap_or((&iterm, ""));
-                            text.push_str(&format!("{net}|pin|{iterm}|{}|{term}\n", db.inst_master(inst)));
-                        }
-                        for bterm in db.net_bterms(net) {
-                            text.push_str(&format!("{net}|port|{bterm}|{}\n", db.bterm_get_io_type(&bterm)));
-                        }
-                    }
                     for (node, cap) in &g.nodes {
                         if bits {
                             text.push_str(&format!("{net}|node|{}|{:08x}\n", name(node), cap.to_bits()));
