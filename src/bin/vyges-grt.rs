@@ -38,8 +38,8 @@ JOB (JSON):
     { \"cmd\": \"global_route\", \"verbose\": b, \"allow_congestion\": b, \"grid_origin\": [x, y],
       \"skip_large_fanout\": n, \"congestion_iterations\": n, \"critical_nets_percentage\": f,
       \"resistance_aware\": b, \"res_aware_nets_percentage\": f, \"use_cugr\": b }
-      (use_cugr: CUGR's model and pattern routing run — written to the file $VYGC_OUT names —
-       then the command is REFUSED, exit 1: CUGR's guides are not modelled yet)
+      (use_cugr: CUGR — its model and pattern routing written to the file $VYGC_OUT names;
+       REFUSED, exit 1, where a net is congested after pattern routing: detours are not modelled)
     { \"cmd\": \"create_clock\", \"ports\": [..] }                        (clock network only)
     { \"cmd\": \"set_layer_rc\", \"layer\" | \"via\": name, \"resistance\": f } (user units)
     { \"cmd\": \"propagated_clock\" }
@@ -992,6 +992,9 @@ fn run(job: &Value) -> Result<Value, Fail> {
     let mut log = Vec::new();
     // The router as a later command finds it: the last global_route's state.
     let mut after: Option<(vyges_grt::global_route::AfterRoute, i32)> = None;
+    // The last global_route was CUGR's: the router state a later command reads (repair,
+    // incremental) is FastRoute's here, so those commands are refused after it.
+    let mut routed_by_cugr = false;
     // set_placement_padding -global: opendp's padding, in sites, left and right.
     let mut padding = (0, 0);
     for step in job["steps"].as_array().ok_or_else(|| err("steps"))? {
@@ -1099,7 +1102,17 @@ fn run(job: &Value) -> Result<Value, Fail> {
                     if !r.congested.is_empty() {
                         return Err(Fail::Refused(format!("cugr: {} congested net(s) after stage 1 — detours (stage 3) are not modelled", r.congested.len())));
                     }
-                    return Err(Fail::Refused("cugr: routed through stage 1; the guides are not modelled yet".into()));
+                    let g = vyges_grt::cugr::route::cugr_guides(&mut db, &opts, &r.init.cugr, &mut log).map_err(|e| classify(e.to_string()))?;
+                    // saveGuides replaces the guides of every net it routes; the others keep theirs.
+                    for ng in &g.guides {
+                        db_guides.insert(ng.net.clone(), ng.guides.clone());
+                        guides.insert(ng.net.clone(), ng.guides.iter().map(|x| (x.box_.x_min, x.box_.y_min, x.box_.x_max, x.box_.y_max, g.layer_names[&x.layer].clone())).collect());
+                    }
+                    log.extend(r.log);
+                    calls.push(json!({ "nets": g.guides.len(), "use_cugr": true }));
+                    after = None;
+                    routed_by_cugr = true;
+                    continue;
                 }
                 let res = route_design(&mut db, &opts, &stt, &flutes).map_err(|e| classify(e.to_string()))?;
                 // saveGuides replaces the guides of every net it routes; the others keep theirs.
@@ -1114,6 +1127,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 }
                 calls.push(json!({ "nets": res.guides.len(), "total_overflow": res.total_overflow, "congested": res.guide_is_congested, "clock_nets": res.clock_nets }));
                 after = Some((res.after.clone(), res.total_overflow));
+                routed_by_cugr = false;
                 if res.total_overflow > 0 && !opts.allow_congestion {
                     // GRT-116: the reference ends the command in error after writing the guides.
                     return Err(Fail::Error("GRT-0116: Global routing finished with congestion".into()));
@@ -1366,6 +1380,9 @@ fn run(job: &Value) -> Result<Value, Fail> {
             // FastRoute's whole state where the first run ended, in the instrumented reference's
             // `VYGI|end|…` format (grt-incr-trace.py) — what an incremental re-route starts from.
             "router_state" => {
+                if routed_by_cugr {
+                    return Err(Fail::Refused("cugr: the router state after a CUGR route is not modelled".into()));
+                }
                 let (state, _) = after.as_ref().ok_or_else(|| Fail::Refused("router_state without a global_route in this session".into()))?;
                 let path = step["path"].as_str().ok_or_else(|| err("path"))?;
                 std::fs::write(path, vyges_grt::global_route::router_state_text("end", state).map_err(Fail::Refused)?).map_err(err)?;
@@ -1404,6 +1421,9 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 padding = (step["left"].as_i64().unwrap_or(0) as i32, step["right"].as_i64().unwrap_or(0) as i32);
             }
             "repair_antennas" => {
+                if routed_by_cugr {
+                    return Err(Fail::Refused("cugr: repair_antennas after a CUGR route is not modelled".into()));
+                }
                 // No route in this session: the routes a database brought with it (`haveRoutes` →
                 // `loadGuidesFromDB`), and the router set up around them (`repairAntennas`,
                 // `!initialized_`). A design from DEF has none — GRT-45.

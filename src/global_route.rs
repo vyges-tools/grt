@@ -573,34 +573,26 @@ fn all_layer_edge_costs(n: &RouterNet, num_layers: usize) -> Vec<i8> {
     n.layer_edge_cost.as_ref().map_or_else(|| vec![1; num_layers], |v| v[..num_layers].to_vec())
 }
 
-/// I13 `initNets` (`findNets`: discovery, pins, the order) and I14 `initNetlist`.
+/// `findNets` → `addNet` → `updateNetPins` → `findPins`: every admitted net with its pins placed
+/// on the grid, each with whether it drives, in discovery order.
 ///
-/// ⛔ Refused as in I10: a pad or macro terminal, a net with a wire. A block terminal skipped for
-/// having no routing geometry is the Rudy path's leniency, reproduced (`check_pin_placement` off).
-pub fn setup_nets(db: &Db, t: &TechSetup, e: &mut RouterEdges, has_macros_or_pads: bool, opts: &RouteOptions, log: &mut Vec<String>) -> Res<Vec<RouterNet>> {
-    let (min, max) = (t.min_routing_layer, t.max_routing_layer);
-    let (clk_min, clk_max) = (t.tech.min_layer_for_clock, t.tech.max_layer_for_clock);
+/// `edge_capacity` is FastRoute's: a pad or macro pin that cannot reach its on-grid position is
+/// moved toward its instance's edge. `None` is CUGR's side, which has no FastRoute capacities and
+/// skips that heuristic (`findOnGridPositions`, `!use_cugr_`).
+pub(crate) fn discover_net_pins<'a>(
+    db: &Db,
+    t: &TechSetup,
+    db_nets: &[&'a NetFacts],
+    candidates: &[NetCandidate],
+    opts: &RouteOptions,
+    edge_capacity: Option<&dyn Fn(i32, i32, i32, i32, i32) -> i32>,
+    log: &mut Vec<String>,
+) -> Res<Vec<(&'a NetFacts, Vec<(NetPin, bool)>)>> {
+    let max = t.max_routing_layer;
+    let clk_max = t.tech.max_layer_for_clock;
     let directions: std::collections::BTreeMap<i32, Option<crate::capacity::Direction>> =
         t.tech.routing_layers.iter().map(|l| (l.routing_level, l.direction)).collect();
     let die = t.core.area;
-    // findNets — initClockNets: with a liberty library the timer retypes its clock network's nets
-    // to CLOCK; ⛔ with no clock defined (the only case the caller lets through) it finds none.
-    let all = read_nets(db);
-    let db_nets: Vec<&NetFacts> = match &opts.nets_to_route {
-        None => all.iter().collect(),
-        Some(names) => names.iter().map(|n| all.iter().find(|f| &f.name == n).ok_or_else(|| format!("net {n} not found"))).collect::<Result<_, _>>()?,
-    };
-    let candidates: Vec<NetCandidate> = db_nets
-        .iter()
-        .map(|n| NetCandidate {
-            name: n.name.clone(),
-            is_supply: n.is_supply(),
-            is_special: n.is_special,
-            term_count: n.term_count,
-            has_special_wires: n.has_special_wires,
-            connected_by_abutment: n.connected_by_abutment,
-        })
-        .collect();
     let added = find_nets(&candidates, opts.skip_large_fanout, log);
     // addNet → updateNetPins: every terminal's pin, then findPins.
     let mut masters: std::collections::HashMap<String, MasterShapes> = std::collections::HashMap::new();
@@ -611,7 +603,7 @@ pub fn setup_nets(db: &Db, t: &TechSetup, e: &mut RouterEdges, has_macros_or_pad
         y_grids: t.core.y_grids,
         directions: directions.clone(),
         tracks: t.tracks.iter().map(|r| (r.layer_index, (r.location, r.track_pitch))).collect(),
-        use_cugr: false,
+        use_cugr: edge_capacity.is_none(),
     };
     let mut nets: Vec<(&NetFacts, Vec<(NetPin, bool)>)> = Vec::new();
     for &i in &added {
@@ -652,12 +644,45 @@ pub fn setup_nets(db: &Db, t: &TechSetup, e: &mut RouterEdges, has_macros_or_pad
                 pins.push((pin, db.bterm_get_io_type(bterm) == "INPUT"));
             }
         }
-        let cap = |layer: i32, x1: i32, y1: i32, x2: i32, y2: i32| e.get_edge_capacity(x1, y1, x2, y2, layer);
         for (pin, _) in &mut pins {
-            find_pin(&pin_grid, pin, &[], &mut |p, pos| is_pin_reachable(&pin_grid, p, pos, &cap));
+            // With no capacities (CUGR) `find_pin` never asks: `use_cugr` skips the reachability test.
+            find_pin(&pin_grid, pin, &[], &mut |p, pos| edge_capacity.is_some_and(|cap| is_pin_reachable(&pin_grid, p, pos, cap)));
         }
         nets.push((n, pins));
     }
+    Ok(nets)
+}
+
+/// I13 `initNets` (`findNets`: discovery, pins, the order) and I14 `initNetlist`.
+///
+/// ⛔ Refused as in I10: a pad or macro terminal, a net with a wire. A block terminal skipped for
+/// having no routing geometry is the Rudy path's leniency, reproduced (`check_pin_placement` off).
+pub fn setup_nets(db: &Db, t: &TechSetup, e: &mut RouterEdges, has_macros_or_pads: bool, opts: &RouteOptions, log: &mut Vec<String>) -> Res<Vec<RouterNet>> {
+    let (min, max) = (t.min_routing_layer, t.max_routing_layer);
+    let (clk_min, clk_max) = (t.tech.min_layer_for_clock, t.tech.max_layer_for_clock);
+    let directions: std::collections::BTreeMap<i32, Option<crate::capacity::Direction>> =
+        t.tech.routing_layers.iter().map(|l| (l.routing_level, l.direction)).collect();
+    let die = t.core.area;
+    // findNets — initClockNets: with a liberty library the timer retypes its clock network's nets
+    // to CLOCK; ⛔ with no clock defined (the only case the caller lets through) it finds none.
+    let all = read_nets(db);
+    let db_nets: Vec<&NetFacts> = match &opts.nets_to_route {
+        None => all.iter().collect(),
+        Some(names) => names.iter().map(|n| all.iter().find(|f| &f.name == n).ok_or_else(|| format!("net {n} not found"))).collect::<Result<_, _>>()?,
+    };
+    let candidates: Vec<NetCandidate> = db_nets
+        .iter()
+        .map(|n| NetCandidate {
+            name: n.name.clone(),
+            is_supply: n.is_supply(),
+            is_special: n.is_special,
+            term_count: n.term_count,
+            has_special_wires: n.has_special_wires,
+            connected_by_abutment: n.connected_by_abutment,
+        })
+        .collect();
+    let cap = |layer: i32, x1: i32, y1: i32, x2: i32, y2: i32| e.get_edge_capacity(x1, y1, x2, y2, layer);
+    let nets = discover_net_pins(db, t, &db_nets, &candidates, opts, Some(&cap), log)?;
     // The order: non-leaf clock nets first, each group by name. `isClkTerm` asks the liberty port
     // of each terminal (its instance's master, by name); with no library no terminal is a clock
     // terminal, so every CLOCK-typed net is a non-leaf clock.

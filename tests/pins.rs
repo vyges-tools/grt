@@ -417,3 +417,31 @@ fn the_first_vote_wins_and_the_track_correction_crosses_the_direction() {
     find_pin(&g, &mut pin, &[(1, 50, 250)], &mut |_, _| true);
     assert_eq!(pin.on_grid, (50, 250), "the access point's cell stands");
 }
+
+// Upstream rule (GlobalRouter `findOnGridPositions`): a pad or macro pin that cannot reach its
+// on-grid position is moved toward its instance's edge — but only under FastRoute. CUGR has no
+// FastRoute capacities to ask, so with `use_cugr` the reachability test is NEVER made and the pin
+// stays at its box's centre. No pad or macro pin reaches a CUGR route in the suite.
+#[test]
+fn cugr_never_asks_a_pad_pin_whether_it_is_reachable() {
+    let mut directions = BTreeMap::new();
+    directions.insert(1, Some(Direction::Horizontal));
+    directions.insert(2, Some(Direction::Vertical));
+    let mut tracks = BTreeMap::new();
+    tracks.insert(1, (100, 200));
+    tracks.insert(2, (100, 200));
+    let die = Rect::new(0, 0, 10000, 10000);
+    let mut log = Vec::new();
+    let boxes = [TermBox { pin: 0, level: 2, routing: true, rect: Rect::new(4200, 4200, 4400, 4400) }];
+    let pin = vyges_grt::make_iterm_pin("pad/P", vyges_grt::MasterClass::Pad, false, true, Rect::new(4000, 4000, 6000, 6000), &boxes, die, 2, &directions, false, &mut log).unwrap();
+    for use_cugr in [false, true] {
+        let grid = PinGrid { die, tile_size: 1000, x_grids: 10, y_grids: 10, directions: directions.clone(), tracks: tracks.clone(), use_cugr };
+        let mut p = pin.clone();
+        let mut asked = false;
+        vyges_grt::find_pin(&grid, &mut p, &[], &mut |_, _| {
+            asked = true;
+            false
+        });
+        assert_eq!(asked, !use_cugr, "use_cugr = {use_cugr}");
+    }
+}

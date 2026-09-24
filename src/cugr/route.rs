@@ -128,3 +128,104 @@ pub fn route_cugr(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, tra
     let congested = ci.cugr.congested_nets();
     Ok(CugrRoute { init: ci, log, congested })
 }
+
+/// What a CUGR `global_route` saves.
+pub struct CugrGuides {
+    pub guides: Vec<crate::NetGuides>,
+    /// Routing level → layer name, as the guide writer names layers.
+    pub layer_names: std::collections::BTreeMap<i32, String>,
+}
+
+/// The global router's tail after `CUGR::route`: `findRoutingCugr` (each net's route from CUGR,
+/// then `updatePinAccessPoints`), `addRemainingGuides`, then `saveGuides`.
+///
+/// Upstream rules: the pins are GlobalRouter's own (`initNets(true)`), found with no FastRoute
+/// capacities. A pin CUGR chose a cell for moves to the grid position of that cell's LOW corner
+/// and — unless it sits above the max routing layer — to the top of its layer interval. A net CUGR
+/// exports nothing for (local, or under two pins) is left to `addRemainingGuides`. Unlike
+/// FastRoute's tail there is no `connectPadPins` and no `mergeSegments`, and a CUGR guide is never
+/// marked congested. `isLocal` is asked of the pins AFTER they moved.
+pub fn cugr_guides(db: &mut Db, opts: &RouteOptions, cugr: &Cugr, log: &mut Vec<String>) -> Res<CugrGuides> {
+    use crate::findrouting::{add_remaining_guides, RemainingNet};
+    if opts.nets_to_route.is_some() {
+        return Err("cugr: set_nets_to_route (incremental routing) is not modelled".into());
+    }
+    // initRoutingGrid: layers, tracks and the core grid the guide boxes are cut on.
+    let t = crate::global_route::setup_tech(db, opts)?;
+    let db: &Db = db;
+    let all = read_nets(db);
+    let db_nets: Vec<&crate::read::NetFacts> = all.iter().collect();
+    let candidates: Vec<NetCandidate> = db_nets
+        .iter()
+        .map(|n| NetCandidate {
+            name: n.name.clone(),
+            is_supply: n.is_supply(),
+            is_special: n.is_special,
+            term_count: n.term_count,
+            has_special_wires: n.has_special_wires,
+            connected_by_abutment: n.connected_by_abutment,
+        })
+        .collect();
+    let mut nets = crate::global_route::discover_net_pins(db, &t, &db_nets, &candidates, opts, None, log)?;
+    let pin_grid = crate::pins::PinGrid {
+        die: t.core.area,
+        tile_size: t.core.tile_size,
+        x_grids: t.core.x_grids,
+        y_grids: t.core.y_grids,
+        directions: t.tech.routing_layers.iter().map(|l| (l.routing_level, l.direction)).collect(),
+        tracks: t.tracks.iter().map(|r| (r.layer_index, (r.location, r.track_pitch))).collect(),
+        use_cugr: true,
+    };
+    let by_name: std::collections::HashMap<&str, usize> = cugr.nets.iter().enumerate().map(|(k, n)| (n.name.as_str(), k)).collect();
+    // findRoutingCugr
+    let mut routes: std::collections::BTreeMap<String, Vec<crate::GSegment>> = std::collections::BTreeMap::new();
+    for (n, pins) in &mut nets {
+        let Some(&k) = by_name.get(n.name.as_str()) else { continue };
+        let net = &cugr.nets[k];
+        let route = cugr.net_route(net);
+        if !route.is_empty() {
+            routes.insert(n.name.clone(), route);
+        }
+        // updatePinAccessPoints
+        for (pin, _) in pins.iter_mut() {
+            if let Some((x, y, z)) = cugr.pin_access_point(net, &pin.name, pin.is_port) {
+                if pin.connection_layer <= t.max_routing_layer {
+                    pin.connection_layer = z;
+                }
+                pin.on_grid = pin_grid.position_on_grid((x, y));
+            }
+        }
+    }
+    let grid_pins = |pins: &[(crate::pins::NetPin, bool)]| -> Vec<crate::findrouting::GridPin> { pins.iter().map(|(p, _)| (p.on_grid.0, p.on_grid.1, p.connection_layer)).collect() };
+    let mut remaining = Vec::with_capacity(nets.len());
+    for (n, pins) in &nets {
+        // Net::hasStackedVias — only a net of vias and no wire segments reads the decoded via
+        // points (refused: not wired); any other wired net has none.
+        let (wire_cnt, via_cnt) = (db.net_get_wire_count_wire_cnt(&n.name), db.net_get_wire_count_via_cnt(&n.name));
+        if n.has_wire && wire_cnt == 0 && via_cnt > 0 {
+            return Err(format!("net {}: a via-only wire — hasStackedVias' via points are not wired", n.name).into());
+        }
+        remaining.push(RemainingNet { name: n.name.clone(), made: crate::makes_fastroute_net(pins.len(), n.has_wire, || false), pins: grid_pins(pins) });
+    }
+    add_remaining_guides(&mut routes, &remaining, t.min_routing_layer, t.max_routing_layer, db.block_get_max_routing_layer()).map_err(|e| format!("{e:?}"))?;
+    // saveGuides, over the block's nets in its order.
+    let net_routes: Vec<crate::NetRoute> = db
+        .net_names()
+        .iter()
+        .filter_map(|name| {
+            let (_, pins) = nets.iter().find(|(n, _)| &n.name == name)?;
+            let on_grid: Vec<(i32, i32)> = pins.iter().map(|(p, _)| p.on_grid).collect();
+            Some(crate::NetRoute {
+                name: name.clone(),
+                segments: routes.get(name).cloned().unwrap_or_default(),
+                pins: pins.iter().map(|(p, _)| crate::Pin { connection_layer: p.connection_layer, on_grid_x: p.on_grid.0, on_grid_y: p.on_grid.1 }).collect(),
+                is_local: on_grid.split_first().is_none_or(|(first, rest)| rest.iter().all(|p| p == first)),
+            })
+        })
+        .collect();
+    let grid = crate::Grid { tile_size: t.core.tile_size, area: t.core.area };
+    let save = crate::SaveOptions { guide_is_congested: false, origin_x: opts.grid_origin.0, origin_y: opts.grid_origin.1, min_routing_layer: t.min_routing_layer };
+    let guides = crate::save_guides(&net_routes, &grid, &save).map_err(|e| format!("{e:?}"))?;
+    let layer_names = t.tech.routing_layers.iter().map(|l| (l.routing_level, l.name.clone())).collect();
+    Ok(CugrGuides { guides, layer_names })
+}
