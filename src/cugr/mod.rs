@@ -66,6 +66,43 @@ impl Default for Constants {
     }
 }
 
+/// One layer rule of a net's non-default rule, as `computeNdrCosts` reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NdrRuleFacts {
+    /// The rule's layer: whether it is a ROUTING layer, and its routing level.
+    pub is_routing: bool,
+    pub routing_level: i32,
+    /// `dbTechLayerRule::getWidth` / `getSpacing`.
+    pub width: i32,
+    pub spacing: i32,
+    /// The tech layer's own `getWidth()` and `getPitch()`.
+    pub default_width: i32,
+    pub default_pitch: i32,
+}
+
+/// `computeNdrCosts`: per layer, how many tracks one wire of the rule occupies — 1 everywhere a
+/// rule does not reach.
+///
+/// Upstream rule: `(W + 2S + D) / 2P` in DOUBLE from an INTEGER numerator — the rule's width `W`
+/// and spacing `S`, the layer's default width `D` and pitch `P` (the tech layer's, not the
+/// tracks') — floored at 1. A rule on a non-routing layer, a layer out of range, or a pitch of 0
+/// is skipped.
+pub fn ndr_costs(num_layers: usize, rules: &[NdrRuleFacts]) -> Vec<f64> {
+    let mut factors = vec![1.0; num_layers];
+    for r in rules {
+        if !r.is_routing {
+            continue;
+        }
+        let layer = r.routing_level - 1;
+        if layer < 0 || layer as usize >= num_layers || r.default_pitch <= 0 {
+            continue;
+        }
+        let f = f64::from(r.width + 2 * r.spacing + r.default_width) / f64::from(2 * r.default_pitch);
+        factors[layer as usize] = f.max(1.0);
+    }
+    factors
+}
+
 /// The router after `init`: the design, the graph, and the nets it will route.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cugr {
@@ -307,6 +344,16 @@ mod tests {
         let seg = |s: &crate::GSegment| (s.init_x, s.init_y, s.init_layer, s.final_x, s.final_y, s.final_layer);
         let got: Vec<_> = r.iter().map(seg).collect();
         assert_eq!(got, vec![(1500, 4500, 1, 1500, 4500, 2), (1500, 4500, 2, 1500, 4500, 3), (1500, 4500, 3, 4500, 4500, 3)]);
+    }
+
+    // Upstream rule (CUGR `computeNdrCosts`): (W + 2S + D) / 2P from an integer numerator, floored
+    // at 1; a non-routing layer, one out of range, or a zero pitch is skipped. A 1w/3s rule on a
+    // 140-wide, 380-pitch layer: (140 + 840 + 140) / 760.
+    #[test]
+    fn ndr_cost_factors() {
+        let r = |is_routing, routing_level, width, spacing, default_pitch| NdrRuleFacts { is_routing, routing_level, width, spacing, default_width: 140, default_pitch };
+        let f = ndr_costs(3, &[r(true, 2, 140, 420, 380), r(true, 3, 0, 0, 380), r(false, 1, 999, 999, 380), r(true, 4, 999, 999, 380), r(true, 1, 999, 0, 0)]);
+        assert_eq!(f, vec![1.0, 1120.0 / 760.0, 1.0]);
     }
 
     // Upstream rule (CUGR `getNetRoute`, `GRNet::isLocal`): a net whose pins all chose ONE cell

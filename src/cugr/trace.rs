@@ -113,6 +113,9 @@ pub fn model(c: &Cugr, min_routing_layer: i32, max_routing_layer: i32, clock_net
     for n in &c.nets {
         let b = &n.bounding_box;
         out.push(format!("VYGC|grnet|{}|{}|pins={}|driver={}|bbox={},{},{},{}|hp={}", n.index, n.name, n.num_pins(), n.driver_pin_index, b.lx(), b.ly(), b.hx(), b.hy(), b.hp()));
+        if n.ndr_costs.iter().any(|&c| c > 1.0) {
+            out.push(format!("VYGC|ndr|{}|{}", n.index, list(&n.ndr_costs)));
+        }
         for (p, points) in n.pin_access_points.iter().enumerate() {
             let s: String = points.iter().map(|g| format!("{}:{}:{};", g.layer, g.p.x, g.p.y)).collect();
             out.push(format!("VYGC|pap|{}|{p}|{s}", n.index));

@@ -99,28 +99,57 @@ pub struct CugrRoute {
 ///
 /// Refused up front, where stage 1 would read what is not modelled:
 /// - detailed-router ACCESS POINTS in the database (`findODBAccessPoints`' path);
-/// - a net with a NON-DEFAULT RULE (`computeNdrCosts`);
-/// - a CLOCK defined with a liberty library: the stage-1 order then reads the timer's slacks.
-///   Without one every net is unconstrained — `1e+30` with a library (the critical-net
-///   percentage defaults to 10), `0` without (forced to 0) — one constant, so the order is the
-///   bounding boxes'.
-pub fn route_cugr(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, trace: Option<&mut Vec<String>>) -> Res<CugrRoute> {
+/// - a CLOCK defined with a liberty library and no captured slacks: the stage-1 order then reads
+///   the timer's. Without a clock every net is unconstrained — `1e+30` with a library (the
+///   critical-net percentage defaults to 10), `0` without (forced to 0) — one constant, so the
+///   order is the bounding boxes'. `call` counts this session's `-use_cugr` routes, from 0.
+pub fn route_cugr(db: &mut Db, opts: &RouteOptions, call: usize, stt: SteinerBuilder<'_>, trace: Option<&mut Vec<String>>) -> Res<CugrRoute> {
     if db.block_access_point_count()? > 0 {
         return Err("cugr: pin access points in the database — findODBAccessPoints is not modelled".into());
     }
-    if opts.liberty.is_some() && !opts.clock_sources.is_empty() {
+    let timed = opts.liberty.is_some() && !opts.clock_sources.is_empty();
+    let oracle = opts.cugr_slacks.as_ref().map(|calls| calls.get(call));
+    if timed && oracle.is_none() {
         return Err("cugr: a clock with a liberty library — the critical-net slacks are not modelled".into());
     }
     let mut ci = init_cugr(db, opts)?;
-    for n in &ci.cugr.nets {
-        if !db.net_get_non_default_rule(&n.name).is_empty() {
-            return Err(format!("cugr: net {} has a non-default rule — computeNdrCosts is not modelled", n.name).into());
+    // computeNdrCosts, per net (`CUGR::init`).
+    let num_layers = ci.cugr.grid.num_layers;
+    for n in &mut ci.cugr.nets {
+        let ndr = db.net_get_non_default_rule(&n.name);
+        if ndr.is_empty() {
+            continue;
         }
+        let rules: Vec<super::NdrRuleFacts> = db
+            .ndr_layer_rules(&ndr)?
+            .into_iter()
+            .map(|(layer, width, spacing)| super::NdrRuleFacts {
+                is_routing: db.layer_get_type(&layer).map(|t| t == "ROUTING").unwrap_or(false),
+                routing_level: db.layer_get_routing_level(&layer),
+                width,
+                spacing,
+                default_width: db.layer_get_width(&layer) as i32,
+                default_pitch: db.layer_get_pitch(&layer),
+            })
+            .collect();
+        n.ndr_costs = super::ndr_costs(num_layers, &rules);
     }
-    let slack = if opts.liberty.is_some() && opts.critical_nets_percentage != 0.0 { 1.0e30f32 } else { 0.0 };
+    // setInitialNetSlacks — only with a non-zero critical-net percentage (forced to 0 without a
+    // liberty library). With no clock every net is unconstrained (`1e+30`); with one, the slacks
+    // are the timer's and come from the oracle, every net or none.
+    let slack_of = |name: &str| -> Res<f32> {
+        if opts.liberty.is_none() || opts.critical_nets_percentage == 0.0 {
+            return Ok(0.0);
+        }
+        match oracle {
+            Some(Some(m)) => m.get(name).copied().ok_or_else(|| format!("cugr: net {name} has no captured slack — not modelled").into()),
+            Some(None) if timed => Err(format!("cugr: no captured slacks for CUGR call {call} — not modelled").into()),
+            _ => Ok(1.0e30),
+        }
+    };
     let mut alphas = Vec::with_capacity(ci.cugr.nets.len());
     for n in &mut ci.cugr.nets {
-        n.slack = slack;
+        n.slack = slack_of(&n.name)?;
         alphas.push(crate::global_route::net_steiner_alpha(db, opts, &n.name)?);
     }
     let mut log = Vec::new();

@@ -954,6 +954,23 @@ fn run(job: &Value) -> Result<Value, Fail> {
         opts.captured_slacks = Some(partial);
         opts.captured_update_slacks = Some(update);
     }
+    // cugr_slacks — the reference's CUGR stage-1 slacks, per `-use_cugr` call: `<call> <net>
+    // <bits>`. An ORACLE, like timer_slacks.
+    if let Some(path) = job["cugr_slacks"].as_str() {
+        let mut calls: Vec<BTreeMap<String, f32>> = Vec::new();
+        for (n, line) in std::fs::read_to_string(path).map_err(err)?.lines().enumerate() {
+            let bad = || err(format!("{path}:{}: expected `<call> <net> <bits>`", n + 1));
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let [k, net, bits] = f[..] else { return Err(bad()) };
+            let k: usize = k.parse().map_err(|_| bad())?;
+            let v = f32::from_bits(u32::from_str_radix(bits, 16).map_err(|_| bad())?);
+            while calls.len() <= k {
+                calls.push(BTreeMap::new());
+            }
+            calls[k].insert(net.to_string(), v);
+        }
+        opts.cugr_slacks = Some(calls);
+    }
     let mut guides: BTreeMap<String, Vec<(i32, i32, i32, i32, String)>> = BTreeMap::new();
     // A database brings its guides with it: they are what `write_guides` writes and what the antenna
     // checker reads until a command in this session replaces a net's.
@@ -995,6 +1012,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
     // The last global_route was CUGR's: the router state a later command reads (repair,
     // incremental) is FastRoute's here, so those commands are refused after it.
     let mut routed_by_cugr = false;
+    let mut cugr_calls = 0usize;
     // set_placement_padding -global: opendp's padding, in sites, left and right.
     let mut padding = (0, 0);
     for step in job["steps"].as_array().ok_or_else(|| err("steps"))? {
@@ -1091,7 +1109,8 @@ fn run(job: &Value) -> Result<Value, Fail> {
                     // the command is refused after.
                     let branches = |x: &[i32], y: &[i32], d: usize, a: f32| stt(x, y, d, a).branch.iter().map(|b| (b.x, b.y, b.n)).collect::<Vec<_>>();
                     let mut stage = Vec::new();
-                    let r = vyges_grt::cugr::route::route_cugr(&mut db, &opts, &branches, Some(&mut stage)).map_err(|e| classify(e.to_string()))?;
+                    let r = vyges_grt::cugr::route::route_cugr(&mut db, &opts, cugr_calls, &branches, Some(&mut stage)).map_err(|e| classify(e.to_string()))?;
+                    cugr_calls += 1;
                     if let Ok(path) = std::env::var("VYGC_OUT") {
                         let c = &r.init;
                         let mut lines = vyges_grt::cugr::trace::model(&c.cugr, c.min_routing_layer, c.max_routing_layer, c.clock_nets.len());
