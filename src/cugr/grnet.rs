@@ -39,6 +39,14 @@ pub struct GrNet {
     /// The tree was adopted from a route (`restoreNetRoute`), not routed: its commits skip spans
     /// below the min layer and spread wrong-way spans. Cleared by any new tree.
     pub adopted: bool,
+    /// `ndr_widths_`: the NDR rule's wire width per layer (0: the layer's), empty without a rule.
+    pub ndr_widths: Vec<i32>,
+    /// `is_res_aware_`, `resistance_`, `net_length_` — stage 2's marking.
+    pub res_aware: bool,
+    pub resistance: f32,
+    pub net_length: i32,
+    /// The database net's signal type is CLOCK (`markResAwareNets` asks it, leaf clocks included).
+    pub is_clock_sig: bool,
 }
 
 impl GrNet {
@@ -91,6 +99,11 @@ impl GrNet {
             shape_ap_choices: Vec::new(),
             soft_ndr: false,
             adopted: false,
+            ndr_widths: Vec::new(),
+            res_aware: false,
+            resistance: 0.0,
+            net_length: 0,
+            is_clock_sig: false,
         })
     }
 
@@ -113,6 +126,13 @@ impl GrNet {
     pub fn set_soft_ndr(&mut self) {
         self.soft_ndr = true;
         self.ndr_costs.iter_mut().for_each(|c| *c = 1.0);
+        // The wire width goes with the demand factor (keeps `ndr_width` in step with `has_ndr`).
+        self.ndr_widths.iter_mut().for_each(|w| *w = 0);
+    }
+
+    /// `getNdrWidth`: 0 off the vector's end.
+    pub fn ndr_width(&self, layer: usize) -> i32 {
+        self.ndr_widths.get(layer).copied().unwrap_or(0)
     }
 
     /// `getDriverAccessPoint`: the driver pin's chosen cell, if it has one.

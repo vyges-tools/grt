@@ -46,6 +46,9 @@ pub struct RouteOptions {
     pub resistance_aware: bool,
     /// `-res_aware_nets_percentage` — once given, FIXED (`is_fixed_nets_percentage_`).
     pub res_aware_nets_percentage: Option<f32>,
+    /// The reference's CUGR timer slacks at each `updateNetSlacks`, per `-use_cugr` call — an
+    /// ORACLE, like `cugr_slacks`.
+    pub cugr_raw_slacks: Option<Vec<Vec<std::collections::BTreeMap<String, f32>>>>,
     /// `set_layer_rc -layer` — the ESTIMATOR's table: routing level → (ohm/m, F/m). The parasitics
     /// read it in preference to the technology's own values.
     pub layer_rc: std::collections::BTreeMap<i32, (f64, f64)>,
@@ -95,6 +98,7 @@ impl RouteOptions {
             captured_update_slacks: None,
             resistance_aware: false,
             res_aware_nets_percentage: None,
+            cugr_raw_slacks: None,
             layer_rc: std::collections::BTreeMap::new(),
             via_rc: std::collections::BTreeMap::new(),
             critical_nets_percentage: 10.0,

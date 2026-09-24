@@ -556,6 +556,11 @@ fn calculate_routing_costs(dag: &mut Dag, node: usize, net: &GrNet, cx: &CostCon
                 if net.is_inside_layer_range(layer as i32) {
                     let wire = cx.grid.wire_cost(layer, np, pp, net.ndr_cost(layer), cx.constants, cx.cost_multiplier).expect("a path is aligned by construction");
                     cost = dag.nodes[path].costs[layer] + wire;
+                    // A res-aware net also pays the wire's resistance (its NDR width, else the
+                    // layer's), added after the wire cost.
+                    if net.res_aware {
+                        cost += cx.grid.wire_resistance_cost(cx.design, cx.constants, layer, np, pp, net.ndr_width(layer));
+                    }
                 }
                 if cost < child_costs[child_index][layer].0 {
                     child_costs[child_index][layer] = (cost, path_index as i32);
@@ -575,6 +580,11 @@ fn calculate_routing_costs(dag: &mut Dag, node: usize, net: &GrNet, cx: &CostCon
     let mut via_costs = vec![0.0; num_layers];
     for layer in 1..num_layers {
         via_costs[layer] = via_costs[layer - 1] + cx.grid.via_cost(cx.design, layer - 1, p, &net.ndr_costs, cx.constants, cx.cost_multiplier);
+        // A res-aware net pays each via's resistance too, so climbing pays off only when the
+        // upper layer's lower wire resistance beats it.
+        if net.res_aware {
+            via_costs[layer] += cx.grid.via_resistance_cost(cx.design, cx.constants, layer - 1);
+        }
     }
     let range = net.layer_range;
     let fixed = if n.fixed.is_valid() {
@@ -809,6 +819,11 @@ pub(crate) mod tests {
             shape_ap_choices: Vec::new(),
             soft_ndr: false,
             adopted: false,
+            ndr_widths: Vec::new(),
+            res_aware: false,
+            resistance: 0.0,
+            net_length: 0,
+            is_clock_sig: false,
         };
         for p in &n.pin_access_points.clone() {
             for g in p {
@@ -945,7 +960,7 @@ pub(crate) mod tests {
             c.nets.push(n);
         }
         let mut order: Vec<usize> = (0..4).collect();
-        c.sort_net_indices(&mut order).unwrap();
+        c.sort_net_indices(&mut order, false, 1, None).unwrap();
         assert_eq!(order, vec![2, 1, 3, 0]);
     }
 

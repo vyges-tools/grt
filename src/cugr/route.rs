@@ -119,7 +119,14 @@ fn init_net_costs(ci: &mut CugrInit, db: &Db, opts: &RouteOptions) -> Res<(Vec<f
     let num_layers = ci.cugr.grid.num_layers;
     for n in &mut ci.cugr.nets {
         n.ndr_costs = net_ndr_costs(db, &n.name, num_layers)?;
+        n.ndr_widths = net_ndr_widths(db, &n.name, num_layers)?;
+        n.is_clock_sig = db.net_sigtype(&n.name) == "CLOCK";
     }
+    // The router's settings as the command left them: resistance-aware routing, the critical-net
+    // percentage (zeroed without a liberty library) and the res-aware one (15 unless given).
+    ci.cugr.resistance_aware = opts.resistance_aware;
+    ci.cugr.critical_nets_percentage = opts.critical_nets_percentage;
+    ci.cugr.res_aware_percentage = opts.res_aware_nets_percentage.unwrap_or(15.0);
     let constant = if opts.liberty.is_none() || opts.critical_nets_percentage == 0.0 { 0.0 } else { 1.0e30f32 };
     let mut alphas = Vec::with_capacity(ci.cugr.nets.len());
     for n in &mut ci.cugr.nets {
@@ -127,6 +134,27 @@ fn init_net_costs(ci: &mut CugrInit, db: &Db, opts: &RouteOptions) -> Res<(Vec<f
         alphas.push(crate::global_route::net_steiner_alpha(db, opts, &n.name)?);
     }
     Ok((alphas, constant))
+}
+
+/// `computeNdrWidths(net)`: the NDR rule's wire width per routing layer (0 where it sets none);
+/// EMPTY without a rule.
+pub(crate) fn net_ndr_widths(db: &Db, net: &str, num_layers: usize) -> Res<Vec<i32>> {
+    let ndr = db.net_get_non_default_rule(net);
+    if ndr.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut widths = vec![0; num_layers];
+    for (layer, width, _) in db.ndr_layer_rules(&ndr)? {
+        if !db.layer_get_type(&layer).is_ok_and(|t| t == "ROUTING") {
+            continue;
+        }
+        let index = db.layer_get_routing_level(&layer) - 1;
+        if index < 0 || index as usize >= num_layers {
+            continue;
+        }
+        widths[index as usize] = width;
+    }
+    Ok(widths)
 }
 
 /// What `route_cugr` leaves.
@@ -146,12 +174,6 @@ pub fn route_cugr(db: &mut Db, opts: &RouteOptions, call: usize, stt: SteinerBui
     if db.block_access_point_count()? > 0 {
         return Err("cugr: pin access points in the database — findODBAccessPoints is not modelled".into());
     }
-    // Resistance-aware routing runs only with a critical-net percentage (without one it warns,
-    // GRT-0702, and changes nothing): stage 2 re-routes the critical nets on real resistance, and
-    // every later sort takes the res-aware order.
-    if opts.resistance_aware && opts.critical_nets_percentage != 0.0 {
-        return Err("cugr: -resistance_aware with critical nets (stage 2, the res-aware net order) is not modelled".into());
-    }
     let timed = opts.liberty.is_some() && !opts.clock_sources.is_empty();
     let oracle = opts.cugr_slacks.as_ref().map(|calls| calls.get(call));
     if timed && oracle.is_none() {
@@ -159,6 +181,22 @@ pub fn route_cugr(db: &mut Db, opts: &RouteOptions, call: usize, stt: SteinerBui
     }
     let mut ci = init_cugr(db, opts)?;
     let (alphas, constant) = init_net_costs(&mut ci, db, opts)?;
+    // The timer's slack of every net at each updateNetSlacks — the refresh before stages 2 to 5
+    // with critical nets; the engine marks and demotes on them itself.
+    if let Some(Some(raw)) = opts.cugr_raw_slacks.as_ref().map(|calls| calls.get(call)) {
+        if timed {
+            ci.cugr.raw_slacks = Some(raw.clone());
+        }
+    }
+    // Without a clock (a liberty library, critical nets) every refresh reads the one constant.
+    if !timed && constant != 0.0 {
+        ci.cugr.constant_slack = Some(constant);
+    }
+    // Resistance-aware routing with critical nets (stage 2, the res-aware order) marks on the
+    // timer's slacks: without them it is not modelled.
+    if opts.resistance_aware && opts.critical_nets_percentage != 0.0 && ci.cugr.raw_slacks.is_none() {
+        return Err("cugr: -resistance_aware with critical nets needs the timer's slacks at each refresh — not modelled without them".into());
+    }
     // With a clock the slacks are the timer's, refreshed and demoted before each later sort, and
     // come from the capture — per sort, at the sort (`sort_net_indices`).
     if timed && opts.critical_nets_percentage != 0.0 {
@@ -180,6 +218,9 @@ pub fn route_cugr(db: &mut Db, opts: &RouteOptions, call: usize, stt: SteinerBui
     }
     let mut all: Vec<usize> = (0..ci.cugr.nets.len()).collect();
     ci.cugr.pattern_route(&mut all, &alphas, stt, &mut log, trace.as_deref_mut()).map_err(fail)?;
+    // Stage 2: the critical nets re-routed on real resistance (resistance-aware with critical nets
+    // only; not congestion-gated).
+    ci.cugr.pattern_route_res_aware(&alphas, stt, &mut log, trace.as_deref_mut()).map_err(fail)?;
     // updateCongestedNets after stage 1 — the trace tags it stage 2 (patternRouteResAware sets its
     // tag before returning).
     let mut nets = ci.cugr.congested_nets(2, trace.as_deref_mut());
@@ -551,12 +592,14 @@ pub fn update_dirty_routes_cugr(
                 Some(&k) => {
                     // The design's answer is not read: a held net is rebuilt from what it holds.
                     let (pins, range) = (cugr.design.nets[k].pins.clone(), cugr.design.nets[k].layer_range);
-                    cugr.update_net(k, pins, range, &drivers[fi], ndr, &mut queued).map_err(|e| format!("cugr: {e:?}"))?;
+                    let widths = net_ndr_widths(db, name, cugr.grid.num_layers)?;
+                    cugr.update_net(k, pins, range, &drivers[fi], ndr, widths, &mut queued).map_err(|e| format!("cugr: {e:?}"))?;
                     cugr.nets[k].slack = cg.slack;
                 }
                 None => {
                     if let Some(k) = updated {
-                        cugr.add_net(k, &drivers[fi], ndr, &mut queued).map_err(|e| format!("cugr: {e:?}"))?;
+                        let widths = net_ndr_widths(db, name, cugr.grid.num_layers)?;
+                        cugr.add_net(k, &drivers[fi], ndr, widths, &mut queued).map_err(|e| format!("cugr: {e:?}"))?;
                         cugr.nets[k].slack = cg.slack;
                         cg.alphas.push(crate::global_route::net_steiner_alpha(db, opts, name)?);
                         index.insert(name.clone(), k);

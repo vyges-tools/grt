@@ -1053,6 +1053,20 @@ fn run(job: &Value) -> Result<Value, Fail> {
         for (n, line) in std::fs::read_to_string(path).map_err(err)?.lines().enumerate() {
             let bad = || err(format!("{path}:{}: expected `<call> [<sort>] <net> <bits>`", n + 1));
             let f: Vec<&str> = line.split_whitespace().collect();
+            // `R <call> <n> <net> <bits>`: the timer's slack at the call's n-th updateNetSlacks.
+            if let ["R", k, n, net, bits] = f[..] {
+                let (k, n): (usize, usize) = (k.parse().map_err(|_| bad())?, n.parse().map_err(|_| bad())?);
+                let v = f32::from_bits(u32::from_str_radix(bits, 16).map_err(|_| bad())?);
+                let calls = opts.cugr_raw_slacks.get_or_insert_with(Vec::new);
+                while calls.len() <= k {
+                    calls.push(Vec::new());
+                }
+                while calls[k].len() <= n {
+                    calls[k].push(BTreeMap::new());
+                }
+                calls[k][n].insert(net.to_string(), v);
+                continue;
+            }
             let (k, sort, net, bits) = match f[..] {
                 [k, sort, net, bits] => (k, sort.parse::<usize>().map_err(|_| bad())?, net, bits),
                 [k, net, bits] => (k, 0, net, bits),

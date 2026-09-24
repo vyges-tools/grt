@@ -104,6 +104,86 @@ impl GridGraph {
         self.grid_centers[direction][edge_index + 1] - self.grid_centers[direction][edge_index]
     }
 
+    /// `ref_resistance_`, `ref_via_resistance_`: the first non-zero sheet and via resistance over
+    /// the layers in order — the res-aware costs' references (0 when a technology has none).
+    pub fn ref_resistances(design: &Design) -> (f64, f64) {
+        let first = |f: &dyn Fn(&super::layers::MetalLayer) -> f64| design.layers.iter().map(f).find(|&r| r > 0.0).unwrap_or(0.0);
+        (first(&|l| l.resistance), first(&|l| l.via_resistance))
+    }
+
+    /// `getWireResistanceCost`: a res-aware net's wire from `u` to `v` on `layer`.
+    ///
+    /// Upstream rules: the width is the net's NDR width on the layer, else the layer's; with no
+    /// width, no reference, or a layer without resistance the cost is 0. The length is the edge
+    /// lengths summed in DBU; `R = sheet * length / width`, then `weight * R / ref`, left to right.
+    pub fn wire_resistance_cost(&self, design: &Design, c: &super::Constants, layer: usize, u: Point, v: Point, wire_width: i32) -> f64 {
+        let l = &design.layers[layer];
+        let width = if wire_width > 0 { f64::from(wire_width) } else { f64::from(l.width) };
+        let (reference, _) = Self::ref_resistances(design);
+        if width <= 0.0 || reference <= 0.0 || l.resistance <= 0.0 {
+            return 0.0;
+        }
+        let direction = self.layer_directions[layer];
+        let (lo, hi) = (u.get(direction).min(v.get(direction)), u.get(direction).max(v.get(direction)));
+        let length: i32 = (lo..hi).map(|i| self.edge_length(direction, i as usize)).sum();
+        let resistance = l.resistance * f64::from(length) / width;
+        c.resistance_weight * resistance / reference
+    }
+
+    /// `getViaResistanceCost`: one via above `lower_layer`, `weight * R / ref`; 0 without either.
+    pub fn via_resistance_cost(&self, design: &Design, c: &super::Constants, lower_layer: usize) -> f64 {
+        let (_, reference) = Self::ref_resistances(design);
+        let via_r = design.layers[lower_layer].via_resistance;
+        if reference <= 0.0 || via_r <= 0.0 {
+            return 0.0;
+        }
+        c.resistance_weight * via_r / reference
+    }
+
+    /// `getNetResistance`: a tree's wire and via resistance, summed in preorder, each node's
+    /// children in order.
+    ///
+    /// Upstream rules: a same-layer child is a wire, `sheet * length / width` with the NDR width if
+    /// set on that layer (else the layer's; none, skipped); a layer change is the via resistance of
+    /// every layer crossed, bottom up. No tree, 0.
+    pub fn net_resistance(&self, design: &Design, tree: Option<&GrTree>, ndr_widths: &[i32]) -> f64 {
+        let Some(tree) = tree else { return 0.0 };
+        let mut total = 0.0;
+        for i in tree.preorder() {
+            let node = &tree.nodes[i];
+            for &c in &node.children {
+                let child = &tree.nodes[c];
+                if node.layer == child.layer {
+                    if node.layer < 0 {
+                        continue;
+                    }
+                    let layer = node.layer as usize;
+                    let l = &design.layers[layer];
+                    let ndr_width = ndr_widths.get(layer).copied().unwrap_or(0);
+                    let width = if ndr_width > 0 { f64::from(ndr_width) } else { f64::from(l.width) };
+                    if width <= 0.0 {
+                        continue;
+                    }
+                    let direction = self.layer_directions[layer];
+                    let (lo, hi) = (node.p.get(direction).min(child.p.get(direction)), node.p.get(direction).max(child.p.get(direction)));
+                    let length: i32 = (lo..hi).map(|e| self.edge_length(direction, e as usize)).sum();
+                    total += l.resistance * f64::from(length) / width;
+                } else {
+                    for l in node.layer.min(child.layer)..node.layer.max(child.layer) {
+                        total += design.layers[l as usize].via_resistance;
+                    }
+                }
+            }
+        }
+        total
+    }
+
+    /// `getTreeLength`: the planar length in gcells (vias add nothing). No tree, 0.
+    pub fn tree_length(tree: Option<&GrTree>) -> i32 {
+        let Some(tree) = tree else { return 0 };
+        tree.preorder().into_iter().flat_map(|i| tree.nodes[i].children.iter().map(move |&c| (i, c))).map(|(i, c)| (tree.nodes[i].p.x - tree.nodes[c].p.x).abs() + (tree.nodes[i].p.y - tree.nodes[c].p.y).abs()).sum()
+    }
+
     pub fn edge(&self, layer: usize, x: usize, y: usize) -> &GraphEdge {
         &self.graph_edges[layer][x][y]
     }
@@ -911,5 +991,37 @@ mod tests {
         assert_eq!(g.range_search_rows(0, Interval::new(999, 2001)).unwrap(), Interval::new(0, 2));
         assert_eq!(g.range_search_rows(0, Interval::new(3001, 3001)).unwrap(), Interval::new(3, 2), "a point on the die edge is empty");
         assert!(g.range_search_rows(0, Interval::new(3100, 3200)).is_err(), "past the die: the reference reads out of range");
+    }
+
+    // Upstream rules (`getWireResistanceCost`, `getNetResistance`): a net's NDR width on a layer
+    // replaces the layer's (0 = the layer's), and the references are the FIRST NON-ZERO sheet and
+    // via resistance over the layers in order — here m2's, as m1 has none. A via stack adds each
+    // crossed layer's via resistance. No net of the stage-2 corpus has an NDR.
+    #[test]
+    fn resistance_takes_the_ndr_width_and_the_first_nonzero_reference() {
+        let mut f = facts();
+        f.layers[1].metal.as_mut().unwrap().resistance = 2.0;
+        f.layers[2].metal.as_mut().unwrap().resistance = 4.0;
+        f.layers[1].metal.as_mut().unwrap().via_resistance = 3.0;
+        let d = Design::new(&f, &Constants::default(), 2, 3).unwrap();
+        let g = GridGraph::new(&d, 1).unwrap();
+        let c = Constants::default();
+        assert_eq!(GridGraph::ref_resistances(&d), (2.0, 3.0));
+        let dir = g.layer_directions[2];
+        let len = f64::from(g.edge_length(dir, 0) + g.edge_length(dir, 1));
+        let (a, b) = (Point::new(0, 0), Point::new(2, 0));
+        assert_eq!(g.wire_resistance_cost(&d, &c, 2, a, b, 0), 50.0 * (4.0 * len / 100.0) / 2.0);
+        assert_eq!(g.wire_resistance_cost(&d, &c, 2, a, b, 200), 50.0 * (4.0 * len / 200.0) / 2.0);
+        assert_eq!(g.via_resistance_cost(&d, &c, 1), 50.0 * 3.0 / 3.0);
+        assert_eq!(g.via_resistance_cost(&d, &c, 0), 0.0, "a layer with no via resistance costs nothing");
+        let mut t = GrTree::default();
+        let root = t.add(1, a);
+        let up = t.add(2, a);
+        let far = t.add(2, b);
+        t.nodes[root].children.push(up);
+        t.nodes[up].children.push(far);
+        assert_eq!(g.net_resistance(&d, Some(&t), &[0, 0, 200]), 3.0 + 4.0 * len / 200.0);
+        assert_eq!(g.net_resistance(&d, Some(&t), &[]), 3.0 + 4.0 * len / 100.0);
+        assert_eq!(GridGraph::tree_length(Some(&t)), 2);
     }
 }

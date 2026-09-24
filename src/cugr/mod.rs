@@ -125,7 +125,25 @@ pub struct Cugr {
     /// `incremental_candidates_`: during an incremental route, the nets it re-routes (its
     /// congested-set scans and RRR rounds are scoped to them).
     pub incremental_candidates: Option<Vec<usize>>,
+    /// `resistance_aware_`, `critical_nets_percentage_`, `res_aware_percentage_` (15 unless set).
+    pub resistance_aware: bool,
+    pub critical_nets_percentage: f32,
+    pub res_aware_percentage: f32,
+    /// The timer's slack of every net at each `updateNetSlacks` (captured), and the calls made.
+    /// With them the engine refreshes, marks and demotes itself; without, sorts after the first
+    /// take the per-sort capture.
+    pub raw_slacks: Option<Vec<std::collections::BTreeMap<String, f32>>>,
+    pub raw_done: usize,
+    /// Without a clock the timer answers one slack for every net (unconstrained, `1e+30`): each
+    /// refresh then sets it — no capture needed.
+    pub constant_slack: Option<f32>,
+    /// `worst_slack_`, `worst_resistance_`, `worst_fanout_`, `worst_net_length_`: the res-aware
+    /// score's normalisers, as the last marking left them.
+    pub worst: (f32, f32, i32, i32),
 }
+
+/// `kDemotedSlack`: a non-critical net's slack after demotion.
+pub const DEMOTED_SLACK: f32 = f32::MAX;
 
 /// A stage that stopped where the reference would have gone on to something not modelled, or
 /// would have raised an error.
@@ -142,15 +160,189 @@ impl Cugr {
     /// `sortNetIndices(nets, res_aware_order=false)`: a STABLE sort by `(slack, bbox half
     /// perimeter)`, from index order. Where captured slacks are set, each listed net first takes
     /// this sort's (the reference refreshes and demotes them before stages 3 and 4).
-    pub fn sort_net_indices(&mut self, indices: &mut [usize]) -> Result<(), StageError> {
+    ///
+    /// With `res_aware_order` the key is the res-aware score instead (lower first), a stable sort.
+    /// With the timer's raw slacks captured, only the first sort takes the per-sort capture: later
+    /// sorts read the slacks the engine refreshed and demoted itself.
+    pub fn sort_net_indices(&mut self, indices: &mut [usize], res_aware_order: bool, stage: i32, trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
         if let Some(sorts) = &self.sort_slacks {
-            let m = sorts.get(self.sorts_done).ok_or_else(|| StageError::Slacks(format!("no captured slacks for sort {}", self.sorts_done)))?;
-            for &k in indices.iter() {
-                self.nets[k].slack = *m.get(&self.nets[k].name).ok_or_else(|| StageError::Slacks(format!("net {} has no captured slack in sort {}", self.nets[k].name, self.sorts_done)))?;
+            if self.raw_slacks.is_none() || self.sorts_done == 0 {
+                let m = sorts.get(self.sorts_done).ok_or_else(|| StageError::Slacks(format!("no captured slacks for sort {}", self.sorts_done)))?;
+                for &k in indices.iter() {
+                    self.nets[k].slack = *m.get(&self.nets[k].name).ok_or_else(|| StageError::Slacks(format!("net {} has no captured slack in sort {}", self.nets[k].name, self.sorts_done)))?;
+                }
             }
         }
         self.sorts_done += 1;
-        self.sort_by_slack_then_hp(indices);
+        if res_aware_order {
+            let scores: Vec<f32> = (0..self.nets.len()).map(|k| self.res_aware_score(k)).collect();
+            indices.sort_by(|&a, &b| scores[a].partial_cmp(&scores[b]).unwrap_or(std::cmp::Ordering::Equal));
+            if let Some(t) = trace {
+                for (pos, &k) in indices.iter().enumerate() {
+                    t.push(format!("VYGC|rorder|{stage}|{pos}|{k}|{}|{:08x}", self.nets[k].name, scores[k].to_bits()));
+                }
+            }
+        } else {
+            self.sort_by_slack_then_hp(indices);
+        }
+        Ok(())
+    }
+
+    /// Stages 3 to 5 sort in the res-aware order when resistance-aware routing has critical nets.
+    fn res_aware_order(&self) -> bool {
+        self.resistance_aware && self.critical_nets_percentage != 0.0
+    }
+
+    /// `getResAwareScore` (lower = more critical), in f32, left to right:
+    /// `slack/norm*4 − R/worstR*1 − pins/worstFanout*3 − len/worstLen*2`, `norm = max(|worst
+    /// slack|, 1e-9)`.
+    pub fn res_aware_score(&self, k: usize) -> f32 {
+        let n = &self.nets[k];
+        let (worst_slack, worst_resistance, worst_fanout, worst_length) = self.worst;
+        let slack_norm = worst_slack.abs().max(1e-9f32);
+        let slack_term = n.slack / slack_norm * 4.0f32;
+        let resistance_term = n.resistance / worst_resistance * 1.0f32;
+        let fanout_term = n.num_pins() as f32 / worst_fanout as f32 * 3.0f32;
+        let length_term = n.net_length as f32 / worst_length as f32 * 2.0f32;
+        slack_term - resistance_term - fanout_term - length_term
+    }
+
+    /// `updateCriticalNets`: every net's slack refreshed from the timer (`updateNetSlacks`, the
+    /// next captured call), the res-aware set marked on those real slacks, then — outside an
+    /// incremental route — every non-critical net demoted.
+    pub fn update_critical_nets(&mut self, stage: i32, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
+        match (&self.raw_slacks, self.constant_slack) {
+            (Some(raw), _) => {
+                let m = raw.get(self.raw_done).ok_or_else(|| StageError::Slacks(format!("no captured timer slacks for update {}", self.raw_done)))?;
+                for n in &mut self.nets {
+                    n.slack = *m.get(&n.name).ok_or_else(|| StageError::Slacks(format!("net {} has no captured timer slack in update {}", n.name, self.raw_done)))?;
+                }
+            }
+            (None, Some(constant)) => self.nets.iter_mut().for_each(|n| n.slack = constant),
+            (None, None) => return Ok(()),
+        }
+        self.raw_done += 1;
+        self.mark_res_aware_nets(stage, trace.as_deref_mut());
+        if self.incremental_candidates.is_none() {
+            let th = self.critical_slack_threshold();
+            if let Some(t) = trace {
+                t.push(format!("VYGC|dthr|{stage}|{:08x}", th.to_bits()));
+            }
+            for n in &mut self.nets {
+                if n.slack > th && !n.res_aware {
+                    n.slack = DEMOTED_SLACK;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `criticalSlackThreshold`: every net's slack, stably sorted; the one at
+    /// `ceil(count * percentage / 100)` (f32), clamped to the last.
+    fn critical_slack_threshold(&self) -> f32 {
+        let mut slacks: Vec<f32> = self.nets.iter().map(|n| n.slack).collect();
+        if slacks.is_empty() {
+            return 0.0;
+        }
+        slacks.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let index = (slacks.len() as f32 * self.critical_nets_percentage / 100.0f32).ceil() as usize;
+        slacks[index.min(slacks.len() - 1)]
+    }
+
+    /// `markResAwareNets` — only with resistance-aware routing. The set only ever grows.
+    ///
+    /// Upstream rules: pass 1 over every net (the rerouted ones in an incremental route) sets its
+    /// resistance (the tree's, f64 → f32) and length (the tree's planar length, else the bounding
+    /// box's half perimeter); a net of under two pins, of length ≤ `resistance_min_net_length`,
+    /// or of positive slack (a CLOCK-typed net excepted) is skipped; the rest update the
+    /// normalisers (from 1, 1, 1 and `f32::MAX`), and a CLOCK or NDR net is marked outright while
+    /// an unmarked one becomes a candidate. Pass 2 ranks the candidates by `(score, index)` and
+    /// marks the first `ceil(count * res_aware_percentage / 100)` (f32) — every one in an
+    /// incremental route.
+    fn mark_res_aware_nets(&mut self, stage: i32, mut trace: Option<&mut Vec<String>>) {
+        if !self.resistance_aware {
+            return;
+        }
+        let (mut worst_slack, mut worst_resistance, mut worst_fanout, mut worst_length) = (f32::MAX, 1.0f32, 1i32, 1i32);
+        let scope: Vec<usize> = match &self.incremental_candidates {
+            Some(c) => c.clone(),
+            None => (0..self.nets.len()).collect(),
+        };
+        let mut candidates = Vec::new();
+        for k in scope {
+            let resistance = self.grid.net_resistance(&self.design, self.nets[k].routing_tree.as_ref(), &self.nets[k].ndr_widths) as f32;
+            let length = if self.nets[k].routing_tree.is_some() { GridGraph::tree_length(self.nets[k].routing_tree.as_ref()) } else { self.nets[k].bounding_box.hp() };
+            let min_length = self.constants.resistance_min_net_length;
+            let n = &mut self.nets[k];
+            n.resistance = resistance;
+            n.net_length = length;
+            let is_positive_slack = n.slack > 0.0 && !n.is_clock_sig;
+            let is_short = n.net_length <= min_length;
+            let skip = n.num_pins() < 2 || is_short || is_positive_slack;
+            if let Some(t) = trace.as_deref_mut() {
+                t.push(format!("VYGC|ranet|{stage}|{}|{:08x}|{}|{:08x}|{}|{}", n.name, n.resistance.to_bits(), n.net_length, n.slack.to_bits(), n.num_pins(), i32::from(skip)));
+            }
+            if skip {
+                continue;
+            }
+            worst_resistance = worst_resistance.max(n.resistance);
+            worst_fanout = worst_fanout.max(n.num_pins() as i32);
+            worst_length = worst_length.max(n.net_length);
+            worst_slack = worst_slack.min(n.slack);
+            if n.is_clock_sig || n.has_ndr() {
+                n.res_aware = true;
+            } else if !n.res_aware {
+                candidates.push(k);
+            }
+        }
+        self.worst = (worst_slack, worst_resistance, worst_fanout, worst_length);
+        let mut scored: Vec<(usize, f32)> = candidates.iter().map(|&k| (k, self.res_aware_score(k))).collect();
+        scored.sort_by(|a, b| (a.1, a.0).partial_cmp(&(b.1, b.0)).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some(t) = trace.as_deref_mut() {
+            t.push(format!("VYGC|raworst|{stage}|{:08x}|{:08x}|{worst_fanout}|{worst_length}", worst_slack.to_bits(), worst_resistance.to_bits()));
+            for (i, &(k, score)) in scored.iter().enumerate() {
+                t.push(format!("VYGC|rascore|{stage}|{i}|{}|{:08x}", self.nets[k].name, score.to_bits()));
+            }
+        }
+        let count = if self.incremental_candidates.is_some() { scored.len() } else { (scored.len() as f32 * self.res_aware_percentage / 100.0f32).ceil() as usize };
+        for &(k, _) in scored.iter().take(count) {
+            self.nets[k].res_aware = true;
+        }
+        if let Some(t) = trace {
+            t.push(format!("VYGC|racount|{stage}|{count}|{}", scored.len()));
+        }
+    }
+
+    /// `patternRouteResAware` (stage 2), with resistance-aware routing and critical nets only: the
+    /// critical nets updated and marked on the stage-1 trees, then every marked net — in the
+    /// res-aware order — ripped up and pattern-routed again (no detours), its res-aware costs on.
+    pub fn pattern_route_res_aware(&mut self, alphas: &[f32], stt: pattern_route::SteinerBuilder<'_>, log: &mut Vec<String>, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
+        if !self.res_aware_order() {
+            return Ok(());
+        }
+        self.update_critical_nets(2, trace.as_deref_mut())?;
+        let mut nets: Vec<usize> = (0..self.nets.len()).filter(|&k| self.nets[k].res_aware).collect();
+        if nets.is_empty() {
+            return Ok(());
+        }
+        self.sort_net_indices(&mut nets, true, 2, trace.as_deref_mut())?;
+        for &k in nets.iter() {
+            if self.nets[k].num_pins() < 2 {
+                continue;
+            }
+            let mut ripped = Vec::new();
+            self.commit_net(k, true, &mut ripped)?;
+            if let Some(t) = trace.as_deref_mut() {
+                trace::commits(t, &ripped, 2);
+            }
+            let cx = pattern_route::CostContext { grid: &self.grid, design: &self.design, constants: &self.constants, cost_multiplier: self.cost_multiplier };
+            let route = pattern_route::pattern_route_net(&mut self.nets[k], alphas[k], stt, &cx, None, log).map_err(StageError::Pattern)?;
+            let mut commits = Vec::new();
+            self.commit_net(k, false, &mut commits)?;
+            if let Some(t) = trace.as_deref_mut() {
+                trace::net_route(t, &self.nets[k], &route, &commits, 2);
+            }
+        }
         Ok(())
     }
 
@@ -169,7 +361,7 @@ impl Cugr {
     /// ⚠️ The list is sorted IN PLACE, as upstream's is: an incremental route hands the sorted
     /// list on to stages 3 and 4.
     pub fn pattern_route(&mut self, order: &mut Vec<usize>, alphas: &[f32], stt: pattern_route::SteinerBuilder<'_>, log: &mut Vec<String>, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
-        self.sort_net_indices(order)?;
+        self.sort_net_indices(order, false, 1, None)?;
         if let Some(t) = trace.as_deref_mut() {
             trace::order(t, self, order, 1);
         }
@@ -222,11 +414,15 @@ impl Cugr {
         if nets.is_empty() {
             return Ok(());
         }
+        if self.critical_nets_percentage != 0.0 {
+            self.update_critical_nets(3, trace.as_deref_mut())?;
+        }
         let view = self.grid.extract_congestion_view();
         if let Some(t) = trace.as_deref_mut() {
             trace::congestion_view(t, &view);
         }
-        self.sort_net_indices(nets)?;
+        let res_aware = self.res_aware_order();
+        self.sort_net_indices(nets, res_aware, 3, trace.as_deref_mut())?;
         if let Some(t) = trace.as_deref_mut() {
             trace::order(t, self, nets, 3);
         }
@@ -262,15 +458,21 @@ impl Cugr {
         if nets.is_empty() {
             return Ok(());
         }
+        if self.critical_nets_percentage != 0.0 {
+            self.update_critical_nets(stage, trace.as_deref_mut())?;
+        }
         let mut ripped = Vec::new();
         for &k in nets.iter() {
             self.commit_net(k, true, &mut ripped)?;
         }
         let mut view: grid_graph::View<f64> = Vec::new();
         self.grid.extract_wire_cost_view(&mut view, &[], &self.constants, self.cost_multiplier);
-        self.sort_net_indices(nets)?;
+        let res_aware = self.res_aware_order();
+        let mut sorted_trace = Vec::new();
+        self.sort_net_indices(nets, res_aware, stage, Some(&mut sorted_trace))?;
         if let Some(t) = trace.as_deref_mut() {
             trace::commits(t, &ripped, stage);
+            t.extend(sorted_trace);
             trace::order(t, self, nets, stage);
             trace::wire_cost_view(t, &view, stage);
         }
@@ -444,7 +646,7 @@ impl Cugr {
     /// `CUGR::updateNet(net)` for a net the router holds: its tree's demand released (with its
     /// adopted flag), the net rebuilt from `net_facts` as new — no preferred access points, slack
     /// 0 — with its rule's factors, kept at 1 if it was soft-demoted; queued for the next route.
-    pub fn update_net(&mut self, k: usize, pins: Vec<design::CugrPin>, layer_range: design::LayerRange, driver_term: &str, ndr_costs: Vec<f64>, queue: &mut Vec<usize>) -> Result<(), StageError> {
+    pub fn update_net(&mut self, k: usize, pins: Vec<design::CugrPin>, layer_range: design::LayerRange, driver_term: &str, ndr_costs: Vec<f64>, ndr_widths: Vec<i32>, queue: &mut Vec<usize>) -> Result<(), StageError> {
         let was_soft = self.nets[k].soft_ndr;
         if self.nets[k].routing_tree.is_some() {
             let mut commits = Vec::new();
@@ -454,6 +656,7 @@ impl Cugr {
         self.design.nets[k].layer_range = layer_range;
         let mut n = grnet::GrNet::new(&self.design.nets[k], driver_term, &self.grid).map_err(|e| StageError::Maze(format!("{e:?}")))?;
         n.ndr_costs = ndr_costs;
+        n.ndr_widths = ndr_widths;
         if was_soft {
             n.set_soft_ndr();
         }
@@ -465,12 +668,13 @@ impl Cugr {
     /// `CUGR::updateNet`'s branch for a net CUGR does not hold: the design appended it at `k`
     /// ([`design::Design::update_net`]); its GRNet is appended too, with its rule's factors, and
     /// queued.
-    pub fn add_net(&mut self, k: usize, driver_term: &str, ndr_costs: Vec<f64>, queue: &mut Vec<usize>) -> Result<(), StageError> {
+    pub fn add_net(&mut self, k: usize, driver_term: &str, ndr_costs: Vec<f64>, ndr_widths: Vec<i32>, queue: &mut Vec<usize>) -> Result<(), StageError> {
         if k != self.nets.len() {
             return Err(StageError::Maze(format!("cugr: a new net at {k} with {} held — not aligned", self.nets.len())));
         }
         let mut n = grnet::GrNet::new(&self.design.nets[k], driver_term, &self.grid).map_err(|e| StageError::Maze(format!("{e:?}")))?;
         n.ndr_costs = ndr_costs;
+        n.ndr_widths = ndr_widths;
         self.nets.push(n);
         queue.push(k);
         Ok(())
@@ -521,7 +725,7 @@ pub fn init(facts: &DesignFacts, driver_terms: &[String], min_routing_layer: i32
         .map(|n| GrNet::new(n, &driver_terms[n.facts_index], &grid))
         .collect::<Result<Vec<_>, _>>()
         .map_err(InitError::Grid)?;
-    Ok(Cugr { constants, design, grid, nets, cost_multiplier: 1.0, sort_slacks: None, sorts_done: 0, incremental_candidates: None })
+    Ok(Cugr { constants, design, grid, nets, cost_multiplier: 1.0, sort_slacks: None, sorts_done: 0, incremental_candidates: None, resistance_aware: false, critical_nets_percentage: 0.0, res_aware_percentage: 15.0, raw_slacks: None, raw_done: 0, constant_slack: None, worst: (1.0, 1.0, 1, 1) })
 }
 
 #[cfg(test)]
@@ -589,6 +793,11 @@ mod tests {
             shape_ap_choices: Vec::new(),
             soft_ndr: false,
             adopted: false,
+            ndr_widths: Vec::new(),
+            res_aware: false,
+            resistance: 0.0,
+            net_length: 0,
+            is_clock_sig: false,
         }
     }
 
@@ -676,12 +885,54 @@ mod tests {
         n.set_soft_ndr();
         c.nets = vec![n];
         let mut queue = Vec::new();
-        c.update_net(0, Vec::new(), range, "", vec![2.0; 3], &mut queue).unwrap();
+        c.update_net(0, Vec::new(), range, "", vec![2.0; 3], Vec::new(), &mut queue).unwrap();
         assert!(c.nets[0].soft_ndr);
         assert_eq!(c.nets[0].ndr_costs, vec![1.0; 3]);
         assert_eq!(queue, vec![0]);
         c.nets[0].soft_ndr = false;
-        c.update_net(0, Vec::new(), range, "", vec![2.0; 3], &mut queue).unwrap();
+        c.update_net(0, Vec::new(), range, "", vec![2.0; 3], Vec::new(), &mut queue).unwrap();
         assert_eq!(c.nets[0].ndr_costs, vec![2.0; 3], "a hard-NDR net keeps its factors");
+    }
+
+    // Upstream rule (`GRNet::setSoftNdr`): a soft-demoted net loses its NDR wire widths with its
+    // demand factors, so a res-aware cost reads the layer's width again. No soft-NDR net is
+    // resistance-aware in the corpus.
+    #[test]
+    fn soft_ndr_clears_the_wire_widths() {
+        let mut n = net_with(GrTree::default(), &[]);
+        n.ndr_costs = vec![1.0, 2.0, 1.0];
+        n.ndr_widths = vec![0, 300, 0];
+        n.set_soft_ndr();
+        assert_eq!(n.ndr_widths, vec![0, 0, 0]);
+        assert_eq!(n.ndr_width(1), 0);
+        assert_eq!(n.ndr_width(9), 0, "off the end");
+    }
+
+    /// Two-pin nets on m3 from (0,0) to (4,0): long enough (4 > 3 gcells) to be eligible.
+    fn critical_candidate(slack: f32) -> GrNet {
+        let mut t = GrTree::default();
+        let a = t.add(2, Point::new(0, 0));
+        let b = t.add(2, Point::new(4, 0));
+        t.nodes[a].children.push(b);
+        let mut n = net_with(t, &[]);
+        n.slack = slack;
+        n
+    }
+
+    // Upstream rules (`markResAwareNets`): a CLOCK-typed net is eligible even with a positive
+    // slack, and eligible CLOCK nets are marked outright; ranked candidates that tie on score go
+    // by index. Every clock net of the stage-2 corpus has a negative slack, and no two candidates
+    // tie.
+    #[test]
+    fn marking_takes_positive_clocks_and_breaks_ties_by_index() {
+        let mut c = router();
+        c.resistance_aware = true;
+        c.res_aware_percentage = 50.0;
+        let mut clock = critical_candidate(1.0);
+        clock.is_clock_sig = true;
+        c.nets = vec![critical_candidate(-1.0), critical_candidate(-1.0), clock];
+        c.mark_res_aware_nets(2, None);
+        assert!(c.nets[2].res_aware, "a positive-slack CLOCK net is still marked");
+        assert!(c.nets[0].res_aware && !c.nets[1].res_aware, "a tie goes to the lower index: ceil(2 * 50%) = 1");
     }
 }
