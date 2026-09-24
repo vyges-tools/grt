@@ -100,6 +100,141 @@ pub fn planar_route(edges: &[PlanarEdge<'_>], net_min_layer: usize, layer_dir: &
     out
 }
 
+/// The net's pins in grid coordinates with their 0-based layers (`getPinX/Y/L`).
+#[derive(Debug, Clone, Copy)]
+pub struct NetPinsGrid<'a> {
+    pub x: &'a [i32],
+    pub y: &'a [i32],
+    pub layer: &'a [i16],
+}
+
+/// The reference's `BIG_INT`, a Steiner node's "no upper edge".
+const BIG_INT: i32 = 1_000_000_000;
+
+/// `getViaStackRange`: the lowest and highest layer of the NET's pins at a node's grid point
+/// (`SHRT_MAX` / `-1` with none there).
+fn via_stack_range(tree: &crate::maze3d::Tree3D, node: usize, pins: NetPinsGrid<'_>) -> (i16, i16) {
+    let (nx, ny) = (i32::from(tree.nodes[node].x), i32::from(tree.nodes[node].y));
+    let (mut bot, mut top) = (i16::MAX, -1i16);
+    for p in 0..pins.layer.len() {
+        if pins.x[p] == nx && pins.y[p] == ny {
+            bot = bot.min(pins.layer[p]);
+            top = top.max(pins.layer[p]);
+        }
+    }
+    (bot, top)
+}
+
+/// `convertGridsToSegments`: consecutive grid points as segments (layers from 1), skipping a
+/// point that repeats the last; a segment already made for the net is not made again.
+fn convert_grids(grids: &[crate::full3d::Point3D], count: usize, origin: GridOrigin, out: &mut Vec<Segment>) {
+    let GridOrigin { tile_size, x_corner, y_corner } = origin;
+    let mut last = (grid_to_dbu(grids[0].x, tile_size, x_corner), grid_to_dbu(grids[0].y, tile_size, y_corner), i32::from(grids[0].layer));
+    for g in &grids[1..=count] {
+        let cur = (grid_to_dbu(g.x, tile_size, x_corner), grid_to_dbu(g.y, tile_size, y_corner), i32::from(g.layer));
+        if cur == last {
+            continue;
+        }
+        push_unique(out, Segment::new(last.0, last.1, last.2 + 1, cur.0, cur.1, cur.2 + 1));
+        last = cur;
+    }
+}
+
+/// `FastRouteCore::get3DRoute` — a net's route as segments AFTER layer assignment, which the
+/// parasitics are built on in a 3D pass (`getPlanarRoutes` with `is_3d_step_`).
+///
+/// Rules:
+/// - an edge of positive length gets, at each end the edge owns (a terminal, the node's highest
+///   edge, or its lowest when it has no highest), the via stack from the node's layer range —
+///   widened, at a terminal, to the layers of every pin of the net at that point;
+/// - its grid points are then converted as one walk, and EVERY filled point is recorded for
+///   bridging afterwards (a one-layer gap against what an earlier edge left there);
+/// - a zero-length edge with steps (a via stack a later pass appended) is converted as it is.
+pub fn route_3d(tree: &crate::maze3d::Tree3D, pins: NetPinsGrid<'_>, origin: GridOrigin) -> Vec<Segment> {
+    use crate::full3d::Point3D;
+    let GridOrigin { tile_size, x_corner, y_corner } = origin;
+    let mut out: Vec<Segment> = Vec::new();
+    let mut seen: BTreeMap<(i32, i32), i32> = BTreeMap::new();
+    let nt = tree.num_terminals;
+    let bridge_all = |grids: &[Point3D], seen: &mut BTreeMap<(i32, i32), i32>, out: &mut Vec<Segment>| {
+        for g in grids {
+            record_layer_and_bridge(grid_to_dbu(g.x, tile_size, x_corner), grid_to_dbu(g.y, tile_size, y_corner), i32::from(g.layer), seen, out);
+        }
+    };
+    for (edge_id, e) in tree.edges.iter().enumerate() {
+        let eid = edge_id as i32;
+        if e.len > 0 {
+            let grids = &e.grids;
+            let owns = |n: usize| {
+                let c = &tree.nodes[n].conn;
+                n < nt || c.h_id == eid || (eid == c.l_id && c.h_id == BIG_INT)
+            };
+            let mut filled: Vec<Point3D> = Vec::new();
+            let (n1, n2) = (e.n1a, e.n2a);
+            if owns(n1) {
+                let c = &tree.nodes[n1].conn;
+                let (mut bot, mut top) = (c.bot_layer, c.top_layer);
+                let init = grids[0].layer;
+                let at = |l: i16| Point3D { x: grids[0].x, y: grids[0].y, layer: l };
+                if n1 < nt {
+                    let (pb, pt) = via_stack_range(tree, n1, pins);
+                    bot = bot.min(pb);
+                    top = top.max(pt);
+                    for l in bot..top {
+                        filled.push(at(l));
+                    }
+                    let mut l = top;
+                    while l > init {
+                        filled.push(at(l));
+                        l -= 1;
+                    }
+                } else {
+                    for l in bot..init {
+                        filled.push(at(l));
+                    }
+                }
+            }
+            filled.extend_from_slice(&grids[..=e.routelen as usize]);
+            if owns(n2) {
+                let c = &tree.nodes[n2].conn;
+                let (mut bot, mut top) = (c.bot_layer, c.top_layer);
+                let back = |f: &Vec<Point3D>| *f.last().expect("the edge's own points");
+                if n2 < nt {
+                    let (pb, pt) = via_stack_range(tree, n2, pins);
+                    bot = bot.min(pb);
+                    top = top.max(pt);
+                    if bot == back(&filled).layer {
+                        bot += 1;
+                    }
+                    let mut l = back(&filled).layer - 1;
+                    while l > bot {
+                        let b = back(&filled);
+                        filled.push(Point3D { x: b.x, y: b.y, layer: l });
+                        l -= 1;
+                    }
+                    for l in bot..=top {
+                        let b = back(&filled);
+                        filled.push(Point3D { x: b.x, y: b.y, layer: l });
+                    }
+                } else {
+                    let mut l = top - 1;
+                    while l >= bot {
+                        let b = back(&filled);
+                        filled.push(Point3D { x: b.x, y: b.y, layer: l });
+                        l -= 1;
+                    }
+                }
+            }
+            convert_grids(&filled, filled.len() - 1, origin, &mut out);
+            bridge_all(&filled, &mut seen, &mut out);
+        } else if e.routelen > 0 {
+            convert_grids(&e.grids, e.routelen as usize, origin, &mut out);
+            bridge_all(&e.grids[..=e.routelen as usize], &mut seen, &mut out);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +323,40 @@ mod tests {
     fn a_zero_length_edge_contributes_nothing() {
         let g = [(0, 0), (0, 0)];
         assert!(planar_route(&[PlanarEdge { len: 0, routelen: 0, grids: &g }], 0, &dirs(), ORIGIN).is_empty());
+    }
+
+    /// Rule (`get3DRoute`): at a TERMINAL end the stack first descends from the edge's layer to one
+    /// above the stack's bottom, then climbs the whole stack — so the same cut appears walked down
+    /// and then up, and both directions are kept (the set compares layers in order).
+    #[test]
+    fn a_terminal_end_descends_then_climbs_its_stack() {
+        use crate::full3d::{Point3D, RouteType};
+        use crate::maze3d::{Edge3D, Node3D, NodeConnections, Tree3D};
+        let conn = NodeConnections { e_id: [0; crate::spiral::MAX_CONNECTIONS], heights: [0; crate::spiral::MAX_CONNECTIONS], con_cnt: 1, bot_layer: 0, top_layer: 2, l_id: 0, h_id: 0 };
+        let node = |x| Node3D { x, y: 0, stack_alias: 0, assigned: true, status: 0, conn, nbr: Vec::new() };
+        let p = |x, l| Point3D { x, y: 0, layer: l };
+        let tree = Tree3D {
+            num_terminals: 2,
+            num_layers: 3,
+            pin_layers: vec![0, 0],
+            nodes: vec![node(0), node(2)],
+            edges: vec![Edge3D { n1: 0, n2: 1, n1a: 0, n2a: 1, len: 2, route_type: RouteType::MazeRoute, routelen: 2, grids: vec![p(0, 2), p(1, 2), p(2, 2)] }],
+        };
+        let pins = NetPinsGrid { x: &[0, 2], y: &[0, 0], layer: &[0, 0] };
+        let segs = route_3d(&tree, pins, ORIGIN);
+        let s = Segment::new;
+        assert_eq!(
+            segs,
+            vec![
+                s(50, 50, 1, 50, 50, 2),
+                s(50, 50, 2, 50, 50, 3),
+                s(50, 50, 3, 150, 50, 3),
+                s(150, 50, 3, 250, 50, 3),
+                s(250, 50, 3, 250, 50, 2),
+                s(250, 50, 2, 250, 50, 1),
+                s(250, 50, 1, 250, 50, 2),
+                s(250, 50, 2, 250, 50, 3),
+            ]
+        );
     }
 }

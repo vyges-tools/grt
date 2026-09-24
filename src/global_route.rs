@@ -42,6 +42,11 @@ pub struct RouteOptions {
     pub captured_slacks: Option<Vec<std::collections::BTreeMap<String, f32>>>,
     /// The same, at each `updateSlacks` call (resistance-aware only).
     pub captured_update_slacks: Option<Vec<std::collections::BTreeMap<String, f32>>>,
+    /// The timer's libraries and constraints: with a clock and no captured slacks, the slacks are
+    /// computed at each read.
+    pub timing: Option<crate::timer::Timing>,
+    /// Where to write every computed read (`<P|U> <call> <net> <f32 bits>`), if anywhere.
+    pub timer_trace: Option<String>,
     /// `global_route -resistance_aware`.
     pub resistance_aware: bool,
     /// `-res_aware_nets_percentage` — once given, FIXED (`is_fixed_nets_percentage_`).
@@ -96,6 +101,8 @@ impl RouteOptions {
             clock_sources: Vec::new(),
             captured_slacks: None,
             captured_update_slacks: None,
+            timing: None,
+            timer_trace: None,
             resistance_aware: false,
             res_aware_nets_percentage: None,
             cugr_raw_slacks: None,
@@ -962,6 +969,55 @@ pub type SteinerBuilder<'a> = &'a dyn Fn(&[i32], &[i32], usize, f32) -> crate::b
 
 /// `globalRoute` end to end over the database: setup (I) → `run()` (R) → `findRouting`'s
 /// post-processing (F) → `saveGuides` (X). The Steiner tree builder and FLUTE are injected.
+/// `estimateAllGlobalRouteParasitics` for one net on its planar route: the route's segments, the
+/// pins where they attach, and the RC network.
+fn planar_net_network(
+    n: &RouterNet,
+    tree: &crate::brk_rsmt::StTree,
+    rc: &crate::parasitics::LayerRC,
+    layer_dir: &[crate::layertable::LayerDir],
+    origin: crate::routes::GridOrigin,
+    min_routing_layer: i32,
+) -> (Vec<crate::parasitics::Segment>, Vec<crate::parasitics::PinGridLocation>, crate::parasitics::Network) {
+    let edges: Vec<crate::planar_route::PlanarEdge<'_>> = tree
+        .edges
+        .iter()
+        .zip(&tree.routes)
+        .map(|(e, route)| crate::planar_route::PlanarEdge { len: e.len, routelen: route.routelen, grids: &route.grids })
+        .collect();
+    let route = crate::planar_route::planar_route(&edges, (n.min_layer - 1) as usize, layer_dir, origin);
+    let (pins, network) = net_network(n, &route, rc, min_routing_layer, crate::parasitics::PinAttach::Planar);
+    (route, pins, network)
+}
+
+/// `MakeWireParasitics::estimateParasitics` for one net on a route: the pins where it attaches and
+/// the RC network (`attach`: planar, or by the pins' real layers on a route after layer assignment).
+fn net_network(
+    n: &RouterNet,
+    route: &[crate::parasitics::Segment],
+    rc: &crate::parasitics::LayerRC,
+    min_routing_layer: i32,
+    attach: crate::parasitics::PinAttach,
+) -> (Vec<crate::parasitics::PinGridLocation>, crate::parasitics::Network) {
+    let pins: Vec<crate::parasitics::PinGridLocation> = n
+        .net_pins
+        .iter()
+        .zip(&n.pin_is_driver)
+        .map(|(p, &is_driver)| crate::parasitics::PinGridLocation { name: p.name.clone(), is_port: p.is_port, is_driver, pt: p.position, grid_pt: p.on_grid, conn_layer: p.connection_layer })
+        .collect();
+    let np = crate::parasitics::NetParasitics {
+        name: &n.name,
+        route,
+        pins: &pins,
+        net_min_layer: n.min_layer,
+        min_routing_layer,
+        ndr_width: n.ndr_widths.as_ref(),
+        attach,
+    };
+    let network = crate::parasitics::estimate_net(&np, rc);
+    (pins, network)
+}
+
 pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, flutes: crate::brk_rsmt::Flutes<'_>) -> Res<RouteResult> {
     use crate::brk_rsmt::{CapLayer, Caps3D, NetState, RsmtNet};
     use crate::run::{fastroute_run, RunEnd, RunInputs, RunObserver, Stage};
@@ -1061,9 +1117,85 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
             .collect::<Result<_, _>>()?,
         _ => Vec::new(),
     };
+    // ⛔ The parasitics read the estimator's table where it has a value, and the technology's own
+    // only where it has none (`MakeWireParasitics::layerRC`).
+    let layer_rc = |db: &Db| -> crate::parasitics::LayerRC {
+        let mut rc = crate::parasitics::LayerRC { dbu_per_micron: db.tech_get_db_units_per_micron(), ..Default::default() };
+        for l in &t.tech.routing_layers {
+            let (lvl, name) = (l.routing_level, &l.name);
+            rc.width.insert(lvl, db.layer_get_width(name) as i32);
+            rc.resistance.insert(lvl, db.layer_get_resistance(name));
+            rc.capacitance.insert(lvl, db.layer_get_capacitance(name));
+            rc.edge_capacitance.insert(lvl, db.layer_get_edge_capacitance(name));
+            if let Some(&(res, cap)) = opts.layer_rc.get(&lvl) {
+                rc.table_res.insert(lvl, res);
+                rc.table_cap.insert(lvl, cap);
+            }
+            let cut = db.layer_get_upper_layer(name);
+            if !cut.is_empty() {
+                rc.cut_resistance.insert(lvl, db.layer_get_resistance(&cut));
+                if let Some(&res) = opts.via_rc.get(&cut) {
+                    rc.cut_table_res.insert(lvl, res);
+                }
+            }
+        }
+        rc
+    };
+    let layer_dir: Vec<crate::layertable::LayerDir> = (1..=num_layers as i32)
+        .map(|l| match t.tech.routing_layers.iter().find(|r| r.routing_level == l).and_then(|r| r.direction) {
+            Some(crate::capacity::Direction::Horizontal) => crate::layertable::LayerDir::Horizontal,
+            Some(crate::capacity::Direction::Vertical) => crate::layertable::LayerDir::Vertical,
+            None => crate::layertable::LayerDir::Other,
+        })
+        .collect();
+    // With a clock and no capture, the timer itself answers each read, on the routes as they stand:
+    // est::estimateAllGlobalRouteParasitics over the planar routes, then vyges-sta.
+    let origin = crate::routes::GridOrigin { tile_size: t.core.tile_size, x_corner: t.core.area.x_min, y_corner: t.core.area.y_min };
+    let timer_rc = layer_rc(db);
+    let timer_netlist = opts.timing.as_ref().map(|_| crate::timer::netlist(db));
+    // `timer_trace`: every computed read, as `<P|U> <call> <net> <f32 bits>` (a capture's format).
+    let timer_trace = std::cell::RefCell::new(String::new());
+    let compute = |read: crate::congestion_loop::SlackRead, k: usize, st: &[NetState]| -> Result<Vec<f32>, String> {
+        let (Some(timing), Some(nl)) = (&opts.timing, &timer_netlist) else { return Err("no timer".into()) };
+        let mut par = std::collections::BTreeMap::new();
+        // getPlanarRoutes: the planar routes before layer assignment, the 3D routes (estimated
+        // with the pins attached by their real layers) in a 3D pass.
+        let is_3d = read == (crate::congestion_loop::SlackRead::Update { is_3d_step: true });
+        for &id in &net_ids {
+            let n = &nets[id];
+            if is_3d {
+                let tree = st[id].tree3d.as_ref().ok_or_else(|| format!("net {}: no 3D tree in a 3D pass", n.name))?;
+                let (px, py): (Vec<i32>, Vec<i32>) = n.pins.iter().map(|p| (p.0, p.1)).unzip();
+                let pl: Vec<i16> = n.pins.iter().map(|p| (p.2 - 1) as i16).collect();
+                let route = crate::planar_route::route_3d(tree, crate::planar_route::NetPinsGrid { x: &px, y: &py, layer: &pl }, origin);
+                par.insert(n.name.clone(), net_network(n, &route, &timer_rc, t.min_routing_layer, crate::parasitics::PinAttach::Routed).1);
+            } else if let Some(tree) = st[id].tree.as_ref() {
+                par.insert(n.name.clone(), planar_net_network(n, tree, &timer_rc, &layer_dir, origin, t.min_routing_layer).2);
+            }
+        }
+        let by_name = crate::timer::net_slacks(timing, nl, &par)?;
+        if opts.timer_trace.is_some() {
+            let tag = if read == crate::congestion_loop::SlackRead::Partial { "P" } else { "U" };
+            let mut tr = timer_trace.borrow_mut();
+            for &id in &net_ids {
+                if let Some(v) = by_name.get(&nets[id].name) {
+                    tr.push_str(&format!("{tag} {k} {} {:08x}\n", nets[id].name, v.to_bits()));
+                }
+            }
+        }
+        (0..nets.len())
+            .map(|k| match by_name.get(&nets[k].name) {
+                Some(&s) => Ok(s),
+                None if nets[k].is_local => Ok(0.0),
+                None => Err(format!("net {}: not in the timing netlist", nets[k].name)),
+            })
+            .collect()
+    };
+    let computed = opts.timing.is_some();
     let update_slacks = match (&opts.liberty, opts.clock_sources.is_empty(), &opts.captured_update_slacks) {
         (Some(_), true, _) => crate::congestion_loop::TimerSlack::Every(&unconstrained),
         (Some(_), false, Some(_)) => crate::congestion_loop::TimerSlack::PerCall(&captured_update),
+        (Some(_), false, None) if computed => crate::congestion_loop::TimerSlack::Compute(&compute),
         _ => crate::congestion_loop::TimerSlack::None,
     };
     // preProcessTechLayers: each routing layer (by level, up to the router's layers) and the cut
@@ -1091,6 +1223,7 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     let timer_slack = match (&opts.liberty, opts.clock_sources.is_empty(), &opts.captured_slacks) {
         (Some(_), true, _) => crate::congestion_loop::TimerSlack::Every(&unconstrained),
         (Some(_), false, Some(_)) => crate::congestion_loop::TimerSlack::PerCall(&captured),
+        (Some(_), false, None) if computed => crate::congestion_loop::TimerSlack::Compute(&compute),
         _ => crate::congestion_loop::TimerSlack::None,
     };
     // makeSteinerTree(net, …): the net's own alpha, else — ⛔ an else-if chain — the min-HPWL rule
@@ -1108,13 +1241,6 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         None => Vec::new(),
     };
     let stt_net = |id: usize| stt(&pins[id].0, &pins[id].1, nets[id].root, steiner_alpha(opts, &nets[id], hpwl.get(id).copied().flatten()));
-    let layer_dir: Vec<crate::layertable::LayerDir> = (1..=num_layers as i32)
-        .map(|l| match t.tech.routing_layers.iter().find(|r| r.routing_level == l).and_then(|r| r.direction) {
-            Some(crate::capacity::Direction::Horizontal) => crate::layertable::LayerDir::Horizontal,
-            Some(crate::capacity::Direction::Vertical) => crate::layertable::LayerDir::Vertical,
-            None => crate::layertable::LayerDir::Other,
-        })
-        .collect();
     let db_id: Vec<u32> = (0..nets.len() as u32).collect();
     let inp = RunInputs {
         x_grid: xg,
@@ -1143,30 +1269,6 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         origin: crate::routes::GridOrigin { tile_size: t.core.tile_size, x_corner: t.core.area.x_min, y_corner: t.core.area.y_min },
         db_id: &db_id,
         resume: None,
-    };
-    // ⛔ The parasitics read the estimator's table where it has a value, and the technology's own
-    // only where it has none (`MakeWireParasitics::layerRC`).
-    let layer_rc = |db: &Db| -> crate::parasitics::LayerRC {
-        let mut rc = crate::parasitics::LayerRC { dbu_per_micron: db.tech_get_db_units_per_micron(), ..Default::default() };
-        for l in &t.tech.routing_layers {
-            let (lvl, name) = (l.routing_level, &l.name);
-            rc.width.insert(lvl, db.layer_get_width(name) as i32);
-            rc.resistance.insert(lvl, db.layer_get_resistance(name));
-            rc.capacitance.insert(lvl, db.layer_get_capacitance(name));
-            rc.edge_capacitance.insert(lvl, db.layer_get_edge_capacitance(name));
-            if let Some(&(res, cap)) = opts.layer_rc.get(&lvl) {
-                rc.table_res.insert(lvl, res);
-                rc.table_cap.insert(lvl, cap);
-            }
-            let cut = db.layer_get_upper_layer(name);
-            if !cut.is_empty() {
-                rc.cut_resistance.insert(lvl, db.layer_get_resistance(&cut));
-                if let Some(&res) = opts.via_rc.get(&cut) {
-                    rc.cut_table_res.insert(lvl, res);
-                }
-            }
-        }
-        rc
     };
     // The run's final overflow (after R19), for the congestion verdict — and the 2D trees at the
     // router's first timer read, which is the state `estimateAllGlobalRouteParasitics` reads
@@ -1205,7 +1307,11 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     }
     let mut state = vec![NetState::default(); nets.len()];
     let mut ov = Observer { overflow: 0, cnp: t.config.critical_nets_percentage, res_aware: opts.resistance_aware, trees: None, g3: None, g2d: None };
-    let routes = match fastroute_run(&inp, &mut state, &mut ov)? {
+    let run = fastroute_run(&inp, &mut state, &mut ov);
+    if let Some(path) = &opts.timer_trace {
+        std::fs::write(path, timer_trace.borrow().as_str())?;
+    }
+    let routes = match run? {
         RunEnd::Routed(r) => r,
         RunEnd::Stopped => return Err("run() stopped".into()),
     };
@@ -1216,33 +1322,11 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     let mut snapshot_edges: std::collections::BTreeMap<String, Vec<SnapshotEdge>> = std::collections::BTreeMap::new();
     if let Some(trees) = &ov.trees {
         let rc = layer_rc(db);
-        let origin = crate::routes::GridOrigin { tile_size: t.core.tile_size, x_corner: t.core.area.x_min, y_corner: t.core.area.y_min };
         for &id in &net_ids {
             let n = &nets[id];
             let Some(tree) = trees[id].as_ref() else { continue };
-            let edges: Vec<crate::planar_route::PlanarEdge<'_>> = tree
-                .edges
-                .iter()
-                .zip(&tree.routes)
-                .map(|(e, route)| crate::planar_route::PlanarEdge { len: e.len, routelen: route.routelen, grids: &route.grids })
-                .collect();
-            let route = crate::planar_route::planar_route(&edges, (n.min_layer - 1) as usize, &layer_dir, origin);
-            let pins: Vec<crate::parasitics::PinGridLocation> = n
-                .net_pins
-                .iter()
-                .zip(&n.pin_is_driver)
-                .map(|(p, &is_driver)| crate::parasitics::PinGridLocation { name: p.name.clone(), is_port: p.is_port, is_driver, pt: p.position, grid_pt: p.on_grid, conn_layer: p.connection_layer })
-                .collect();
-            let np = crate::parasitics::NetParasitics {
-                name: &n.name,
-                route: &route,
-                pins: &pins,
-                net_min_layer: n.min_layer,
-                min_routing_layer: t.min_routing_layer,
-                ndr_width: n.ndr_widths.as_ref(),
-                attach: crate::parasitics::PinAttach::Planar,
-            };
-            parasitics.insert(n.name.clone(), crate::parasitics::estimate_net(&np, &rc));
+            let (route, pins, network) = planar_net_network(n, tree, &rc, &layer_dir, origin, t.min_routing_layer);
+            parasitics.insert(n.name.clone(), network);
             parasitic_pins.insert(n.name.clone(), pins.clone());
             planar_routes.insert(n.name.clone(), route);
             snapshot_edges.insert(

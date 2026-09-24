@@ -145,6 +145,8 @@ pub mod read;
 #[cfg(feature = "odb")]
 pub mod global_route;
 #[cfg(feature = "odb")]
+pub mod timer;
+#[cfg(feature = "odb")]
 pub use apply::apply_guides;
 
 /// An inclusive rectangle in database units.

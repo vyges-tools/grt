@@ -17,7 +17,7 @@ repository = "https://github.com/vyges-tools/grt"
 # ⛔ It must pull in `gen-write` too: `net_clear_guides` is a GENERATED setter and the database
 # crate keeps its whole generated write surface behind that feature. Depending on the crate
 # without it compiles the read half only, and the applier needs to clear before it writes.
-odb = ["dep:vyges-opendb", "vyges-opendb/gen-write", "vyges-est/odb"]
+odb = ["dep:vyges-opendb", "vyges-opendb/gen-write", "vyges-est/odb", "dep:vyges-sta"]
 # The `vyges-grt` command: the database, plus the Steiner-tree engine the router calls for real
 # (R5/R7 take it as an injected function) and JSON for the job file and the report.
 # `repair_antennas` legalizes the diodes it inserts with the detailed placer, as the reference's
@@ -40,6 +40,8 @@ vyges-stt = { git = "https://github.com/vyges-tools/stt.git", branch = "main", o
 serde_json = { version = "1", optional = true }
 flate2 = { version = "1", optional = true }
 vyges-dpl = { git = "https://github.com/vyges-tools/dpl.git", branch = "main", optional = true }
+# The timer the router reads its net slacks from (a clock defined, no captured slacks).
+vyges-sta = { git = "https://github.com/vyges-tools/sta.git", branch = "main", optional = true }
 
 # Local development against the sibling checkouts. Patches are only honored from the root
 # manifest, so this is a no-op for downstream consumers pulling us by git.
@@ -51,6 +53,9 @@ vyges-opendb-lib = { path = "../vyges-tools-opendb-lib" }
 
 [patch."https://github.com/vyges-tools/est.git"]
 vyges-est = { path = "../vyges-tools-est" }
+
+[patch."https://github.com/vyges-tools/sta.git"]
+vyges-sta = { path = "../vyges-tools-sta" }
 
 [patch."https://github.com/vyges-tools/dpl.git"]
 vyges-dpl = { path = "../vyges-tools-dpl" }

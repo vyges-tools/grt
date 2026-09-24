@@ -20,8 +20,20 @@ use crate::overflow2d::Overflow2DScan;
 /// The reference's `BIG_INT`.
 const BIG_INT: i32 = 1_000_000_000;
 
+/// Which timer read a slack request is: a partial-slack call (`CalculatePartialSlack`), or an
+/// `updateSlacks` call — before layer assignment, or in a 3D pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlackRead {
+    Partial,
+    Update { is_3d_step: bool },
+}
+
+/// Computes the timer's slacks at one read (its kind and its index among reads of that kind), per
+/// net id, from the routes as they stand.
+pub type SlackFn<'a> = dyn Fn(SlackRead, usize, &[crate::brk_rsmt::NetState]) -> Result<Vec<f32>, String> + 'a;
+
 /// The timer's answer to `getNetSlack`, per net id, as the partial-slack pass reads it.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub enum TimerSlack<'a> {
     /// No liberty library, or slacks not bound: a pass that reads them is refused.
     None,
@@ -30,16 +42,30 @@ pub enum TimerSlack<'a> {
     /// The timer's slacks captured at each `CalculatePartialSlack` call, in call order. ⛔ A call
     /// beyond the captured ones is refused, never answered with a stale capture.
     PerCall(&'a [Vec<f32>]),
+    /// The timer itself, run at each read on the routes as they stand.
+    Compute(&'a SlackFn<'a>),
+}
+
+impl std::fmt::Debug for TimerSlack<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TimerSlack::None => write!(f, "None"),
+            TimerSlack::Every(s) => write!(f, "Every({} nets)", s.len()),
+            TimerSlack::PerCall(v) => write!(f, "PerCall({} calls)", v.len()),
+            TimerSlack::Compute(_) => write!(f, "Compute"),
+        }
+    }
 }
 
 impl<'a> TimerSlack<'a> {
-    /// The slacks for the `k`-th partial-slack call (from 0).
-    pub fn for_call(&self, k: usize) -> Option<&'a [f32]> {
-        match *self {
+    /// The slacks for the `k`-th read of kind `read` (from 0), with the router's state as it is.
+    pub fn for_call(&self, k: usize, read: SlackRead, state: &[crate::brk_rsmt::NetState]) -> Result<Option<std::borrow::Cow<'a, [f32]>>, String> {
+        Ok(match *self {
             TimerSlack::None => None,
-            TimerSlack::Every(s) => Some(s),
-            TimerSlack::PerCall(v) => v.get(k).map(Vec::as_slice),
-        }
+            TimerSlack::Every(s) => Some(std::borrow::Cow::Borrowed(s)),
+            TimerSlack::PerCall(v) => v.get(k).map(|s| std::borrow::Cow::Borrowed(s.as_slice())),
+            TimerSlack::Compute(f) => Some(std::borrow::Cow::Owned(f(read, k, state)?)),
+        })
     }
 }
 
@@ -189,10 +215,13 @@ pub fn congestion_loop(
     let mut soft_ndr = Vec::new();
     let pass = |grid: &mut BrkGrid<'_>, nets: &[RsmtNet<'_>], state: &mut [NetState], p: &MsmdParams| -> Result<(), String> {
         let k = partial_calls.get();
-        if p.ordering && p.critical_nets_percentage != 0.0 {
+        let reads = p.ordering && p.critical_nets_percentage != 0.0;
+        if reads {
             partial_calls.set(k + 1);
         }
-        slack_th.set(maze_route_msmd_sequential(p, net_ids, nets, state, grid, timer_slack.for_call(k))?.slack_th);
+        // The timer runs only where the pass reads it (a computed read costs a full timing).
+        let slacks = if reads { timer_slack.for_call(k, SlackRead::Partial, state)? } else { None };
+        slack_th.set(maze_route_msmd_sequential(p, net_ids, nets, state, grid, slacks.as_deref())?.slack_th);
         Ok(())
     };
 

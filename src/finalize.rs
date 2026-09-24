@@ -234,7 +234,7 @@ fn update_slacks(net_ids: &[usize], nets: &[RsmtNet<'_>], attrs: &[NetLayerAttrs
     };
     let mut ra = ra_cell.borrow_mut();
     let k = ra.calls;
-    let slacks = ra.slacks.for_call(k).ok_or_else(|| format!("updateSlacks call {k}: the timer's slacks are not bound"))?;
+    let slacks = ra.slacks.for_call(k, crate::congestion_loop::SlackRead::Update { is_3d_step }, state)?.ok_or_else(|| format!("updateSlacks call {k}: the timer's slacks are not bound"))?;
     ra.calls += 1;
     let lens: Vec<Vec<i32>> = net_ids.iter().map(|&id| match &state[id].tree3d {
         Some(t) => t.edges.iter().map(|e| e.len).collect(),

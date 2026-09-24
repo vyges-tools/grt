@@ -27,7 +27,8 @@ JOB (JSON):
   { \"lefs\": [..], \"liberty\": [..], \"def\": \"..\" | \"db\": \"..\", \"timer_slacks\": \"..\",
     \"steps\": [ STEP, .. ] }
   timer_slacks: slacks captured from a reference timer, `<call> <net> <f32 hex bits>` per line.
-  With liberty and no clock every net is unconstrained; with a clock, a pass that reads slacks is refused.
+  With liberty and no clock every net is unconstrained; with a clock and a period the slacks are timed at each
+  read (captured timer_slacks, when given, answer instead); with a clock and neither, a pass that reads slacks is refused.
   STEP is one of
     { \"cmd\": \"set_routing_layers\", \"signal\": [lo, hi], \"clock\": [lo, hi] }
     { \"cmd\": \"layer_adjustment\", \"layers\": [lo, hi], \"value\": f }      (one layer: lo == hi)
@@ -39,7 +40,9 @@ JOB (JSON):
       \"skip_large_fanout\": n, \"congestion_iterations\": n, \"critical_nets_percentage\": f,
       \"resistance_aware\": b, \"res_aware_nets_percentage\": f, \"use_cugr\": b }
       (use_cugr: CUGR — its model and every stage written to the file $VYGC_OUT names)
-    { \"cmd\": \"create_clock\", \"ports\": [..] }                        (clock network only)
+    { \"cmd\": \"create_clock\", \"ports\": [..], \"name\": s, \"period\": f, \"waveform\": [r, f] }  (user units: the slacks are timed)
+    { \"cmd\": \"set_input_delay\" | \"set_output_delay\", \"value\": f | \"period_times\": f,
+      \"ports\": [..] | \"inputs_except_clocks\" | \"outputs\" }      (relative to the clock's rise edge)
     { \"cmd\": \"set_layer_rc\", \"layer\" | \"via\": name, \"resistance\": f } (user units)
     { \"cmd\": \"propagated_clock\" }
     { \"cmd\": \"write_parasitics\", \"path\": \"..\" }       (the networks the slacks are read from)
@@ -1008,6 +1011,8 @@ fn run(job: &Value) -> Result<Value, Fail> {
     // read and which are not modelled — refused wherever they would be read, but only when present.
     let has_access_points = from_db && db.block_access_point_count().map_err(err)? > 0;
     let mut opts = RouteOptions::new();
+    // The libraries' texts, for the timer — parsed only once a clock with a period is defined.
+    let mut liberty_texts: Vec<(String, String)> = Vec::new();
     // read_liberty — the libraries in read order; a cell in two resolves to the first.
     for lib in job["liberty"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
         let path = lib.as_str().ok_or_else(|| err("a liberty path"))?;
@@ -1019,7 +1024,10 @@ fn run(job: &Value) -> Result<Value, Fail> {
             std::fs::read_to_string(path).map_err(err)?
         };
         opts.liberty.get_or_insert_with(Default::default).read(&text).map_err(|e| Fail::Refused(format!("{path}: {e}")))?;
+        liberty_texts.push((path.to_string(), text));
     }
+    // timer_trace — where the router writes each slack read its own timer computed.
+    opts.timer_trace = job["timer_trace"].as_str().map(str::to_string);
     // timer_slacks — the reference timer's slacks, captured per call: `P <call> <net> <bits>` for
     // a partial-slack call (`CalculatePartialSlack`), `U <call> <net> <bits>` for an `updateSlacks`
     // call (a bare `<call> <net> <bits>` is a P line). An ORACLE: no timing is computed here.
@@ -1342,15 +1350,53 @@ fn run(job: &Value) -> Result<Value, Fail> {
                     return Err(err("set_layer_rc needs a layer or via"));
                 }
             }
-            // create_clock on top-level ports; the clock's period and waveform do not reach the
-            // clock network.
+            // create_clock on top-level ports. The ports reach the clock network; a period (user
+            // units) makes the router's slacks the timer's own, computed at each read.
             "create_clock" => {
+                let mut ports = Vec::new();
                 for p in step["ports"].as_array().ok_or_else(|| err("ports"))? {
-                    opts.clock_sources.push(p.as_str().ok_or_else(|| err("a port name"))?.to_string());
+                    ports.push(p.as_str().ok_or_else(|| err("a port name"))?.to_string());
+                }
+                opts.clock_sources.extend(ports.iter().cloned());
+                if let Some(period) = step["period"].as_f64() {
+                    let timing = timing_of(&mut opts, &liberty_texts)?;
+                    if timing.constraints.clock.is_some() {
+                        return Err(err("a second clock: one clock is timed"));
+                    }
+                    let name = step["name"].as_str().unwrap_or("clk").to_string();
+                    let waveform = match step["waveform"].as_array().map(Vec::as_slice) {
+                        Some([r, f]) => Some([r.as_f64().ok_or_else(|| err("waveform"))?, f.as_f64().ok_or_else(|| err("waveform"))?]),
+                        Some(_) => return Err(err("waveform: {rise fall}")),
+                        None => None,
+                    };
+                    timing.constraints.clock = Some((name, period, ports, waveform));
                 }
             }
-            // set_propagated_clock: only the slacks read it, and with a clock none are bound.
-            "propagated_clock" => {}
+            // set_propagated_clock: the timer propagates the clock through its network.
+            "propagated_clock" => {
+                if let Some(timing) = opts.timing.as_mut() {
+                    timing.constraints.propagated = true;
+                }
+            }
+            // set_input_delay / set_output_delay relative to the clock's rise edge (user units):
+            // `value`, or `period_times` (the clock's period read back, times a factor); `ports`
+            // is a list, "inputs_except_clocks" or "outputs".
+            cmd @ ("set_input_delay" | "set_output_delay") => {
+                let value = match (step["value"].as_f64(), step["period_times"].as_f64()) {
+                    (Some(v), None) => vyges_grt::timer::UserValue::Literal(v),
+                    (None, Some(f)) => vyges_grt::timer::UserValue::PeriodTimes(f),
+                    _ => return Err(err(format!("{cmd} needs one of value / period_times"))),
+                };
+                let ports = match &step["ports"] {
+                    serde_json::Value::String(s) if s == "inputs_except_clocks" => vyges_grt::timer::PortSet::InputsExceptClockSources,
+                    serde_json::Value::String(s) if s == "outputs" => vyges_grt::timer::PortSet::Outputs,
+                    serde_json::Value::Array(a) => vyges_grt::timer::PortSet::Named(a.iter().map(|p| p.as_str().unwrap_or_default().to_string()).collect()),
+                    _ => return Err(err(format!("{cmd}: ports"))),
+                };
+                let timing = opts.timing.as_mut().ok_or_else(|| err(format!("{cmd} before a clock with a period")))?;
+                let list = if cmd == "set_input_delay" { &mut timing.constraints.input_delays } else { &mut timing.constraints.output_delays };
+                list.push((value, ports));
+            }
             // The parasitics the router's own slacks are read from, in the reference's dump shape:
             // `<net>|node|<node>|<farads>` and `<net>|res|<n1>|<n2>|<ohms>`.
             "write_parasitics" => {
@@ -1833,4 +1879,20 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// The timer's inputs, made on first use: every liberty file read so far, parsed for timing.
+fn timing_of<'a>(opts: &'a mut RouteOptions, texts: &[(String, String)]) -> Result<&'a mut vyges_grt::timer::Timing, Fail> {
+    if opts.timing.is_none() {
+        let mut libs = Vec::new();
+        for (path, text) in texts {
+            let g = vyges_sta::liberty_parse::parse(text).map_err(|e| Fail::Refused(format!("{path}: {e}")))?;
+            libs.push(vyges_sta::liberty::Library::read(&g).map_err(|e| Fail::Refused(format!("{path}: {e}")))?);
+        }
+        if libs.is_empty() {
+            return Err(Fail::Refused("a clock period with no liberty library to time it".into()));
+        }
+        opts.timing = Some(vyges_grt::timer::Timing { libs, constraints: Default::default() });
+    }
+    Ok(opts.timing.as_mut().expect("just made"))
 }
