@@ -1169,11 +1169,14 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         rc
     };
     // The run's final overflow (after R19), for the congestion verdict — and the 2D trees at the
-    // first partial-slack call, which is the state `estimateAllGlobalRouteParasitics` reads
-    // (`getPartialRoutes` → `getPlanarRoutes`) when the router asks the timer for slacks.
+    // router's first timer read, which is the state `estimateAllGlobalRouteParasitics` reads
+    // (`getPartialRoutes` → `getPlanarRoutes`): the first partial-slack call, else — a
+    // resistance-aware run with none — `layerAssignment`'s `updateSlacks`, whose trees are those
+    // after R15's `removeLoops` (B15).
     struct Observer {
         overflow: i32,
         cnp: f32,
+        res_aware: bool,
         trees: Option<Vec<Option<crate::brk_rsmt::StTree>>>,
         /// The 3D edges at R19 — nothing after it changes them, so they are what antenna repair's
         /// jumper pass reads (`hasAvailableResources`) and charges.
@@ -1192,13 +1195,16 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
                 Stage::Loop(crate::congestion_loop::LoopEvent::Before { params, .. }) if params.ordering && self.cnp != 0.0 && self.trees.is_none() => {
                     self.trees = Some(st.iter().map(|n| n.tree.clone()).collect());
                 }
+                Stage::Scan { tag: "B15", .. } if self.res_aware && self.trees.is_none() => {
+                    self.trees = Some(st.iter().map(|n| n.tree.clone()).collect());
+                }
                 _ => {}
             }
             true
         }
     }
     let mut state = vec![NetState::default(); nets.len()];
-    let mut ov = Observer { overflow: 0, cnp: t.config.critical_nets_percentage, trees: None, g3: None, g2d: None };
+    let mut ov = Observer { overflow: 0, cnp: t.config.critical_nets_percentage, res_aware: opts.resistance_aware, trees: None, g3: None, g2d: None };
     let routes = match fastroute_run(&inp, &mut state, &mut ov)? {
         RunEnd::Routed(r) => r,
         RunEnd::Stopped => return Err("run() stopped".into()),
