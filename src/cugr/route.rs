@@ -107,6 +107,28 @@ fn net_ndr_costs(db: &Db, net: &str, num_layers: usize) -> Res<Vec<f64>> {
     Ok(super::ndr_costs(num_layers, &rules))
 }
 
+/// Each net's costs as `CUGR::init` leaves them, whichever command set CUGR up: its rule's
+/// factors (`computeNdrCosts`), the constant stage-1 slack, and its Steiner alpha. Returns the
+/// alphas and the slack.
+///
+/// Upstream rule (`setInitialNetSlacks` / `updateCriticalNets`): slacks are set only with a
+/// non-zero critical-net percentage (forced to 0 without a liberty library). With no clock every
+/// net is unconstrained (`1e+30`, and none is ever demoted: the percentile threshold is `1e+30`
+/// too).
+fn init_net_costs(ci: &mut CugrInit, db: &Db, opts: &RouteOptions) -> Res<(Vec<f32>, f32)> {
+    let num_layers = ci.cugr.grid.num_layers;
+    for n in &mut ci.cugr.nets {
+        n.ndr_costs = net_ndr_costs(db, &n.name, num_layers)?;
+    }
+    let constant = if opts.liberty.is_none() || opts.critical_nets_percentage == 0.0 { 0.0 } else { 1.0e30f32 };
+    let mut alphas = Vec::with_capacity(ci.cugr.nets.len());
+    for n in &mut ci.cugr.nets {
+        n.slack = constant;
+        alphas.push(crate::global_route::net_steiner_alpha(db, opts, &n.name)?);
+    }
+    Ok((alphas, constant))
+}
+
 /// What `route_cugr` leaves.
 pub struct CugrRoute {
     pub init: CugrInit,
@@ -131,27 +153,14 @@ pub fn route_cugr(db: &mut Db, opts: &RouteOptions, call: usize, stt: SteinerBui
         return Err("cugr: a clock with a liberty library — the critical-net slacks are not modelled".into());
     }
     let mut ci = init_cugr(db, opts)?;
-    // computeNdrCosts, per net (`CUGR::init`).
-    let num_layers = ci.cugr.grid.num_layers;
-    for n in &mut ci.cugr.nets {
-        n.ndr_costs = net_ndr_costs(db, &n.name, num_layers)?;
-    }
-    // setInitialNetSlacks / updateCriticalNets — only with a non-zero critical-net percentage
-    // (forced to 0 without a liberty library). With no clock every net is unconstrained
-    // (`1e+30`, and none is ever demoted: the percentile threshold is `1e+30` too); with one the
-    // slacks are the timer's, refreshed and demoted before each later sort, and come from the
-    // capture — per sort, at the sort (`sort_net_indices`).
-    let constant = if opts.liberty.is_none() || opts.critical_nets_percentage == 0.0 { 0.0 } else { 1.0e30f32 };
+    let (alphas, constant) = init_net_costs(&mut ci, db, opts)?;
+    // With a clock the slacks are the timer's, refreshed and demoted before each later sort, and
+    // come from the capture — per sort, at the sort (`sort_net_indices`).
     if timed && opts.critical_nets_percentage != 0.0 {
         match oracle {
             Some(Some(sorts)) => ci.cugr.sort_slacks = Some(sorts.clone()),
             _ => return Err(format!("cugr: no captured slacks for CUGR call {call} — not modelled").into()),
         }
-    }
-    let mut alphas = Vec::with_capacity(ci.cugr.nets.len());
-    for n in &mut ci.cugr.nets {
-        n.slack = constant;
-        alphas.push(crate::global_route::net_steiner_alpha(db, opts, &n.name)?);
     }
     let mut log = Vec::new();
     let mut trace = trace;
@@ -306,6 +315,140 @@ pub fn cugr_guides(db: &mut Db, opts: &RouteOptions, cugr: &Cugr, clock_nets: &B
         alphas: alphas.to_vec(),
         slack,
     })
+}
+
+/// `repairAntennas` in a session that routed nothing, over a database a CUGR route was saved to
+/// (the block's `grt_use_cugr` property selects the engine): the global router's routes and pins
+/// come from the guides, then CUGR is set up and adopts each route as the net's demand. In the
+/// reference's order:
+///
+/// 1. `loadGuidesFromDB` (reached through `check_antennas` → `haveRoutes`): GlobalRouter's nets
+///    and pins (found with no FastRoute capacities), then per net in block order each guide
+///    [`box_to_global_routing`](crate::restore::box_to_global_routing), then `dedupViaSegments`,
+///    `addImplicitVias`, `mergeSegments`, and `ensurePinsPositions`;
+/// 2. `initCUGR` — the same model a route builds ([`init_cugr`]), each net's rule factors, the
+///    constant slack; the rip-up budget is GlobalRouter's (50 unless this session set one);
+/// 3. demand adoption: per net in block order that has a route, `restoreNetRoute` — a refusal
+///    is counted, not an error.
+///
+/// Upstream rules: `ensurePinsPositions` moves a pin no restored segment covers only through the
+/// database's access points — a covered one (`findCoveredAccessPoint`), or the recomputation
+/// `findOnGridPositions(…, true)`, which without access points reads the same shapes `findPins`
+/// read. With none in the database (the only case modelled) no pin moves. A saved CUGR guide is
+/// never marked congested (`saveGuides`: `&& !use_cugr_`), so a congested guide changes nothing.
+///
+/// ⛔ Refused rather than guessed: access points in the database, a clock with a liberty library
+/// (the timer's slacks), a detail-routed net (`makeRouteFromWires`), a guide on a net the global
+/// router does not know (GRT-0127), and a route on a net CUGR does not hold (`restoreNetRoute`
+/// re-admits it).
+pub fn restore_cugr_for_repair(db: &mut Db, opts: &RouteOptions, mut trace: Option<&mut Vec<String>>) -> Res<(Cugr, CugrGuides)> {
+    if db.block_access_point_count()? > 0 {
+        return Err("cugr: pin access points in the database — ensurePinsPositions' access-point branch is not modelled".into());
+    }
+    if opts.liberty.is_some() && !opts.clock_sources.is_empty() {
+        return Err("cugr: a clock with a liberty library — the critical-net slacks are not modelled".into());
+    }
+    // 1. loadGuidesFromDB
+    let t = crate::global_route::setup_tech(db, opts)?;
+    let mut log = Vec::new();
+    let (routes, pins, order) = {
+        let db: &Db = db;
+        let all = read_nets(db);
+        let db_nets: Vec<&crate::read::NetFacts> = all.iter().collect();
+        let candidates: Vec<NetCandidate> = db_nets
+            .iter()
+            .map(|n| NetCandidate {
+                name: n.name.clone(),
+                is_supply: n.is_supply(),
+                is_special: n.is_special,
+                term_count: n.term_count,
+                has_special_wires: n.has_special_wires,
+                connected_by_abutment: n.connected_by_abutment,
+            })
+            .collect();
+        let nets = crate::global_route::discover_net_pins(db, &t, &db_nets, &candidates, opts, None, &mut log)?;
+        let pins: std::collections::BTreeMap<String, Vec<crate::pins::NetPin>> = nets.iter().map(|(n, p)| (n.name.clone(), p.iter().map(|(pin, _)| pin.clone()).collect())).collect();
+        let order = db.net_names();
+        let tile = t.core.tile_size;
+        let block_min = db.block_get_min_routing_layer();
+        let mut routes: std::collections::BTreeMap<String, Vec<crate::GSegment>> = std::collections::BTreeMap::new();
+        for name in &order {
+            for k in 0..db.num_net_get_guides(name) {
+                let bx = (db.guide_get_box_x_min(name, k), db.guide_get_box_y_min(name, k), db.guide_get_box_x_max(name, k), db.guide_get_box_y_max(name, k));
+                let layer = db.layer_get_routing_level(&db.guide_get_layer(name, k));
+                let via_layer = db.layer_get_routing_level(&db.guide_get_via_layer(name, k));
+                crate::restore::box_to_global_routing(bx, layer, via_layer, tile, routes.entry(name.clone()).or_default());
+            }
+        }
+        for (name, route) in routes.iter_mut() {
+            let p = pins.get(name).ok_or_else(|| format!("[ERROR GRT-0127] net_id for db_net {name} not found — not modelled"))?;
+            let grid_pins: Vec<crate::findrouting::GridPin> = p.iter().map(|p| (p.on_grid.0, p.on_grid.1, p.connection_layer)).collect();
+            crate::restore::finish_loaded_route(route, &grid_pins, block_min);
+        }
+        // ensurePinsPositions: no access points in the database (refused above) — no pin moves.
+        if let Some(tr) = trace.as_deref_mut() {
+            for name in order.iter().filter(|n| routes.contains_key(*n)) {
+                tr.push(super::trace::loaded_route(name, &routes[name]));
+            }
+            for name in order.iter().filter(|n| routes.contains_key(*n)) {
+                tr.push(super::trace::loaded_pins(name, &pins[name]));
+            }
+        }
+        (routes, pins, order)
+    };
+    // 2. initCUGR
+    let mut ci = init_cugr(db, opts)?;
+    let (alphas, constant) = init_net_costs(&mut ci, db, opts)?;
+    if let Some(tr) = trace.as_deref_mut() {
+        tr.extend(super::trace::model(&ci.cugr, ci.min_routing_layer, ci.max_routing_layer, ci.clock_nets.len()));
+    }
+    // 3. Demand adoption, per net in block order.
+    let index: std::collections::HashMap<String, usize> = ci.cugr.nets.iter().enumerate().map(|(k, n)| (n.name.clone(), k)).collect();
+    let mut commits = Vec::new();
+    for name in &order {
+        if db.net_get_wire_type(name) == "ROUTED" && !db.net_is_special(name) && db.net_has_wire(name) {
+            return Err(format!("cugr: net {name} is detail-routed — makeRouteFromWires is not modelled").into());
+        }
+        let Some(route) = routes.get(name) else { continue };
+        let Some(&k) = index.get(name) else {
+            return Err(format!("cugr: net {name} has a route but CUGR does not hold it — restoreNetRoute's re-admission is not modelled").into());
+        };
+        let r = ci.cugr.restore_net_route(k, route, &mut commits).map_err(|e| format!("cugr: restoring net {name}: {e:?}"))?;
+        if let Some(tr) = trace.as_deref_mut() {
+            tr.push(super::trace::restore(name, &r));
+        }
+    }
+    let net_routes: Vec<crate::NetRoute> = order
+        .iter()
+        .filter_map(|name| {
+            let p = pins.get(name)?;
+            let on_grid: Vec<(i32, i32)> = p.iter().map(|p| p.on_grid).collect();
+            Some(crate::NetRoute {
+                name: name.clone(),
+                segments: routes.get(name).cloned().unwrap_or_default(),
+                pins: p.iter().map(|p| crate::Pin { connection_layer: p.connection_layer, on_grid_x: p.on_grid.0, on_grid_y: p.on_grid.1 }).collect(),
+                is_local: on_grid.split_first().is_none_or(|(first, rest)| rest.iter().all(|p| p == first)),
+            })
+        })
+        .collect();
+    let grid = crate::Grid { tile_size: t.core.tile_size, area: t.core.area };
+    let save = crate::SaveOptions { guide_is_congested: false, origin_x: opts.grid_origin.0, origin_y: opts.grid_origin.1, min_routing_layer: t.min_routing_layer };
+    let guides = CugrGuides {
+        guides: Vec::new(),
+        layer_names: t.tech.routing_layers.iter().map(|l| (l.routing_level, l.name.clone())).collect(),
+        routes,
+        net_routes,
+        jumper_grid: crate::repair_antennas::JumperGrid { grid, x_grids: t.core.x_grids, y_grids: t.core.y_grids },
+        max_routing_layer: t.max_routing_layer,
+        save,
+        pins,
+        clock_nets: ci.clock_nets.clone(),
+        min_routing_layer: t.min_routing_layer,
+        iterations: opts.congestion_iterations,
+        alphas,
+        slack: constant,
+    };
+    Ok((ci.cugr, guides))
 }
 
 /// `updatePinAccessPoints`, one pin: CUGR's chosen access point replaces the pin's grid position,

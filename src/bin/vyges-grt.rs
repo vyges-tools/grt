@@ -581,16 +581,7 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, router: Repai
                 std::fs::write(p, t.iter().map(|l| format!("VYGJ|{l}\n")).collect::<String>()).map_err(err)?;
             }
             if let Ok(path) = std::env::var("VYGC_OUT") {
-                let mut lines = String::new();
-                for (net, r) in &router.restores {
-                    match r {
-                        vyges_grt::cugr::restore::Restore::Ok(t) => {
-                            let s: String = t.preorder().into_iter().map(|i| format!("{}:{}:{}:{};", t.nodes[i].layer, t.nodes[i].p.x, t.nodes[i].p.y, t.nodes[i].children.len())).collect();
-                            lines.push_str(&format!("VYGC|restore|{net}|ok|{s}\n"));
-                        }
-                        vyges_grt::cugr::restore::Restore::Fail(why) => lines.push_str(&format!("VYGC|restore|{net}|fail|{why}\n")),
-                    }
-                }
+                let lines: String = router.restores.iter().map(|(net, r)| vyges_grt::cugr::trace::restore(net, r) + "\n").collect();
                 let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(err)?;
                 std::io::Write::write_all(&mut f, lines.as_bytes()).map_err(err)?;
             }
@@ -1551,6 +1542,19 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 padding = (step["left"].as_i64().unwrap_or(0) as i32, step["right"].as_i64().unwrap_or(0) as i32);
             }
             "repair_antennas" => {
+                // No route in this session, over a database a CUGR route was saved to: the engine
+                // is the block's `grt_use_cugr` property (`ensureEngineSelected`), and the router is
+                // set up around the database's guides (`loadGuidesFromDB`, `initCUGR`, adoption).
+                if !routed_by_cugr && after.is_none() && from_db && db.block_bool_property("grt_use_cugr").map_err(err)? == Some(true) {
+                    let mut trace = std::env::var("VYGC_OUT").ok().map(|_| Vec::new());
+                    let restored = vyges_grt::cugr::route::restore_cugr_for_repair(&mut db, &opts, trace.as_mut());
+                    if let (Ok(path), Some(t)) = (std::env::var("VYGC_OUT"), &trace) {
+                        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(err)?;
+                        std::io::Write::write_all(&mut f, (t.join("\n") + "\n").as_bytes()).map_err(err)?;
+                    }
+                    cugr_state = Some(restored.map_err(|e| classify(e.to_string()))?);
+                    routed_by_cugr = true;
+                }
                 if routed_by_cugr {
                     let (cugr, cg) = cugr_state.as_mut().ok_or_else(|| Fail::Refused("cugr: no router state".into()))?;
                     let repaired = repair_antennas(&mut db, &opts, step, RepairRouter::Cugr(cugr, cg), &db_guides, has_access_points, padding, &mut log)?;

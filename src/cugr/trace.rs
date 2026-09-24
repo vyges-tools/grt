@@ -16,6 +16,8 @@
 //! | `unit\|wire=\|via=\|short=…` | unit costs |
 //! | `grid\|…`, `centers\|dim\|…`, `tracks\|layer\|…`, `cap\|layer\|x\|c(y=0),…`, `origres\|…` | `GridGraph` |
 //! | `grnet\|idx\|name\|pins=\|driver=\|bbox=lx,ly,hx,hy\|hp=`, `pap\|net\|pin\|l:x:y;…` | each `GRNet` |
+//! | `restore\|net\|ok\|l:x:y:n;…` / `restore\|net\|fail\|why` | `restoreNetRoute`: the adopted tree (preorder), or why not |
+//! | `ldb\|net\|x0,y0,l0,x1,y1,l1;…`, `ldbpin\|net\|pin:l:x,y;…` | a route and pins loaded from the database's guides |
 
 use std::fmt::Write;
 
@@ -256,3 +258,27 @@ pub fn demand(out: &mut Vec<String>, g: &GridGraph, stage: i32) {
         }
     }
 }
+
+/// `restoreNetRoute`'s answer for `net`.
+pub fn restore(net: &str, r: &super::restore::Restore) -> String {
+    match r {
+        super::restore::Restore::Ok(t) => {
+            let s: String = t.preorder().into_iter().map(|i| format!("{}:{}:{}:{};", t.nodes[i].layer, t.nodes[i].p.x, t.nodes[i].p.y, t.nodes[i].children.len())).collect();
+            format!("VYGC|restore|{net}|ok|{s}")
+        }
+        super::restore::Restore::Fail(why) => format!("VYGC|restore|{net}|fail|{why}"),
+    }
+}
+
+/// A route loaded from the database's guides (`loadGuidesFromDB`, after the merge).
+pub fn loaded_route(net: &str, route: &[crate::GSegment]) -> String {
+    let segs: String = route.iter().map(|g| format!("{},{},{},{},{},{};", g.init_x, g.init_y, g.init_layer, g.final_x, g.final_y, g.final_layer)).collect();
+    format!("VYGC|ldb|{net}|{segs}")
+}
+
+/// A loaded net's pins after `ensurePinsPositions`, in the net's pin order.
+pub fn loaded_pins(net: &str, pins: &[crate::pins::NetPin]) -> String {
+    let ps: String = pins.iter().map(|p| format!("{}:{}:{},{};", p.name, p.connection_layer, p.on_grid.0, p.on_grid.1)).collect();
+    format!("VYGC|ldbpin|{net}|{ps}")
+}
+

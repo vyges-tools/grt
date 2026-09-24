@@ -158,6 +158,16 @@ mod tests {
         assert_eq!(r[4], GSegment::new(50, 50, 1, 50, 50, 2));
     }
 
+    /// Upstream rule (`loadGuidesFromDB`, both engines): every loaded route gets its implicit vias
+    /// before the merge. No corpus guide needs one (every transition is an explicit via guide), so
+    /// this is the only witness that the shared tail calls it.
+    #[test]
+    fn a_loaded_route_is_bridged_before_the_merge() {
+        let mut r = vec![GSegment::new(50, 50, 1, 150, 50, 1), GSegment::new(50, 50, 2, 50, 150, 2)];
+        finish_loaded_route(&mut r, &[], 1);
+        assert!(r.contains(&GSegment::new(50, 50, 1, 50, 50, 2)), "{r:?}");
+    }
+
     /// A pin is covered by a segment's closed box on a layer inside its span.
     #[test]
     fn coverage_is_inclusive_in_position_and_layer() {
@@ -168,3 +178,12 @@ mod tests {
         assert_eq!(net_is_covered(&[s], &[at(50, 50, 1), at(250, 50, 1)]), vec![1]);
     }
 }
+
+/// `loadGuidesFromDB`'s tail for one net's route, the same under both engines:
+/// `dedupViaSegments`, `addImplicitVias`, then `mergeSegments` against the net's pins.
+pub fn finish_loaded_route(route: &mut Vec<GSegment>, pins: &[crate::findrouting::GridPin], block_min_routing_layer: i32) {
+    dedup_via_segments(route);
+    add_implicit_vias(route);
+    crate::findrouting::merge_segments(pins, route, block_min_routing_layer);
+}
+

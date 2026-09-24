@@ -1433,10 +1433,8 @@ pub fn restore_for_repair(db: &mut Db, opts: &RouteOptions) -> Res<AfterRoute> {
     }
     for (name, route) in routes.iter_mut() {
         let n = nets.iter().find(|n| &n.name == name).ok_or_else(|| format!("[ERROR GRT-0127] net_id for db_net {name} not found — not modelled"))?;
-        crate::restore::dedup_via_segments(route);
-        crate::restore::add_implicit_vias(route);
         let grid_pins: Vec<crate::findrouting::GridPin> = n.net_pins.iter().map(|p| (p.on_grid.0, p.on_grid.1, p.connection_layer)).collect();
-        crate::findrouting::merge_segments(&grid_pins, route, block_min);
+        crate::restore::finish_loaded_route(route, &grid_pins, block_min);
         // ensurePinsPositions: only a net some pin of which no segment covers has anything to do.
         let uncovered = crate::restore::net_is_covered(route, &pins_of(n));
         if !uncovered.is_empty() {
