@@ -290,6 +290,15 @@ pub struct JumperInputs<'a> {
     pub max_routing_layer: i32,
 }
 
+/// A later iteration's `checkAntennaViolations(routes_, nets_to_repair, …)`: only the nets to
+/// repair — the previous pass's dirty nets — are checked, and `antenna_violations_` keeps the
+/// block's net order (a PtrMap by ID). `net` names a violation's net.
+pub fn recheck_scope<V>(mut found: Vec<V>, net: impl Fn(&V) -> &String, nets_to_repair: &[String], order: &[String]) -> Vec<V> {
+    found.retain(|v| nets_to_repair.contains(net(v)));
+    found.sort_by_key(|v| order.iter().position(|m| m == net(v)).unwrap_or(usize::MAX));
+    found
+}
+
 /// `RepairAntennas::jumperInsertion`.
 ///
 /// `trace`, when given, collects the pass's call sequence in the reference instrument's `VYGJ|`

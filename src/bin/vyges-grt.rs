@@ -621,8 +621,13 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, router: Repai
         }
     };
     second.sort_by_key(|(n, ..)| order.iter().position(|m| m == n).unwrap_or(usize::MAX));
-    if !second.is_empty() && !jumper_only {
-        let mut text = String::new();
+    // The command's `while (violations && itr < iterations)`: each pass inserts diodes for the
+    // violations it holds and reroutes the dirty nets; a later pass first re-checks ONLY those
+    // nets (`nets_to_repair` = the dirty nets), on the guides the previous pass saved.
+    let mut checks = if jumpers_ran { 2 } else { 1 };
+    let mut itr = 1;
+    let mut text = String::new();
+    while !second.is_empty() && !jumper_only {
         // What the router's callbacks will see move: every instance's location and orientation.
         let placed_before: BTreeMap<String, ((i32, i32), String)> = db.inst_names().into_iter().map(|i| (i.clone(), (db.inst_location(&i), db.inst_get_orient(&i)))).collect();
         let diodes = insert_diodes(db, &second, padding, &mut text, log)?;
@@ -668,10 +673,27 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, router: Repai
             if let Some(path) = step["diode_trace"].as_str() {
                 std::fs::write(path, &text).map_err(err)?;
             }
-            if iterations > 1 {
-                return Err(Fail::Refused("a second repair iteration is not modelled".into()));
+            if itr >= iterations {
+                break;
             }
-            return Ok(saved);
+            if !diode_only {
+                return Err(Fail::Refused("a later repair iteration with the jumper pass (hasNewViolations) is not modelled".into()));
+            }
+            itr += 1;
+            second = match &oracle {
+                Some(blocks) => blocks.get(checks).cloned().unwrap_or_default(),
+                None => {
+                    let mut after = db_guides.clone();
+                    for ng in &saved {
+                        after.insert(ng.net.clone(), ng.guides.clone());
+                    }
+                    check_design(db, &after, true, ratio_margin)?
+                }
+            };
+            checks += 1;
+            second = vyges_grt::repair_antennas::recheck_scope(second, |v| &v.0, &nets_to_repair, &order);
+            log.push(format!("GRT-0012: Found {} antenna violations.", second.iter().map(|v| &v.0).collect::<BTreeSet<_>>().len()));
+            continue;
         }
         let Some((state, total_overflow)) = fast.as_mut() else { return Err(Fail::Refused("no router state".into())) };
         let (state, total_overflow): (&mut vyges_grt::global_route::AfterRoute, i32) = (state, *total_overflow);
@@ -707,8 +729,12 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, router: Repai
         sopts.guide_is_congested = total_overflow > 0 && !allow_congestion;
         let modified: Vec<vyges_grt::NetRoute> = nets_to_repair.iter().filter_map(|n| state.net_routes.iter().find(|r| &r.name == n).cloned()).collect();
         saved.extend(vyges_grt::save_guides(&modified, &state.jumper_grid.grid, &sopts).map_err(|e| err(format!("{e:?}")))?);
+        if iterations > 1 {
+            return Err(Fail::Refused("a second repair iteration after a FastRoute route is not modelled".into()));
+        }
+        break;
     }
-    if !second.is_empty() && iterations > 1 {
+    if jumper_only && !second.is_empty() && iterations > 1 {
         return Err(Fail::Refused("a second repair iteration is not modelled".into()));
     }
     Ok(saved)

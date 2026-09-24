@@ -497,3 +497,16 @@ fn a_jumper_relayers_the_nets_tree_zero_based() {
     let got: Vec<(i16, i16)> = trees[0].tree3d.as_ref().unwrap().edges[0].grids.iter().map(|p| (p.x, p.layer)).collect();
     assert_eq!(got, vec![(0, 2), (1, 2), (1, 4), (2, 4), (3, 4), (3, 2), (4, 2)]);
 }
+
+// Upstream rule (`GlobalRouter::repairAntennas`, iteration 2+): `nets_to_repair` becomes the
+// previous pass's dirty nets, and `checkAntennaViolations` checks ONLY those — a violation on any
+// other net is not seen. The order is the block's net order. In the corpus every net still
+// violating after a pass is dirty (it was given diodes), so the scope never removes one.
+#[test]
+fn a_later_iteration_rechecks_only_the_dirty_nets() {
+    let order: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+    let found = vec![("c".to_string(), 1), ("b".to_string(), 2), ("a".to_string(), 3)];
+    let dirty = vec!["c".to_string(), "a".to_string()];
+    let got = vyges_grt::repair_antennas::recheck_scope(found, |v| &v.0, &dirty, &order);
+    assert_eq!(got, vec![("a".to_string(), 3), ("c".to_string(), 1)]);
+}
