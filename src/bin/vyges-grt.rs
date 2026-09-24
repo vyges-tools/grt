@@ -1698,6 +1698,34 @@ fn run(job: &Value) -> Result<Value, Fail> {
                         guides.remove(&net);
                         db_guides.remove(&net);
                     }
+                    "move_first_bterm_pin" => {
+                        // The first block terminal (block order) whose first pin's first box is on
+                        // `from` gets that box on `to` instead: a new PLACED pin with the box, the old
+                        // pin destroyed (`dbBPin_create`, `dbBox_create`, `setPlacementStatus`,
+                        // `dbBPin_destroy`). No callback is registered outside a bracket.
+                        if incremental.is_some() {
+                            return Err(Fail::Refused("a block pin moved inside an incremental bracket is not modelled".into()));
+                        }
+                        let (from, to) = (s("from")?, s("to")?);
+                        let number = db.layer_get_number(from) as i64;
+                        for bterm in db.bterm_names() {
+                            let Some(&(layer, x0, y0, x1, y1)) = db.bpin_layer_boxes(&bterm, 0).map_err(err)?.first() else { continue };
+                            if layer != number {
+                                continue;
+                            }
+                            // The terminal is left with the one new pin either way; the old one is
+                            // PLACED (never FIXED) in every design this runs on — asserted.
+                            if db.bpin_get_placement_status(&bterm, 0) == "FIRM" || db.bpin_get_placement_status(&bterm, 0) == "LOCKED" || db.bpin_get_placement_status(&bterm, 0) == "FIXED" {
+                                return Err(Fail::Refused(format!("moving the fixed pin of {bterm} is not modelled")));
+                            }
+                            if db.bterm_clear_unfixed_bpins(&bterm).map_err(err)? != 1 {
+                                return Err(Fail::Refused(format!("block terminal {bterm} has more than one pin — not modelled")));
+                            }
+                            let idx = db.create_bterm_pin(&bterm, to, (x0, y0, x1, y1)).map_err(err)?;
+                            db.bpin_set_placement_status(&bterm, idx, "PLACED").map_err(err)?;
+                            break;
+                        }
+                    }
                     other => return Err(Fail::Refused(format!("odb {other} is not modelled"))),
                 }
                 let cb = incremental.as_mut().map(|d| d.take_trace()).unwrap_or_default();
