@@ -74,6 +74,14 @@ fn stt(x: &[i32], y: &[i32], drvr: usize, alpha: f32) -> vyges_grt::RsmtTree {
     LUT.with(|lut| to_rsmt(&vyges_stt::make_steiner_tree(lut, x, y, drvr, alpha).0.expect("a Steiner tree")))
 }
 
+/// The Steiner tree the estimator's placement estimate builds (`SteinerTreeBuilder::makeSteinerTree`).
+fn est_stt(x: &[i32], y: &[i32], drvr: usize, alpha: f32) -> vyges_est::placement::SttTree {
+    LUT.with(|lut| {
+        let t = vyges_stt::make_steiner_tree(lut, x, y, drvr, alpha).0.expect("a Steiner tree");
+        vyges_est::placement::SttTree { deg: t.deg, branch: t.branch.iter().map(|b| vyges_est::placement::Branch { x: b.x, y: b.y, n: b.n }).collect() }
+    })
+}
+
 /// FastRoute's pre-sorted FLUTE.
 fn flutes(xs: &[i32], ys: &[i32], s: &[usize], acc: i32) -> vyges_grt::RsmtTree {
     LUT.with(|lut| to_rsmt(&vyges_stt::flute::medium_degree::flutes_all_degree_acc(lut, xs.len(), xs, ys, s, acc).expect("flute")))
@@ -1014,6 +1022,9 @@ fn run(job: &Value) -> Result<Value, Fail> {
     let mut opts = RouteOptions::new();
     // The libraries' texts, for the timer — parsed only once a clock with a period is defined.
     let mut liberty_texts: Vec<(String, String)> = Vec::new();
+    // The estimator's RC (set_layer_rc / set_wire_rc as the script sets them), for a placement
+    // estimate the timer reads.
+    let mut est_rc = vyges_est::rc::Rc::new();
     // read_liberty — the libraries in read order; a cell in two resolves to the first.
     for lib in job["liberty"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
         let path = lib.as_str().ok_or_else(|| err("a liberty path"))?;
@@ -1373,10 +1384,23 @@ fn run(job: &Value) -> Result<Value, Fail> {
                     timing.constraints.clock = Some((name, period, ports, waveform));
                 }
             }
-            // estimate_parasitics -placement: parasitics a timer read with no estimate of its own sees.
+            // The estimator's RC commands, raw (`command`: set_layer_rc | set_wire_rc).
+            "est_rc" => {
+                let args: Vec<String> = step["args"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
+                let u = opts.liberty.as_ref().and_then(|l| l.units).ok_or_else(|| Fail::Refused("RC before a liberty library: the timer's default units are not modelled".into()))?;
+                let units = vyges_est::rc::Units { resistance: u.resistance, capacitance: u.capacitance, distance: u.distance };
+                match step["command"].as_str() {
+                    Some("set_layer_rc") => est_rc.set_layer_rc(&mut db, units, &args).map_err(err)?,
+                    Some("set_wire_rc") => est_rc.set_wire_rc(&db, units, &args).map_err(err)?,
+                    _ => return Err(err("est_rc: command")),
+                }
+            }
+            // estimate_parasitics -placement: the networks a timer read with no estimate of its own
+            // sees — estimated NOW, on the design as it stands (the estimator's own rules).
             "estimate_parasitics" => {
                 if step["placement"].as_bool() == Some(true) {
                     opts.placement_parasitics = true;
+                    opts.placement_networks = placement_networks(&db, &mut est_rc, &opts)?;
                 }
             }
             // set_propagated_clock: the timer propagates the clock through its network.
@@ -1902,4 +1926,35 @@ fn timing_of<'a>(opts: &'a mut RouteOptions, texts: &[(String, String)]) -> Resu
         opts.timing = Some(vyges_grt::timer::Timing { libs, constraints: Default::default() });
     }
     Ok(opts.timing.as_mut().expect("just made"))
+}
+
+/// `estimate_parasitics -placement` (corner 0) as the timer reads it: each estimated net's network,
+/// or `None` where the estimator makes none (EST-0018: a corner with no signal wire capacitance).
+fn placement_networks(db: &Db, rc: &mut vyges_est::rc::Rc, opts: &RouteOptions) -> Result<Option<BTreeMap<String, vyges_est::network::Parasitic>>, Fail> {
+    use vyges_est::placement::{estimate_wire_parasitics, Decision, Timing};
+    let tech = db.tech_get_name();
+    let zero = (0..rc.scenes.len()).any(|k| {
+        let v = rc.resolved(&tech, k);
+        (v[2] + v[3]) / 2.0 == 0.0
+    });
+    if zero || rc.resolve(&tech, |w| &w.signal_cap).is_empty() {
+        return Ok(None);
+    }
+    rc.sort_clk_and_signal_layers();
+    let propagated = opts.timing.as_ref().is_some_and(|t| t.constraints.propagated);
+    let timing = Timing { liberty: opts.liberty.as_ref(), clock_sources: opts.clock_sources.clone(), propagated };
+    let nets = estimate_wire_parasitics(db, &timing, 0.3, &est_stt).map_err(err)?;
+    let mut out = BTreeMap::new();
+    for n in &nets {
+        let g = match &n.decision {
+            Decision::Tree { tree, non_leaf_clock, .. } => {
+                let cx = vyges_est::network::NetCtx { db, rc, tech: &tech, corner: 0, is_clk: *non_leaf_clock };
+                vyges_est::network::make_steiner_parasitic(&cx, &n.net, tree).map_err(err)?
+            }
+            Decision::Pad { pins } => vyges_est::network::make_pad_parasitic(db, pins).map_err(err)?,
+            _ => continue,
+        };
+        out.insert(n.net.clone(), g);
+    }
+    Ok(Some(out))
 }

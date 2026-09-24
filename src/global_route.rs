@@ -50,6 +50,8 @@ pub struct RouteOptions {
     /// `estimate_parasitics -placement` ran: a timer read with no route estimate of its own sees
     /// those parasitics.
     pub placement_parasitics: bool,
+    /// Their networks by net (corner 0), when the estimator made any.
+    pub placement_networks: Option<std::collections::BTreeMap<String, vyges_est::network::Parasitic>>,
     /// `global_route -resistance_aware`.
     pub resistance_aware: bool,
     /// `-res_aware_nets_percentage` — once given, FIXED (`is_fixed_nets_percentage_`).
@@ -107,6 +109,7 @@ impl RouteOptions {
             timing: None,
             timer_trace: None,
             placement_parasitics: false,
+            placement_networks: None,
             resistance_aware: false,
             res_aware_nets_percentage: None,
             cugr_raw_slacks: None,

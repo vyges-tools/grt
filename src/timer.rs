@@ -138,15 +138,46 @@ pub fn timer_network(net: &str, n: &crate::parasitics::Network) -> NetParasitics
     NetParasitics { network: Network { node_caps: n.nodes.iter().map(|(_, c)| *c).collect(), resistors }, node_names }
 }
 
-/// `getNetSlack` for every net of the netlist: the worst max slack over its load pins.
+/// A placement estimate's network, as the timer reads it: pin nodes by pin name, Steiner points
+/// `<net>:<id>`, resistors in the order they were made.
+pub fn placement_network(net: &str, g: &vyges_est::network::Parasitic) -> NetParasitics {
+    use vyges_est::network::Node;
+    let mut node_names = Vec::new();
+    let mut node_caps = Vec::new();
+    let (mut sub, mut pin) = (HashMap::new(), HashMap::new());
+    for (&id, &cap) in &g.sub_nodes {
+        sub.insert(id, node_names.len());
+        node_names.push(format!("{net}:{id}"));
+        node_caps.push(cap);
+    }
+    for (&key, p) in &g.pin_nodes {
+        pin.insert(key, node_names.len());
+        node_names.push(p.name.clone());
+        node_caps.push(p.cap);
+    }
+    let at = |n: &Node| match n {
+        Node::Sub(id) => sub[id],
+        Node::Pin(k) => pin[k],
+    };
+    let resistors = g.resistors.iter().map(|(a, b, r)| (at(a), at(b), *r)).collect();
+    NetParasitics { network: Network { node_caps, resistors }, node_names }
+}
+
+/// `getNetSlack` for every net of the netlist on route estimates: the worst max slack over its
+/// load pins.
 pub fn net_slacks(timing: &Timing, nl: &Netlist, parasitics: &BTreeMap<String, crate::parasitics::Network>) -> Result<HashMap<String, f32>, String> {
+    let par: HashMap<String, NetParasitics> = parasitics.iter().map(|(net, n)| (net.clone(), timer_network(net, n))).collect();
+    net_slacks_on(timing, nl, &par)
+}
+
+/// The same, on networks already in the timer's form.
+pub fn net_slacks_on(timing: &Timing, nl: &Netlist, par: &HashMap<String, NetParasitics>) -> Result<HashMap<String, f32>, String> {
     let scale = timing.libs.first().ok_or("timing needs a library")?.time_scale;
     let Some(sdc) = sdc(&timing.constraints, nl, scale)? else {
         return Ok(nl.nets.iter().map(|n| (n.name.clone(), 1e30)).collect());
     };
-    let par: HashMap<String, NetParasitics> = parasitics.iter().map(|(net, n)| (net.clone(), timer_network(net, n))).collect();
     let mut g = Graph::build(&timing.libs, nl)?;
-    g.find_delays(&par, None)?;
+    g.find_delays(par, None)?;
     let mut s = Search::in_graph_order(&g, &sdc);
     s.find_arrivals()?;
     s.find_requireds()?;

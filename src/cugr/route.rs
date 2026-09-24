@@ -175,17 +175,19 @@ pub fn route_cugr(db: &mut Db, opts: &RouteOptions, call: usize, stt: SteinerBui
     let oracle = opts.cugr_slacks.as_ref().map(|calls| calls.get(call));
     // ⛔ CUGR reads the timer only with critical nets (`setInitialNetSlacks` and `updateNetSlacks`
     // are both behind `critical_nets_percentage_ != 0`): without them a clock changes nothing.
-    // With no capture but the timer's inputs, stage 1's read (`setInitialNetSlacks`) is timed here:
-    // on no parasitics — the script estimated none — so every net is lumped at its pin caps.
+    // With no capture but the timer's inputs, stage 1's read (`setInitialNetSlacks`) is timed here,
+    // on the placement estimate's networks if the script made one, else on none (every net lumped
+    // at its pin caps).
     // Later reads (after `updateNetSlacks` re-estimates on CUGR's routes) are not modelled yet.
     let computed_stage1 = match (&opts.timing, oracle.is_none() && timed && opts.critical_nets_percentage != 0.0) {
-        // ⛔ After `estimate_parasitics -placement` stage 1 reads THOSE parasitics: not modelled.
-        (Some(_), true) if opts.placement_parasitics => {
-            return Err("cugr: stage 1's slacks on placement parasitics are not modelled".into());
-        }
+        // After `estimate_parasitics -placement` stage 1 reads THOSE networks; otherwise none.
         (Some(timing), true) => {
             let nl = crate::timer::netlist(db);
-            let by_name = crate::timer::net_slacks(timing, &nl, &std::collections::BTreeMap::new())?;
+            let par: std::collections::HashMap<String, vyges_sta::graph::NetParasitics> = match &opts.placement_networks {
+                Some(nets) if opts.placement_parasitics => nets.iter().map(|(n, g)| (n.clone(), crate::timer::placement_network(n, g))).collect(),
+                _ => std::collections::HashMap::new(),
+            };
+            let by_name = crate::timer::net_slacks_on(timing, &nl, &par)?;
             let m: std::collections::BTreeMap<String, f32> = by_name.into_iter().collect();
             if let Some(path) = &opts.timer_trace {
                 // `C <call> <sort> <net> <bits>`, as the CUGR capture writes its reads.
@@ -212,11 +214,6 @@ pub fn route_cugr(db: &mut Db, opts: &RouteOptions, call: usize, stt: SteinerBui
     if !timed && constant != 0.0 {
         ci.cugr.constant_slack = Some(constant);
     }
-    // Resistance-aware routing with critical nets (stage 2, the res-aware order) marks on the
-    // timer's slacks: without them it is not modelled.
-    if opts.resistance_aware && opts.critical_nets_percentage != 0.0 && ci.cugr.raw_slacks.is_none() {
-        return Err("cugr: -resistance_aware with critical nets needs the timer's slacks at each refresh — not modelled without them".into());
-    }
     // With a clock the slacks are the timer's, refreshed and demoted before each later sort, and
     // come from the capture — per sort, at the sort (`sort_net_indices`).
     if timed && opts.critical_nets_percentage != 0.0 {
@@ -228,6 +225,11 @@ pub fn route_cugr(db: &mut Db, opts: &RouteOptions, call: usize, stt: SteinerBui
             }
             _ => return Err(format!("cugr: no captured slacks for CUGR call {call} — not modelled").into()),
         }
+    }
+    // Resistance-aware routing with critical nets (stage 2, the res-aware order) marks on the
+    // timer's slacks at each refresh: captured, or the timer's own.
+    if opts.resistance_aware && opts.critical_nets_percentage != 0.0 && ci.cugr.raw_slacks.is_none() && ci.cugr.slack_source.0.is_none() {
+        return Err("cugr: -resistance_aware with critical nets needs the timer's slacks at each refresh — not modelled without them".into());
     }
     let mut log = Vec::new();
     let mut trace = trace;
