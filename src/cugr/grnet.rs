@@ -36,6 +36,9 @@ pub struct GrNet {
     pub shape_ap_choices: Vec<(usize, i32, i32, i32, Point)>,
     /// Demoted to the default rule by RRR (`setSoftNdr`).
     pub soft_ndr: bool,
+    /// The tree was adopted from a route (`restoreNetRoute`), not routed: its commits skip spans
+    /// below the min layer and spread wrong-way spans. Cleared by any new tree.
+    pub adopted: bool,
 }
 
 impl GrNet {
@@ -87,6 +90,7 @@ impl GrNet {
             routing_tree: None,
             shape_ap_choices: Vec::new(),
             soft_ndr: false,
+            adopted: false,
         })
     }
 

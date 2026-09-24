@@ -469,7 +469,18 @@ fn read_violation_blocks(path: &str) -> Result<Vec<Vec<Viol>>, Fail> {
 /// `saveGuides` over the nets that got jumpers → the second check. Diode insertion, and a second
 /// iteration with violations left, are refused.
 #[allow(clippy::too_many_arguments)]
-fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, state: &mut vyges_grt::global_route::AfterRoute, total_overflow: i32, db_guides: &BTreeMap<String, Vec<vyges_grt::Guide>>, has_access_points: bool, padding: (i32, i32), log: &mut Vec<String>) -> Result<Vec<vyges_grt::NetGuides>, Fail> {
+/// The router `repair_antennas` asks and re-routes with: FastRoute's state after its run (and its
+/// total overflow), or CUGR's after its route.
+enum RepairRouter<'a> {
+    FastRoute(&'a mut vyges_grt::global_route::AfterRoute, i32),
+    Cugr(&'a mut vyges_grt::cugr::Cugr, &'a mut vyges_grt::cugr::route::CugrGuides),
+}
+
+fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, router: RepairRouter<'_>, db_guides: &BTreeMap<String, Vec<vyges_grt::Guide>>, has_access_points: bool, padding: (i32, i32), log: &mut Vec<String>) -> Result<Vec<vyges_grt::NetGuides>, Fail> {
+    let (mut fast, mut cugr) = match router {
+        RepairRouter::FastRoute(s, t) => (Some((s, t)), None),
+        RepairRouter::Cugr(c, g) => (None, Some((c, g))),
+    };
     use vyges_grt::repair_antennas::{jumper_insertion, AntViolation, FastRouteJumpers, GatePin, JumperInputs, NetViolations};
     let jumper_only = step["jumper_only"].as_bool().unwrap_or(false);
     let diode_only = step["diode_only"].as_bool().unwrap_or(false);
@@ -532,27 +543,67 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, state: &mut v
     let mut saved = Vec::new();
     // hasNewViolations: every net is new on the first iteration.
     if !diode_only && !by_net.is_empty() {
-        let g3 = state.final_3d.as_mut().ok_or_else(|| Fail::Refused("jumper insertion without the router's 3D edges".into()))?;
-        let mut routes: BTreeMap<String, Vec<vyges_grt::GSegment>> = state.net_routes.iter().map(|n| (n.name.clone(), n.segments.clone())).collect();
-        let inp = JumperInputs { tech: &tech, grid: state.jumper_grid, max_routing_layer: state.max_routing_layer };
-        let ids: BTreeMap<String, usize> = state.router_nets.iter().enumerate().map(|(k, n)| (n.name.clone(), k)).collect();
-        let mut router = FastRouteJumpers { g3, grid: state.jumper_grid, layer_edge_cost: &state.layer_edge_cost, trees: &mut state.final_state, ids: &ids };
-        let mut trace = step["trace"].as_str().map(|_| Vec::new());
-        let res = jumper_insertion(&by_net, &mut routes, &inp, &mut router, trace.as_mut()).map_err(Fail::Refused)?;
-        if let (Some(p), Some(t)) = (step["trace"].as_str(), &trace) {
-            std::fs::write(p, t.iter().map(|l| format!("VYGJ|{l}\n")).collect::<String>()).map_err(err)?;
+        if let Some((state, total_overflow)) = fast.as_mut() {
+            let (state, total_overflow): (&mut vyges_grt::global_route::AfterRoute, i32) = (state, *total_overflow);
+            let g3 = state.final_3d.as_mut().ok_or_else(|| Fail::Refused("jumper insertion without the router's 3D edges".into()))?;
+            let mut routes: BTreeMap<String, Vec<vyges_grt::GSegment>> = state.net_routes.iter().map(|n| (n.name.clone(), n.segments.clone())).collect();
+            let inp = JumperInputs { tech: &tech, grid: state.jumper_grid, max_routing_layer: state.max_routing_layer };
+            let ids: BTreeMap<String, usize> = state.router_nets.iter().enumerate().map(|(k, n)| (n.name.clone(), k)).collect();
+            let mut router = FastRouteJumpers { g3, grid: state.jumper_grid, layer_edge_cost: &state.layer_edge_cost, trees: &mut state.final_state, ids: &ids };
+            let mut trace = step["trace"].as_str().map(|_| Vec::new());
+            let res = jumper_insertion(&by_net, &mut routes, &inp, &mut router, trace.as_mut()).map_err(Fail::Refused)?;
+            if let (Some(p), Some(t)) = (step["trace"].as_str(), &trace) {
+                std::fs::write(p, t.iter().map(|l| format!("VYGJ|{l}\n")).collect::<String>()).map_err(err)?;
+            }
+            log.push(format!("GRT-0302: Inserted {} jumpers for {} nets.", res.total_jumpers, res.net_with_jumpers));
+            // saveGuides(nets_with_jumpers), with the congestion mark as the command left it.
+            let mut opts = state.save_options;
+            opts.guide_is_congested = total_overflow > 0 && !allow_congestion;
+            let mut modified = Vec::new();
+            for name in &res.modified_nets {
+                let nr = state.net_routes.iter_mut().find(|n| &n.name == name).ok_or_else(|| err(format!("net {name} has no route")))?;
+                nr.segments = routes[name].clone();
+                modified.push(nr.clone());
+            }
+            saved = vyges_grt::save_guides(&modified, &state.jumper_grid.grid, &opts).map_err(|e| err(format!("{e:?}")))?;
+        } else if let Some((cugr, cg)) = cugr.as_mut() {
+            // Under CUGR the pass asks CUGR (`hasAvailableResources`, `hasJumperResources`) and
+            // re-adopts each jumpered route into it (`restoreNetRoute`); `routes_` persists.
+            let inp = JumperInputs { tech: &tech, grid: cg.jumper_grid, max_routing_layer: cg.max_routing_layer };
+            let index = cugr.nets.iter().enumerate().map(|(k, n)| (n.name.clone(), k)).collect();
+            let mut router = vyges_grt::cugr::jumpers::CugrJumpers { cugr, grid: cg.jumper_grid, index, restores: Vec::new(), commits: Vec::new(), unmodelled: None };
+            let mut trace = step["trace"].as_str().map(|_| Vec::new());
+            let res = jumper_insertion(&by_net, &mut cg.routes, &inp, &mut router, trace.as_mut()).map_err(Fail::Refused)?;
+            if let Some(u) = router.unmodelled.take() {
+                return Err(Fail::Refused(u));
+            }
+            if let (Some(p), Some(t)) = (step["trace"].as_str(), &trace) {
+                std::fs::write(p, t.iter().map(|l| format!("VYGJ|{l}\n")).collect::<String>()).map_err(err)?;
+            }
+            if let Ok(path) = std::env::var("VYGC_OUT") {
+                let mut lines = String::new();
+                for (net, r) in &router.restores {
+                    match r {
+                        vyges_grt::cugr::restore::Restore::Ok(t) => {
+                            let s: String = t.preorder().into_iter().map(|i| format!("{}:{}:{}:{};", t.nodes[i].layer, t.nodes[i].p.x, t.nodes[i].p.y, t.nodes[i].children.len())).collect();
+                            lines.push_str(&format!("VYGC|restore|{net}|ok|{s}\n"));
+                        }
+                        vyges_grt::cugr::restore::Restore::Fail(why) => lines.push_str(&format!("VYGC|restore|{net}|fail|{why}\n")),
+                    }
+                }
+                let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(err)?;
+                std::io::Write::write_all(&mut f, lines.as_bytes()).map_err(err)?;
+            }
+            log.push(format!("GRT-0302: Inserted {} jumpers for {} nets.", res.total_jumpers, res.net_with_jumpers));
+            // saveGuides(nets_with_jumpers): a CUGR guide is never marked congested.
+            let mut modified = Vec::new();
+            for name in &res.modified_nets {
+                let nr = cg.net_routes.iter_mut().find(|n| &n.name == name).ok_or_else(|| err(format!("net {name} has no route")))?;
+                nr.segments = cg.routes[name].clone();
+                modified.push(nr.clone());
+            }
+            saved = vyges_grt::save_guides(&modified, &cg.jumper_grid.grid, &cg.save).map_err(|e| err(format!("{e:?}")))?;
         }
-        log.push(format!("GRT-0302: Inserted {} jumpers for {} nets.", res.total_jumpers, res.net_with_jumpers));
-        // saveGuides(nets_with_jumpers), with the congestion mark as the command left it.
-        let mut opts = state.save_options;
-        opts.guide_is_congested = total_overflow > 0 && !allow_congestion;
-        let mut modified = Vec::new();
-        for name in &res.modified_nets {
-            let nr = state.net_routes.iter_mut().find(|n| &n.name == name).ok_or_else(|| err(format!("net {name} has no route")))?;
-            nr.segments = routes[name].clone();
-            modified.push(nr.clone());
-        }
-        saved = vyges_grt::save_guides(&modified, &state.jumper_grid.grid, &opts).map_err(|e| err(format!("{e:?}")))?;
     }
     // antenna_violations_ as the diodes see it: the first check's when no jumper pass ran, else the
     // second check's, on the guides the jumpers left.
@@ -571,6 +622,10 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, state: &mut v
     };
     second.sort_by_key(|(n, ..)| order.iter().position(|m| m == n).unwrap_or(usize::MAX));
     if !second.is_empty() && !jumper_only {
+        let Some((state, total_overflow)) = fast.as_mut() else {
+            return Err(Fail::Refused("cugr: diode insertion after a CUGR route — its incremental reroute is not modelled".into()));
+        };
+        let (state, total_overflow): (&mut vyges_grt::global_route::AfterRoute, i32) = (state, *total_overflow);
         let mut text = String::new();
         // What the router's callbacks will see move: every instance's location and orientation.
         let placed_before: BTreeMap<String, ((i32, i32), String)> = db.inst_names().into_iter().map(|i| (i.clone(), (db.inst_location(&i), db.inst_get_orient(&i)))).collect();
@@ -1018,6 +1073,9 @@ fn run(job: &Value) -> Result<Value, Fail> {
     // The last global_route was CUGR's: the router state a later command reads (repair,
     // incremental) is FastRoute's here, so those commands are refused after it.
     let mut routed_by_cugr = false;
+    // The router a later command reads after a CUGR route: CUGR itself and the global router's
+    // routes, pins and grid (`repairAntennas` does not re-initialize after one).
+    let mut cugr_state: Option<(vyges_grt::cugr::Cugr, vyges_grt::cugr::route::CugrGuides)> = None;
     let mut cugr_calls = 0usize;
     // set_placement_padding -global: opendp's padding, in sites, left and right.
     let mut padding = (0, 0);
@@ -1132,10 +1190,11 @@ fn run(job: &Value) -> Result<Value, Fail> {
                         db_guides.insert(ng.net.clone(), ng.guides.clone());
                         guides.insert(ng.net.clone(), ng.guides.iter().map(|x| (x.box_.x_min, x.box_.y_min, x.box_.x_max, x.box_.y_max, g.layer_names[&x.layer].clone())).collect());
                     }
-                    log.extend(r.log);
+                    log.extend(r.log.clone());
                     calls.push(json!({ "nets": g.guides.len(), "use_cugr": true }));
                     after = None;
                     routed_by_cugr = true;
+                    cugr_state = Some((r.init.cugr, g));
                     continue;
                 }
                 let res = route_design(&mut db, &opts, &stt, &flutes).map_err(|e| classify(e.to_string()))?;
@@ -1446,7 +1505,13 @@ fn run(job: &Value) -> Result<Value, Fail> {
             }
             "repair_antennas" => {
                 if routed_by_cugr {
-                    return Err(Fail::Refused("cugr: repair_antennas after a CUGR route is not modelled".into()));
+                    let (cugr, cg) = cugr_state.as_mut().ok_or_else(|| Fail::Refused("cugr: no router state".into()))?;
+                    let repaired = repair_antennas(&mut db, &opts, step, RepairRouter::Cugr(cugr, cg), &db_guides, has_access_points, padding, &mut log)?;
+                    for ng in repaired {
+                        guides.insert(ng.net.clone(), ng.guides.iter().map(|g| (g.box_.x_min, g.box_.y_min, g.box_.x_max, g.box_.y_max, db_layer_name(&db, g.layer))).collect());
+                        db_guides.insert(ng.net.clone(), ng.guides);
+                    }
+                    continue;
                 }
                 // No route in this session: the routes a database brought with it (`haveRoutes` →
                 // `loadGuidesFromDB`), and the router set up around them (`repairAntennas`,
@@ -1462,7 +1527,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
                     after = Some((restored, 0));
                 }
                 let (state, total_overflow) = after.as_mut().expect("set above");
-                let repaired = repair_antennas(&mut db, &opts, step, state, *total_overflow, &db_guides, has_access_points, padding, &mut log)?;
+                let repaired = repair_antennas(&mut db, &opts, step, RepairRouter::FastRoute(state, *total_overflow), &db_guides, has_access_points, padding, &mut log)?;
                 for ng in repaired {
                     guides.insert(ng.net.clone(), ng.guides.iter().map(|g| (g.box_.x_min, g.box_.y_min, g.box_.x_max, g.box_.y_max, db_layer_name(&db, g.layer))).collect());
                     db_guides.insert(ng.net.clone(), ng.guides);

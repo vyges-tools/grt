@@ -20,9 +20,11 @@ pub mod design;
 pub mod geo;
 pub mod grid_graph;
 pub mod grnet;
+pub mod jumpers;
 pub mod layers;
 pub mod maze_route;
 pub mod pattern_route;
+pub mod restore;
 pub mod trace;
 #[cfg(feature = "odb")]
 pub mod read;
@@ -174,7 +176,7 @@ impl Cugr {
             let route = pattern_route::pattern_route_net(&mut self.nets[k], alphas[k], stt, &cx, None, log).map_err(StageError::Pattern)?;
             let mut commits = Vec::new();
             let tree = self.nets[k].routing_tree.clone().expect("set by the route");
-            self.grid.commit_tree(&self.design, &tree, false, &self.nets[k].ndr_costs, &mut commits).map_err(StageError::Commit)?;
+            self.grid.commit_tree(&self.design, &tree, false, &self.nets[k].ndr_costs, false, &mut commits).map_err(StageError::Commit)?;
             if let Some(t) = trace.as_deref_mut() {
                 trace::net_route(t, &self.nets[k], &route, &commits, 1);
             }
@@ -201,7 +203,7 @@ impl Cugr {
     /// Rip up or restore one net's tree, its commits appended.
     fn commit_net(&mut self, k: usize, rip_up: bool, commits: &mut Vec<grid_graph::Commit>) -> Result<(), StageError> {
         let Some(tree) = self.nets[k].routing_tree.clone() else { return Ok(()) };
-        self.grid.commit_tree(&self.design, &tree, rip_up, &self.nets[k].ndr_costs, commits).map_err(StageError::Commit)
+        self.grid.commit_tree(&self.design, &tree, rip_up, &self.nets[k].ndr_costs, self.nets[k].adopted, commits).map_err(StageError::Commit)
     }
 
     /// `patternRouteWithDetours` (stage 3): the overflow view taken ONCE, the congested nets in the
@@ -499,6 +501,7 @@ mod tests {
             routing_tree: Some(tree),
             shape_ap_choices: Vec::new(),
             soft_ndr: false,
+            adopted: false,
         }
     }
 

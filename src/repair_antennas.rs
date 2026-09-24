@@ -109,8 +109,10 @@ impl JumperGrid {
 pub trait JumperRouter {
     fn has_available_resources(&mut self, is_horizontal: bool, x: i32, y: i32, layer_level: i32, net: &str) -> bool;
     fn has_jumper_resources(&mut self, init: (i32, i32), fin: (i32, i32), layer_level: i32, net: &str) -> bool;
-    fn update_jumpered_route(&mut self, init: (i32, i32), fin: (i32, i32), layer_level: i32, new_layer_level: i32, net: &str) -> bool;
-    fn restore_net_demand(&mut self, net: &str);
+    /// `route` is the net's route as the jumper just left it (`routes_[net]`) — CUGR re-adopts it.
+    fn update_jumpered_route(&mut self, route: &[GSegment], init: (i32, i32), fin: (i32, i32), layer_level: i32, new_layer_level: i32, net: &str) -> bool;
+    /// `route` is the net's route rolled back.
+    fn restore_net_demand(&mut self, route: &[GSegment], net: &str);
     /// For the trace only: `(cap, usage, cost)` of the edge `has_available_resources` reads.
     fn headroom(&self, is_horizontal: bool, x: i32, y: i32, layer_level: i32, net: &str) -> (i32, i32, i32);
 }
@@ -177,7 +179,7 @@ impl JumperRouter for FastRouteJumpers<'_> {
     /// ⚠️ Only the 3D half of the usage move is modelled: the 2D half is `-edgeCost` then
     /// `+edgeCost` on the same edges and cancels, and the used-grid entries the `+` adds are
     /// discarded by the next run's `clearUsed`.
-    fn update_jumpered_route(&mut self, init: (i32, i32), fin: (i32, i32), layer_level: i32, new_layer_level: i32, net: &str) -> bool {
+    fn update_jumpered_route(&mut self, _: &[GSegment], init: (i32, i32), fin: (i32, i32), layer_level: i32, new_layer_level: i32, net: &str) -> bool {
         self.update_resources(init, fin, layer_level, -1, net);
         self.update_resources(init, fin, new_layer_level, 1, net);
         let (x1, y1) = (self.grid.dbu_to_tile(init.0, true), self.grid.dbu_to_tile(init.1, false));
@@ -187,7 +189,7 @@ impl JumperRouter for FastRouteJumpers<'_> {
         }
         true
     }
-    fn restore_net_demand(&mut self, _: &str) {}
+    fn restore_net_demand(&mut self, _: &[GSegment], _: &str) {}
     fn headroom(&self, is_horizontal: bool, x: i32, y: i32, layer_level: i32, net: &str) -> (i32, i32, i32) {
         let gx = self.grid.dbu_to_tile(x, true) as usize;
         let gy = self.grid.dbu_to_tile(y, false) as usize;
@@ -905,11 +907,11 @@ fn add_jumper_to_route(
     route.push(GSegment::new(seg_init_x, seg_init_y, layer_level, ji.0, ji.1, layer_level));
     route[seg_id].init_x = jf.0;
     route[seg_id].init_y = jf.1;
-    if !router.update_jumpered_route(ji, jf, layer_level, layer_level + 2, net) {
+    if !router.update_jumpered_route(route, ji, jf, layer_level, layer_level + 2, net) {
         route.truncate(route_size_before);
         route[seg_id].init_x = seg_init_x;
         route[seg_id].init_y = seg_init_y;
-        router.restore_net_demand(net);
+        router.restore_net_demand(route, net);
         return false;
     }
     true

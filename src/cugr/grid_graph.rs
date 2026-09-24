@@ -475,10 +475,15 @@ impl GridGraph {
         log.push(Commit { layer, p: lower, delta: demand * net_factor });
     }
 
-    /// `commitTree(tree, rip_up, net_costs, adopted=false)`: a native tree, in preorder — each
-    /// same-layer child a wire (one track per edge crossed), each layer change a via per layer
-    /// crossed at the parent's cell.
-    pub fn commit_tree(&mut self, design: &Design, tree: &GrTree, rip_up: bool, net_costs: &[f64], log: &mut Vec<Commit>) -> Result<(), CommitError> {
+    /// `commitTree(tree, rip_up, net_costs, adopted)`, in preorder — each same-layer child a wire
+    /// (one track per edge crossed), each layer change a via per layer crossed at the parent's
+    /// cell.
+    ///
+    /// Upstream rule for an ADOPTED tree (restored from a route): a span below the min routing
+    /// layer commits nothing, and a WRONG-WAY span deposits, per cell it crosses, the layer's
+    /// wrong-way demand length over that cell's flank edges (`commitWrongWayWire`). A native tree
+    /// with either is an error, as is a diagonal span on any tree.
+    pub fn commit_tree(&mut self, design: &Design, tree: &GrTree, rip_up: bool, net_costs: &[f64], adopted: bool, log: &mut Vec<Commit>) -> Result<(), CommitError> {
         let sign = if rip_up { -1.0 } else { 1.0 };
         for n in tree.preorder() {
             let node = &tree.nodes[n];
@@ -488,11 +493,27 @@ impl GridGraph {
                     // Wrong way first; GRT-0307 per edge committed (`commitWire`), so a
                     // zero-length wire never trips it.
                     let layer = node.layer as usize;
-                    let direction = self.layer_directions[layer];
-                    if node.p.get(1 - direction) != child.p.get(1 - direction) {
-                        return Err(CommitError::WrongWayWire { layer: node.layer });
+                    if adopted && layer < self.min_routing_layer {
+                        continue;
                     }
+                    let direction = self.layer_directions[layer];
+                    let perp = 1 - direction;
                     let factor = net_costs.get(layer).copied().unwrap_or(1.0);
+                    if node.p.get(perp) != child.p.get(perp) {
+                        let diagonal = node.p.get(direction) != child.p.get(direction);
+                        if !adopted || diagonal {
+                            return Err(CommitError::WrongWayWire { layer: node.layer });
+                        }
+                        for c in node.p.get(perp).min(child.p.get(perp))..node.p.get(perp).max(child.p.get(perp)) {
+                            let mut cell = node.p;
+                            cell.set(perp, c);
+                            let length = design.wrong_way_demand_length[layer];
+                            for (edge, sum) in self.flank_edges(layer, cell) {
+                                self.commit(layer, edge, sign * (length / f64::from(sum)), factor, log);
+                            }
+                        }
+                        continue;
+                    }
                     let (lo, hi) = (node.p.get(direction).min(child.p.get(direction)), node.p.get(direction).max(child.p.get(direction)));
                     for i in lo..hi {
                         if layer < self.min_routing_layer {

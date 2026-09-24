@@ -171,11 +171,18 @@ pub fn route_cugr(db: &mut Db, opts: &RouteOptions, call: usize, stt: SteinerBui
     Ok(CugrRoute { init: ci, log })
 }
 
-/// What a CUGR `global_route` saves.
+/// What a CUGR `global_route` saves, and the global router's state a later command reads.
 pub struct CugrGuides {
     pub guides: Vec<crate::NetGuides>,
     /// Routing level → layer name, as the guide writer names layers.
     pub layer_names: std::collections::BTreeMap<i32, String>,
+    /// `routes_`: every net's route after `addRemainingGuides` (what antenna repair edits).
+    pub routes: std::collections::BTreeMap<String, Vec<crate::GSegment>>,
+    /// Each net as `saveGuides` reads it — its pins AFTER `updatePinAccessPoints`.
+    pub net_routes: Vec<crate::NetRoute>,
+    pub jumper_grid: crate::repair_antennas::JumperGrid,
+    pub max_routing_layer: i32,
+    pub save: crate::SaveOptions,
 }
 
 /// The global router's tail after `CUGR::route`: `findRoutingCugr` (each net's route from CUGR,
@@ -269,5 +276,6 @@ pub fn cugr_guides(db: &mut Db, opts: &RouteOptions, cugr: &Cugr, log: &mut Vec<
     let save = crate::SaveOptions { guide_is_congested: false, origin_x: opts.grid_origin.0, origin_y: opts.grid_origin.1, min_routing_layer: t.min_routing_layer };
     let guides = crate::save_guides(&net_routes, &grid, &save).map_err(|e| format!("{e:?}"))?;
     let layer_names = t.tech.routing_layers.iter().map(|l| (l.routing_level, l.name.clone())).collect();
-    Ok(CugrGuides { guides, layer_names })
+    let jumper_grid = crate::repair_antennas::JumperGrid { grid, x_grids: t.core.x_grids, y_grids: t.core.y_grids };
+    Ok(CugrGuides { guides, layer_names, routes, net_routes, jumper_grid, max_routing_layer: t.max_routing_layer, save })
 }

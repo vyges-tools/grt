@@ -725,6 +725,7 @@ pub fn pattern_route_net(
     }
     let tree = run(&mut dag, net, cx)?;
     net.routing_tree = Some(tree);
+    net.adopted = false; // `setRoutingTree`
     Ok(NetRoute { selected, steiner, dag, chose_access_points: true, maze: None })
 }
 
@@ -734,11 +735,17 @@ pub fn pattern_route_tree(net: &mut GrNet, steiner: SteinerTree, cx: &CostContex
     let mut dag = construct_routing_dag(&steiner);
     let tree = run(&mut dag, net, cx)?;
     net.routing_tree = Some(tree);
+    net.adopted = false; // `setRoutingTree`
     Ok(NetRoute { selected: AccessPointMap::new(), steiner, dag, chose_access_points: false, maze: None })
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests_support {
+    pub(crate) use super::tests::net;
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
     use super::*;
     use crate::cugr::design::{DesignFacts, TechLayerFacts};
     use crate::cugr::grid_graph::GridGraph;
@@ -787,7 +794,7 @@ mod tests {
         init(&f, &[], 2, 3).unwrap()
     }
 
-    fn net(grid: &GridGraph, pins: &[&[(i32, i32, i32)]]) -> GrNet {
+    pub(crate) fn net(grid: &GridGraph, pins: &[&[(i32, i32, i32)]]) -> GrNet {
         let mut n = GrNet {
             index: 0,
             name: "n".into(),
@@ -801,6 +808,7 @@ mod tests {
             routing_tree: None,
             shape_ap_choices: Vec::new(),
             soft_ndr: false,
+            adopted: false,
         };
         for p in &n.pin_access_points.clone() {
             for g in p {

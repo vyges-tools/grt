@@ -271,10 +271,10 @@ impl JumperRouter for Refusing {
     fn has_jumper_resources(&mut self, init: (i32, i32), _: (i32, i32), _: i32, _: &str) -> bool {
         !self.no_fit.contains(&init.0)
     }
-    fn update_jumpered_route(&mut self, _: (i32, i32), _: (i32, i32), _: i32, _: i32, _: &str) -> bool {
+    fn update_jumpered_route(&mut self, _: &[GSegment], _: (i32, i32), _: (i32, i32), _: i32, _: i32, _: &str) -> bool {
         !self.reject_update
     }
-    fn restore_net_demand(&mut self, _: &str) {
+    fn restore_net_demand(&mut self, _: &[GSegment], _: &str) {
         self.restored += 1;
     }
     fn headroom(&self, _: bool, _: i32, _: i32, _: i32, _: &str) -> (i32, i32, i32) {
@@ -493,7 +493,7 @@ fn a_jumper_relayers_the_nets_tree_zero_based() {
     let ids = BTreeMap::from([("n".to_string(), 0usize)]);
     let (mut g, lec) = (g3(10), BTreeMap::new());
     let mut router = FastRouteJumpers { g3: &mut g, grid: grid(), layer_edge_cost: &lec, trees: &mut trees, ids: &ids };
-    assert!(router.update_jumpered_route((150, 50), (350, 50), 3, 5, "n"));
+    assert!(router.update_jumpered_route(&[], (150, 50), (350, 50), 3, 5, "n"));
     let got: Vec<(i16, i16)> = trees[0].tree3d.as_ref().unwrap().edges[0].grids.iter().map(|p| (p.x, p.layer)).collect();
     assert_eq!(got, vec![(0, 2), (1, 2), (1, 4), (2, 4), (3, 4), (3, 2), (4, 2)]);
 }
