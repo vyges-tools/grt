@@ -1375,8 +1375,15 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 // `"bits": true` — every value as its f32 bits, and each net's pins with what they
                 // are (an instance's master and terminal, a port's direction): a timer's input.
                 let bits = step["bits"].as_bool().unwrap_or(false);
-                // Every net's pins — a net without a network (a local net) still loads its driver.
+                // Every instance with its master, every port with its direction, then every net's
+                // pins — a net without a network (a local net) still loads its driver.
                 if bits {
+                    for inst in db.inst_names() {
+                        text.push_str(&format!("#inst|{inst}|{}\n", db.inst_master(&inst)));
+                    }
+                    for bterm in db.bterm_names() {
+                        text.push_str(&format!("#port|{bterm}|{}\n", db.bterm_get_io_type(&bterm)));
+                    }
                     for net in db.net_names() {
                         if db.net_is_special(&net) {
                             continue;
