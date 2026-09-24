@@ -140,12 +140,17 @@ pub struct CugrRoute {
 }
 
 /// `CUGR::route(false)`: `initCUGR`, then stage 1, then — each only while congested nets remain —
-/// stage 3 (detours), stage 4 (maze), stage 5 (rip-up and re-route). Stage 2 (resistance-aware)
-/// needs `-resistance_aware`, refused before here.
-///
+/// stage 3 (detours), stage 4 (maze), stage 5 (rip-up and re-route). Stage 2 (resistance-aware,
+/// `-resistance_aware` with critical nets) is refused.
 pub fn route_cugr(db: &mut Db, opts: &RouteOptions, call: usize, stt: SteinerBuilder<'_>, trace: Option<&mut Vec<String>>) -> Res<CugrRoute> {
     if db.block_access_point_count()? > 0 {
         return Err("cugr: pin access points in the database — findODBAccessPoints is not modelled".into());
+    }
+    // Resistance-aware routing runs only with a critical-net percentage (without one it warns,
+    // GRT-0702, and changes nothing): stage 2 re-routes the critical nets on real resistance, and
+    // every later sort takes the res-aware order.
+    if opts.resistance_aware && opts.critical_nets_percentage != 0.0 {
+        return Err("cugr: -resistance_aware with critical nets (stage 2, the res-aware net order) is not modelled".into());
     }
     let timed = opts.liberty.is_some() && !opts.clock_sources.is_empty();
     let oracle = opts.cugr_slacks.as_ref().map(|calls| calls.get(call));
