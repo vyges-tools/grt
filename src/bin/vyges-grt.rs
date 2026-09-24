@@ -1372,6 +1372,9 @@ fn run(job: &Value) -> Result<Value, Fail> {
                         text.push_str(&format!("{net}|seg|{}|{}|{}|{}|{}|{}\n", sg.init_x, sg.init_y, sg.init_layer, sg.final_x, sg.final_y, sg.final_layer));
                     }
                 }
+                // `"bits": true` — every value as its f32 bits, and each net's pins with what they
+                // are (an instance's master and terminal, a port's direction): a timer's input.
+                let bits = step["bits"].as_bool().unwrap_or(false);
                 for (net, g) in parasitics {
                     let name = |n: &vyges_grt::parasitics::NodeId| match n {
                         vyges_grt::parasitics::NodeId::Pin(p) => p.clone(),
@@ -1379,11 +1382,28 @@ fn run(job: &Value) -> Result<Value, Fail> {
                         // with a size of 0 prints as `<net>:1`.
                         vyges_grt::parasitics::NodeId::Point(i) => format!("{net}:{}", i + 1),
                     };
+                    if bits {
+                        for iterm in db.net_iterms(net) {
+                            let (inst, term) = iterm.rsplit_once('/').unwrap_or((&iterm, ""));
+                            text.push_str(&format!("{net}|pin|{iterm}|{}|{term}\n", db.inst_master(inst)));
+                        }
+                        for bterm in db.net_bterms(net) {
+                            text.push_str(&format!("{net}|port|{bterm}|{}\n", db.bterm_get_io_type(&bterm)));
+                        }
+                    }
                     for (node, cap) in &g.nodes {
-                        text.push_str(&format!("{net}|node|{}|{:.8e}\n", name(node), cap));
+                        if bits {
+                            text.push_str(&format!("{net}|node|{}|{:08x}\n", name(node), cap.to_bits()));
+                        } else {
+                            text.push_str(&format!("{net}|node|{}|{:.8e}\n", name(node), cap));
+                        }
                     }
                     for (n1, n2, res) in &g.resistors {
-                        text.push_str(&format!("{net}|res|{}|{}|{:.8e}\n", name(n1), name(n2), res));
+                        if bits {
+                            text.push_str(&format!("{net}|res|{}|{}|{:08x}\n", name(n1), name(n2), res.to_bits()));
+                        } else {
+                            text.push_str(&format!("{net}|res|{}|{}|{:.8e}\n", name(n1), name(n2), res));
+                        }
                     }
                 }
                 std::fs::write(path, text).map_err(err)?;
