@@ -86,23 +86,17 @@ pub fn init_cugr(db: &mut Db, opts: &RouteOptions) -> Res<CugrInit> {
     Ok(CugrInit { cugr, min_routing_layer: min, max_routing_layer: max, clock_nets })
 }
 
-/// How far `route_cugr` got.
+/// What `route_cugr` leaves.
 pub struct CugrRoute {
     pub init: CugrInit,
-    /// Stage 1's log lines (GRT-0274).
+    /// The stages' log lines (GRT-0274, GRT-0277, GRT-0305, GRT-0118).
     pub log: Vec<String>,
-    /// Nets whose stage-1 tree is congested; non-empty means stage 3 would run.
-    pub congested: Vec<usize>,
 }
 
-/// `CUGR::route(false)` as far as it is modelled: `initCUGR`, then stage 1.
+/// `CUGR::route(false)`: `initCUGR`, then stage 1, then — each only while congested nets remain —
+/// stage 3 (detours), stage 4 (maze), stage 5 (rip-up and re-route). Stage 2 (resistance-aware)
+/// needs `-resistance_aware`, refused before here.
 ///
-/// Refused up front, where stage 1 would read what is not modelled:
-/// - detailed-router ACCESS POINTS in the database (`findODBAccessPoints`' path);
-/// - a CLOCK defined with a liberty library and no captured slacks: the stage-1 order then reads
-///   the timer's. Without a clock every net is unconstrained — `1e+30` with a library (the
-///   critical-net percentage defaults to 10), `0` without (forced to 0) — one constant, so the
-///   order is the bounding boxes'. `call` counts this session's `-use_cugr` routes, from 0.
 pub fn route_cugr(db: &mut Db, opts: &RouteOptions, call: usize, stt: SteinerBuilder<'_>, trace: Option<&mut Vec<String>>) -> Res<CugrRoute> {
     if db.block_access_point_count()? > 0 {
         return Err("cugr: pin access points in the database — findODBAccessPoints is not modelled".into());
@@ -134,28 +128,47 @@ pub fn route_cugr(db: &mut Db, opts: &RouteOptions, call: usize, stt: SteinerBui
             .collect();
         n.ndr_costs = super::ndr_costs(num_layers, &rules);
     }
-    // setInitialNetSlacks — only with a non-zero critical-net percentage (forced to 0 without a
-    // liberty library). With no clock every net is unconstrained (`1e+30`); with one, the slacks
-    // are the timer's and come from the oracle, every net or none.
-    let slack_of = |name: &str| -> Res<f32> {
-        if opts.liberty.is_none() || opts.critical_nets_percentage == 0.0 {
-            return Ok(0.0);
-        }
+    // setInitialNetSlacks / updateCriticalNets — only with a non-zero critical-net percentage
+    // (forced to 0 without a liberty library). With no clock every net is unconstrained
+    // (`1e+30`, and none is ever demoted: the percentile threshold is `1e+30` too); with one the
+    // slacks are the timer's, refreshed and demoted before each later sort, and come from the
+    // capture — per sort, at the sort (`sort_net_indices`).
+    let constant = if opts.liberty.is_none() || opts.critical_nets_percentage == 0.0 { 0.0 } else { 1.0e30f32 };
+    if timed && opts.critical_nets_percentage != 0.0 {
         match oracle {
-            Some(Some(m)) => m.get(name).copied().ok_or_else(|| format!("cugr: net {name} has no captured slack — not modelled").into()),
-            Some(None) if timed => Err(format!("cugr: no captured slacks for CUGR call {call} — not modelled").into()),
-            _ => Ok(1.0e30),
+            Some(Some(sorts)) => ci.cugr.sort_slacks = Some(sorts.clone()),
+            _ => return Err(format!("cugr: no captured slacks for CUGR call {call} — not modelled").into()),
         }
-    };
+    }
     let mut alphas = Vec::with_capacity(ci.cugr.nets.len());
     for n in &mut ci.cugr.nets {
-        n.slack = slack_of(&n.name)?;
+        n.slack = constant;
         alphas.push(crate::global_route::net_steiner_alpha(db, opts, &n.name)?);
     }
     let mut log = Vec::new();
-    ci.cugr.pattern_route(&alphas, stt, &mut log, trace).map_err(|e: StageError| format!("cugr: {e:?}"))?;
-    let congested = ci.cugr.congested_nets();
-    Ok(CugrRoute { init: ci, log, congested })
+    let mut trace = trace;
+    // The model's records are those of `CUGR::init` — before any stage changes a net (RRR's
+    // soft-NDR demotion resets its factors).
+    if let Some(t) = trace.as_deref_mut() {
+        t.extend(super::trace::model(&ci.cugr, ci.min_routing_layer, ci.max_routing_layer, ci.clock_nets.len()));
+    }
+    let fail = |e: StageError| format!("cugr: {e:?}");
+    if let Some(t) = trace.as_deref_mut() {
+        t.push("VYGC|route|0".into());
+    }
+    ci.cugr.pattern_route(&alphas, stt, &mut log, trace.as_deref_mut()).map_err(fail)?;
+    // updateCongestedNets after stage 1 — the trace tags it stage 2 (patternRouteResAware sets its
+    // tag before returning).
+    let mut nets = ci.cugr.congested_nets(2, trace.as_deref_mut());
+    ci.cugr.pattern_route_with_detours(&mut nets, &alphas, stt, &mut log, trace.as_deref_mut()).map_err(fail)?;
+    let mut nets = ci.cugr.congested_nets(3, trace.as_deref_mut());
+    ci.cugr.maze_route(&mut nets, 4, &mut log, trace.as_deref_mut()).map_err(fail)?;
+    let mut nets = ci.cugr.congested_nets(4, trace.as_deref_mut());
+    ci.cugr.iterative_rrr(&mut nets, opts.congestion_iterations, &mut log, trace.as_deref_mut()).map_err(fail)?;
+    if let Some(t) = trace.as_deref_mut() {
+        t.push("VYGC|routed".into());
+    }
+    Ok(CugrRoute { init: ci, log })
 }
 
 /// What a CUGR `global_route` saves.

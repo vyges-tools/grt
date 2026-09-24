@@ -10,6 +10,9 @@
 //! | --- | --- | --- |
 //! | 0 · the model | `Design`, `GridGraph`, `GRNet` construction | [`init`] |
 //! | 1 · pattern routing | `CUGR::patternRoute` | [`Cugr::pattern_route`] |
+//! | 3 · detours | `CUGR::patternRouteWithDetours` | [`Cugr::pattern_route_with_detours`] |
+//! | 4 · maze | `CUGR::mazeRoute` | [`Cugr::maze_route`] |
+//! | 5 · rip-up and re-route | `CUGR::iterativeRRR` | [`Cugr::iterative_rrr`] |
 //!
 //! [`init`] is `CUGR::init`'s call sequence and does no work of its own; so is each stage.
 
@@ -18,6 +21,7 @@ pub mod geo;
 pub mod grid_graph;
 pub mod grnet;
 pub mod layers;
+pub mod maze_route;
 pub mod pattern_route;
 pub mod trace;
 #[cfg(feature = "odb")]
@@ -111,6 +115,11 @@ pub struct Cugr {
     pub grid: GridGraph,
     /// Indexed by net index (every design net is valid at `init`).
     pub nets: Vec<GrNet>,
+    /// `GridGraph::cost_multiplier_`: RRR's slope multiplier on the logistic costs (1 otherwise).
+    pub cost_multiplier: f64,
+    /// Captured slacks per net-order sort, where the timer's are needed; the next sort's index.
+    pub sort_slacks: Option<Vec<std::collections::BTreeMap<String, f32>>>,
+    pub sorts_done: usize,
 }
 
 /// A stage that stopped where the reference would have gone on to something not modelled, or
@@ -119,12 +128,28 @@ pub struct Cugr {
 pub enum StageError {
     Pattern(pattern_route::PatternError),
     Commit(grid_graph::CommitError),
+    Maze(String),
+    /// A captured slack the sort needs is missing — not modelled.
+    Slacks(String),
 }
 
 impl Cugr {
     /// `sortNetIndices(nets, res_aware_order=false)`: a STABLE sort by `(slack, bbox half
-    /// perimeter)`, from index order.
-    pub fn sort_net_indices(&self, indices: &mut [usize]) {
+    /// perimeter)`, from index order. Where captured slacks are set, each listed net first takes
+    /// this sort's (the reference refreshes and demotes them before stages 3 and 4).
+    pub fn sort_net_indices(&mut self, indices: &mut [usize]) -> Result<(), StageError> {
+        if let Some(sorts) = &self.sort_slacks {
+            let m = sorts.get(self.sorts_done).ok_or_else(|| StageError::Slacks(format!("no captured slacks for sort {}", self.sorts_done)))?;
+            for &k in indices.iter() {
+                self.nets[k].slack = *m.get(&self.nets[k].name).ok_or_else(|| StageError::Slacks(format!("net {} has no captured slack in sort {}", self.nets[k].name, self.sorts_done)))?;
+            }
+        }
+        self.sorts_done += 1;
+        self.sort_by_slack_then_hp(indices);
+        Ok(())
+    }
+
+    fn sort_by_slack_then_hp(&self, indices: &mut [usize]) {
         indices.sort_by(|&a, &b| {
             let (na, nb) = (&self.nets[a], &self.nets[b]);
             (na.slack, na.bounding_box.hp()).partial_cmp(&(nb.slack, nb.bounding_box.hp())).unwrap_or(std::cmp::Ordering::Equal)
@@ -137,16 +162,16 @@ impl Cugr {
     /// `alphas[k]` is net `k`'s Steiner alpha. With `trace`, the stage's records are appended.
     pub fn pattern_route(&mut self, alphas: &[f32], stt: pattern_route::SteinerBuilder<'_>, log: &mut Vec<String>, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
         let mut order: Vec<usize> = (0..self.nets.len()).collect();
-        self.sort_net_indices(&mut order);
+        self.sort_net_indices(&mut order)?;
         if let Some(t) = trace.as_deref_mut() {
-            trace::order(t, self, &order);
+            trace::order(t, self, &order, 1);
         }
         for &k in &order {
             if self.nets[k].num_pins() < 2 {
                 continue;
             }
             let cx = pattern_route::CostContext { grid: &self.grid, design: &self.design, constants: &self.constants, cost_multiplier: 1.0 };
-            let route = pattern_route::pattern_route_net(&mut self.nets[k], alphas[k], stt, &cx, log).map_err(StageError::Pattern)?;
+            let route = pattern_route::pattern_route_net(&mut self.nets[k], alphas[k], stt, &cx, None, log).map_err(StageError::Pattern)?;
             let mut commits = Vec::new();
             let tree = self.nets[k].routing_tree.clone().expect("set by the route");
             self.grid.commit_tree(&self.design, &tree, false, &self.nets[k].ndr_costs, &mut commits).map_err(StageError::Commit)?;
@@ -160,12 +185,164 @@ impl Cugr {
         Ok(())
     }
 
-    /// `updateCongestedNets(threshold 1)` over every routed net: those whose tree crosses an edge
-    /// with more demand than capacity. Empty means stages 3 to 5 have nothing to do.
-    pub fn congested_nets(&self) -> Vec<usize> {
-        (0..self.nets.len())
+    /// `updateCongestedNets(threshold 1)` over every routed net, in index order: those whose tree
+    /// crosses an edge with more demand than capacity. Empty means stages 3 to 5 have nothing to
+    /// do. `tag` is the stage the trace records it under.
+    pub fn congested_nets(&self, tag: i32, trace: Option<&mut Vec<String>>) -> Vec<usize> {
+        let out: Vec<usize> = (0..self.nets.len())
             .filter(|&k| self.nets[k].routing_tree.as_ref().is_some_and(|t| self.grid.check_congestion(t, 1.0) > 0))
-            .collect()
+            .collect();
+        if let Some(t) = trace {
+            t.push(format!("VYGC|cong|{tag}|{}|{}", out.len(), trace::list(&out)));
+        }
+        out
+    }
+
+    /// Rip up or restore one net's tree, its commits appended.
+    fn commit_net(&mut self, k: usize, rip_up: bool, commits: &mut Vec<grid_graph::Commit>) -> Result<(), StageError> {
+        let Some(tree) = self.nets[k].routing_tree.clone() else { return Ok(()) };
+        self.grid.commit_tree(&self.design, &tree, rip_up, &self.nets[k].ndr_costs, commits).map_err(StageError::Commit)
+    }
+
+    /// `patternRouteWithDetours` (stage 3): the overflow view taken ONCE, the congested nets in the
+    /// neutral order, each ripped up and pattern-routed again with detours through the view.
+    pub fn pattern_route_with_detours(&mut self, nets: &mut Vec<usize>, alphas: &[f32], stt: pattern_route::SteinerBuilder<'_>, log: &mut Vec<String>, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
+        if nets.is_empty() {
+            return Ok(());
+        }
+        let view = self.grid.extract_congestion_view();
+        if let Some(t) = trace.as_deref_mut() {
+            trace::congestion_view(t, &view);
+        }
+        self.sort_net_indices(nets)?;
+        if let Some(t) = trace.as_deref_mut() {
+            trace::order(t, self, nets, 3);
+        }
+        for &k in nets.iter() {
+            if self.nets[k].num_pins() < 2 {
+                continue;
+            }
+            let mut commits = Vec::new();
+            self.commit_net(k, true, &mut commits)?;
+            let cx = pattern_route::CostContext { grid: &self.grid, design: &self.design, constants: &self.constants, cost_multiplier: self.cost_multiplier };
+            let route = pattern_route::pattern_route_net(&mut self.nets[k], alphas[k], stt, &cx, Some(&view), log).map_err(StageError::Pattern)?;
+            self.commit_net(k, false, &mut commits)?;
+            if let Some(t) = trace.as_deref_mut() {
+                trace::net_route(t, &self.nets[k], &route, &commits, 3);
+            }
+        }
+        if let Some(t) = trace {
+            trace::demand(t, &self.grid, 3);
+        }
+        Ok(())
+    }
+
+    /// `mazeRoute(nets, stage)` (stage 4, and each RRR iteration as stage 5): EVERY listed net
+    /// ripped up first, then the wire-cost view taken, the nets in the neutral order, each routed
+    /// on a sparsified grid whose offset steps after every net, its tree laid onto layers by
+    /// pattern routing, committed, and the view re-priced along it.
+    pub fn maze_route(&mut self, nets: &mut Vec<usize>, stage: i32, log: &mut Vec<String>, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
+        if nets.is_empty() {
+            return Ok(());
+        }
+        let mut ripped = Vec::new();
+        for &k in nets.iter() {
+            self.commit_net(k, true, &mut ripped)?;
+        }
+        let mut view: grid_graph::View<f64> = Vec::new();
+        self.grid.extract_wire_cost_view(&mut view, &[], &self.constants, self.cost_multiplier);
+        self.sort_net_indices(nets)?;
+        if let Some(t) = trace.as_deref_mut() {
+            trace::commits(t, &ripped, stage);
+            trace::order(t, self, nets, stage);
+            trace::wire_cost_view(t, &view, stage);
+        }
+        let mut grid = maze_route::SparseGrid::new(10, 10, 0, 0);
+        let mut ndr_view: grid_graph::View<f64> = Vec::new();
+        for &k in nets.iter() {
+            if self.nets[k].num_pins() < 2 {
+                continue;
+            }
+            let selected = pattern_route::select_access_points(&mut self.nets[k], &self.grid, log).map_err(StageError::Pattern)?;
+            let has_ndr = self.nets[k].has_ndr();
+            if has_ndr {
+                self.grid.extract_wire_cost_view(&mut ndr_view, &self.nets[k].ndr_costs, &self.constants, self.cost_multiplier);
+            }
+            let (sparse, arena, found, steiner) = maze_route::maze_tree(&selected, if has_ndr { &ndr_view } else { &view }, &grid, &self.grid).map_err(|e| StageError::Maze(e))?;
+            let cx = pattern_route::CostContext { grid: &self.grid, design: &self.design, constants: &self.constants, cost_multiplier: self.cost_multiplier };
+            let mut route = pattern_route::pattern_route_tree(&mut self.nets[k], steiner, &cx).map_err(StageError::Pattern)?;
+            route.maze = Some((sparse, arena, found));
+            let mut commits = Vec::new();
+            self.commit_net(k, false, &mut commits)?;
+            let tree = self.nets[k].routing_tree.clone().expect("set by the route");
+            self.grid.update_wire_cost_view(&mut view, &tree, &self.constants, self.cost_multiplier);
+            if let Some(t) = trace.as_deref_mut() {
+                trace::net_route(t, &self.nets[k], &route, &commits, stage);
+                trace::maze(t, &self.nets[k], &route, &grid);
+            }
+            grid.step();
+        }
+        if let Some(t) = trace {
+            trace::demand(t, &self.grid, stage);
+        }
+        Ok(())
+    }
+
+    /// `iterativeRRR` (stage 5): only with integer overflow left; up to `iterations` rounds, each
+    /// taking the congested nets again (stopping when none), demoting an NDR net congested two
+    /// rounds running to the default rule, raising the logistic slope by 1 up to 6, and maze-
+    /// routing the congested set. The multiplier is reset after.
+    pub fn iterative_rrr(&mut self, nets: &mut Vec<usize>, iterations: i32, log: &mut Vec<String>, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
+        if self.grid.total_overflow() == 0 {
+            return Ok(());
+        }
+        let mut streak: std::collections::HashMap<usize, i32> = std::collections::HashMap::new();
+        let mut multiplier = 1.0f64;
+        for i in 1..=iterations {
+            *nets = self.congested_nets(5, trace.as_deref_mut());
+            if nets.is_empty() {
+                break;
+            }
+            let current: std::collections::HashSet<usize> = nets.iter().copied().collect();
+            let mut demoted = Vec::new();
+            let mut commits = Vec::new();
+            for &k in nets.iter() {
+                if !self.nets[k].has_ndr() {
+                    continue;
+                }
+                let s = streak.entry(k).or_insert(0);
+                *s += 1;
+                if *s >= 2 {
+                    self.commit_net(k, true, &mut commits)?;
+                    self.nets[k].set_soft_ndr();
+                    self.commit_net(k, false, &mut commits)?;
+                    demoted.push(self.nets[k].name.clone());
+                }
+            }
+            for (k, s) in streak.iter_mut() {
+                if !current.contains(k) {
+                    *s = 0;
+                }
+            }
+            if !demoted.is_empty() {
+                log.push(format!("[WARNING GRT-0305] Demoted {} NDR net(s) to default rule to reduce congestion (use debug 'softNDR' for net list).", demoted.len()));
+            }
+            if multiplier < 6.0 {
+                multiplier += 1.0;
+            }
+            self.cost_multiplier = multiplier;
+            if let Some(t) = trace.as_deref_mut() {
+                trace::commits(t, &commits, 5);
+                t.push(format!("VYGC|rrr|{i}|{multiplier}|{}|{}|demoted={}", nets.len(), trace::list(nets.iter()), demoted.iter().map(|d| format!("{d},")).collect::<String>()));
+            }
+            self.maze_route(nets, 5, log, trace.as_deref_mut())?;
+        }
+        self.cost_multiplier = 1.0;
+        let residual = self.grid.total_overflow();
+        if residual > 0 {
+            log.push(format!("[WARNING GRT-0118] Iterative RRR finished with congestion remaining ({residual})."));
+        }
+        Ok(())
     }
 }
 
@@ -255,7 +432,7 @@ pub fn init(facts: &DesignFacts, driver_terms: &[String], min_routing_layer: i32
         .map(|n| GrNet::new(n, &driver_terms[n.facts_index], &grid))
         .collect::<Result<Vec<_>, _>>()
         .map_err(InitError::Grid)?;
-    Ok(Cugr { constants, design, grid, nets })
+    Ok(Cugr { constants, design, grid, nets, cost_multiplier: 1.0, sort_slacks: None, sorts_done: 0 })
 }
 
 #[cfg(test)]
@@ -321,6 +498,7 @@ mod tests {
             ndr_costs: vec![1.0; 3],
             routing_tree: Some(tree),
             shape_ap_choices: Vec::new(),
+            soft_ndr: false,
         }
     }
 

@@ -25,7 +25,7 @@ use super::layers::MetalLayer;
 use super::pattern_route::NetRoute;
 use super::Cugr;
 
-fn list<T: std::fmt::Display>(v: impl IntoIterator<Item = T>) -> String {
+pub fn list<T: std::fmt::Display>(v: impl IntoIterator<Item = T>) -> String {
     let mut s = String::new();
     for x in v {
         let _ = write!(s, "{x},");
@@ -125,11 +125,67 @@ pub fn model(c: &Cugr, min_routing_layer: i32, max_routing_layer: i32, clock_net
 }
 
 /// `order|stage|pos|idx|name|slack|hp`: the nets in routing order.
-pub fn order(out: &mut Vec<String>, c: &Cugr, order: &[usize]) {
+pub fn order(out: &mut Vec<String>, c: &Cugr, order: &[usize], stage: i32) {
     for (pos, &k) in order.iter().enumerate() {
         let n = &c.nets[k];
-        out.push(format!("VYGC|order|1|{pos}|{k}|{}|{}|{}", n.name, n.slack, n.bounding_box.hp()));
+        out.push(format!("VYGC|order|{stage}|{pos}|{k}|{}|{}|{}", n.name, n.slack, n.bounding_box.hp()));
     }
+}
+
+/// `cgv|dir|x|0101…`: stage 3's congestion view.
+pub fn congestion_view(out: &mut Vec<String>, view: &super::grid_graph::View<bool>) {
+    for (d, columns) in view.iter().enumerate() {
+        for (x, column) in columns.iter().enumerate() {
+            out.push(format!("VYGC|cgv|{d}|{x}|{}", column.iter().map(|&b| if b { '1' } else { '0' }).collect::<String>()));
+        }
+    }
+}
+
+/// `wcv|stage|dir|x|c(y=0),…`: the wire-cost view as the maze stage takes it.
+pub fn wire_cost_view(out: &mut Vec<String>, view: &super::grid_graph::View<f64>, stage: i32) {
+    for (d, columns) in view.iter().enumerate() {
+        for (x, column) in columns.iter().enumerate() {
+            out.push(format!("VYGC|wcv|{stage}|{d}|{x}|{}", list(column)));
+        }
+    }
+}
+
+/// `cm|stage|l|x|y|delta` for commits made outside a net's own route (rip-ups, demotions).
+pub fn commits(out: &mut Vec<String>, commits: &[Commit], stage: i32) {
+    for c in commits {
+        out.push(format!("VYGC|cm|{stage}|{}|{}|{}|{}", c.layer, c.p.x, c.p.y, c.delta));
+    }
+}
+
+/// `sparse|net|off=x,y|xs=…|ys=…|pins=…`, `mazepath|net|k|v:cost;…`, `mazetree|net|…`.
+pub fn maze(out: &mut Vec<String>, n: &GrNet, r: &NetRoute, grid: &super::maze_route::SparseGrid) {
+    let Some((g, arena, found)) = &r.maze else { return };
+    let k = n.index;
+    let pins: String = g.pseudo_pins.iter().map(|(p, l)| format!("{},{},{},{};", p.x, p.y, l.low, l.high)).collect();
+    out.push(format!("VYGC|sparse|{k}|off={},{}|xs={}|ys={}|pins={pins}", grid.offset.x, grid.offset.y, list(&g.xs), list(&g.ys)));
+    for (i, &f) in found.iter().enumerate() {
+        let mut path = String::new();
+        let mut t = Some(f);
+        while let Some(id) = t {
+            path.push_str(&format!("{}:{};", arena[id].vertex, arena[id].cost));
+            t = arena[id].prev;
+        }
+        out.push(format!("VYGC|mazepath|{k}|{i}|{path}"));
+    }
+    // One cell: `getSteinerTree` returns before the reference records its tree.
+    if g.pseudo_pins.len() == 1 {
+        return;
+    }
+    let st: String = r
+        .steiner
+        .preorder()
+        .into_iter()
+        .map(|i| {
+            let s = &r.steiner.nodes[i];
+            format!("{},{},{},{},{};", s.p.x, s.p.y, s.fixed.low, s.fixed.high, s.children.len())
+        })
+        .collect();
+    out.push(format!("VYGC|mazetree|{k}|{st}"));
 }
 
 /// One net's stage records, in the reference's order: per pin the (empty) detailed-router access
@@ -143,11 +199,13 @@ pub fn net_route(out: &mut Vec<String>, n: &GrNet, r: &NetRoute, commits: &[Comm
     for &(pin, best, acc, dist, center) in &n.shape_ap_choices {
         out.push(format!("VYGC|shapeap|{k}|{pin}|{best}|{acc}|{dist}|center={},{}", center.x, center.y));
     }
-    for (pin, (p, layers)) in &n.preferred_aps {
-        out.push(format!("VYGC|pref|{k}|{pin}|{}|{}|{}|{}", p.x, p.y, layers.low, layers.high));
-    }
-    for (&(x, y), layers) in &r.selected {
-        out.push(format!("VYGC|sel|{k}|{x}|{y}|{}|{}", layers.low, layers.high));
+    if r.chose_access_points {
+        for (pin, (p, layers)) in &n.preferred_aps {
+            out.push(format!("VYGC|pref|{k}|{pin}|{}|{}|{}|{}", p.x, p.y, layers.low, layers.high));
+        }
+        for (&(x, y), layers) in &r.selected {
+            out.push(format!("VYGC|sel|{k}|{x}|{y}|{}|{}", layers.low, layers.high));
+        }
     }
     if let Some((xs, ys, driver)) = &r.steiner.input {
         let input: String = xs.iter().zip(ys).map(|(x, y)| format!("{x},{y};")).collect();

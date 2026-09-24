@@ -52,9 +52,10 @@ pub struct RouteOptions {
     /// `set_layer_rc -via` — the estimator's table for a cut layer, by its name (ohms per cut).
     pub via_rc: std::collections::BTreeMap<String, f64>,
     pub critical_nets_percentage: f32,
-    /// CUGR's stage-1 slacks, captured from the reference per `-use_cugr` call: net → slack. An
-    /// ORACLE: CUGR orders by them where a clock makes them the timer's.
-    pub cugr_slacks: Option<Vec<std::collections::BTreeMap<String, f32>>>,
+    /// CUGR's slacks as each net-order sort reads them, captured from the reference: per
+    /// `-use_cugr` call, per sort (stage 1's first, then stage 3's, 4's and each RRR round's),
+    /// net → slack. An ORACLE: CUGR orders by them where a clock makes them the timer's.
+    pub cugr_slacks: Option<Vec<Vec<std::collections::BTreeMap<String, f32>>>>,
     /// `set_global_routing_layer_adjustment *`.
     pub adjustment: f32,
     pub grid_origin: (i32, i32),

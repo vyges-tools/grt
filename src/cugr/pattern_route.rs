@@ -245,10 +245,18 @@ impl Dag {
     }
 
     /// `constructPaths(start, end)`: a straight path when aligned, else two L-shapes — through
-    /// `(end.x, start.y)` first, then `(start.x, end.y)`.
+    /// `(end.x, start.y)` first, then `(start.x, end.y)` — as a NEW child's paths.
     fn construct_paths(&mut self, start: usize, end: usize) {
-        let child_index = self.nodes[start].paths.len();
-        self.nodes[start].paths.push(Vec::new());
+        self.construct_paths_at(start, end, None);
+    }
+
+    /// `constructPaths(start, end, child_index)`: with an index, the paths are ADDED to that
+    /// child's alternatives (a detour); without one, a new child's are made.
+    fn construct_paths_at(&mut self, start: usize, end: usize, child_index: Option<usize>) {
+        let child_index = child_index.unwrap_or_else(|| {
+            self.nodes[start].paths.push(Vec::new());
+            self.nodes[start].paths.len() - 1
+        });
         let (s, e) = (self.nodes[start].p, self.nodes[end].p);
         if s.x == e.x || s.y == e.y {
             self.nodes[start].paths[child_index].push(end);
@@ -280,6 +288,230 @@ pub fn construct_routing_dag(steiner: &SteinerTree) -> Dag {
     let mut dag = Dag::default();
     dag.root = construct(&mut dag, None, steiner, steiner.root);
     dag
+}
+
+// ---------------------------------------------------------------- detours (stage 3) ----
+
+/// A node of a detour scaffold: a DAG node (none for the virtual root) and its scaffold children.
+struct Scaffold {
+    node: Option<usize>,
+    children: Vec<usize>,
+}
+
+/// `constructDetours(congestion_view)`: for each run of the DAG along one direction that crosses
+/// a congested edge (a SCAFFOLD), copies of the run shifted across that direction, as alternative
+/// paths the DP may choose.
+///
+/// Upstream rules, all transcribed as written:
+/// - scaffolds are grown bottom-up in the DAG's path order; a child's pending scaffold is handed to
+///   a new top scaffold inside the loop over each child's PATHS (so once per path list);
+/// - the shift range grows while the stems' total length stays within `trunk × max_detour_ratio`
+///   (truncated to an int) — upward the test reads the stems at `high - 1`, not `high + 1`;
+/// - the step widens until fewer than `target_detour_count` shifts remain on either side;
+/// - a pinned node is copied (its pins stay) and joined to its shifted twin.
+pub fn construct_detours(dag: &mut Dag, view: &super::grid_graph::View<bool>, sizes: [usize; 2], c: &Constants, log: &mut Log) {
+    use super::grid_graph::view_check;
+    let n0 = dag.nodes.len();
+    let mut sc: Vec<Scaffold> = Vec::new();
+    let mut scaffolds: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
+    let mut scaffold_nodes: [Vec<Option<usize>>; 2] = [vec![None; n0], vec![None; n0]];
+    let mut visited = vec![false; n0];
+    fn new_scaffold(sc: &mut Vec<Scaffold>, node: Option<usize>) -> usize {
+        sc.push(Scaffold { node, children: Vec::new() });
+        sc.len() - 1
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn build(dag: &Dag, node: usize, view: &super::grid_graph::View<bool>, visited: &mut [bool], sc: &mut Vec<Scaffold>, sn: &mut [Vec<Option<usize>>; 2], scaffolds: &mut [Vec<usize>; 2]) {
+        if visited[node] {
+            return;
+        }
+        visited[node] = true;
+        let dir_of = |a: usize, b: usize| if dag.nodes[a].p.y == dag.nodes[b].p.y { H } else { V };
+        if dag.nodes[node].optional {
+            let path = dag.nodes[node].paths[0][0];
+            build(dag, path, view, visited, sc, sn, scaffolds);
+            let d = dir_of(node, path);
+            if sn[d][path].is_none() && view_check(view, dag.nodes[node].p, dag.nodes[path].p) {
+                sn[d][path] = Some(new_scaffold(sc, Some(path)));
+            }
+            return;
+        }
+        for child_paths in dag.nodes[node].paths.clone() {
+            for &path in &child_paths {
+                build(dag, path, view, visited, sc, sn, scaffolds);
+                let d = dir_of(node, path);
+                if dag.nodes[path].optional {
+                    if sn[d][node].is_none() && view_check(view, dag.nodes[node].p, dag.nodes[path].p) {
+                        sn[d][node] = Some(new_scaffold(sc, Some(node)));
+                    }
+                } else if view_check(view, dag.nodes[node].p, dag.nodes[path].p) {
+                    if sn[d][node].is_none() {
+                        sn[d][node] = Some(new_scaffold(sc, Some(node)));
+                    }
+                    let parent = sn[d][node].expect("set above");
+                    match sn[d][path] {
+                        None => {
+                            let s = new_scaffold(sc, Some(path));
+                            sc[parent].children.push(s);
+                        }
+                        Some(s) => {
+                            sc[parent].children.push(s);
+                            sn[d][path] = None;
+                        }
+                    }
+                }
+            }
+            for &child in &dag.nodes[node].children {
+                for d in 0..2 {
+                    if let Some(s) = sn[d][child] {
+                        let top = new_scaffold(sc, Some(node));
+                        sc[top].children.push(s);
+                        scaffolds[d].push(top);
+                        sn[d][child] = None;
+                    }
+                }
+            }
+        }
+    }
+    build(dag, dag.root, view, &mut visited, &mut sc, &mut scaffold_nodes, &mut scaffolds);
+    for d in 0..2 {
+        if let Some(s) = scaffold_nodes[d][dag.root] {
+            let top = new_scaffold(&mut sc, None);
+            sc[top].children.push(s);
+            scaffolds[d].push(top);
+        }
+    }
+
+    fn trunk_and_stems(dag: &Dag, sc: &[Scaffold], s: usize, trunk: &mut Interval, stems: &mut Vec<i32>, d: usize, starting: bool) {
+        if starting {
+            if let Some(n) = sc[s].node {
+                stems.push(dag.nodes[n].p.get(1 - d));
+                trunk.update(dag.nodes[n].p.get(d));
+            }
+            for &child in &sc[s].children {
+                trunk_and_stems(dag, sc, child, trunk, stems, d, false);
+            }
+            return;
+        }
+        let n = sc[s].node.expect("a scaffold below the top has a node");
+        trunk.update(dag.nodes[n].p.get(d));
+        if dag.nodes[n].fixed.is_valid() {
+            stems.push(dag.nodes[n].p.get(1 - d));
+        }
+        for &tree_child in &dag.nodes[n].children {
+            match sc[s].children.iter().find(|&&c| sc[c].node == Some(tree_child)) {
+                Some(&c) => trunk_and_stems(dag, sc, c, trunk, stems, d, false),
+                None => {
+                    stems.push(dag.nodes[tree_child].p.get(1 - d));
+                    trunk.update(dag.nodes[tree_child].p.get(d));
+                }
+            }
+        }
+    }
+    let stem_length = |stems: &[i32], pos: i32| stems.iter().map(|s| (s - pos).abs()).sum::<i32>();
+
+    fn build_detour(dag: &mut Dag, sc: &[Scaffold], s: usize, d: usize, shift: i32) -> usize {
+        let tree_node = sc[s].node.expect("a scaffold below the top has a node");
+        let (p, fixed) = (dag.nodes[tree_node].p, dag.nodes[tree_node].fixed);
+        let shifted = if fixed.is_valid() {
+            let dup = dag.add(p, fixed, false);
+            let shifted = dag.add(p, Interval::default(), false);
+            dag.nodes[shifted].p.set(1 - d, p.get(1 - d) + shift);
+            dag.construct_paths(shifted, dup);
+            shifted
+        } else {
+            let shifted = dag.add(p, Interval::default(), false);
+            dag.nodes[shifted].p.set(1 - d, p.get(1 - d) + shift);
+            shifted
+        };
+        for tree_child in dag.nodes[tree_node].children.clone() {
+            match sc[s].children.iter().find(|&&c| sc[c].node == Some(tree_child)) {
+                Some(&c) => {
+                    let child = build_detour(dag, sc, c, d, shift);
+                    dag.construct_paths(shifted, child);
+                }
+                None => dag.construct_paths(shifted, tree_child),
+            }
+        }
+        shifted
+    }
+
+    for d in 0..2 {
+        for &top in &scaffolds[d] {
+            let mut trunk = Interval::default();
+            let mut stems = Vec::new();
+            trunk_and_stems(dag, &sc, top, &mut trunk, &mut stems, d, true);
+            stems.sort();
+            let first = sc[top].children[0];
+            let trunk_pos = dag.nodes[sc[first].node.expect("scaffold child has a node")].p.get(1 - d);
+            let original = stem_length(&stems, trunk_pos);
+            let mut shift = Interval::point(trunk_pos);
+            let max_increase = (f64::from(trunk.range()) * c.max_detour_ratio) as i32;
+            let size = sizes[1 - d] as i32;
+            while shift.low - 1 >= 0 && stem_length(&stems, shift.low - 1) - original <= max_increase {
+                shift.low -= 1;
+            }
+            while shift.high + 1 < size && stem_length(&stems, shift.high - 1) - original <= max_increase {
+                shift.high += 1;
+            }
+            let step = detour_step(trunk_pos, shift.low, shift.high, c.target_detour_count);
+            shift = Interval::new(trunk_pos - (trunk_pos - shift.low) / step * step, trunk_pos + (shift.high - trunk_pos) / step * step);
+            let mut pos = shift.low;
+            while pos <= shift.high {
+                let amount = pos - trunk_pos;
+                pos += step;
+                if amount == 0 {
+                    continue;
+                }
+                if let Some(node) = sc[top].node {
+                    let child_node = sc[first].node.expect("scaffold child has a node");
+                    let at = dag.nodes[child_node].p.get(1 - d) + amount;
+                    if at < 0 || at >= size {
+                        continue;
+                    }
+                    for child_index in 0..dag.nodes[node].children.len() {
+                        if dag.nodes[node].children[child_index] == child_node {
+                            let shifted = build_detour(dag, &sc, first, d, amount);
+                            dag.construct_paths_at(node, shifted, Some(child_index));
+                        }
+                    }
+                } else {
+                    let tree_node = sc[first].node.expect("scaffold child has a node");
+                    if dag.nodes[tree_node].children.len() == 1 {
+                        let p = dag.nodes[tree_node].p;
+                        let at = p.get(1 - d) + amount;
+                        if at < 0 || at >= size {
+                            continue;
+                        }
+                        let shifted = dag.add(p, Interval::default(), false);
+                        dag.nodes[shifted].p.set(1 - d, at);
+                        dag.construct_paths_at(tree_node, shifted, Some(0));
+                        for tree_child in dag.nodes[tree_node].children.clone() {
+                            match sc[first].children.iter().find(|&&c| sc[c].node == Some(tree_child)) {
+                                Some(&c) => {
+                                    let child = build_detour(dag, &sc, c, d, amount);
+                                    dag.construct_paths(shifted, child);
+                                }
+                                None => dag.construct_paths(shifted, tree_child),
+                            }
+                        }
+                    } else {
+                        log.push("[WARNING GRT-0277] The root doesn't have exactly one child.".into());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `constructDetours`' step: widened while the shifts left on the two sides at the NEXT step
+/// still number the target or more (`>=`).
+fn detour_step(trunk_pos: i32, low: i32, high: i32, target: i32) -> i32 {
+    let mut step = 1;
+    while (trunk_pos - low) / (step + 1) + (high - trunk_pos) / (step + 1) >= target {
+        step += 1;
+    }
+    step
 }
 
 // ---------------------------------------------------------------- the DP ----
@@ -468,17 +700,41 @@ pub struct NetRoute {
     pub selected: AccessPointMap,
     pub steiner: SteinerTree,
     pub dag: Dag,
+    /// The access points were chosen by this route (`constructSteinerTree`), not by the maze.
+    pub chose_access_points: bool,
+    /// Stage 4: the sparsified graph, the search's states and the paths found.
+    pub maze: Option<(super::maze_route::SparseGraph, Vec<super::maze_route::Solution>, Vec<usize>)>,
 }
 
-/// Stage 1 for one net: `constructSteinerTree` (with `selectAccessPoints`) → `constructRoutingDAG`
-/// → `run`. The tree is set on the net; committing its usage is the caller's.
-pub fn pattern_route_net(net: &mut GrNet, alpha: f32, stt: SteinerBuilder<'_>, cx: &CostContext<'_>, log: &mut Log) -> Result<NetRoute, PatternError> {
+/// Stages 1 and 3 for one net: `constructSteinerTree` (with `selectAccessPoints`) →
+/// `constructRoutingDAG` → with a congestion view, `constructDetours` → `run`. The tree is set on
+/// the net; committing its usage is the caller's.
+pub fn pattern_route_net(
+    net: &mut GrNet,
+    alpha: f32,
+    stt: SteinerBuilder<'_>,
+    cx: &CostContext<'_>,
+    detours: Option<&super::grid_graph::View<bool>>,
+    log: &mut Log,
+) -> Result<NetRoute, PatternError> {
     let selected = select_access_points(net, cx.grid, log)?;
     let steiner = construct_steiner_tree(net, &selected, alpha, stt)?;
     let mut dag = construct_routing_dag(&steiner);
+    if let Some(view) = detours {
+        construct_detours(&mut dag, view, [cx.grid.x_size, cx.grid.y_size], cx.constants, log);
+    }
     let tree = run(&mut dag, net, cx)?;
     net.routing_tree = Some(tree);
-    Ok(NetRoute { selected, steiner, dag })
+    Ok(NetRoute { selected, steiner, dag, chose_access_points: true, maze: None })
+}
+
+/// Stage 4's second half for one net: `setSteinerTree` (the maze's) → `constructRoutingDAG` →
+/// `run`.
+pub fn pattern_route_tree(net: &mut GrNet, steiner: SteinerTree, cx: &CostContext<'_>) -> Result<NetRoute, PatternError> {
+    let mut dag = construct_routing_dag(&steiner);
+    let tree = run(&mut dag, net, cx)?;
+    net.routing_tree = Some(tree);
+    Ok(NetRoute { selected: AccessPointMap::new(), steiner, dag, chose_access_points: false, maze: None })
 }
 
 #[cfg(test)]
@@ -544,6 +800,7 @@ mod tests {
             ndr_costs: vec![1.0; grid.num_layers],
             routing_tree: None,
             shape_ap_choices: Vec::new(),
+            soft_ndr: false,
         };
         for p in &n.pin_access_points.clone() {
             for g in p {
@@ -624,6 +881,15 @@ mod tests {
         assert_eq!(dag.nodes[node].best_paths[1], vec![(0, 1)], "the tie keeps m2's own path");
     }
 
+    // Upstream rule (PatternRoute `constructDetours`): the step widens while the next step still
+    // leaves the target count or MORE shifts. Trunk 20 in 0..40, target 20: step 1 → 20/2 + 20/2
+    // = 20, not fewer, so step 2 (6 + 6). No stage-3 range in the suite lands on the boundary.
+    #[test]
+    fn detour_step_widens_on_reaching_the_target() {
+        assert_eq!(detour_step(20, 0, 40, 20), 2);
+        assert_eq!(detour_step(20, 0, 39, 20), 1, "19 shifts left: stays at 1");
+    }
+
     // Upstream rule (PatternRoute `constructPaths`): an unaligned pair gets TWO L-shapes, the mid
     // at (end.x, start.y) first, then (start.x, end.y); an aligned pair a single straight path.
     #[test]
@@ -671,7 +937,7 @@ mod tests {
             c.nets.push(n);
         }
         let mut order: Vec<usize> = (0..4).collect();
-        c.sort_net_indices(&mut order);
+        c.sort_net_indices(&mut order).unwrap();
         assert_eq!(order, vec![2, 1, 3, 0]);
     }
 

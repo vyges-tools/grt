@@ -34,6 +34,8 @@ pub struct GrNet {
     /// The last `selectShapeAccessPoint` choices, for the trace: `(pin, index, accessibility,
     /// distance, bbox centre)`.
     pub shape_ap_choices: Vec<(usize, i32, i32, i32, Point)>,
+    /// Demoted to the default rule by RRR (`setSoftNdr`).
+    pub soft_ndr: bool,
 }
 
 impl GrNet {
@@ -84,6 +86,7 @@ impl GrNet {
             ndr_costs: vec![1.0; grid.num_layers],
             routing_tree: None,
             shape_ap_choices: Vec::new(),
+            soft_ndr: false,
         })
     }
 
@@ -95,6 +98,17 @@ impl GrNet {
     /// `getNdrCost(layer)`: 1 outside the vector.
     pub fn ndr_cost(&self, layer: usize) -> f64 {
         self.ndr_costs.get(layer).copied().unwrap_or(1.0)
+    }
+
+    /// `hasNdr`: some layer's factor strictly above 1.
+    pub fn has_ndr(&self) -> bool {
+        self.ndr_costs.iter().any(|&c| c > 1.0)
+    }
+
+    /// `setSoftNdr`: every factor back to 1.
+    pub fn set_soft_ndr(&mut self) {
+        self.soft_ndr = true;
+        self.ndr_costs.iter_mut().for_each(|c| *c = 1.0);
     }
 
     /// `getDriverAccessPoint`: the driver pin's chosen cell, if it has one.

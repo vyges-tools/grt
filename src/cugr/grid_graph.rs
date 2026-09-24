@@ -545,6 +545,201 @@ impl GridGraph {
     }
 }
 
+/// A 2D view over both directions: `[direction][x][y]` (`GridGraphView`).
+pub type View<T> = Vec<Vec<Vec<T>>>;
+
+/// `GridGraphView<bool>::check(u, v)`: any flagged edge on the straight run from `u` to `v`.
+pub fn view_check(view: &View<bool>, u: Point, v: Point) -> bool {
+    if u.y == v.y {
+        (u.x.min(v.x)..u.x.max(v.x)).any(|x| view[H][x as usize][u.y as usize])
+    } else {
+        (u.y.min(v.y)..u.y.max(v.y)).any(|y| view[V][u.x as usize][y as usize])
+    }
+}
+
+/// `GridGraphView<CostT>::sum(u, v)`: the run's edge costs, summed in ascending order from 0.
+pub fn view_sum(view: &View<f64>, u: Point, v: Point) -> f64 {
+    let mut res = 0.0;
+    if u.y == v.y {
+        for x in u.x.min(v.x)..u.x.max(v.x) {
+            res += view[H][x as usize][u.y as usize];
+        }
+    } else {
+        for y in u.y.min(v.y)..u.y.max(v.y) {
+            res += view[V][u.x as usize][y as usize];
+        }
+    }
+    res
+}
+
+impl GridGraph {
+    /// `extractCongestionView`: per direction, an edge overflowing (`capacity - demand < 0`) on
+    /// any routable layer of that direction.
+    pub fn extract_congestion_view(&self) -> View<bool> {
+        let mut view = vec![vec![vec![false; self.y_size]; self.x_size]; 2];
+        for l in self.min_routing_layer..self.num_layers {
+            let d = self.layer_directions[l];
+            for x in 0..self.x_size {
+                for y in 0..self.y_size {
+                    let e = &self.graph_edges[l][x][y];
+                    if e.capacity - e.demand < 0.0 {
+                        view[d][x][y] = true;
+                    }
+                }
+            }
+        }
+        view
+    }
+
+    /// The per-direction layers from the min routing layer, and the smallest short cost among them.
+    fn direction_layers(&self, direction: usize) -> (Vec<usize>, f64) {
+        let mut layers = Vec::new();
+        let mut short = f64::MAX;
+        for l in self.min_routing_layer..self.num_layers {
+            if self.layer_directions[l] == direction {
+                layers.push(l);
+                short = short.min(self.unit_length_short_costs[l]);
+            }
+        }
+        (layers, short)
+    }
+
+    /// `extractWireCostView(view, net_costs)`: per direction and edge, length × (unit wire cost +
+    /// the direction's smallest short cost × the logistic of the free capacity summed over its
+    /// layers — or 1 where under one track). An NDR net (a factor > 1 on the direction's layers)
+    /// uses the best SINGLE layer's headroom less `(factor - 1)` instead. The last edge of each
+    /// run keeps its initial value (`f64::MAX` in a fresh view).
+    pub fn extract_wire_cost_view(&self, view: &mut View<f64>, net_costs: &[f64], c: &super::Constants, cost_multiplier: f64) {
+        let sized = view.len() == 2 && view[0].len() == self.x_size && (self.x_size == 0 || view[0][0].len() == self.y_size);
+        if !sized {
+            *view = vec![vec![vec![f64::MAX; self.y_size]; self.x_size]; 2];
+        }
+        for direction in 0..2 {
+            let (layers, short) = self.direction_layers(direction);
+            let mut net_factor: f64 = 1.0;
+            for &l in &layers {
+                if let Some(&f) = net_costs.get(l) {
+                    net_factor = net_factor.max(f);
+                }
+            }
+            let ndr_active = net_factor > 1.0;
+            for x in 0..self.x_size {
+                for y in 0..self.y_size {
+                    let edge_index = if direction == H { x } else { y };
+                    if edge_index >= self.size(direction) - 1 {
+                        continue;
+                    }
+                    let mut capacity = 0.0;
+                    let effective;
+                    if ndr_active {
+                        let mut best = f64::MIN;
+                        for &l in &layers {
+                            let e = &self.graph_edges[l][x][y];
+                            capacity += e.capacity;
+                            best = best.max(e.capacity - e.demand);
+                        }
+                        effective = best - (net_factor - 1.0);
+                    } else {
+                        let mut demand = 0.0;
+                        for &l in &layers {
+                            let e = &self.graph_edges[l][x][y];
+                            capacity += e.capacity;
+                            demand += e.demand;
+                        }
+                        effective = capacity - demand;
+                    }
+                    let length = f64::from(self.edge_length(direction, edge_index));
+                    view[direction][x][y] = length
+                        * (self.unit_length_wire_cost
+                            + short * if capacity < 1.0 { 1.0 } else { GridGraph::logistic(effective, c.maze_logistic_slope * cost_multiplier) });
+                }
+            }
+        }
+    }
+
+    /// `updateWireCostView(view, tree)`: re-price (the summed, NDR-blind way) every edge the tree's
+    /// wires cross, and at each via, per layer crossed, the edge at the cell and the one before it
+    /// along that layer's direction.
+    pub fn update_wire_cost_view(&self, view: &mut View<f64>, tree: &GrTree, c: &super::Constants, cost_multiplier: f64) {
+        let dirs = [self.direction_layers(0), self.direction_layers(1)];
+        let update = |view: &mut View<f64>, direction: usize, x: i32, y: i32| {
+            let edge_index = if direction == H { x } else { y } as usize;
+            if edge_index >= self.size(direction) - 1 {
+                return;
+            }
+            let (layers, short) = &dirs[direction];
+            let (mut capacity, mut demand) = (0.0, 0.0);
+            for &l in layers {
+                let e = &self.graph_edges[l][x as usize][y as usize];
+                capacity += e.capacity;
+                demand += e.demand;
+            }
+            let length = f64::from(self.edge_length(direction, edge_index));
+            view[direction][x as usize][y as usize] = length
+                * (self.unit_length_wire_cost
+                    + short * if capacity < 1.0 { 1.0 } else { GridGraph::logistic(capacity - demand, c.maze_logistic_slope * cost_multiplier) });
+        };
+        for n in tree.preorder() {
+            let node = &tree.nodes[n];
+            for &ch in &node.children {
+                let child = &tree.nodes[ch];
+                if node.layer == child.layer {
+                    let direction = self.layer_directions[node.layer as usize];
+                    if direction == H {
+                        for x in node.p.x.min(child.p.x)..node.p.x.max(child.p.x) {
+                            update(view, direction, x, node.p.y);
+                        }
+                    } else {
+                        for y in node.p.y.min(child.p.y)..node.p.y.max(child.p.y) {
+                            update(view, direction, node.p.x, y);
+                        }
+                    }
+                } else {
+                    for l in node.layer.min(child.layer)..node.layer.max(child.layer) {
+                        let direction = self.layer_directions[l as usize];
+                        update(view, direction, node.p.x, node.p.y);
+                        if node.p.get(direction) > 0 {
+                            update(view, direction, node.p.x - 1 + direction as i32, node.p.y - direction as i32);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// `computeCongestionInformation` → `totalOverflow`: per routable layer the overflow
+    /// (`demand - capacity` where positive) summed in the layer's row order and ROUNDED, then the
+    /// layers added.
+    pub fn total_overflow(&self) -> i32 {
+        let mut total = 0;
+        for l in self.min_routing_layer..self.num_layers {
+            let mut sum = 0.0;
+            let mut acc = |x: usize, y: usize| {
+                let e = &self.graph_edges[l][x][y];
+                let overflow = e.demand - e.capacity;
+                if overflow > 0.0 {
+                    sum += overflow;
+                }
+            };
+            if self.layer_directions[l] == H {
+                for y in 0..self.y_size {
+                    for x in 0..self.x_size.saturating_sub(1) {
+                        acc(x, y);
+                    }
+                }
+            } else {
+                for x in 0..self.x_size {
+                    for y in 0..self.y_size.saturating_sub(1) {
+                        acc(x, y);
+                    }
+                }
+            }
+            total += sum.round() as i32;
+        }
+        total
+    }
+}
+
 /// One `commit`, as the reference's trace records it: `(layer, lower cell, demand × factor)`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Commit {
@@ -671,6 +866,19 @@ mod tests {
         assert_eq!(g.original_resources_per_layer[1], 30, "totals are taken before the adjustment");
         f.layers[1].metal.as_mut().unwrap().adjustment = 1.0;
         assert_eq!(graph(&f).edge(1, 0, 0).capacity, 0.0, "exactly 1 removes everything");
+    }
+
+    // Upstream rule (CUGR `totalOverflow` ← `computeCongestionInformation`): each layer's overflow
+    // is summed and ROUNDED on its own, then the layers are added — 0.4 on m2 and 0.4 on m3 is 0,
+    // where rounding the total would give 1.
+    #[test]
+    fn total_overflow_rounds_per_layer() {
+        let mut g = graph(&facts());
+        g.graph_edges[1][0][0].demand = 5.4;
+        g.graph_edges[2][0][0].demand = 5.4;
+        assert_eq!(g.total_overflow(), 0);
+        g.graph_edges[1][0][1].demand = 5.2;
+        assert_eq!(g.total_overflow(), 1, "0.4 + 0.2 on m2 rounds to 1");
     }
 
     // Upstream rule (GridGraph `rangeSearchRows`): starting ON a gridline starts in that gcell,

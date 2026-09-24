@@ -38,8 +38,7 @@ JOB (JSON):
     { \"cmd\": \"global_route\", \"verbose\": b, \"allow_congestion\": b, \"grid_origin\": [x, y],
       \"skip_large_fanout\": n, \"congestion_iterations\": n, \"critical_nets_percentage\": f,
       \"resistance_aware\": b, \"res_aware_nets_percentage\": f, \"use_cugr\": b }
-      (use_cugr: CUGR — its model and pattern routing written to the file $VYGC_OUT names;
-       REFUSED, exit 1, where a net is congested after pattern routing: detours are not modelled)
+      (use_cugr: CUGR — its model and every stage written to the file $VYGC_OUT names)
     { \"cmd\": \"create_clock\", \"ports\": [..] }                        (clock network only)
     { \"cmd\": \"set_layer_rc\", \"layer\" | \"via\": name, \"resistance\": f } (user units)
     { \"cmd\": \"propagated_clock\" }
@@ -954,20 +953,27 @@ fn run(job: &Value) -> Result<Value, Fail> {
         opts.captured_slacks = Some(partial);
         opts.captured_update_slacks = Some(update);
     }
-    // cugr_slacks — the reference's CUGR stage-1 slacks, per `-use_cugr` call: `<call> <net>
-    // <bits>`. An ORACLE, like timer_slacks.
+    // cugr_slacks — the reference's CUGR slacks per `-use_cugr` call and per net-order sort:
+    // `<call> <sort> <net> <bits>` (`<call> <net> <bits>` is sort 0). An ORACLE, like timer_slacks.
     if let Some(path) = job["cugr_slacks"].as_str() {
-        let mut calls: Vec<BTreeMap<String, f32>> = Vec::new();
+        let mut calls: Vec<Vec<BTreeMap<String, f32>>> = Vec::new();
         for (n, line) in std::fs::read_to_string(path).map_err(err)?.lines().enumerate() {
-            let bad = || err(format!("{path}:{}: expected `<call> <net> <bits>`", n + 1));
+            let bad = || err(format!("{path}:{}: expected `<call> [<sort>] <net> <bits>`", n + 1));
             let f: Vec<&str> = line.split_whitespace().collect();
-            let [k, net, bits] = f[..] else { return Err(bad()) };
+            let (k, sort, net, bits) = match f[..] {
+                [k, sort, net, bits] => (k, sort.parse::<usize>().map_err(|_| bad())?, net, bits),
+                [k, net, bits] => (k, 0, net, bits),
+                _ => return Err(bad()),
+            };
             let k: usize = k.parse().map_err(|_| bad())?;
             let v = f32::from_bits(u32::from_str_radix(bits, 16).map_err(|_| bad())?);
             while calls.len() <= k {
-                calls.push(BTreeMap::new());
+                calls.push(Vec::new());
             }
-            calls[k].insert(net.to_string(), v);
+            while calls[k].len() <= sort {
+                calls[k].push(BTreeMap::new());
+            }
+            calls[k][sort].insert(net.to_string(), v);
         }
         opts.cugr_slacks = Some(calls);
     }
@@ -1089,9 +1095,13 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 if let Some(n) = step["skip_large_fanout"].as_i64() {
                     opts.skip_large_fanout = n as i32;
                 }
-                if let Some(n) = step["congestion_iterations"].as_i64() {
-                    opts.congestion_iterations = n as i32;
-                }
+                // The Tcl proc sets the budget on EVERY call: the flag's value, else 5 with
+                // `-use_cugr` (its RRR saturates around 5), else 50 — never the previous call's.
+                opts.congestion_iterations = match step["congestion_iterations"].as_i64() {
+                    Some(n) => n as i32,
+                    None if step["use_cugr"].as_bool() == Some(true) => 5,
+                    None => 50,
+                };
                 // setCriticalNetsPercentage: zeroed without a liberty library (GRT-301); it persists
                 // into later calls like the router's member.
                 // setResistanceAware; setResAwareNetsPercentage — zeroed (GRT-308) when not enabled,
@@ -1112,14 +1122,9 @@ fn run(job: &Value) -> Result<Value, Fail> {
                     let r = vyges_grt::cugr::route::route_cugr(&mut db, &opts, cugr_calls, &branches, Some(&mut stage)).map_err(|e| classify(e.to_string()))?;
                     cugr_calls += 1;
                     if let Ok(path) = std::env::var("VYGC_OUT") {
-                        let c = &r.init;
-                        let mut lines = vyges_grt::cugr::trace::model(&c.cugr, c.min_routing_layer, c.max_routing_layer, c.clock_nets.len());
-                        lines.extend(stage);
+                        let lines = stage;
                         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(err)?;
                         std::io::Write::write_all(&mut f, (lines.join("\n") + "\n").as_bytes()).map_err(err)?;
-                    }
-                    if !r.congested.is_empty() {
-                        return Err(Fail::Refused(format!("cugr: {} congested net(s) after stage 1 — detours (stage 3) are not modelled", r.congested.len())));
                     }
                     let g = vyges_grt::cugr::route::cugr_guides(&mut db, &opts, &r.init.cugr, &mut log).map_err(|e| classify(e.to_string()))?;
                     // saveGuides replaces the guides of every net it routes; the others keep theirs.
