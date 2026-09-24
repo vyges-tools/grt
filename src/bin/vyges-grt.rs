@@ -1115,6 +1115,9 @@ fn run(job: &Value) -> Result<Value, Fail> {
     // routes, pins and grid (`repairAntennas` does not re-initialize after one).
     let mut cugr_state: Option<(vyges_grt::cugr::Cugr, vyges_grt::cugr::route::CugrGuides)> = None;
     let mut cugr_calls = 0usize;
+    // `global_route -start_incremental` … `-end_incremental`: GlobalRouter's database callbacks are
+    // registered, and the nets they marked dirty (`dirty_nets_`, by name; ordered at the end).
+    let mut incremental: Option<vyges_grt::callbacks::DirtyNets> = None;
     // set_placement_padding -global: opendp's padding, in sites, left and right.
     let mut padding = (0, 0);
     for step in job["steps"].as_array().ok_or_else(|| err("steps"))? {
@@ -1208,6 +1211,41 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 }
                 if let Some(p) = step["critical_nets_percentage"].as_f64() {
                     opts.critical_nets_percentage = if opts.liberty.is_some() { p as f32 } else { 0.0 };
+                }
+                // `-start_incremental` / `-end_incremental`: the engine is the one the session last
+                // routed with (the Tcl keeps `use_cugr` across the bracket). CUGR's rip-up budget
+                // is the one `initCUGR` gave it: this call's reset never reaches it.
+                match step["incremental"].as_str() {
+                    Some("start") => {
+                        if !routed_by_cugr || cugr_state.is_none() {
+                            return Err(Fail::Refused("incremental routing without a CUGR route in the session is not modelled".into()));
+                        }
+                        incremental = Some(vyges_grt::callbacks::DirtyNets::default());
+                        continue;
+                    }
+                    Some("end") => {
+                        let dirty = incremental.take().ok_or_else(|| Fail::Refused("-end_incremental without -start_incremental".into()))?;
+                        let (c, cg) = cugr_state.as_mut().ok_or_else(|| Fail::Refused("cugr: no router state".into()))?;
+                        // updateDirtyRoutesCugr over dirty_nets_ (a PtrSet: block order).
+                        let list = dirty.in_block_order(&db.net_names());
+                        let branches = |x: &[i32], y: &[i32], d: usize, a: f32| stt(x, y, d, a).branch.iter().map(|b| (b.x, b.y, b.n)).collect::<Vec<_>>();
+                        let mut trace = std::env::var("VYGC_OUT").ok().map(|_| Vec::new());
+                        let res = vyges_grt::cugr::route::update_dirty_routes_cugr(&mut db, &opts, c, cg, &list, &branches, &mut log, trace.as_mut());
+                        if let (Ok(path), Some(t)) = (std::env::var("VYGC_OUT"), &trace) {
+                            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(err)?;
+                            std::io::Write::write_all(&mut f, (t.join("\n") + "\n").as_bytes()).map_err(err)?;
+                        }
+                        let mut saved = res.map_err(|e| classify(e.to_string()))?;
+                        // finishGlobalRouting → saveGuides(every net): a net with a route is
+                        // rewritten, the others keep what they have.
+                        saved.extend(vyges_grt::save_guides(&cg.net_routes, &cg.jumper_grid.grid, &cg.save).map_err(|e| err(format!("{e:?}")))?);
+                        for ng in saved {
+                            guides.insert(ng.net.clone(), ng.guides.iter().map(|x| (x.box_.x_min, x.box_.y_min, x.box_.x_max, x.box_.y_max, cg.layer_names[&x.layer].clone())).collect());
+                            db_guides.insert(ng.net.clone(), ng.guides);
+                        }
+                        continue;
+                    }
+                    _ => {}
                 }
                 if step["use_cugr"].as_bool() == Some(true) {
                     // `-use_cugr`: the model and stage 1 (pattern routing) are built and, when
@@ -1582,6 +1620,90 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 for ng in repaired {
                     guides.insert(ng.net.clone(), ng.guides.iter().map(|g| (g.box_.x_min, g.box_.y_min, g.box_.x_max, g.box_.y_max, db_layer_name(&db, g.layer))).collect());
                     db_guides.insert(ng.net.clone(), ng.guides);
+                }
+            }
+            "odb" => {
+                // A netlist edit through the database API. Inside an incremental bracket GlobalRouter's
+                // callbacks see it (GRouteDbCbk): a terminal (dis)connected marks its net dirty
+                // (`addDirtyNet`: a net the global router holds, not special), a net created is
+                // added (`addNet`), a net destroyed removed (`removeNet`).
+                let s = |k: &str| step[k].as_str().ok_or_else(|| err(format!("odb step: {k}")));
+                let op = s("op")?;
+                let mark = |db: &Db, net: &str, dirty: &mut Option<vyges_grt::callbacks::DirtyNets>, held: &dyn Fn(&str) -> bool| {
+                    if let Some(d) = dirty.as_mut() {
+                        d.mark(net, !net.is_empty() && db.net_is_special(net), held(net));
+                    }
+                };
+                let held_names: BTreeSet<String> = cugr_state.as_ref().map(|(_, cg)| cg.pins.keys().cloned().collect()).unwrap_or_default();
+                let held = |n: &str| held_names.contains(n);
+                match op {
+                    "net_create" => {
+                        let net = s("net")?;
+                        db.create_net(net).map_err(err)?;
+                        if incremental.is_some() {
+                            let sig = db.net_sigtype(net);
+                            let routable = vyges_grt::init::is_routable(sig == "POWER" || sig == "GROUND", db.net_is_special(net), db.num_net_get_s_wires(net) > 0, db.net_is_connected_by_abutment(net));
+                            if let Some(d) = incremental.as_mut() {
+                                d.added(net, routable);
+                            }
+                            if routable {
+                                // addNet → updateNetPins: a net with no terminal has no pins.
+                                let (_, cg) = cugr_state.as_mut().expect("the bracket needs a CUGR route");
+                                cg.pins.insert(net.to_string(), Vec::new());
+                            }
+                        }
+                    }
+                    "inst_create" => db.create_inst(s("master")?, s("inst")?).map_err(err)?,
+                    "iterm_disconnect" => {
+                        let (inst, pin) = (s("inst")?, s("pin")?);
+                        let net = db.iterm_get_net(inst, pin);
+                        mark(&db, &net, &mut incremental, &held);
+                        db.disconnect(inst, pin).map_err(err)?;
+                    }
+                    "iterm_connect" => {
+                        let (inst, pin, net) = (s("inst")?, s("pin")?, s("net")?);
+                        db.connect(inst, pin, net).map_err(err)?;
+                        mark(&db, net, &mut incremental, &held);
+                    }
+                    "inst_destroy" => {
+                        // dbInst::destroy disconnects its terminals in REVERSE order, each firing
+                        // inDbITermPreDisconnect.
+                        let inst = s("inst")?;
+                        let terms: Vec<String> = db.master_mterms(&db.inst_get_master(inst)).map_err(err)?.into_iter().map(|(t, _)| t).collect();
+                        for term in terms.iter().rev() {
+                            let net = db.iterm_get_net(inst, term);
+                            mark(&db, &net, &mut incremental, &held);
+                        }
+                        db.destroy_inst(inst).map_err(err)?;
+                    }
+                    "net_destroy" => {
+                        // dbNet::destroy disconnects its terminals first (each marking it), then
+                        // inDbNetDestroy → removeNet: out of the dirty set, the router's nets and
+                        // routes_.
+                        let net = s("net")?.to_string();
+                        if db.net_get_term_count(&net) > 0 {
+                            return Err(Fail::Refused(format!("destroying net {net} with terminals connected is not modelled")));
+                        }
+                        if let Some(d) = incremental.as_mut() {
+                            d.removed(&net);
+                            if let Some((c, cg)) = cugr_state.as_mut() {
+                                if c.nets.iter().any(|n| n.name == net) {
+                                    return Err(Fail::Refused(format!("cugr: removing net {net}, which CUGR holds (CUGR::removeNet), is not modelled")));
+                                }
+                                cg.pins.remove(&net);
+                                cg.routes.remove(&net);
+                            }
+                        }
+                        db.destroy_net(&net).map_err(err)?;
+                        guides.remove(&net);
+                        db_guides.remove(&net);
+                    }
+                    other => return Err(Fail::Refused(format!("odb {other} is not modelled"))),
+                }
+                let cb = incremental.as_mut().map(|d| d.take_trace()).unwrap_or_default();
+                if let (Ok(path), false) = (std::env::var("VYGC_OUT"), cb.is_empty()) {
+                    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(err)?;
+                    std::io::Write::write_all(&mut f, (cb.join("\n") + "\n").as_bytes()).map_err(err)?;
                 }
             }
             "write_guides" => write_guides(step["path"].as_str().ok_or_else(|| err("path"))?, &guides)?,

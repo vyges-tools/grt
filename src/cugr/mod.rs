@@ -462,14 +462,30 @@ impl Cugr {
         Ok(())
     }
 
+    /// `CUGR::updateNet`'s branch for a net CUGR does not hold: the design appended it at `k`
+    /// ([`design::Design::update_net`]); its GRNet is appended too, with its rule's factors, and
+    /// queued.
+    pub fn add_net(&mut self, k: usize, driver_term: &str, ndr_costs: Vec<f64>, queue: &mut Vec<usize>) -> Result<(), StageError> {
+        if k != self.nets.len() {
+            return Err(StageError::Maze(format!("cugr: a new net at {k} with {} held — not aligned", self.nets.len())));
+        }
+        let mut n = grnet::GrNet::new(&self.design.nets[k], driver_term, &self.grid).map_err(|e| StageError::Maze(format!("{e:?}")))?;
+        n.ndr_costs = ndr_costs;
+        self.nets.push(n);
+        queue.push(k);
+        Ok(())
+    }
+
     /// `CUGR::route(true)`: the queued nets only — stage 1 on them (sorted in place), then stages
     /// 3 and 4 on ALL of them (no congested-set narrowing), then RRR scoped to them; no GRT-0118.
     pub fn route_incremental(&mut self, queued: Vec<usize>, iterations: i32, alphas: &[f32], stt: pattern_route::SteinerBuilder<'_>, log: &mut Vec<String>, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
-        if queued.is_empty() {
-            return Ok(());
-        }
         if let Some(t) = trace.as_deref_mut() {
             t.push("VYGC|route|1".into());
+        }
+        // Nothing queued (a restore- or remove-only round): no stage runs, and `route` returns
+        // before its end.
+        if queued.is_empty() {
+            return Ok(());
         }
         self.incremental_candidates = Some(queued.clone());
         let mut nets = queued;

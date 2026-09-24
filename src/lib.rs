@@ -132,6 +132,7 @@ pub use capacity::{
     mirror_grid_to_fast_route, set_capacities, init_edges_capacity_per_layer, CapacityLayer, EdgeCapacities, FastRouteGrid,
 };
 pub mod init;
+pub mod callbacks;
 pub use init::{
     init_fast_route, init_grid, is_clk_term, is_local, is_non_leaf_clock, is_routable, order_nets,
     AbsentStage, CoreGrid, DiscoveredNet, ITermClockFacts, SetupReport, config_fast_route, report_layer_settings, FastRouteConfig, SetupOptions,

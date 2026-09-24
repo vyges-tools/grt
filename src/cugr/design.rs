@@ -283,6 +283,35 @@ impl Design {
         }
     }
 
+    /// `Design::updateNet`: a net's pins re-read from the netlist, its layer range recomputed
+    /// (`clock_nets_` is the set `init` read), returning its index — `None` for a net never routed.
+    ///
+    /// Upstream rules: a special, supply, special-wired or abutment-connected net answers `None`
+    /// FIRST. A net the design holds takes its new pins whatever their count (none, when the
+    /// netlist emptied it) and keeps its index; a net it does not hold joins only with two pins or
+    /// more, appended at the end.
+    pub fn update_net(&mut self, n: &NetFacts, facts_index: usize, min_routing_layer: i32, max_routing_layer: i32, min_layer_for_clock: i32, max_layer_for_clock: i32) -> Option<usize> {
+        if n.is_special || n.is_supply || n.has_swires || n.connected_by_abutment {
+            return None;
+        }
+        let pins = self.make_net_pins(n);
+        let mut layer_range = LayerRange { min_layer: min_routing_layer - 1, max_layer: max_routing_layer - 1 };
+        if n.is_clock && min_layer_for_clock > 0 && max_layer_for_clock > 0 {
+            layer_range = LayerRange { min_layer: min_layer_for_clock - 1, max_layer: max_layer_for_clock - 1 };
+        }
+        if let Some(k) = self.nets.iter().position(|d| d.name == n.name) {
+            self.nets[k].pins = pins;
+            self.nets[k].layer_range = layer_range;
+            return Some(k);
+        }
+        if pins.len() < 2 {
+            return None;
+        }
+        let index = self.nets.len();
+        self.nets.push(CugrNet { index, name: n.name.clone(), pins, layer_range, facts_index });
+        Some(index)
+    }
+
     /// The obstacle filter `readInstanceObstructions` and `readDesignObstructions` share: a layer,
     /// ROUTING, at or below the max routing layer. The layer index is NOT clamped.
     fn push_routing_obstacle(&mut self, s: &Shape, max_routing_layer: i32) {

@@ -520,8 +520,7 @@ pub fn update_dirty_routes_cugr(
         .collect();
     let discovered = crate::global_route::discover_net_pins(db, &t, &dirty_facts, &candidates, opts, None, log)?;
     let (facts, drivers) = read_design_facts(db, &cg.clock_nets)?;
-    let fresh = super::design::Design::new(&facts, &cugr.constants, cg.min_routing_layer, cg.max_routing_layer).map_err(|e| format!("{e:?}"))?;
-    let index: std::collections::HashMap<String, usize> = cugr.nets.iter().enumerate().map(|(k, n)| (n.name.clone(), k)).collect();
+    let mut index: std::collections::HashMap<String, usize> = cugr.nets.iter().enumerate().map(|(k, n)| (n.name.clone(), k)).collect();
     let mut queued = Vec::new();
     let mut rerouted: Vec<String> = Vec::new();
     for name in dirty {
@@ -537,14 +536,28 @@ pub fn update_dirty_routes_cugr(
         }
         cg.pins.insert(name.clone(), new_pins);
         if reroute {
-            let Some(&k) = index.get(name) else {
-                return Err(format!("cugr: rerouting net {name}, which CUGR does not hold, is not modelled").into());
-            };
+            // CUGR::updateNet: the design re-reads the net (Design::updateNet), then a held net's
+            // GRNet is rebuilt in place, and a new one is appended — unless the design never
+            // routes it (special, or under two pins), when nothing is queued.
             let fi = facts.nets.iter().position(|f| &f.name == name).ok_or("a dirty net missing from the database")?;
-            let dn = fresh.nets.iter().find(|n| &n.name == name).ok_or_else(|| format!("cugr: net {name} is no longer routable — not modelled"))?;
             let ndr = net_ndr_costs(db, name, cugr.grid.num_layers)?;
-            cugr.update_net(k, dn.pins.clone(), dn.layer_range, &drivers[fi], ndr, &mut queued).map_err(|e| format!("cugr: {e:?}"))?;
-            cugr.nets[k].slack = cg.slack;
+            let updated = cugr.design.update_net(&facts.nets[fi], fi, cg.min_routing_layer, cg.max_routing_layer, facts.min_layer_for_clock, facts.max_layer_for_clock);
+            match index.get(name) {
+                Some(&k) => {
+                    // The design's answer is not read: a held net is rebuilt from what it holds.
+                    let (pins, range) = (cugr.design.nets[k].pins.clone(), cugr.design.nets[k].layer_range);
+                    cugr.update_net(k, pins, range, &drivers[fi], ndr, &mut queued).map_err(|e| format!("cugr: {e:?}"))?;
+                    cugr.nets[k].slack = cg.slack;
+                }
+                None => {
+                    if let Some(k) = updated {
+                        cugr.add_net(k, &drivers[fi], ndr, &mut queued).map_err(|e| format!("cugr: {e:?}"))?;
+                        cugr.nets[k].slack = cg.slack;
+                        cg.alphas.push(crate::global_route::net_steiner_alpha(db, opts, name)?);
+                        index.insert(name.clone(), k);
+                    }
+                }
+            }
             rerouted.push(name.clone());
         }
     }
@@ -562,16 +575,18 @@ pub fn update_dirty_routes_cugr(
     };
     let mut remaining = Vec::new();
     for name in &rerouted {
-        let k = index[name];
-        let route = cugr.net_route(&cugr.nets[k]);
+        // getNetRoute: nothing for a net CUGR does not hold.
+        let route = index.get(name).map(|&k| cugr.net_route(&cugr.nets[k])).unwrap_or_default();
         if route.is_empty() {
             cg.routes.remove(name);
         } else {
             cg.routes.insert(name.clone(), route);
         }
         let pins = cg.pins.get_mut(name).expect("inserted above");
-        for pin in pins.iter_mut() {
-            update_pin_access_point(cugr, &cugr.nets[k], pin, &pin_grid, t.max_routing_layer);
+        if let Some(&k) = index.get(name) {
+            for pin in pins.iter_mut() {
+                update_pin_access_point(cugr, &cugr.nets[k], pin, &pin_grid, t.max_routing_layer);
+            }
         }
         let f = all.iter().find(|f| &f.name == name).expect("a dirty net");
         remaining.push(RemainingNet { name: name.clone(), made: crate::makes_fastroute_net(pins.len(), f.has_wire, || false), pins: grid_pins(pins) });
@@ -589,9 +604,6 @@ pub fn update_dirty_routes_cugr(
             pins: pins.iter().map(|p| crate::Pin { connection_layer: p.connection_layer, on_grid_x: p.on_grid.0, on_grid_y: p.on_grid.1 }).collect(),
             is_local: on_grid.split_first().is_none_or(|(first, rest)| rest.iter().all(|p| p == first)),
         };
-        if let Some(slot) = cg.net_routes.iter_mut().find(|n| &n.name == name) {
-            *slot = nr.clone();
-        }
         if cg.routes.contains_key(name) {
             to_save.push(nr);
         } else if rerouted.contains(name) {
@@ -599,7 +611,27 @@ pub fn update_dirty_routes_cugr(
         }
     }
     saved.extend(crate::save_guides(&to_save, &cg.jumper_grid.grid, &cg.save).map_err(|e| format!("{e:?}"))?);
+    refresh_net_routes(db, cg);
     Ok(saved)
+}
+
+/// The global router's nets as `saveGuides` reads them, in block order: each held net's route and
+/// its pins as they stand — after nets were added or removed.
+pub fn refresh_net_routes(db: &Db, cg: &mut CugrGuides) {
+    cg.net_routes = db
+        .net_names()
+        .iter()
+        .filter_map(|name| {
+            let pins = cg.pins.get(name)?;
+            let on_grid: Vec<(i32, i32)> = pins.iter().map(|p| p.on_grid).collect();
+            Some(crate::NetRoute {
+                name: name.clone(),
+                segments: cg.routes.get(name).cloned().unwrap_or_default(),
+                pins: pins.iter().map(|p| crate::Pin { connection_layer: p.connection_layer, on_grid_x: p.on_grid.0, on_grid_y: p.on_grid.1 }).collect(),
+                is_local: on_grid.split_first().is_none_or(|(first, rest)| rest.iter().all(|p| p == first)),
+            })
+        })
+        .collect();
 }
 
 #[cfg(test)]
