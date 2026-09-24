@@ -544,9 +544,8 @@ pub fn restore_cugr_for_repair(db: &mut Db, opts: &RouteOptions, mut trace: Opti
 /// ⚠️ Known divergence after the first read: the reference then times INCREMENTALLY — only the
 /// re-estimated nets' pins are invalidated, and a load slew that changed by less than the fuzzy
 /// tolerance does not re-time its fanout — so a few downstream delays stay stale where a full
-/// timing (this one) moves them by an ulp or two. Measured: exact at every read of four of the
-/// five reads-after-a-refresh witnessed; one read of one script off in the last bits on 14 of 411
-/// nets, with its guides still exact.
+/// timing (this one) moves them by an ulp or two. Measured over the four reads after a refresh
+/// witnessed: three exact; one off in the last bits on 14 of 411 nets, its guides still exact.
 fn timer_slack_source(db: &mut Db, opts: &RouteOptions) -> Res<super::SlackSource> {
     use crate::parasitics::{estimate_net, NetParasitics, PinAttach, PinGridLocation, Segment};
     let timing = opts.timing.clone().ok_or("cugr: no timer")?;
