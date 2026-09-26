@@ -224,6 +224,12 @@ fn err<E: std::fmt::Display>(e: E) -> Fail {
     Fail::Error(e.to_string())
 }
 
+/// `err`, naming the file it concerns: `x.def: ODB-0421: …`, `job.json: No such file or directory`.
+/// ⚠️ A file error without its path is the one a user cannot act on — a job names several files.
+fn at<E: std::fmt::Display>(path: impl std::fmt::Display) -> impl FnOnce(E) -> Fail {
+    move |e| Fail::Error(format!("{path}: {e}"))
+}
+
 /// A message from the engine naming something it does not model yet.
 fn classify(msg: String) -> Fail {
     if ["not wired", "not bound", "none bound", "not modelled"].iter().any(|k| msg.contains(k)) {
@@ -256,7 +262,7 @@ fn write_guides(path: &str, store: &BTreeMap<String, Vec<(i32, i32, i32, i32, St
         }
         text.push_str(")\n");
     }
-    std::fs::write(path, text).map_err(err)
+    std::fs::write(path, text).map_err(at(path))
 }
 
 /// The name of a routing level.
@@ -570,7 +576,7 @@ type Viol = (String, i32, Vec<String>, i32);
 fn read_violation_blocks(path: &str) -> Result<Vec<Vec<Viol>>, Fail> {
     let mut blocks: Vec<Vec<Viol>> = Vec::new();
     let mut open = false;
-    for line in std::fs::read_to_string(path).map_err(err)?.lines() {
+    for line in std::fs::read_to_string(path).map_err(at(path))?.lines() {
         let Some(rest) = line.strip_prefix("VYGA|viol|") else {
             open = false;
             continue;
@@ -679,7 +685,7 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, router: Repai
             let mut trace = step["trace"].as_str().map(|_| Vec::new());
             let res = jumper_insertion(&by_net, &mut routes, &inp, &mut router, trace.as_mut()).map_err(Fail::Refused)?;
             if let (Some(p), Some(t)) = (step["trace"].as_str(), &trace) {
-                std::fs::write(p, t.iter().map(|l| format!("VYGJ|{l}\n")).collect::<String>()).map_err(err)?;
+                std::fs::write(p, t.iter().map(|l| format!("VYGJ|{l}\n")).collect::<String>()).map_err(at(p))?;
             }
             log.push(format!("GRT-0302: Inserted {} jumpers for {} nets.", res.total_jumpers, res.net_with_jumpers));
             // saveGuides(nets_with_jumpers), with the congestion mark as the command left it.
@@ -704,11 +710,11 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, router: Repai
                 return Err(Fail::Refused(u));
             }
             if let (Some(p), Some(t)) = (step["trace"].as_str(), &trace) {
-                std::fs::write(p, t.iter().map(|l| format!("VYGJ|{l}\n")).collect::<String>()).map_err(err)?;
+                std::fs::write(p, t.iter().map(|l| format!("VYGJ|{l}\n")).collect::<String>()).map_err(at(p))?;
             }
             if let Ok(path) = std::env::var("VYGC_OUT") {
                 let lines: String = router.restores.iter().map(|(net, r)| vyges_grt::cugr::trace::restore(net, r) + "\n").collect();
-                let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(err)?;
+                let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(at(&path))?;
                 std::io::Write::write_all(&mut f, lines.as_bytes()).map_err(err)?;
             }
             log.push(format!("GRT-0302: Inserted {} jumpers for {} nets.", res.total_jumpers, res.net_with_jumpers));
@@ -751,7 +757,7 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, router: Repai
         let gates: Vec<String> = second.iter().flat_map(|v| v.2.iter().map(|g| g.rsplit_once('/').map_or(g.clone(), |p| p.0.to_string()))).collect();
         let legalized = legalize_placed_cells(db, padding, &diodes, &gates, &mut text);
         if let Some(path) = step["diode_trace"].as_str() {
-            std::fs::write(path, &text).map_err(err)?;
+            std::fs::write(path, &text).map_err(at(path))?;
         }
         legalized?;
         log.push(format!("GRT-0015: Inserted {} diodes.", diodes.len()));
@@ -783,12 +789,12 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, router: Repai
             let mut trace = std::env::var("VYGC_OUT").ok().map(|_| Vec::new());
             let res = vyges_grt::cugr::route::update_dirty_routes_cugr(db, opts, c, cg, &nets_to_repair, &branches, log, trace.as_mut());
             if let (Ok(path), Some(t)) = (std::env::var("VYGC_OUT"), &trace) {
-                let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(err)?;
+                let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(at(&path))?;
                 std::io::Write::write_all(&mut f, (t.join("\n") + "\n").as_bytes()).map_err(err)?;
             }
             saved.extend(res.map_err(|e| classify(e.to_string()))?);
             if let Some(path) = step["diode_trace"].as_str() {
-                std::fs::write(path, &text).map_err(err)?;
+                std::fs::write(path, &text).map_err(at(path))?;
             }
             if itr >= iterations {
                 break;
@@ -826,7 +832,7 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, router: Repai
         };
         let rerouted = vyges_grt::global_route::update_dirty_routes_fast_route(db, &ropts, state, &nets_to_repair, &stt, &flutes, &mut obs);
         if let Some(path) = step["incr_trace"].as_str() {
-            std::fs::write(path, &incr_text).map_err(err)?;
+            std::fs::write(path, &incr_text).map_err(at(path))?;
         }
         let rerouted = rerouted.map_err(|e| Fail::Refused(e.to_string()))?;
         for n in &rerouted {
@@ -839,7 +845,7 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, router: Repai
             }
         }
         if let Some(path) = step["diode_trace"].as_str() {
-            std::fs::write(path, &text).map_err(err)?;
+            std::fs::write(path, &text).map_err(at(path))?;
         }
         // saveGuides(nets_to_repair): every dirty net, re-routed or not.
         let mut sopts = state.save_options;
@@ -1123,12 +1129,13 @@ fn run(job: &Value) -> Result<Value, Fail> {
     // A design from a database may carry pin access points; one from DEF carries none.
     let from_db = job["db"].is_string();
     for lef in job["lefs"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
-        db.read_lef(lef.as_str().ok_or_else(|| err("a LEF path"))?).map_err(err)?;
+        let lef = lef.as_str().ok_or_else(|| err("a LEF path"))?;
+        db.read_lef(lef).map_err(at(lef))?;
     }
     if let Some(def) = job["def"].as_str() {
-        db.read_def(def, "default").map_err(err)?;
+        db.read_def(def, "default").map_err(at(def))?;
     } else if let Some(odb) = job["db"].as_str() {
-        db = Db::open(odb).map_err(err)?;
+        db = Db::open(odb).map_err(at(odb))?;
     }
     // ⛔ A database may carry pin access points, which grt's pin positions and the antenna checker
     // read and which are not modelled — refused wherever they would be read, but only when present.
@@ -1144,10 +1151,10 @@ fn run(job: &Value) -> Result<Value, Fail> {
         let path = lib.as_str().ok_or_else(|| err("a liberty path"))?;
         let text = if path.ends_with(".gz") {
             let mut s = String::new();
-            std::io::Read::read_to_string(&mut flate2::read::MultiGzDecoder::new(std::fs::File::open(path).map_err(err)?), &mut s).map_err(err)?;
+            std::io::Read::read_to_string(&mut flate2::read::MultiGzDecoder::new(std::fs::File::open(path).map_err(at(path))?), &mut s).map_err(at(path))?;
             s
         } else {
-            std::fs::read_to_string(path).map_err(err)?
+            std::fs::read_to_string(path).map_err(at(path))?
         };
         opts.liberty.get_or_insert_with(Default::default).read(&text).map_err(|e| Fail::Refused(format!("{path}: {e}")))?;
         liberty_texts.push((path.to_string(), text));
@@ -1159,7 +1166,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
     // call (a bare `<call> <net> <bits>` is a P line). An ORACLE: no timing is computed here.
     if let Some(path) = job["timer_slacks"].as_str() {
         let (mut partial, mut update): (Vec<BTreeMap<String, f32>>, Vec<BTreeMap<String, f32>>) = (Vec::new(), Vec::new());
-        for (n, line) in std::fs::read_to_string(path).map_err(err)?.lines().enumerate() {
+        for (n, line) in std::fs::read_to_string(path).map_err(at(path))?.lines().enumerate() {
             let f: Vec<&str> = line.split_whitespace().collect();
             let bad = || err(format!("{path}:{}: expected `[P|U] <call> <net> <bits>`", n + 1));
             let (calls, k, net, bits) = match f[..] {
@@ -1184,7 +1191,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
     // `<call> <sort> <net> <bits>` (`<call> <net> <bits>` is sort 0). An ORACLE, like timer_slacks.
     if let Some(path) = job["cugr_slacks"].as_str() {
         let mut calls: Vec<Vec<BTreeMap<String, f32>>> = Vec::new();
-        for (n, line) in std::fs::read_to_string(path).map_err(err)?.lines().enumerate() {
+        for (n, line) in std::fs::read_to_string(path).map_err(at(path))?.lines().enumerate() {
             let bad = || err(format!("{path}:{}: expected `<call> [<sort>] <net> <bits>`", n + 1));
             let f: Vec<&str> = line.split_whitespace().collect();
             // `R <call> <n> <net> <bits>`: the timer's slack at the call's n-th updateNetSlacks.
@@ -1380,7 +1387,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
                         let mut trace = std::env::var("VYGC_OUT").ok().map(|_| Vec::new());
                         let res = vyges_grt::cugr::route::update_dirty_routes_cugr(&mut db, &opts, c, cg, &list, &branches, &mut log, trace.as_mut());
                         if let (Ok(path), Some(t)) = (std::env::var("VYGC_OUT"), &trace) {
-                            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(err)?;
+                            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(at(&path))?;
                             std::io::Write::write_all(&mut f, (t.join("\n") + "\n").as_bytes()).map_err(err)?;
                         }
                         let mut saved = res.map_err(|e| classify(e.to_string()))?;
@@ -1405,7 +1412,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
                     cugr_calls += 1;
                     if let Ok(path) = std::env::var("VYGC_OUT") {
                         let lines = stage;
-                        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(err)?;
+                        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(at(&path))?;
                         std::io::Write::write_all(&mut f, (lines.join("\n") + "\n").as_bytes()).map_err(err)?;
                     }
                     let g = vyges_grt::cugr::route::cugr_guides(&mut db, &opts, &r.init.cugr, &r.init.clock_nets, &r.alphas, r.slack, &mut log).map_err(|e| classify(e.to_string()))?;
@@ -1610,7 +1617,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
                         }
                     }
                 }
-                std::fs::write(path, text).map_err(err)?;
+                std::fs::write(path, text).map_err(at(path))?;
             }
             // The same networks as SPEF, for a timer that reads one.
             //
@@ -1674,7 +1681,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
                     }
                     text.push_str("*END\n\n");
                 }
-                std::fs::write(path, text).map_err(err)?;
+                std::fs::write(path, text).map_err(at(path))?;
             }
             // ant::WireBuilder::makeNetWiresFromGuides over the block's nets, in block order —
             // `VYGA|wire|<net>|<x1>,<y1>,<l1>|<x2>,<y2>,<l2>` per segment, in creation order.
@@ -1693,7 +1700,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
                         text.push_str(&format!("VYGA|wire|{}|{},{},{}|{},{},{}\n", w.net, sg.pt1.x, sg.pt1.y, sg.pt1.layer, sg.pt2.x, sg.pt2.y, sg.pt2.layer));
                     }
                 }
-                std::fs::write(path, text).map_err(err)?;
+                std::fs::write(path, text).map_err(at(path))?;
                 if let Some(enc) = step["encoder"].as_str() {
                     let name = |l: i32| db_layer_name(&db, l);
                     let mut text = String::new();
@@ -1712,7 +1719,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
                             });
                         }
                     }
-                    std::fs::write(enc, text).map_err(err)?;
+                    std::fs::write(enc, text).map_err(at(enc))?;
                 }
                 // With "shapes": what the database decodes from that wire, `VYGC|<net>|shape|…` and
                 // `…|vbox|…` as the reference's stage-2 trace prints them.
@@ -1734,7 +1741,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
                             }
                         }
                     }
-                    std::fs::write(out, text).map_err(err)?;
+                    std::fs::write(out, text).map_err(at(out))?;
                 }
                 // With "nodes": the checker's polygons per layer (`buildLayerMaps`), `VYGC|<net>|node|…`.
                 if step["nodes"].is_string() || step["checker"].is_string() {
@@ -1767,10 +1774,10 @@ fn run(job: &Value) -> Result<Value, Fail> {
                         }
                     }
                     if let Some(out) = out {
-                        std::fs::write(out, text).map_err(err)?;
+                        std::fs::write(out, text).map_err(at(out))?;
                     }
                     if let (Some(path), Some(c)) = (step["checker"].as_str(), checker) {
-                        std::fs::write(path, c.text).map_err(err)?;
+                        std::fs::write(path, c.text).map_err(at(path))?;
                     }
                 }
             }
@@ -1782,7 +1789,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 }
                 let (state, _) = after.as_ref().ok_or_else(|| Fail::Refused("router_state without a global_route in this session".into()))?;
                 let path = step["path"].as_str().ok_or_else(|| err("path"))?;
-                std::fs::write(path, vyges_grt::global_route::router_state_text("end", state).map_err(Fail::Refused)?).map_err(err)?;
+                std::fs::write(path, vyges_grt::global_route::router_state_text("end", state).map_err(Fail::Refused)?).map_err(at(path))?;
             }
             // Filler insertion is deliberately NOT a step. It only adds new, unconnected instances in
             // the row gaps and touches nothing already placed, and the router listens for database
@@ -1825,7 +1832,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
                     let mut trace = std::env::var("VYGC_OUT").ok().map(|_| Vec::new());
                     let restored = vyges_grt::cugr::route::restore_cugr_for_repair(&mut db, &opts, trace.as_mut());
                     if let (Ok(path), Some(t)) = (std::env::var("VYGC_OUT"), &trace) {
-                        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(err)?;
+                        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(at(&path))?;
                         std::io::Write::write_all(&mut f, (t.join("\n") + "\n").as_bytes()).map_err(err)?;
                     }
                     cugr_state = Some(restored.map_err(|e| classify(e.to_string()))?);
@@ -1849,7 +1856,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
                     }
                     let restored = vyges_grt::global_route::restore_for_repair(&mut db, &opts).map_err(|e| classify(e.to_string()))?;
                     if let Some(path) = step["restore_trace"].as_str() {
-                        std::fs::write(path, vyges_grt::global_route::router_state_text("restore", &restored).map_err(Fail::Refused)?).map_err(err)?;
+                        std::fs::write(path, vyges_grt::global_route::router_state_text("restore", &restored).map_err(Fail::Refused)?).map_err(at(path))?;
                     }
                     after = Some((restored, 0));
                 }
@@ -1978,7 +1985,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 }
                 let cb = incremental.as_mut().map(|d| d.take_trace()).unwrap_or_default();
                 if let (Ok(path), false) = (std::env::var("VYGC_OUT"), cb.is_empty()) {
-                    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(err)?;
+                    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(at(&path))?;
                     std::io::Write::write_all(&mut f, (cb.join("\n") + "\n").as_bytes()).map_err(err)?;
                 }
             }
