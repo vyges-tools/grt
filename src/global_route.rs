@@ -857,6 +857,9 @@ pub struct RouteResult {
     pub log: Vec<String>,
     /// The router's state as a later command in the same session reads it.
     pub after: AfterRoute,
+    /// `FastRouteCore::updateDbCongestion`'s gcell grid, as it writes it: per axis (origin, count,
+    /// step) = (`x_corner_`, `x_grid_`, `tile_size_`) — the core's low corner, grid count and tile.
+    pub gcell_grid: ((i32, i32, i32), (i32, i32, i32)),
 }
 
 /// What stays alive in the router after `global_route` for a later command — antenna repair's
@@ -1446,7 +1449,8 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         layer_edge_cost,
         max_routing_layer: t.max_routing_layer,
     };
-    Ok(RouteResult { guides, layer_names, total_overflow, guide_is_congested, routes: raw_routes, clock_nets, parasitics, routed_parasitics, parasitic_pins, planar_routes, snapshot_edges, log, after })
+    let gcell_grid = ((t.core.area.x_min, t.core.x_grids, t.core.tile_size), (t.core.area.y_min, t.core.y_grids, t.core.tile_size));
+    Ok(RouteResult { guides, layer_names, total_overflow, guide_is_congested, routes: raw_routes, clock_nets, parasitics, routed_parasitics, parasitic_pins, planar_routes, snapshot_edges, log, after, gcell_grid })
 }
 
 /// `VYGI|<tag>|…` — FastRoute's whole state in the format `grt-incr-trace.py` patches into

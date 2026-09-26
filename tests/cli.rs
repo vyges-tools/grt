@@ -142,3 +142,24 @@ fn a_def_with_undefined_cells_names_the_file_the_cause_and_the_fix() {
     assert!(reason.contains("caused by ODB-0092: unknown library cell referenced (BUF) for instance (u1)"), "{reason}");
     assert!(reason.contains("a LEF defining that cell was not read"), "{reason}");
 }
+
+/// `write_db` writes the database as global routing leaves it — what detailed routing reads: each
+/// routed net's guides, the gcell grid (one pattern per axis), and `grt_use_cugr` false after the
+/// default router. ⚠️ A regression pin on this design; the gate against the reference's database is
+/// grt-db-gate.py, outside this repository.
+#[test]
+fn write_db_leaves_guides_and_the_gcell_grid_in_the_database() {
+    let db_out = tmp("routed.odb");
+    let (o, r) = route("write_db.json", serde_json::json!({
+        "lefs": [data("tiny.lef")], "def": data("tiny.def"),
+        "steps": [{ "cmd": "global_route" }, { "cmd": "write_db", "path": db_out.to_str().unwrap() }]
+    }), &[]);
+    assert_eq!(o.status.code(), Some(0), "{r}");
+    assert_eq!(r["files_written"], serde_json::json!([db_out.to_str().unwrap()]), "{r}");
+    let db = vyges_opendb::Db::open(&db_out).unwrap();
+    let routed: Vec<String> = db.net_names().into_iter().filter(|n| !db.net_guides(n).unwrap().is_empty()).collect();
+    assert_eq!(routed.len(), 2, "both nets carry guides: {routed:?}");
+    assert!(db.gcell_grid_pattern_x(0).is_ok() && db.gcell_grid_pattern_y(0).is_ok(), "a gcell grid is written");
+    assert!(db.gcell_grid_pattern_x(1).is_err() && db.gcell_grid_pattern_y(1).is_err(), "one pattern per axis");
+    assert_eq!(db.block_bool_property("grt_use_cugr").unwrap(), Some(false));
+}

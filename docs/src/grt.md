@@ -32,6 +32,16 @@ vyges-grt route job.json               # the report on stdout
 vyges-grt route job.json -o report.json
 ```
 
+To hand the result straight to detailed routing, add `{ "cmd": "write_db", "path": "routed.odb" }`
+after `global_route`: it writes the database as global routing leaves it — every net's guides, the
+gcell grid and the routing layers — and `vyges-drt detailed_route --db routed.odb` reads exactly
+that:
+
+```sh
+vyges-grt route job.json                                   # ... "write_db", "path": "gr.odb"
+vyges-drt detailed_route --db gr.odb --out routed.def
+```
+
 A design can come from a database (`"db": "placed.odb"`) instead of LEF and DEF. Order matters:
 a per-layer adjustment is judged against the maximum routing layer at the time it is given, and a
 second `global_route` runs on the design the first one left. The full step list is in the

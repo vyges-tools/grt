@@ -37,6 +37,7 @@ JOB (JSON):
     { "cmd": "write_parasitics", "path": ".." }       (the networks the slacks are read from)
     { "cmd": "write_spef", "path": "..", "source": "partial" | "routed" }
     { "cmd": "write_guides", "path": ".." }
+    { "cmd": "write_db", "path": ".." }            (the database as global_route leaves it: guides, gcell grid, what detailed routing reads)
     { "cmd": "antenna_wires", "path": ".." }      (the wires antenna checking synthesises from the guides)
     { "cmd": "repair_antennas", "violations": "..", "jumper_only": b, "diode_only": b, "iterations": n,
       "allow_congestion": b, "trace": ".." }

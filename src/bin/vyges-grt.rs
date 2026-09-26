@@ -52,6 +52,7 @@ JOB (JSON):
     { \"cmd\": \"write_parasitics\", \"path\": \"..\" }       (the networks the slacks are read from)
     { \"cmd\": \"write_spef\", \"path\": \"..\", \"source\": \"partial\" | \"routed\" }
     { \"cmd\": \"write_guides\", \"path\": \"..\" }
+    { \"cmd\": \"write_db\", \"path\": \"..\" }            (the database as global_route leaves it: guides, gcell grid, what detailed routing reads)
     { \"cmd\": \"antenna_wires\", \"path\": \"..\" }      (the wires antenna checking synthesises from the guides)
     { \"cmd\": \"repair_antennas\", \"violations\": \"..\", \"jumper_only\": b, \"diode_only\": b, \"iterations\": n,
       \"allow_congestion\": b, \"trace\": \"..\" }
@@ -96,6 +97,7 @@ const DESCRIBE: &str = r#"{
     "status is one of routed, vacuous, refused or error. VACUOUS IS NOT ROUTED: every step ran but none produced anything -- no global_route and no file written. Exit status is 0 for routed, 2 for vacuous and for error, 3 for refused.",
     "input_hash covers the argument vector, not the content of the job file or of the design files it names.",
     "Correlated end to end on the guide files it writes, compared against a fresh reference run: 85 of 85 cases of the reference router's own global-routing regression suite, 2026-09-25 -- 80 exact from the scripts' inputs, and 5 exact on a database whose pin access points vyges-drt pin_access wrote. Both routers are covered (the default one and the CUGR one), with timing-driven routing timed by this engine's own timer and no captured slacks. The correlation harness is not part of this repository.",
+    "write_db is correlated on the database it writes: on 84 of 84 comparable cases of the same suite it equals the reference's database right after global routing -- every net's guides in order, the gcell grid, the routing layers and the grt_use_cugr property -- 2026-09-26. Detailed-routing that database with vyges-drt gives a DEF byte-identical to the reference's global_route plus detailed_route on 57 of them; of the rest the detailed router refuses 9 and differs on 10 (9 of them routes through antenna-repair jumpers), and the reference itself routes nothing on 8. Not written: the gcell grid's per-cell capacity and usage, which nothing downstream reads.",
     "One input is an ORACLE: repair_antennas takes the antenna violations as the reference checker reports them (its `violations` file); the violation check itself is not modelled. Diode insertion is refused. timer_slacks, when given, also answers the timer's reads from a captured file instead of computing them.",
     "REFUSED rather than approximated: reading pin access points during antenna checking or antenna-wire synthesis; a second repair iteration; incremental routing with no CUGR route in the session; database edits the incremental bracket does not model (named); RC commands before any liberty library; a clock period with no liberty library to time it; any step not listed in --help.",
     "Global routing that ends congested without allow_congestion is an error, as it is in the reference (after the guides are saved).",
@@ -155,7 +157,7 @@ mod events {
 
 /// The steps that PRODUCE something: a route, or a file. A job with none of them ran and made
 /// nothing, and its status is `vacuous` — a pass word must never come from a run that did nothing.
-const PRODUCING: &[&str] = &["global_route", "repair_antennas", "write_guides", "write_spef", "write_parasitics", "antenna_wires", "router_state"];
+const PRODUCING: &[&str] = &["global_route", "repair_antennas", "write_guides", "write_spef", "write_parasitics", "antenna_wires", "router_state", "write_db"];
 
 /// The files a job that ran to the end wrote: each writing step's `path`, in step order. Read from
 /// the job because a successful run executes every step — a step that failed would have ended it.
@@ -608,7 +610,10 @@ enum RepairRouter<'a> {
     Cugr(&'a mut vyges_grt::cugr::Cugr, &'a mut vyges_grt::cugr::route::CugrGuides),
 }
 
-fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, router: RepairRouter<'_>, db_guides: &BTreeMap<String, Vec<vyges_grt::Guide>>, has_access_points: bool, padding: (i32, i32), log: &mut Vec<String>) -> Result<Vec<vyges_grt::NetGuides>, Fail> {
+/// `saved_guides` is set when a `saveGuides` ran (the jumper pass, or a diode iteration) — which is
+/// what writes the block's `grt_use_cugr` property in the reference, even when no guide changed.
+#[allow(clippy::too_many_arguments)]
+fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, router: RepairRouter<'_>, db_guides: &BTreeMap<String, Vec<vyges_grt::Guide>>, has_access_points: bool, padding: (i32, i32), log: &mut Vec<String>, saved_guides: &mut bool) -> Result<Vec<vyges_grt::NetGuides>, Fail> {
     let (mut fast, mut cugr) = match router {
         RepairRouter::FastRoute(s, t) => (Some((s, t)), None),
         RepairRouter::Cugr(c, g) => (None, Some((c, g))),
@@ -697,6 +702,7 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, router: Repai
                 nr.segments = routes[name].clone();
                 modified.push(nr.clone());
             }
+            *saved_guides = true;
             saved = vyges_grt::save_guides(&modified, &state.jumper_grid.grid, &opts).map_err(|e| err(format!("{e:?}")))?;
         } else if let Some((cugr, cg)) = cugr.as_mut() {
             // Under CUGR the pass asks CUGR (`hasAvailableResources`, `hasJumperResources`) and
@@ -725,6 +731,7 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, router: Repai
                 nr.segments = cg.routes[name].clone();
                 modified.push(nr.clone());
             }
+            *saved_guides = true;
             saved = vyges_grt::save_guides(&modified, &cg.jumper_grid.grid, &cg.save).map_err(|e| err(format!("{e:?}")))?;
         }
     }
@@ -851,6 +858,7 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, router: Repai
         let mut sopts = state.save_options;
         sopts.guide_is_congested = total_overflow > 0 && !allow_congestion;
         let modified: Vec<vyges_grt::NetRoute> = nets_to_repair.iter().filter_map(|n| state.net_routes.iter().find(|r| &r.name == n).cloned()).collect();
+        *saved_guides = true;
         saved.extend(vyges_grt::save_guides(&modified, &state.jumper_grid.grid, &sopts).map_err(|e| err(format!("{e:?}")))?);
         if iterations > 1 {
             return Err(Fail::Refused("a second repair iteration after a FastRoute route is not modelled".into()));
@@ -1269,6 +1277,10 @@ fn run(job: &Value) -> Result<Value, Fail> {
     // The router a later command reads after a CUGR route: CUGR itself and the global router's
     // routes, pins and grid (`repairAntennas` does not re-initialize after one).
     let mut cugr_state: Option<(vyges_grt::cugr::Cugr, vyges_grt::cugr::route::CugrGuides)> = None;
+    // What `write_db` writes besides the guides, as the LAST global_route left it: the gcell grid
+    // (`updateDbCongestion`, per router) and the block's `grt_use_cugr` property (`saveGuides`).
+    let mut gcell_grid: Option<((i32, i32, i32), (i32, i32, i32))> = None;
+    let mut used_cugr: Option<bool> = None;
     let mut cugr_calls = 0usize;
     // `global_route -start_incremental` … `-end_incremental`: GlobalRouter's database callbacks are
     // registered, and the nets they marked dirty (`dirty_nets_`, by name; ordered at the end).
@@ -1392,7 +1404,11 @@ fn run(job: &Value) -> Result<Value, Fail> {
                         }
                         let mut saved = res.map_err(|e| classify(e.to_string()))?;
                         // finishGlobalRouting → saveGuides(every net): a net with a route is
-                        // rewritten, the others keep what they have.
+                        // rewritten, the others keep what they have. It also writes the router
+                        // (`grt_use_cugr`) and, through updateDbCongestion, the gcell grid.
+                        used_cugr = Some(true);
+                        let step_g = c.design.gridline_spacing;
+                        gcell_grid = Some(((c.design.die.x.low, c.grid.x_size as i32, step_g), (c.design.die.y.low, c.grid.y_size as i32, step_g)));
                         saved.extend(vyges_grt::save_guides(&cg.net_routes, &cg.jumper_grid.grid, &cg.save).map_err(|e| err(format!("{e:?}")))?);
                         for ng in saved {
                             guides.insert(ng.net.clone(), ng.guides.iter().map(|x| (x.box_.x_min, x.box_.y_min, x.box_.x_max, x.box_.y_max, cg.layer_names[&x.layer].clone())).collect());
@@ -1425,10 +1441,17 @@ fn run(job: &Value) -> Result<Value, Fail> {
                     calls.push(json!({ "nets": g.guides.len(), "use_cugr": true }));
                     after = None;
                     routed_by_cugr = true;
+                    // `CUGR::updateDbCongestion`: (die low edge, grid size, default gridline spacing).
+                    let c = &r.init.cugr;
+                    let step = c.design.gridline_spacing;
+                    gcell_grid = Some(((c.design.die.x.low, c.grid.x_size as i32, step), (c.design.die.y.low, c.grid.y_size as i32, step)));
+                    used_cugr = Some(true);
                     cugr_state = Some((r.init.cugr, g));
                     continue;
                 }
                 let res = route_design(&mut db, &opts, &stt, &flutes).map_err(|e| classify(e.to_string()))?;
+                gcell_grid = Some(res.gcell_grid);
+                used_cugr = Some(false);
                 // saveGuides replaces the guides of every net it routes; the others keep theirs.
                 parasitics = res.parasitics.clone();
                 parasitic_pins = res.parasitic_pins.clone();
@@ -1840,7 +1863,11 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 }
                 if routed_by_cugr {
                     let (cugr, cg) = cugr_state.as_mut().ok_or_else(|| Fail::Refused("cugr: no router state".into()))?;
-                    let repaired = repair_antennas(&mut db, &opts, step, RepairRouter::Cugr(cugr, cg), &db_guides, has_access_points, padding, &mut log)?;
+                    let mut saved = false;
+                    let repaired = repair_antennas(&mut db, &opts, step, RepairRouter::Cugr(cugr, cg), &db_guides, has_access_points, padding, &mut log, &mut saved)?;
+                    if saved {
+                        used_cugr = Some(true);
+                    }
                     for ng in repaired {
                         guides.insert(ng.net.clone(), ng.guides.iter().map(|g| (g.box_.x_min, g.box_.y_min, g.box_.x_max, g.box_.y_max, db_layer_name(&db, g.layer))).collect());
                         db_guides.insert(ng.net.clone(), ng.guides);
@@ -1861,7 +1888,11 @@ fn run(job: &Value) -> Result<Value, Fail> {
                     after = Some((restored, 0));
                 }
                 let (state, total_overflow) = after.as_mut().expect("set above");
-                let repaired = repair_antennas(&mut db, &opts, step, RepairRouter::FastRoute(state, *total_overflow), &db_guides, has_access_points, padding, &mut log)?;
+                let mut saved = false;
+                let repaired = repair_antennas(&mut db, &opts, step, RepairRouter::FastRoute(state, *total_overflow), &db_guides, has_access_points, padding, &mut log, &mut saved)?;
+                if saved {
+                    used_cugr = Some(false);
+                }
                 for ng in repaired {
                     guides.insert(ng.net.clone(), ng.guides.iter().map(|g| (g.box_.x_min, g.box_.y_min, g.box_.x_max, g.box_.y_max, db_layer_name(&db, g.layer))).collect());
                     db_guides.insert(ng.net.clone(), ng.guides);
@@ -1990,6 +2021,25 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 }
             }
             "write_guides" => write_guides(step["path"].as_str().ok_or_else(|| err("path"))?, &guides)?,
+            // The database as `global_route` leaves it — what `detailed_route` then reads: every
+            // net's guides (`saveGuides`, in segment order), the gcell grid (`updateDbCongestion`)
+            // and the `grt_use_cugr` property. The routing layers are already in it
+            // (`set_routing_layers` writes them as it runs).
+            // ⚠️ Not written: the grid's per-gcell capacity and usage (congestion) — nothing in the
+            // suite reads them back; the detailed router reads only the grid's patterns.
+            "write_db" => {
+                let path = step["path"].as_str().ok_or_else(|| err("path"))?;
+                let nets: Vec<vyges_grt::NetGuides> =
+                    db_guides.iter().map(|(net, g)| vyges_grt::NetGuides { net: net.clone(), guides: g.clone(), jumper_count: 0 }).collect();
+                vyges_grt::apply_guides(&mut db, &nets).map_err(at(path))?;
+                if let Some((x, y)) = gcell_grid {
+                    db.block_reset_gcell_grid(x, y).map_err(at(path))?;
+                }
+                if let Some(u) = used_cugr {
+                    db.block_set_bool_property("grt_use_cugr", u).map_err(at(path))?;
+                }
+                db.write(path).map_err(at(path))?;
+            }
             other => return Err(Fail::Refused(format!("step {other:?} is not modelled"))),
         }
     }
