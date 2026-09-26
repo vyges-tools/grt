@@ -1,0 +1,14 @@
+[book]
+title = "vyges-grt"
+description = "Global routing from a placed design: route guides per net"
+authors = ["Vyges"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "light"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/vyges-tools/grt"
+
+# The chapter (src/grt.md) and the CLI reference (src/reference/vyges-grt.md) are written to drop
+# into the Vyges book unchanged, as engines/grt.md and engines/reference/vyges-grt.md.

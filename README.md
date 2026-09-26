@@ -9,14 +9,15 @@ guide records.
 
 ## Status
 
-**The router runs end to end** (`vyges-grt`, feature `cli`): FastRoute's full sequence from a
-placed design, pattern and maze routing, 3D layer assignment, rip-up and reroute, non-default
-rules, incremental routing and antenna repair, writing route guides to the design database.
-Against OpenROAD at pin `da9f29f1`, over the reference's own global-routing regression suite, the
-guide files of 43 of 85 cases match exactly, and 6 more match once the timer's slacks are taken
-from the reference (those are timing-driven, and the timer does not yet reproduce the slacks bit
-for bit). Most of the remaining cases run CUGR, a second router this crate does not implement, or
-need detailed-routing pin access.
+**The router runs end to end** (`vyges-grt route <job.json>`, feature `cli`): the default
+router's full sequence from a placed design — pattern and maze routing, 3D layer assignment, rip-up
+and reroute — and a second, CUGR-style router, both with non-default rules, incremental routing and
+antenna repair, writing route guides. Timing-driven routing is timed by the engine's own timer.
+Over the reference router's own global-routing regression suite, the guide files of **85 of 85**
+cases match a fresh reference run (2026-09-25): 80 from the scripts' inputs, and 5 on a database
+whose pin access points `vyges-drt pin_access` wrote. `vyges-grt --describe` publishes the
+reference build this is measured against, the one oracle input (antenna violations for
+`repair_antennas`), and what is refused. The CLI and its exit codes are in [the book](docs/src/grt.md).
 
 ✅ **Validated end to end, over five designs.** On the main one — 563 nets, 3,770 segments —
 every one of the 3,848 guides matches the output of a published global router, per net and in

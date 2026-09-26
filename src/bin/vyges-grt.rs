@@ -6,8 +6,9 @@
 //! `write_guides`). Order matters: a per-layer adjustment is judged against the max routing layer
 //! AT THE TIME it is given, and a second `global_route` runs on the database the first left.
 //!
-//! Exit status: 0 routed (report on stdout), 1 refused (a feature this engine does not model yet —
-//! named in the report), 2 usage or read error.
+//! Exit status: 0 routed (report on stdout), 2 vacuous (no step produced anything — not a pass),
+//! 2 usage or read error, 3 refused (a feature this engine does not model yet — named in the
+//! report).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::ExitCode;
@@ -20,8 +21,10 @@ const USAGE: &str = "\
 vyges-grt — global routing: route guides from a placed design
 
 USAGE:
-  vyges-grt route <job.json>
+  vyges-grt route <job.json> [-o REPORT.json]
+  vyges-grt --describe
   vyges-grt --help
+  vyges-grt --version
 
 JOB (JSON):
   { \"lefs\": [..], \"liberty\": [..], \"def\": \"..\" | \"db\": \"..\", \"timer_slacks\": \"..\",
@@ -55,11 +58,122 @@ JOB (JSON):
       violations: the reference checker's, captured (`VYGA|viol|…` lines) — an ORACLE; the
       violation check itself is not modelled. Diode insertion is refused.
 
+OPTIONS:
+  -o FILE      write the JSON report to FILE instead of stdout
+  --json       accepted; the report is JSON either way
+  --describe   print a machine-readable JSON description of the command
+
 EXIT STATUS:
-  0  routed    every step ran; the report lists each global_route
-  1  refused   a step needs a feature not modelled yet (named)
+  0  routed    every step ran; the report lists each global_route and every file written
+  2  vacuous   every step ran but none produced anything (no global_route, no file written).
+               NOT a pass
   2  error     usage, unreadable input, or a failed write
+  3  refused   a step needs a feature not modelled yet (named in `reason`)
 ";
+
+/// The pin, inherited from the database crate this binary links.
+const CRATE_PIN: &str = vyges_opendb::OPENROAD_PIN;
+
+/// ⛔ The `openroad_pin` FIELD is this token, substituted at print time — a hand-typed pin
+/// reports what was typed, not what the binary links. A correlation claim in the prose names the
+/// date it was MEASURED and stays a literal.
+const PIN_TOKEN: &str = "@OPENROAD_PIN@";
+
+fn describe() -> String {
+    DESCRIBE.replace(PIN_TOKEN, CRATE_PIN)
+}
+
+/// ⚠️ **`maturity` is `structured`**: the correlation runs against the reference outside this
+/// repository, so the `workflow-validated` rung is not claimed. What is not modelled, and the one
+/// input that is an oracle, go in `provenance_limitations`.
+const DESCRIBE: &str = r#"{
+  "schema": "vyges-tool-descriptor/1.1",
+  "openroad_pin": "@OPENROAD_PIN@",
+  "name": "grt",
+  "summary": "global routing from a placed design: route guides per net, from a job that replays a routing script's steps (layer settings, adjustments, global_route, antenna repair, write_guides)",
+  "maturity": "structured",
+  "provenance_limitations": [
+    "status is one of routed, vacuous, refused or error. VACUOUS IS NOT ROUTED: every step ran but none produced anything -- no global_route and no file written. Exit status is 0 for routed, 2 for vacuous and for error, 3 for refused.",
+    "input_hash covers the argument vector, not the content of the job file or of the design files it names.",
+    "Correlated end to end on the guide files it writes, compared against a fresh reference run: 85 of 85 cases of the reference router's own global-routing regression suite, 2026-09-25 -- 80 exact from the scripts' inputs, and 5 exact on a database whose pin access points vyges-drt pin_access wrote. Both routers are covered (the default one and the CUGR one), with timing-driven routing timed by this engine's own timer and no captured slacks. The correlation harness is not part of this repository.",
+    "One input is an ORACLE: repair_antennas takes the antenna violations as the reference checker reports them (its `violations` file); the violation check itself is not modelled. Diode insertion is refused. timer_slacks, when given, also answers the timer's reads from a captured file instead of computing them.",
+    "REFUSED rather than approximated: reading pin access points during antenna checking or antenna-wire synthesis; a second repair iteration; incremental routing with no CUGR route in the session; database edits the incremental bracket does not model (named); RC commands before any liberty library; a clock period with no liberty library to time it; any step not listed in --help.",
+    "Global routing that ends congested without allow_congestion is an error, as it is in the reference (after the guides are saved).",
+    "The Steiner trees are built by vyges-stt and the placement parasitics by vyges-est, each correlated separately."
+  ],
+  "invocation": {
+    "args_template": ["route", "{job}"],
+    "optional": [ { "arg": "report", "flag": "-o" } ],
+    "emits_json": true
+  },
+  "inputs": {
+    "type": "object",
+    "required": ["job"],
+    "properties": {
+      "job": { "type": "string", "description": "path to a JSON job: {lefs, liberty, def | db, steps: [{cmd, ...}]} -- see --help for the step list" },
+      "report": { "type": "string", "description": "write the JSON report to FILE instead of stdout" }
+    }
+  },
+  "consumes": ["job"],
+  "artifacts": [ { "role": "route_guides", "field": "guides_written" } ],
+  "assertion": {
+    "id": "globally-routed",
+    "field": "status",
+    "pass_when": { "eq": "routed" }
+  },
+  "exit_codes": { "0": "routed", "2": "vacuous or error", "3": "refused" }
+}"#;
+
+/// The `vyges-events` causal trail: every event goes to STDERR, the report to stdout (or `-o`), so
+/// a caller can parse one without the other. Codes name a situation, not a message:
+///
+/// | code | meaning |
+/// |---|---|
+/// | `GRT-DONE` | the run finished; a census of what it did (global_route calls, nets routed, files written). `warn` when the status is not the pass word |
+/// | `GRT-REFUSED` | a step this engine does not model; the reason names it |
+/// | `GRT-ERROR` | usage, unreadable input, or a failed write |
+mod events {
+    use vyges_events::{emit, Event, Severity};
+
+    const TOOL: &str = "vyges-grt";
+
+    /// One event for the run's outcome, from its status word and the report's own fields.
+    pub fn outcome(status: &str, pass: &str, reason: Option<&str>, census: &str) {
+        let (code, severity) = match status {
+            "refused" => ("GRT-REFUSED", Severity::Error),
+            "error" => ("GRT-ERROR", Severity::Error),
+            s if s == pass => ("GRT-DONE", Severity::Info),
+            _ => ("GRT-DONE", Severity::Warn),
+        };
+        let text = match reason {
+            Some(r) => format!("{status}: {r}"),
+            None => format!("{status}: {census}"),
+        };
+        emit(&Event::new(TOOL, severity, text).with_code(code));
+    }
+}
+
+/// The steps that PRODUCE something: a route, or a file. A job with none of them ran and made
+/// nothing, and its status is `vacuous` — a pass word must never come from a run that did nothing.
+const PRODUCING: &[&str] = &["global_route", "repair_antennas", "write_guides", "write_spef", "write_parasitics", "antenna_wires", "router_state"];
+
+/// The files a job that ran to the end wrote: each writing step's `path`, in step order. Read from
+/// the job because a successful run executes every step — a step that failed would have ended it.
+fn files_written(job: &Value, only: Option<&str>) -> Vec<String> {
+    let steps = job["steps"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    steps
+        .iter()
+        .filter(|st| {
+            let c = st["cmd"].as_str().unwrap_or_default();
+            PRODUCING.contains(&c) && only.is_none_or(|o| o == c)
+        })
+        .filter_map(|st| st["path"].as_str().map(str::to_string))
+        .collect()
+}
+
+fn produced_anything(job: &Value) -> bool {
+    job["steps"].as_array().is_some_and(|v| v.iter().any(|st| PRODUCING.contains(&st["cmd"].as_str().unwrap_or_default())))
+}
 
 thread_local! {
     static LUT: vyges_stt::flute::lut::Lut = vyges_stt::flute::lut::load_tables(vyges_stt::flute::lut::MAX_LUT_DEGREE).expect("flute tables");
@@ -1877,8 +1991,34 @@ fn run(job: &Value) -> Result<Value, Fail> {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+    // `-o FILE` — the value is consumed here so it never reaches the positional scan.
+    let mut out: Option<String> = None;
+    let mut positional: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" => match args.get(i + 1) {
+                Some(v) => {
+                    out = Some(v.clone());
+                    i += 1;
+                }
+                None => {
+                    eprintln!("vyges-grt: -o needs a FILE");
+                    return ExitCode::from(2);
+                }
+            },
+            // ⚠️ Accepted and ignored — the report is JSON either way. The descriptor says
+            // `emits_json`, so a registry caller appends `--json`.
+            "--json" => {}
+            a => positional.push(a),
+        }
+        i += 1;
+    }
+    let (report, code) = match positional.as_slice() {
         ["route", path] => {
+            // ⛔ Before any database exists: libodb then logs to the events trail (stderr) only, and
+            // stdout carries nothing but the JSON report a caller parses.
+            vyges_opendb::init_events_logging();
             let job: Value = match std::fs::read_to_string(path).map_err(|e| e.to_string()).and_then(|t| serde_json::from_str(&t).map_err(|e| e.to_string())) {
                 Ok(j) => j,
                 Err(e) => {
@@ -1887,29 +2027,52 @@ fn main() -> ExitCode {
                 }
             };
             match run(&job) {
-                Ok(report) => {
-                    println!("{report}");
-                    ExitCode::SUCCESS
+                Ok(mut report) if produced_anything(&job) => {
+                    report["files_written"] = json!(files_written(&job, None));
+                    report["guides_written"] = json!(files_written(&job, Some("write_guides")));
+                    (report, 0)
                 }
-                Err(Fail::Refused(why)) => {
-                    println!("{}", json!({ "status": "refused", "reason": why }));
-                    ExitCode::from(1)
+                // ⛔ Every step ran and none produced anything: not a pass.
+                Ok(mut report) => {
+                    report["status"] = json!("vacuous");
+                    report["reason"] = json!("no step produced anything: no global_route and no file written");
+                    (report, 2)
                 }
-                Err(Fail::Error(why)) => {
-                    println!("{}", json!({ "status": "error", "reason": why }));
-                    ExitCode::from(2)
-                }
+                Err(Fail::Refused(why)) => (json!({ "status": "refused", "reason": why }), 3),
+                Err(Fail::Error(why)) => (json!({ "status": "error", "reason": why }), 2),
             }
+        }
+        ["--describe"] => {
+            println!("{}", describe());
+            return ExitCode::SUCCESS;
+        }
+        ["--version"] | ["-V"] => {
+            println!("vyges-grt {} ({})\nCopyright (c) Vyges. Apache-2.0.", env!("CARGO_PKG_VERSION"), env!("VYGES_GIT_SHA"));
+            return ExitCode::SUCCESS;
         }
         ["--help"] | ["-h"] => {
             print!("{USAGE}");
-            ExitCode::SUCCESS
+            return ExitCode::SUCCESS;
         }
         _ => {
             eprint!("{USAGE}");
-            ExitCode::from(2)
+            return ExitCode::from(2);
         }
+    };
+    let calls = report["global_route"].as_array().map(Vec::len).unwrap_or(0);
+    let nets: u64 = report["global_route"].as_array().map(|v| v.iter().filter_map(|c| c["nets"].as_u64()).sum()).unwrap_or(0);
+    let files = report["files_written"].as_array().map(Vec::len).unwrap_or(0);
+    events::outcome(report["status"].as_str().unwrap_or("error"), "routed", report["reason"].as_str(), &format!("global_route calls={calls} nets={nets} files_written={files}"));
+    match out {
+        Some(p) => {
+            if let Err(e) = std::fs::write(&p, format!("{report}\n")) {
+                eprintln!("vyges-grt: {p}: {e}");
+                return ExitCode::from(2);
+            }
+        }
+        None => println!("{report}"),
     }
+    ExitCode::from(code)
 }
 
 /// The timer's inputs, made on first use: every liberty file read so far, parsed for timing.
