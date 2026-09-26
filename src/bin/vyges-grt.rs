@@ -697,6 +697,11 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, router: Repai
             let mut opts = state.save_options;
             opts.guide_is_congested = total_overflow > 0 && !allow_congestion;
             let mut modified = Vec::new();
+            // addJumperOnSegments > 0 → `db_net->setJumpers(true)`: the detailed router reads it
+            // (`hasJumpers`) and routes the net at ten times the off-guide cost.
+            for name in &res.modified_nets {
+                db.net_set_jumpers(name, true).map_err(err)?;
+            }
             for name in &res.modified_nets {
                 let nr = state.net_routes.iter_mut().find(|n| &n.name == name).ok_or_else(|| err(format!("net {name} has no route")))?;
                 nr.segments = routes[name].clone();
@@ -726,6 +731,11 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, router: Repai
             log.push(format!("GRT-0302: Inserted {} jumpers for {} nets.", res.total_jumpers, res.net_with_jumpers));
             // saveGuides(nets_with_jumpers): a CUGR guide is never marked congested.
             let mut modified = Vec::new();
+            // addJumperOnSegments > 0 → `db_net->setJumpers(true)`: the detailed router reads it
+            // (`hasJumpers`) and routes the net at ten times the off-guide cost.
+            for name in &res.modified_nets {
+                db.net_set_jumpers(name, true).map_err(err)?;
+            }
             for name in &res.modified_nets {
                 let nr = cg.net_routes.iter_mut().find(|n| &n.name == name).ok_or_else(|| err(format!("net {name} has no route")))?;
                 nr.segments = cg.routes[name].clone();
@@ -761,6 +771,12 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, router: Repai
         // What the router's callbacks will see move: every instance's location and orientation.
         let placed_before: BTreeMap<String, ((i32, i32), String)> = db.inst_names().into_iter().map(|i| (i.clone(), (db.inst_location(&i), db.inst_get_orient(&i)))).collect();
         let diodes = insert_diodes(db, &second, padding, &mut text, log)?;
+        // "Diode insertion deletes the jumpers in guides": a net given diodes loses its jumpers
+        // mark (`db_net->setJumpers(false)`), so the detailed router routes it at the ordinary
+        // off-guide cost again.
+        for net in second.iter().filter(|v| v.3 > 0).map(|v| v.0.clone()).collect::<BTreeSet<String>>() {
+            db.net_set_jumpers(&net, false).map_err(err)?;
+        }
         let gates: Vec<String> = second.iter().flat_map(|v| v.2.iter().map(|g| g.rsplit_once('/').map_or(g.clone(), |p| p.0.to_string()))).collect();
         let legalized = legalize_placed_cells(db, padding, &diodes, &gates, &mut text);
         if let Some(path) = step["diode_trace"].as_str() {

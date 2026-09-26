@@ -45,6 +45,17 @@ pub fn apply_guides(db: &mut Db, nets: &[NetGuides]) -> Result<usize, Box<dyn st
         }
         // ⛔ see the note above: without this the order is reversed.
         db.reverse_guides(&net.net)?;
+        // The flags `saveGuides` sets on a guide (`setIsJumper`, `setIsConnectedToTerm`), by
+        // position in the now-ordered list. The detailed router reads neither; the database keeps
+        // them, and a later antenna check binds guides to pins through the second.
+        for (k, g) in net.guides.iter().enumerate() {
+            if g.is_jumper {
+                db.guide_set_is_jumper(&net.net, k, true)?;
+            }
+            if g.is_connected_to_term {
+                db.guide_set_is_connected_to_term(&net.net, k, true)?;
+            }
+        }
     }
     Ok(written)
 }
