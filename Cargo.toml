@@ -1,6 +1,6 @@
 [package]
 name = "vyges-grt"
-version = "0.1.0"
+version = "0.1.37"
 edition = "2021"
 description = "Global routing over a placed design: route guides and the congestion grid, written to the OpenDB design database."
 license = "Apache-2.0"
