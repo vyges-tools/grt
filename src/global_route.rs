@@ -194,7 +194,7 @@ pub fn setup_tech(db: &mut Db, opts: &RouteOptions) -> Res<TechSetup> {
     report_layer_settings(&setup, &mut log);
     // I6
     let pitches = calc_layer_pitches(&tech.pitch_layers, max, block_min, block_max, tech.routing_layer_count, &tech.vias, &DbSpacing(db));
-    let tracks = init_routing_tracks(&tech.tracks, max, &pitches, tech.dbu_per_micron, opts.verbose, &mut log).map_err(|e| format!("{e:?}"))?;
+    let tracks = init_routing_tracks(&tech.tracks, max, &pitches, tech.dbu_per_micron, opts.verbose, &mut log).map_err(|e| e.to_string())?;
     // I7 — the tile size AFTER G3's write-back.
     let core = init_grid(tech.die, read_tile_size(db), routing_layers.len() as i32, max);
     // I8
@@ -633,6 +633,7 @@ pub(crate) fn discover_net_pins<'a>(
     let directions: std::collections::BTreeMap<i32, Option<crate::capacity::Direction>> =
         t.tech.routing_layers.iter().map(|l| (l.routing_level, l.direction)).collect();
     let die = t.core.area;
+    let layer_name = |level: i32| t.tech.routing_layers.iter().find(|l| l.routing_level == level).map(|l| l.name.clone()).unwrap_or_default();
     let added = find_nets(&candidates, opts.skip_large_fanout, log);
     // addNet → updateNetPins: every terminal's pin, then findPins.
     let mut masters: std::collections::HashMap<String, MasterShapes> = std::collections::HashMap::new();
@@ -675,7 +676,7 @@ pub(crate) fn discover_net_pins<'a>(
             let boxes: Vec<TermBox> = m.pins.iter().filter(|p| &p.0 == term).map(|p| TermBox { pin: 0, level: p.3, routing: p.2, rect: transform_rect(&orient, origin, p.4) }).collect();
             let name = format!("{inst}/{term}");
             let pin = make_iterm_pin(&name, class, db.master_is_core(&master), db.inst_is_placed(inst), inst_box, &boxes, die, max_for_pins, &directions, opts.verbose, log)
-                .map_err(|e| format!("{e:?}"))?;
+                .map_err(|e| e.text(&layer_name))?;
             let io = db.mterm_get_io_type(&master, term);
             aps.push(iterm_access_points(db, inst, term, pin.is_core)?);
             pins.push((pin, io == "OUTPUT" || io == "INOUT"));
@@ -683,7 +684,10 @@ pub(crate) fn discover_net_pins<'a>(
         for bterm in &n.bterms {
             let (placed, bx) = read_bterm(db, bterm)?;
             let boxes: Vec<TermBox> = bx.into_iter().map(|(level, routing, rect)| TermBox { pin: 0, level, routing, rect }).collect();
-            if let Some(pin) = make_bterm_pin(bterm, placed, &boxes, die, &directions, false, opts.verbose, log).map_err(|e| format!("{e:?}"))? {
+            // `check_pin_placement_` is true in every session this engine can build: only the Rudy
+            // congestion path (`initFastRoute(.., false)`) clears it, and there is no Rudy step. So a
+            // port with no routing-layer geometry is GRT-42, not skipped.
+            if let Some(pin) = make_bterm_pin(bterm, placed, &boxes, die, &directions, true, opts.verbose, log).map_err(|e| e.text(&layer_name))? {
                 let per_pin = (0..db.num_bterm_get_b_pins(bterm)).map(|b| Ok(db.bpin_access_points(bterm, b)?.into_iter().map(|(x, y, l)| (l, x, y)).collect())).collect::<Res<Vec<Vec<AccessPoint>>>>()?;
                 aps.push(crate::pins::port_access_points(per_pin));
                 pins.push((pin, db.bterm_get_io_type(bterm) == "INPUT"));
@@ -695,13 +699,18 @@ pub(crate) fn discover_net_pins<'a>(
         }
         nets.push((n, pins));
     }
+    // initNets → checkPinPlacement, after every net's pins: ports sharing a position on a layer
+    // warn GRT-31 and fail the run (GRT-80).
+    let ports: Vec<&NetPin> = nets.iter().flat_map(|(_, pins)| pins.iter().map(|(p, _)| p)).filter(|p| p.is_port).collect();
+    crate::pins::check_pin_placement(&ports, &layer_name, t.tech.dbu_per_micron, log).map_err(|e| e.to_string())?;
     Ok(nets)
 }
 
 /// I13 `initNets` (`findNets`: discovery, pins, the order) and I14 `initNetlist`.
 ///
-/// ⛔ Refused as in I10: a pad or macro terminal, a net with a wire. A block terminal skipped for
-/// having no routing geometry is the Rudy path's leniency, reproduced (`check_pin_placement` off).
+/// ⛔ Refused as in I10: a pad or macro terminal, a net with a wire. A block terminal with no
+/// routing geometry is GRT-42 (`check_pin_placement_` is true: only the Rudy path clears it, and
+/// this engine has no Rudy step), and `checkPinPlacement` runs after the pins (GRT-31 / GRT-80).
 pub fn setup_nets(db: &Db, t: &TechSetup, e: &mut RouterEdges, has_macros_or_pads: bool, opts: &RouteOptions, log: &mut Vec<String>) -> Res<Vec<RouterNet>> {
     Ok(setup_nets_counted(db, t, e, has_macros_or_pads, opts, log)?.0)
 }

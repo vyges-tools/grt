@@ -210,3 +210,17 @@ fn the_usage_check_fires_only_strictly_above_the_limit() {
         "a vertical edge must not be judged against the horizontal capacity"
     );
 }
+
+/// The violations come back in the reference's order, so the first is the one it reports: every
+/// horizontal edge before any vertical one, each direction in (x, y) order — the used-grid sets are
+/// `std::set<std::pair<int, int>>` of `{x, y}`. congestion4's golden is `(0, 3)`, not `(3, 0)`.
+#[test]
+fn usage_violations_come_in_the_references_order() {
+    let mut g = EstimateGrid::new(5, 5);
+    g.update_v(3, 0, 1, 201.0); // vertical edge (3, 0)
+    g.update_v(0, 3, 4, 201.0); // vertical edge (0, 3)
+    g.update_h(2, 3, 4, 201.0); // horizontal edge (2, 4)
+    g.add_est_usage_to_usage();
+    let at: Vec<(bool, usize, usize)> = check_2d_edges_usage(&g, 2, 2).iter().map(|u| (u.horizontal, u.x, u.y)).collect();
+    assert_eq!(at, vec![(true, 2, 4), (false, 0, 3), (false, 3, 0)]);
+}

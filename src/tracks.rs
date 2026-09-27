@@ -44,6 +44,19 @@ pub enum TrackError {
     InvalidDirection { layer: String },
 }
 
+/// The reference's code and text for each (GRT-86 in `initRoutingTracks`; ODB-414/415/416 in
+/// `dbTrackGrid::getAverageTrackSpacing`).
+impl std::fmt::Display for TrackError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TrackError::NoTrackGrid { layer } => write!(f, "GRT-0086: Track for layer {layer} not found."),
+            TrackError::NoHorizontalTracks { layer } => write!(f, "ODB-0414: Horizontal tracks for layer {layer} not found."),
+            TrackError::NoVerticalTracks { layer } => write!(f, "ODB-0415: Vertical tracks for layer {layer} not found."),
+            TrackError::InvalidDirection { layer } => write!(f, "ODB-0416: Layer {layer} has invalid direction."),
+        }
+    }
+}
+
 /// `dbTrackGrid::getAverageTrackSpacing` → `(track_step, track_init, num_tracks)`.
 ///
 /// One pattern on the layer's axis: that pattern, as is. Several: `getAverageTrackPattern` over

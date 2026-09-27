@@ -266,6 +266,11 @@ fn classify(msg: String) -> Fail {
 
 fn level(db: &Db, v: &Value) -> Result<i32, Fail> {
     let name = v.as_str().ok_or_else(|| Fail::Error(format!("a layer name, got {v}")))?;
+    // `parse_layer_name`: no such layer is GRT-5. A layer that exists but routes nothing gives the
+    // reference level 0 and it goes on; that is refused here as an error of our own.
+    if db.layer_get_type(name).map_err(err)?.is_empty() {
+        return Err(Fail::Error(format!("GRT-0005: Layer {name} not found.")));
+    }
     let l = db.layer_get_routing_level(name);
     if l <= 0 {
         return Err(Fail::Error(format!("{name} is not a routing layer")));
@@ -1358,7 +1363,12 @@ fn run(job: &Value) -> Result<Value, Fail> {
             // stt's set_routing_alpha: -net, else -min_fanout, else -min_hpwl, else -clock_nets, else
             // the global alpha.
             "routing_alpha" => {
-                let a = step["alpha"].as_f64().ok_or_else(|| err("alpha"))? as f32;
+                // `set_routing_alpha` checks the value before anything else (STT-1): outside
+                // [0.0, 1.0], or not a number, is an error.
+                let a = match step["alpha"].as_f64() {
+                    Some(a) if (0.0..=1.0).contains(&a) => a as f32,
+                    _ => return Err(Fail::Error("STT-0001: The alpha value must be between 0.0 and 1.0.".into())),
+                };
                 if let Some(nets) = step["nets"].as_array() {
                     for n in nets {
                         let n = n.as_str().ok_or_else(|| err("a net name"))?;
@@ -1516,7 +1526,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 routed_by_cugr = false;
                 if res.total_overflow > 0 && !opts.allow_congestion {
                     // GRT-116: the reference ends the command in error after writing the guides.
-                    return Err(Fail::Error("GRT-0116: Global routing finished with congestion".into()));
+                    return Err(Fail::Error("GRT-0116: Global routing finished with congestion. Check the congestion regions in the DRC Viewer.".into()));
                 }
             }
             // set_layer_rc — ⛔ it WRITES the technology's resistance (set_dblayer_wire_rc /

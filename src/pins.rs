@@ -97,7 +97,8 @@ pub enum PinError {
     /// GRT-11: a block terminal with an unplaced pin.
     PinNotPlaced { pin: String },
     /// GRT-29: an instance terminal with no geometry at or below the max routing layer.
-    NoGeometryBelowMax { pin: String },
+    /// `max_level`: the routing level; the message names that layer ([`PinError::text`]).
+    NoGeometryBelowMax { pin: String, max_level: i32 },
     /// GRT-42: a block terminal with no routing-layer geometry, when pin placement is checked.
     NoRoutingGeometry { pin: String },
     /// GRT-209: a block terminal completely outside the die.
@@ -154,7 +155,7 @@ pub fn make_iterm_pin(
     }
     let layers: Vec<i32> = pin_boxes.keys().copied().filter(|&l| l <= max_routing_layer).collect();
     if layers.is_empty() {
-        return Err(PinError::NoGeometryBelowMax { pin: name.into() });
+        return Err(PinError::NoGeometryBelowMax { pin: name.into(), max_level: max_routing_layer });
     }
     let (edge, connection_layer) = if connected {
         determine_edge(inst_bbox, &pin_boxes, &layers, directions)
@@ -482,6 +483,37 @@ pub fn is_pin_reachable(grid: &PinGrid, pin: &NetPin, pos_on_grid: (i32, i32), e
 /// GRT-80: two ports share a position on one layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvalidPinPlacement;
+
+impl std::fmt::Display for InvalidPinPlacement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GRT-0080: Invalid pin placement.")
+    }
+}
+
+impl PinError {
+    /// The reference's message, with GRT-29's max routing layer NAMED (`getLayerName`), which only
+    /// the caller's layer table can give.
+    pub fn text(&self, layer_name: &dyn Fn(i32) -> String) -> String {
+        match self {
+            PinError::NoGeometryBelowMax { pin, max_level } => format!("GRT-0029: Pin {pin} does not have geometries below the max routing layer ({}).", layer_name(*max_level)),
+            e => e.to_string(),
+        }
+    }
+}
+
+/// The reference's code and text for each (`logger_->error` in `makeItermPins` / `makeBtermPins`).
+/// An instance terminal is named `inst/term`; GRT-10 names the INSTANCE.
+impl std::fmt::Display for PinError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PinError::InstanceNotPlaced { pin } => write!(f, "GRT-0010: Instance {} is not placed.", pin.rsplit_once('/').map_or(pin.as_str(), |(i, _)| i)),
+            PinError::PinNotPlaced { pin } => write!(f, "GRT-0011: Pin {pin} is not placed."),
+            PinError::NoGeometryBelowMax { pin, max_level } => write!(f, "GRT-0029: Pin {pin} does not have geometries below the max routing layer (level {max_level})."),
+            PinError::NoRoutingGeometry { pin } => write!(f, "GRT-0042: Pin {pin} does not have geometries in a valid routing layer."),
+            PinError::OutsideDie { pin } => write!(f, "GRT-0209: Pin {pin} is completely outside the die area and cannot bet routed."),
+        }
+    }
+}
 
 /// I13b — `checkPinPlacement`: ports (in `db_net_map_` order) on the same connection layer at the
 /// same POSITION — `position_`, the raw pin position, not the on-grid one — warn GRT-31 once per

@@ -192,7 +192,10 @@ pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn 
     // R11
     let viol = convert_to_mazeroute_all(ids, state, &mut g2d, inp.h_capacity, inp.v_capacity);
     if !viol.is_empty() {
-        return Err(format!("check2DEdgesUsage (GRT-0228/0229): {viol:?}"));
+        // The reference reports the first offending edge and stops (the list is in its order).
+        let v = viol[0];
+        let (code, dir) = if v.horizontal { ("GRT-0228", "Horizontal") } else { ("GRT-0229", "Vertical") };
+        return Err(format!("{code}: {dir} edge usage exceeds the maximum allowed. ({}, {}) usage={} limit={}", v.x, v.y, v.usage as i64, v.limit));
     }
     stop_unless!(Stage::Scan { tag: "B11", scan: &scan }, None);
     // R12

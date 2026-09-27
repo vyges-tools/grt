@@ -411,9 +411,10 @@ const MAX_USAGE_MULTIPLIER: i32 = 100;
 /// ⚠️ **Strictly greater than the limit**, and the limit is a whole multiple of the capacity, so
 /// an edge sitting exactly on it passes.
 ///
-/// The reference raises an error per offending edge (GRT-228 horizontal, GRT-229 vertical) and
-/// stops. Violations are returned here instead, so a caller can report them all and so the rule
-/// is testable without a design that triggers it — no shipped design does.
+/// The reference raises an error at the FIRST offending edge (GRT-228 horizontal, GRT-229
+/// vertical) and stops. Violations are returned here instead, IN THE REFERENCE'S ORDER: every
+/// horizontal edge before any vertical one, each direction in (x, y) order — its used-grid sets are
+/// `std::set<std::pair<int,int>>` of `{x, y}`. So the first element is the one it reports.
 pub fn check_2d_edges_usage(
     grid: &EstimateGrid,
     h_capacity: i32,
@@ -421,16 +422,16 @@ pub fn check_2d_edges_usage(
 ) -> Vec<UsageViolation> {
     let mut out = Vec::new();
     let (h_limit, v_limit) = (MAX_USAGE_MULTIPLIER * h_capacity, MAX_USAGE_MULTIPLIER * v_capacity);
-    for y in 0..grid.y_grids {
-        for x in 0..grid.h_columns() {
+    for x in 0..grid.h_columns() {
+        for y in 0..grid.y_grids {
             let usage = f64::from(grid.usage_h(x, y));
             if usage > f64::from(h_limit) {
                 out.push(UsageViolation { x, y, horizontal: true, usage, limit: h_limit });
             }
         }
     }
-    for y in 0..grid.v_rows() {
-        for x in 0..grid.x_grids {
+    for x in 0..grid.x_grids {
+        for y in 0..grid.v_rows() {
             let usage = f64::from(grid.usage_v(x, y));
             if usage > f64::from(v_limit) {
                 out.push(UsageViolation { x, y, horizontal: false, usage, limit: v_limit });
