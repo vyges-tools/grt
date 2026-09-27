@@ -119,7 +119,7 @@ jobs:
       - name: Smoke the contract
         run: |
           ./target/release/vyges-grt --version
-          ./target/release/vyges-grt --describe | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["name"]=="grt" and len(d["openroad_pin"])==40 and d["assertion"]["pass_when"]["eq"]=="routed", d'
+          ./target/release/vyges-grt --describe | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["name"]=="grt" and len(d["openroad_pin"])==40 and d["assertion"]["pass_when"]=={"in":["routed","up_to_date"]}, d'
 
   docs:
     name: book
