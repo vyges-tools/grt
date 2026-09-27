@@ -68,8 +68,8 @@ EXIT STATUS:
   0  routed    every step ran; the report lists each global_route and every file written
   0  up_to_date every global_route routed no net because every routable net already has
                wiring (each call's already_wired counts them); nothing needed routing
-  2  vacuous   every step ran but none produced anything (no global_route, no file written).
-               NOT a pass
+  2  vacuous   every step ran but none produced anything (no global_route, no file written),
+               or every global_route found no routable net (GRT-0007). NOT a pass
   2  error     usage, unreadable input, or a failed write
   3  refused   a step needs a feature not modelled yet (named in `reason`)
 ";
@@ -96,7 +96,7 @@ const DESCRIBE: &str = r#"{
   "summary": "global routing from a placed design: route guides per net, from a job that replays a routing script's steps (layer settings, adjustments, global_route, antenna repair, write_guides)",
   "maturity": "structured",
   "provenance_limitations": [
-    "status is one of routed, up_to_date, vacuous, refused or error. UP_TO_DATE: every global_route routed no net because every routable net already has wiring -- each call's already_wired counts them, the evidence the check ran. VACUOUS IS NOT ROUTED: every step ran but none produced anything -- no global_route and no file written. Exit status is 0 for routed and up_to_date, 2 for vacuous and for error, 3 for refused.",
+    "status is one of routed, up_to_date, vacuous, refused or error. UP_TO_DATE: every global_route routed no net because every routable net already has wiring -- each call's already_wired counts them, the evidence the check ran. VACUOUS IS NOT ROUTED: every step ran but none produced anything -- no global_route and no file written -- or every global_route found no routable net (GRT-0007: no net with at least 2 terms), so nothing was routed. Exit status is 0 for routed and up_to_date, 2 for vacuous and for error, 3 for refused.",
     "input_hash covers the argument vector, not the content of the job file or of the design files it names.",
     "Correlated end to end on the guide files it writes, compared against a fresh reference run: 85 of 85 cases of the reference router's own global-routing regression suite, 2026-09-25 -- 80 exact from the scripts' inputs, and 5 exact on a database whose pin access points vyges-drt pin_access wrote. Both routers are covered (the default one and the CUGR one), with timing-driven routing timed by this engine's own timer and no captured slacks. The correlation harness is not part of this repository.",
     "write_db is correlated on the database it writes: on 84 of 84 comparable cases of the same suite it equals the reference's database right after global routing -- every net's guides in order, the gcell grid, the routing layers and the grt_use_cugr property -- 2026-09-26. Detailed-routing that database with vyges-drt gives a DEF byte-identical to the reference's global_route plus detailed_route on 67 of them, antenna-repair jumper routes included, and differs on none; of the rest the detailed router refuses 9 and the reference itself routes nothing on 8. Not written: the gcell grid's per-cell capacity and usage, which nothing downstream reads.",
@@ -185,10 +185,13 @@ fn produced_anything(job: &Value) -> bool {
 /// - `up_to_date` (0): every `global_route` routed NO net, and at least one found routable nets
 ///   ALREADY WIRED — a checked answer (the reference's initNetlist skips such nets too), carried
 ///   with the count that proves the check ran;
+/// - `vacuous` (2) too when every `global_route` found NO routable net (GRT-0007: no net with at
+///   least two terms), so nothing was routed and nothing was checked: the files it wrote carry
+///   nothing from routing;
 /// - `routed` (0): anything else.
 fn settle(produced: bool, calls: &[Value]) -> (&'static str, u8) {
     let n = |c: &Value, k: &str| c[k].as_u64().unwrap_or(0);
-    if !produced {
+    if !produced || (!calls.is_empty() && calls.iter().all(|c| c["routable_nets"] == json!(0))) {
         ("vacuous", 2)
     } else if !calls.is_empty() && calls.iter().all(|c| n(c, "nets") == 0) && calls.iter().any(|c| n(c, "already_wired") > 0) {
         ("up_to_date", 0)
@@ -1454,6 +1457,16 @@ fn run(job: &Value) -> Result<Value, Fail> {
                     }
                     _ => {}
                 }
+                // globalRoute's first act (G1): no net with at least two terms → GRT-0007, and return
+                // BEFORE clear(), the layer range, the grid and finishGlobalRouting. So this call
+                // leaves no gcell grid, no max routing layer and no grt_use_cugr in the database, and
+                // saves no guide. Every net counts, special ones included, as the reference iterates.
+                let names = db.net_names();
+                if !vyges_grt::has_routable_nets(names.iter().map(|n| (db.net_iterms(n).len(), db.net_bterms(n).len()))) {
+                    log.push(vyges_grt::GRT_7.to_string());
+                    calls.push(json!({ "nets": 0, "already_wired": 0, "routable_nets": 0 }));
+                    continue;
+                }
                 if step["use_cugr"].as_bool() == Some(true) {
                     // `-use_cugr`: the model and stage 1 (pattern routing) are built and, when
                     // `VYGC_OUT` names a file, written to it; the guides are not modelled yet, so
@@ -2125,7 +2138,14 @@ fn main() -> ExitCode {
                     let (status, code) = settle(produced_anything(&job), &calls);
                     report["status"] = json!(status);
                     match status {
-                        // ⛔ Every step ran and none produced anything: not a pass.
+                        // ⛔ Every step ran and none produced anything, or no global_route found a net
+                        // to route: not a pass.
+                        "vacuous" if produced_anything(&job) => {
+                            report["reason"] = json!("GRT-0007: the design has no routable net (none with at least 2 terms); nothing was routed");
+                            // The files were still written (empty of routes): say so.
+                            report["files_written"] = json!(files_written(&job, None));
+                            report["guides_written"] = json!(files_written(&job, Some("write_guides")));
+                        }
                         "vacuous" => report["reason"] = json!("no step produced anything: no global_route and no file written"),
                         _ => {
                             report["files_written"] = json!(files_written(&job, None));
@@ -2236,5 +2256,10 @@ mod tests {
         assert_eq!(settle(true, &[call(0, 0)]), ("routed", 0));
         // a job that only writes files (no global_route) stays routed
         assert_eq!(settle(true, &[]), ("routed", 0));
+        // GRT-0007: no global_route found a routable net — nothing routed, nothing checked
+        let none = json!({ "nets": 0, "already_wired": 0, "routable_nets": 0 });
+        assert_eq!(settle(true, &[none.clone()]), ("vacuous", 2));
+        // ...but one call that did route keeps the run routed
+        assert_eq!(settle(true, &[none, call(4, 0)]), ("routed", 0));
     }
 }

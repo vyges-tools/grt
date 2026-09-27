@@ -53,8 +53,8 @@ EXIT STATUS:
   0  routed    every step ran; the report lists each global_route and every file written
   0  up_to_date every global_route routed no net because every routable net already has
                wiring (each call's already_wired counts them); nothing needed routing
-  2  vacuous   every step ran but none produced anything (no global_route, no file written).
-               NOT a pass
+  2  vacuous   every step ran but none produced anything (no global_route, no file written),
+               or every global_route found no routable net (GRT-0007). NOT a pass
   2  error     usage, unreadable input, or a failed write
   3  refused   a step needs a feature not modelled yet (named in `reason`)
 ```

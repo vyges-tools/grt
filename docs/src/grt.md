@@ -60,7 +60,7 @@ The report is JSON:
 | --- | --- | --- |
 | `routed` | 0 | every step ran; the report lists each `global_route` and every file written |
 | `up_to_date` | 0 | every `global_route` routed no net because every routable net already has wiring; each call's `already_wired` counts them, which is the evidence the check ran |
-| `vacuous` | 2 | every step ran but none produced anything: no `global_route` and no file written. **Not a pass** |
+| `vacuous` | 2 | every step ran but none produced anything (no `global_route` and no file written), or every `global_route` found no routable net (GRT-0007: none with at least 2 terms). **Not a pass** |
 | `error` | 2 | usage, unreadable input, a failed write, or routing that ends congested without `allow_congestion` |
 | `refused` | 3 | a step needs something this engine does not model; `reason` names it |
 
