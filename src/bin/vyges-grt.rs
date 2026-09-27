@@ -6,7 +6,7 @@
 //! `write_guides`). Order matters: a per-layer adjustment is judged against the max routing layer
 //! AT THE TIME it is given, and a second `global_route` runs on the database the first left.
 //!
-//! Exit status: 0 routed (report on stdout), 2 vacuous (no step produced anything — not a pass),
+//! Exit status: 0 routed, or up_to_date (every routable net already wired; report on stdout), 2 vacuous (no step produced anything — not a pass),
 //! 2 usage or read error, 3 refused (a feature this engine does not model yet — named in the
 //! report).
 
@@ -66,6 +66,8 @@ OPTIONS:
 
 EXIT STATUS:
   0  routed    every step ran; the report lists each global_route and every file written
+  0  up_to_date every global_route routed no net because every routable net already has
+               wiring (each call's already_wired counts them); nothing needed routing
   2  vacuous   every step ran but none produced anything (no global_route, no file written).
                NOT a pass
   2  error     usage, unreadable input, or a failed write
@@ -94,7 +96,7 @@ const DESCRIBE: &str = r#"{
   "summary": "global routing from a placed design: route guides per net, from a job that replays a routing script's steps (layer settings, adjustments, global_route, antenna repair, write_guides)",
   "maturity": "structured",
   "provenance_limitations": [
-    "status is one of routed, vacuous, refused or error. VACUOUS IS NOT ROUTED: every step ran but none produced anything -- no global_route and no file written. Exit status is 0 for routed, 2 for vacuous and for error, 3 for refused.",
+    "status is one of routed, up_to_date, vacuous, refused or error. UP_TO_DATE: every global_route routed no net because every routable net already has wiring -- each call's already_wired counts them, the evidence the check ran. VACUOUS IS NOT ROUTED: every step ran but none produced anything -- no global_route and no file written. Exit status is 0 for routed and up_to_date, 2 for vacuous and for error, 3 for refused.",
     "input_hash covers the argument vector, not the content of the job file or of the design files it names.",
     "Correlated end to end on the guide files it writes, compared against a fresh reference run: 85 of 85 cases of the reference router's own global-routing regression suite, 2026-09-25 -- 80 exact from the scripts' inputs, and 5 exact on a database whose pin access points vyges-drt pin_access wrote. Both routers are covered (the default one and the CUGR one), with timing-driven routing timed by this engine's own timer and no captured slacks. The correlation harness is not part of this repository.",
     "write_db is correlated on the database it writes: on 84 of 84 comparable cases of the same suite it equals the reference's database right after global routing -- every net's guides in order, the gcell grid, the routing layers and the grt_use_cugr property -- 2026-09-26. Detailed-routing that database with vyges-drt gives a DEF byte-identical to the reference's global_route plus detailed_route on 67 of them, antenna-repair jumper routes included, and differs on none; of the rest the detailed router refuses 9 and the reference itself routes nothing on 8. Not written: the gcell grid's per-cell capacity and usage, which nothing downstream reads.",
@@ -121,9 +123,9 @@ const DESCRIBE: &str = r#"{
   "assertion": {
     "id": "globally-routed",
     "field": "status",
-    "pass_when": { "eq": "routed" }
+    "pass_when": { "in": ["routed", "up_to_date"] }
   },
-  "exit_codes": { "0": "routed", "2": "vacuous or error", "3": "refused" }
+  "exit_codes": { "0": "routed or up_to_date", "2": "vacuous or error", "3": "refused" }
 }"#;
 
 /// The `vyges-events` causal trail: every event goes to STDERR, the report to stdout (or `-o`), so
@@ -144,7 +146,7 @@ mod events {
         let (code, severity) = match status {
             "refused" => ("GRT-REFUSED", Severity::Error),
             "error" => ("GRT-ERROR", Severity::Error),
-            s if s == pass => ("GRT-DONE", Severity::Info),
+            s if s == pass || s == "up_to_date" => ("GRT-DONE", Severity::Info),
             _ => ("GRT-DONE", Severity::Warn),
         };
         let text = match reason {
@@ -175,6 +177,24 @@ fn files_written(job: &Value, only: Option<&str>) -> Vec<String> {
 
 fn produced_anything(job: &Value) -> bool {
     job["steps"].as_array().is_some_and(|v| v.iter().any(|st| PRODUCING.contains(&st["cmd"].as_str().unwrap_or_default())))
+}
+
+/// The status of a run whose every step succeeded, and its exit code. One function, so the three
+/// cases cannot drift apart:
+/// - `vacuous` (2): no step produced anything, so nothing can be vouched for;
+/// - `up_to_date` (0): every `global_route` routed NO net, and at least one found routable nets
+///   ALREADY WIRED — a checked answer (the reference's initNetlist skips such nets too), carried
+///   with the count that proves the check ran;
+/// - `routed` (0): anything else.
+fn settle(produced: bool, calls: &[Value]) -> (&'static str, u8) {
+    let n = |c: &Value, k: &str| c[k].as_u64().unwrap_or(0);
+    if !produced {
+        ("vacuous", 2)
+    } else if !calls.is_empty() && calls.iter().all(|c| n(c, "nets") == 0) && calls.iter().any(|c| n(c, "already_wired") > 0) {
+        ("up_to_date", 0)
+    } else {
+        ("routed", 0)
+    }
 }
 
 thread_local! {
@@ -1454,7 +1474,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
                         guides.insert(ng.net.clone(), ng.guides.iter().map(|x| (x.box_.x_min, x.box_.y_min, x.box_.x_max, x.box_.y_max, g.layer_names[&x.layer].clone())).collect());
                     }
                     log.extend(r.log.clone());
-                    calls.push(json!({ "nets": g.guides.len(), "use_cugr": true }));
+                    calls.push(json!({ "nets": g.guides.len(), "already_wired": g.already_wired, "use_cugr": true }));
                     after = None;
                     routed_by_cugr = true;
                     // `CUGR::updateDbCongestion`: (die low edge, grid size, default gridline spacing).
@@ -1478,7 +1498,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
                     db_guides.insert(ng.net.clone(), ng.guides.clone());
                     guides.insert(ng.net.clone(), ng.guides.iter().map(|g| (g.box_.x_min, g.box_.y_min, g.box_.x_max, g.box_.y_max, res.layer_names[&g.layer].clone())).collect());
                 }
-                calls.push(json!({ "nets": res.guides.len(), "total_overflow": res.total_overflow, "congested": res.guide_is_congested, "clock_nets": res.clock_nets }));
+                calls.push(json!({ "nets": res.guides.len(), "already_wired": res.already_wired, "total_overflow": res.total_overflow, "congested": res.guide_is_congested, "clock_nets": res.clock_nets }));
                 after = Some((res.after.clone(), res.total_overflow));
                 routed_by_cugr = false;
                 if res.total_overflow > 0 && !opts.allow_congestion {
@@ -2100,16 +2120,19 @@ fn main() -> ExitCode {
                 }
             };
             match run(&job) {
-                Ok(mut report) if produced_anything(&job) => {
-                    report["files_written"] = json!(files_written(&job, None));
-                    report["guides_written"] = json!(files_written(&job, Some("write_guides")));
-                    (report, 0)
-                }
-                // ⛔ Every step ran and none produced anything: not a pass.
                 Ok(mut report) => {
-                    report["status"] = json!("vacuous");
-                    report["reason"] = json!("no step produced anything: no global_route and no file written");
-                    (report, 2)
+                    let calls = report["global_route"].as_array().cloned().unwrap_or_default();
+                    let (status, code) = settle(produced_anything(&job), &calls);
+                    report["status"] = json!(status);
+                    match status {
+                        // ⛔ Every step ran and none produced anything: not a pass.
+                        "vacuous" => report["reason"] = json!("no step produced anything: no global_route and no file written"),
+                        _ => {
+                            report["files_written"] = json!(files_written(&job, None));
+                            report["guides_written"] = json!(files_written(&job, Some("write_guides")));
+                        }
+                    }
+                    (report, code)
                 }
                 Err(Fail::Refused(why)) => (json!({ "status": "refused", "reason": why }), 3),
                 Err(Fail::Error(why)) => (json!({ "status": "error", "reason": why }), 2),
@@ -2193,4 +2216,25 @@ fn placement_networks(db: &Db, rc: &mut vyges_est::rc::Rc, opts: &RouteOptions) 
         out.insert(n.net.clone(), g);
     }
     Ok(Some(out))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Rule: a pass word never comes from a run that did nothing; a run that routed nothing because
+    // every routable net was already wired is `up_to_date`, with the count that proves the check.
+    #[test]
+    fn a_run_settles_as_routed_up_to_date_or_vacuous() {
+        let call = |nets: u64, wired: u64| json!({ "nets": nets, "already_wired": wired });
+        assert_eq!(settle(false, &[]), ("vacuous", 2));
+        assert_eq!(settle(true, &[call(12, 0)]), ("routed", 0));
+        assert_eq!(settle(true, &[call(0, 14286)]), ("up_to_date", 0));
+        // one call routed something: not up to date
+        assert_eq!(settle(true, &[call(0, 5), call(3, 0)]), ("routed", 0));
+        // nothing routed and nothing already wired: no evidence of a check, so not up_to_date
+        assert_eq!(settle(true, &[call(0, 0)]), ("routed", 0));
+        // a job that only writes files (no global_route) stays routed
+        assert_eq!(settle(true, &[]), ("routed", 0));
+    }
 }

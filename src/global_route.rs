@@ -703,6 +703,11 @@ pub(crate) fn discover_net_pins<'a>(
 /// ⛔ Refused as in I10: a pad or macro terminal, a net with a wire. A block terminal skipped for
 /// having no routing geometry is the Rudy path's leniency, reproduced (`check_pin_placement` off).
 pub fn setup_nets(db: &Db, t: &TechSetup, e: &mut RouterEdges, has_macros_or_pads: bool, opts: &RouteOptions, log: &mut Vec<String>) -> Res<Vec<RouterNet>> {
+    Ok(setup_nets_counted(db, t, e, has_macros_or_pads, opts, log)?.0)
+}
+
+/// [`setup_nets`], and how many routable nets it left out because they already have wiring.
+pub fn setup_nets_counted(db: &Db, t: &TechSetup, e: &mut RouterEdges, has_macros_or_pads: bool, opts: &RouteOptions, log: &mut Vec<String>) -> Res<(Vec<RouterNet>, usize)> {
     let (min, max) = (t.min_routing_layer, t.max_routing_layer);
     let (clk_min, clk_max) = (t.tech.min_layer_for_clock, t.tech.max_layer_for_clock);
     let directions: std::collections::BTreeMap<i32, Option<crate::capacity::Direction>> =
@@ -746,6 +751,7 @@ pub fn setup_nets(db: &Db, t: &TechSetup, e: &mut RouterEdges, has_macros_or_pad
     // I14 initNetlist — no seed: the order stands. (addResourcesForPinAccess closes it, below.)
     let grid = NetlistGrid { x_min: die.x_min, y_min: die.y_min, tile_size: t.core.tile_size, x_grids: t.core.x_grids, y_grids: t.core.y_grids, num_layers: t.core.num_layers };
     let mut out = Vec::new();
+    let mut already_wired = 0usize;
     for name in order {
         let (n, pins) = nets.iter().find(|(n, _)| n.name == name).expect("ordered from these");
         let conn: Vec<i32> = pins.iter().map(|(p, _)| p.connection_layer).collect();
@@ -757,6 +763,7 @@ pub fn setup_nets(db: &Db, t: &TechSetup, e: &mut RouterEdges, has_macros_or_pad
             return Err(format!("net {}: a via-only wire — hasStackedVias' via points are not wired", n.name).into());
         }
         if !makes_fastroute_net(pins.len(), n.has_wire, || false) {
+            already_wired += usize::from(crate::already_wired(pins.len(), n.has_wire));
             continue;
         }
         let facts: Vec<RouterPinFacts> = pins.iter().map(|(p, d)| RouterPinFacts { on_grid: p.on_grid, connection_layer: p.connection_layer, is_driver: *d }).collect();
@@ -824,7 +831,7 @@ pub fn setup_nets(db: &Db, t: &TechSetup, e: &mut RouterEdges, has_macros_or_pad
             e.add_adjustment(x1, y1, x2, y2, layer, (cap + 1) as u16, false);
         }
     }
-    Ok(out)
+    Ok((out, already_wired))
 }
 
 /// What a whole `global_route` produced.
@@ -855,6 +862,8 @@ pub struct RouteResult {
     /// IN ORDER — what a route-by-route comparison against the reference needs.
     pub snapshot_edges: std::collections::BTreeMap<String, Vec<SnapshotEdge>>,
     pub log: Vec<String>,
+    /// Routable nets left out because they already have wiring (the reference's initNetlist skip).
+    pub already_wired: usize,
     /// The router's state as a later command in the same session reads it.
     pub after: AfterRoute,
     /// `FastRouteCore::updateDbCongestion`'s gcell grid, as it writes it: per axis (origin, count,
@@ -1069,7 +1078,7 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
             db.net_set_sig_type(net, "CLOCK")?;
         }
     }
-    let nets = setup_nets(db, &t, &mut e, adj.has_macros_or_pads, opts, &mut log)?;
+    let (nets, already_wired) = setup_nets_counted(db, &t, &mut e, adj.has_macros_or_pads, opts, &mut log)?;
     let (xg, yg) = (e.x_grid as usize, e.y_grid as usize);
     // The router's grid, in run()'s layout (`[y * xg + x]` for both directions).
     let (mut red_h, mut red_v, mut cap_h, mut cap_v) = (vec![0u16; xg * yg], vec![0u16; xg * yg], vec![0u16; xg * yg], vec![0u16; xg * yg]);
@@ -1450,7 +1459,7 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         max_routing_layer: t.max_routing_layer,
     };
     let gcell_grid = ((t.core.area.x_min, t.core.x_grids, t.core.tile_size), (t.core.area.y_min, t.core.y_grids, t.core.tile_size));
-    Ok(RouteResult { guides, layer_names, total_overflow, guide_is_congested, routes: raw_routes, clock_nets, parasitics, routed_parasitics, parasitic_pins, planar_routes, snapshot_edges, log, after, gcell_grid })
+    Ok(RouteResult { guides, layer_names, total_overflow, guide_is_congested, routes: raw_routes, clock_nets, parasitics, routed_parasitics, parasitic_pins, planar_routes, snapshot_edges, log, already_wired, after, gcell_grid })
 }
 
 /// `VYGI|<tag>|…` — FastRoute's whole state in the format `grt-incr-trace.py` patches into

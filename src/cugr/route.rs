@@ -289,6 +289,9 @@ pub struct CugrGuides {
     pub iterations: i32,
     pub alphas: Vec<f32>,
     pub slack: f32,
+    /// Routable nets left out because they already have wiring (`makes_fastroute_net` false for a
+    /// net of more than one pin).
+    pub already_wired: usize,
 }
 
 /// The global router's tail after `CUGR::route`: `findRoutingCugr` (each net's route from CUGR,
@@ -347,6 +350,7 @@ pub fn cugr_guides(db: &mut Db, opts: &RouteOptions, cugr: &Cugr, clock_nets: &B
     }
     let grid_pins = |pins: &[(crate::pins::NetPin, bool)]| -> Vec<crate::findrouting::GridPin> { pins.iter().map(|(p, _)| (p.on_grid.0, p.on_grid.1, p.connection_layer)).collect() };
     let mut remaining = Vec::with_capacity(nets.len());
+    let mut already_wired = 0usize;
     for (n, pins) in &nets {
         // Net::hasStackedVias — only a net of vias and no wire segments reads the decoded via
         // points (refused: not wired); any other wired net has none.
@@ -354,6 +358,7 @@ pub fn cugr_guides(db: &mut Db, opts: &RouteOptions, cugr: &Cugr, clock_nets: &B
         if n.has_wire && wire_cnt == 0 && via_cnt > 0 {
             return Err(format!("net {}: a via-only wire — hasStackedVias' via points are not wired", n.name).into());
         }
+        already_wired += usize::from(crate::already_wired(pins.len(), n.has_wire));
         remaining.push(RemainingNet { name: n.name.clone(), made: crate::makes_fastroute_net(pins.len(), n.has_wire, || false), pins: grid_pins(pins) });
     }
     add_remaining_guides(&mut routes, &remaining, t.min_routing_layer, t.max_routing_layer, db.block_get_max_routing_layer()).map_err(|e| format!("{e:?}"))?;
@@ -392,6 +397,7 @@ pub fn cugr_guides(db: &mut Db, opts: &RouteOptions, cugr: &Cugr, clock_nets: &B
         iterations: opts.congestion_iterations,
         alphas: alphas.to_vec(),
         slack,
+        already_wired,
     })
 }
 
@@ -525,6 +531,8 @@ pub fn restore_cugr_for_repair(db: &mut Db, opts: &RouteOptions, mut trace: Opti
         iterations: opts.congestion_iterations,
         alphas,
         slack: constant,
+        // Session state for a later incremental route, not a routing result: nothing reads it.
+        already_wired: 0,
     };
     Ok((ci.cugr, guides))
 }

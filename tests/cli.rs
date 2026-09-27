@@ -55,12 +55,13 @@ fn the_descriptor_reports_the_pin_this_binary_was_built_against() {
 }
 
 /// The assertion is `field` + `pass_when` with ONE predicate — the form the registry accepts —
-/// on the pass word, and the artifact field is one the report actually carries.
+/// on the two pass words (`routed`, and `up_to_date`: every routable net was already wired), and
+/// the artifact field is one the report actually carries. `vacuous` is not among them.
 #[test]
-fn the_assertion_passes_only_on_routed() {
+fn the_assertion_passes_on_routed_or_up_to_date() {
     let d = descriptor();
     assert_eq!(d["assertion"]["field"], "status");
-    assert_eq!(d["assertion"]["pass_when"]["eq"], "routed");
+    assert_eq!(d["assertion"]["pass_when"], serde_json::json!({ "in": ["routed", "up_to_date"] }));
     assert_eq!(d["artifacts"][0]["field"], "guides_written");
 }
 

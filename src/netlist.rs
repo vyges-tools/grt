@@ -67,6 +67,13 @@ pub fn makes_fastroute_net(pin_count: usize, has_wires: bool, stacked_vias: impl
     pin_count > 1 && (!has_wires || stacked_vias())
 }
 
+/// A net the gate above leaves out BECAUSE it is already wired: routable (more than one pin) and
+/// carrying wires. Counted so a run that routes nothing can say why — every routable net already
+/// has wiring (`up_to_date`) — instead of reading like a run that did nothing (`vacuous`).
+pub fn already_wired(pin_count: usize, has_wires: bool) -> bool {
+    pin_count > 1 && has_wires
+}
+
 /// `getNetMaxRoutingLayer`: the clock max for a net whose SIGNAL TYPE is clock (not the non-leaf
 /// test [`get_net_layer_range`] uses), when set.
 pub fn net_max_routing_layer(sig_is_clock: bool, clock_max: i32, block_max: i32) -> i32 {
