@@ -55,6 +55,7 @@ EXIT STATUS:
                wiring (each call's already_wired counts them); nothing needed routing
   2  vacuous   every step ran but none produced anything (no global_route, no file written),
                or every global_route found no routable net (GRT-0007). NOT a pass
-  2  error     usage, unreadable input, or a failed write
+  2  error     usage, unreadable input, a failed write, congestion without allow_congestion,
+               or an input the reference rejects too (`reason` carries its code and text)
   3  refused   a step needs a feature not modelled yet (named in `reason`)
 ```

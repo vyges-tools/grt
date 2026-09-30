@@ -70,7 +70,8 @@ EXIT STATUS:
                wiring (each call's already_wired counts them); nothing needed routing
   2  vacuous   every step ran but none produced anything (no global_route, no file written),
                or every global_route found no routable net (GRT-0007). NOT a pass
-  2  error     usage, unreadable input, or a failed write
+  2  error     usage, unreadable input, a failed write, congestion without allow_congestion,
+               or an input the reference rejects too (`reason` carries its code and text)
   3  refused   a step needs a feature not modelled yet (named in `reason`)
 ";
 
@@ -133,9 +134,9 @@ const DESCRIBE: &str = r#"{
 ///
 /// | code | meaning |
 /// |---|---|
-/// | `GRT-DONE` | the run finished; a census of what it did (global_route calls, nets routed, files written). `warn` when the status is not the pass word |
+/// | `GRT-DONE` | the run finished; a census of what it did (global_route calls, nets routed, files written). `warn` when the status is not a pass word (`routed`, `up_to_date`) |
 /// | `GRT-REFUSED` | a step this engine does not model; the reason names it |
-/// | `GRT-ERROR` | usage, unreadable input, or a failed write |
+/// | `GRT-ERROR` | usage, unreadable input, a failed write, congestion, or an input the reference rejects |
 mod events {
     use vyges_events::{emit, Event, Severity};
 

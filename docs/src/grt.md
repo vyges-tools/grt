@@ -50,7 +50,7 @@ second `global_route` runs on the design the first one left. The full step list 
 The report is JSON:
 
 ```json
-{"status":"routed","global_route":[{"nets":2,"total_overflow":0,"congested":false,"clock_nets":[]}],
+{"status":"routed","global_route":[{"nets":2,"already_wired":0,"total_overflow":0,"congested":false,"clock_nets":[]}],
  "files_written":["route.guide"],"guides_written":["route.guide"],"log":[]}
 ```
 
@@ -61,7 +61,7 @@ The report is JSON:
 | `routed` | 0 | every step ran; the report lists each `global_route` and every file written |
 | `up_to_date` | 0 | every `global_route` routed no net because every routable net already has wiring; each call's `already_wired` counts them, which is the evidence the check ran |
 | `vacuous` | 2 | every step ran but none produced anything (no `global_route` and no file written), or every `global_route` found no routable net (GRT-0007: none with at least 2 terms). **Not a pass** |
-| `error` | 2 | usage, unreadable input, a failed write, or routing that ends congested without `allow_congestion` |
+| `error` | 2 | usage, unreadable input, a failed write, routing that ends congested without `allow_congestion`, or a design or step the reference rejects too; `reason` then carries the reference's diagnostic code and text (for example GRT-0042, a port with no routing-layer geometry; GRT-0080, ports placed on the same position; STT-0001, a routing alpha outside 0.0 to 1.0) |
 | `refused` | 3 | a step needs something this engine does not model; `reason` names it |
 
 Diagnostics go to stderr as `vyges-events` records (`GRT-DONE`, `GRT-REFUSED`, `GRT-ERROR`, and
