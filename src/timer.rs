@@ -135,7 +135,7 @@ pub fn timer_network(net: &str, n: &crate::parasitics::Network) -> NetParasitics
     let node_names: Vec<String> = n.nodes.iter().map(|(id, _)| name(id)).collect();
     let index: HashMap<&str, usize> = node_names.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
     let resistors = n.resistors.iter().map(|(a, b, r)| (index[name(a).as_str()], index[name(b).as_str()], *r)).collect();
-    NetParasitics { network: Network { node_caps: n.nodes.iter().map(|(_, c)| *c).collect(), resistors }, node_names }
+    NetParasitics { network: Network { node_caps: n.nodes.iter().map(|(_, c)| *c).collect(), resistors }, node_names, ..Default::default() }
 }
 
 /// A placement estimate's network, as the timer reads it: pin nodes by pin name, Steiner points
@@ -160,7 +160,7 @@ pub fn placement_network(net: &str, g: &vyges_est::network::Parasitic) -> NetPar
         Node::Pin(k) => pin[k],
     };
     let resistors = g.resistors.iter().map(|(a, b, r)| (at(a), at(b), *r)).collect();
-    NetParasitics { network: Network { node_caps, resistors }, node_names }
+    NetParasitics { network: Network { node_caps, resistors }, node_names, ..Default::default() }
 }
 
 /// `getNetSlack` for every net of the netlist on route estimates: the worst max slack over its
