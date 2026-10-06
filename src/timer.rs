@@ -122,7 +122,7 @@ pub fn sdc(c: &Constraints, nl: &Netlist, scale: f32) -> Result<Option<Sdc>, Str
         }
     };
     let delays = |list: &[(UserValue, PortSet)]| -> Vec<PortDelay> { list.iter().flat_map(|(v, set)| resolve(set).into_iter().map(move |p| PortDelay::uniform(&p, value(*v)))).collect() };
-    Ok(Some(Sdc { input_delays: delays(&c.input_delays), output_delays: delays(&c.output_delays), clock: Some(clock), path_delays: Vec::new() }))
+    Ok(Some(Sdc { input_delays: delays(&c.input_delays), output_delays: delays(&c.output_delays), clocks: vec![clock], path_delays: Vec::new() }))
 }
 
 /// A parasitic network from the estimator, as the timer reads it: nodes in the builder's order,
