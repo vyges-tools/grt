@@ -882,7 +882,7 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, router: Repai
                 incr_text.push_str(&vyges_grt::global_route::router_state_text(tag, a).unwrap_or_default());
             }
         };
-        let rerouted = vyges_grt::global_route::update_dirty_routes_fast_route(db, &ropts, state, &nets_to_repair, &stt, &flutes, &mut obs);
+        let rerouted = vyges_grt::global_route::update_dirty_routes_fast_route(db, &ropts, state, &nets_to_repair, &stt, &flutes, &mut obs, false);
         if let Some(path) = step["incr_trace"].as_str() {
             std::fs::write(path, &incr_text).map_err(at(path))?;
         }

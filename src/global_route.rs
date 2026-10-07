@@ -927,6 +927,108 @@ pub struct AfterRoute {
     /// during a repair, or left with fewer than two pins — with their pins as the last
     /// `updateNetPins` left them (`addNet`'s runs before any terminal is connected: none).
     pub held_unrouted: std::collections::BTreeMap<String, Vec<(i32, i32, i32)>>,
+    /// Each net's guides as the database holds them (`dbNet::getGuides`' list order). `saveGuides`
+    /// creates each at the head and then REVERSES the list, so it is the creation order.
+    pub db_guides: std::collections::BTreeMap<String, Vec<crate::Guide>>,
+    /// `Net::restoreRouteFromGuides`: set by `inDbNetPostGuideRestore`, read (and cleared) by the
+    /// next `updateDirtyNets`.
+    pub restore_from_guides: std::collections::BTreeSet<String>,
+    /// Per open eco level (`beginEco`), the guide edits it journaled, in order.
+    pub eco: Vec<Vec<GuideEdit>>,
+    /// `Net::isMergedNet` / `getMergedNet`: set on both nets by a routing merge (buffer removal),
+    /// cleared when `updateDirtyNets` next passes the net.
+    pub merged: std::collections::BTreeMap<String, String>,
+}
+
+/// One journaled guide edit.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GuideEdit {
+    /// `dbGuide::destroy` of each guide, in list order (`clearGuides`, a net's destruction).
+    Deleted(String, Vec<crate::Guide>),
+    /// `dbGuide::create` of each (`saveGuides` after an incremental re-route).
+    Created(String, Vec<crate::Guide>),
+}
+
+/// `dbDatabase::beginEco`, the router's side: a level that records each guide deleted under it.
+pub fn begin_eco(a: &mut AfterRoute) {
+    a.eco.push(Vec::new());
+}
+
+/// `commitEco`: the level's deletions stay; an enclosing level takes them over.
+pub fn commit_eco(a: &mut AfterRoute) {
+    if let Some(level) = a.eco.pop() {
+        if let Some(parent) = a.eco.last_mut() {
+            parent.extend(level);
+        }
+    }
+}
+
+/// `undoEco`, the router's side: each guide the level deleted is created again — the journal
+/// replayed backwards, each at the head of its net's list, so the list comes back in its old order
+/// — and each fires `inDbNetPostGuideRestore`: a held net is to be restored from its guides
+/// (`setRestoreRouteFromGuides`). Returns the net of every guide created, in that order — the
+/// caller marks each dirty (`addDirtyNet`). The database's own undo runs FIRST (a destroyed net is
+/// created again before its guides).
+///
+/// Undoing a guide's CREATION destroys it and fires nothing.
+pub fn undo_eco(a: &mut AfterRoute) -> Vec<String> {
+    let Some(level) = a.eco.pop() else { return Vec::new() };
+    let mut fired = Vec::new();
+    for edit in level.into_iter().rev() {
+        match edit {
+            GuideEdit::Created(net, guides) => {
+                if let Some(list) = a.db_guides.get_mut(&net) {
+                    for g in &guides {
+                        if let Some(k) = list.iter().position(|x| x == g) {
+                            list.remove(k);
+                        }
+                    }
+                    if list.is_empty() {
+                        a.db_guides.remove(&net);
+                    }
+                }
+            }
+            GuideEdit::Deleted(net, guides) => {
+                for g in guides.iter().rev() {
+                    a.db_guides.entry(net.clone()).or_default().insert(0, *g);
+                    if holds(a, &net) {
+                        a.restore_from_guides.insert(net.clone());
+                    }
+                    fired.push(net.clone());
+                }
+            }
+        }
+    }
+    fired
+}
+
+/// `dbNet::clearGuides` (or a net's destruction): every guide deleted, recorded under the open eco
+/// level.
+fn clear_guides(a: &mut AfterRoute, net: &str) {
+    let gone = a.db_guides.remove(net).unwrap_or_default();
+    if gone.is_empty() {
+        return;
+    }
+    if let Some(level) = a.eco.last_mut() {
+        level.push(GuideEdit::Deleted(net.to_string(), gone));
+    }
+}
+
+/// `saveGuides(modified_nets)` for one net after an incremental re-route: its old guides cleared
+/// (none are left: `updateDirtyNets` cleared them) and new ones made from the route, journaled.
+fn save_net_guides(a: &mut AfterRoute, net: &str) -> Res<()> {
+    let Some(r) = a.net_routes.iter().find(|r| r.name == net).cloned() else { return Ok(()) };
+    if r.segments.is_empty() {
+        return Ok(());
+    }
+    clear_guides(a, net);
+    let saved = crate::save_guides(std::slice::from_ref(&r), &a.jumper_grid.grid, &a.save_options).map_err(|e| format!("{e:?}"))?;
+    let guides: Vec<crate::Guide> = saved.into_iter().flat_map(|ng| ng.guides).collect();
+    a.db_guides.insert(net.to_string(), guides.clone());
+    if let Some(level) = a.eco.last_mut() {
+        level.push(GuideEdit::Created(net.to_string(), guides));
+    }
+    Ok(())
 }
 
 /// A net's FastRoute id, the live one (a destroyed net's id is dead).
@@ -958,8 +1060,34 @@ pub fn add_net(db: &Db, a: &mut AfterRoute, net: &str) -> bool {
 ///
 /// ⛔ A merged net (`isMergedNet`) takes other branches: refused.
 pub fn remove_net(a: &mut AfterRoute, net: &str) -> Res<()> {
+    // `dbNet::destroy` deletes the net's guides (journaled).
+    clear_guides(a, net);
+    a.restore_from_guides.remove(net);
     a.held_unrouted.remove(net);
     let Some(id) = live_id(a, net) else { return Ok(()) };
+    // A net merged into its survivor (`isMergedNet`): FastRoute's `mergeNet` moves its tree into
+    // the survivor's (nodes and edges appended; its usage stays, now the survivor's) and drops it.
+    if let Some(preserved) = a.merged.get(net).cloned() {
+        let pid = live_id(a, &preserved).ok_or_else(|| format!("net {net}: merged into {preserved}, which the router no longer holds"))?;
+        if a.final_state[id].segments_restored || a.final_state[pid].segments_restored {
+            return Err(format!("net {net}: a merged net with segments restored from guides — not modelled").into());
+        }
+        let moved = a.final_state[id].tree3d.take();
+        match (moved, a.final_state[pid].tree3d.as_mut()) {
+            (Some(t2), Some(t1)) => {
+                t1.num_terminals += t2.num_terminals;
+                t1.nodes.extend(t2.nodes);
+                t1.edges.extend(t2.edges);
+            }
+            (None, _) => {}
+            (Some(_), None) => return Err(format!("net {preserved}: no 3D tree to merge {net} into — GRT-0013").into()),
+        }
+        a.final_state[id].tree = None;
+        a.merged.remove(net);
+        a.dead.insert(id);
+        a.net_routes.retain(|r| r.name != net);
+        return Ok(());
+    }
     if a.final_state[id].segments_restored {
         let segs = a.net_routes.iter().find(|r| r.name == net).map(|r| r.segments.clone()).unwrap_or_default();
         let lec = a.layer_edge_cost.get(net).cloned().unwrap_or_default();
@@ -973,6 +1101,309 @@ pub fn remove_net(a: &mut AfterRoute, net: &str) -> Res<()> {
     a.dead.insert(id);
     a.net_routes.retain(|r| r.name != net);
     Ok(())
+}
+
+/// `GRouteDbCbk::inDbNetPostMerge(preserved, removed)` → `GlobalRouter::mergeNetsRouting`: a buffer
+/// removed, its two nets' routes joined (`connectRouting`) and the survivor's guides saved again;
+/// both nets marked merged. `Ok(false)` when they could not be joined — the caller marks the
+/// survivor dirty (`addDirtyNet`), to be routed again.
+pub fn merge_nets_routing(db: &mut Db, opts: &RouteOptions, a: &mut AfterRoute, net1: &str, net2: &str) -> Res<bool> {
+    if !connect_routing(db, opts, a, net1, net2)? {
+        return Ok(false);
+    }
+    save_net_guides(a, net1)?;
+    a.merged.insert(net1.to_string(), net2.to_string());
+    a.merged.insert(net2.to_string(), net1.to_string());
+    Ok(true)
+}
+
+/// `GlobalRouter::connectRouting(net1, net2)`, the reference's stages in order:
+/// `findBufferPinPostions` (from the router's stale pins: the buffer is still on them); either
+/// routes empty → not joined; pins in different gcells → `findTopLayerOverPosition` on each route,
+/// `createConnectionForPositions`, `hasAvailableResources` per wire of it (none → not joined),
+/// `addTreeEdge` per wire, net1's route += net2's + the connection; the same gcell → the layer gap
+/// bridged with vias, net1's route += net2's; then `updateNetPins(net1)`, `netIsCovered` (not →
+/// not joined: the extended route stays) and `isConnected` (not → GRT-0298).
+///
+/// ⛔ A net with segments restored from guides takes `updateResources` instead of `addTreeEdge`:
+/// refused.
+fn connect_routing(db: &mut Db, opts: &RouteOptions, a: &mut AfterRoute, net1: &str, net2: &str) -> Res<bool> {
+    let (Some(id1), Some(id2)) = (live_id(a, net1), live_id(a, net2)) else {
+        return Err(format!("merging {net2} into {net1}: a net with no FastRoute net — not modelled").into());
+    };
+    // findBufferPinPostions: the last pin pair on one instance (the inner loop breaks, the outer
+    // does not).
+    let inst_of = |p: &crate::pins::NetPin| p.name.rsplit_once('/').map(|(i, _)| i.to_string());
+    let (mut pos1, mut pos2) = ((0, 0), (0, 0));
+    for p1 in a.router_nets[id1].net_pins.iter().filter(|p| !p.is_port) {
+        for p2 in a.router_nets[id2].net_pins.iter().filter(|p| !p.is_port) {
+            if inst_of(p1) == inst_of(p2) {
+                (pos1, pos2) = (p1.on_grid, p2.on_grid);
+                break;
+            }
+        }
+    }
+    let route_of = |a: &AfterRoute, n: &str| a.net_routes.iter().find(|r| r.name == n).map(|r| r.segments.clone()).unwrap_or_default();
+    let (mut route1, route2) = (route_of(a, net1), route_of(a, net2));
+    if route1.is_empty() || route2.is_empty() {
+        return Ok(false);
+    }
+    if pos1 != pos2 {
+        let layer1 = top_layer_over_position(pos1, &route1)?;
+        let layer2 = top_layer_over_position(pos2, &route2)?;
+        let connection = create_connection_for_positions(a, pos1, pos2, layer1, layer2);
+        let g = &a.jumper_grid;
+        let tiles = |s: &crate::GSegment| (g.dbu_to_tile(s.init_x.min(s.final_x), true), g.dbu_to_tile(s.init_y.min(s.final_y), false), g.dbu_to_tile(s.init_x.max(s.final_x), true), g.dbu_to_tile(s.init_y.max(s.final_y), false));
+        for seg in connection.iter().filter(|s| !s.is_via()) {
+            let (x1, y1, x2, y2) = tiles(seg);
+            if !has_available_resources(a, x1, y1, x2, y2, seg.init_layer, id1) {
+                return Ok(false);
+            }
+        }
+        if a.final_state[id1].segments_restored || a.final_state[id2].segments_restored {
+            return Err(format!("merging {net2} into {net1}: segments restored from guides (updateResources) — not modelled").into());
+        }
+        let (xmin, ymin, tile) = (a.jumper_grid.grid.area.x_min, a.jumper_grid.grid.area.y_min, a.jumper_grid.grid.tile_size);
+        for seg in connection.iter().filter(|s| !s.is_via()) {
+            let x1 = (seg.init_x.min(seg.final_x) - xmin) / tile;
+            let y1 = (seg.init_y.min(seg.final_y) - ymin) / tile;
+            let x2 = (seg.init_x.max(seg.final_x) - xmin) / tile;
+            let y2 = (seg.init_y.max(seg.final_y) - ymin) / tile;
+            add_tree_edge(a, x1, y1, x2, y2, seg.init_layer, id1)?;
+        }
+        route1.extend(route2);
+        route1.extend(connection);
+    } else {
+        let (min1, max1) = layer_range_over_position(pos1, &route1);
+        let (min2, max2) = layer_range_over_position(pos1, &route2);
+        if max1 != -1 && max2 != -1 {
+            if max1 < min2 {
+                insert_vias_for_connection(&mut route1, pos1, max1, min2);
+            } else if max2 < min1 {
+                insert_vias_for_connection(&mut route1, pos1, max2, min1);
+            }
+        }
+        route1.extend(route2);
+    }
+    if let Some(r) = a.net_routes.iter_mut().find(|r| r.name == net1) {
+        r.segments = route1.clone();
+    }
+    // updateNetPins(net1)
+    let fresh = fresh_net_pins(db, opts)?;
+    match fresh.get(net1) {
+        Some(n) => {
+            a.router_nets[id1].net_pins = n.net_pins.clone();
+            a.router_nets[id1].pin_is_driver = n.pin_is_driver.clone();
+        }
+        None => {
+            a.router_nets[id1].net_pins.clear();
+            a.router_nets[id1].pin_is_driver.clear();
+        }
+    }
+    let pins: Vec<crate::Pin> = a.router_nets[id1].net_pins.iter().map(|p| crate::Pin { connection_layer: p.connection_layer, on_grid_x: p.on_grid.0, on_grid_y: p.on_grid.1 }).collect();
+    if !crate::restore::net_is_covered(&route1, &pins).is_empty() {
+        return Ok(false);
+    }
+    if !is_connected(&route1)? {
+        return Err(format!("[ERROR GRT-0298] Net {net1} has disconnected segments after merge.").into());
+    }
+    Ok(true)
+}
+
+/// `findTopLayerOverPosition`: the highest layer of a segment with an END at the point. ⛔ None is
+/// GRT-0703.
+fn top_layer_over_position(pos: (i32, i32), route: &[crate::GSegment]) -> Res<i32> {
+    let top = route
+        .iter()
+        .filter(|s| (s.init_x, s.init_y) == pos || (s.final_x, s.final_y) == pos)
+        .map(|s| s.init_layer.max(s.final_layer))
+        .max()
+        .unwrap_or(-1);
+    if top == -1 {
+        return Err("[ERROR GRT-0703] No segment was found in the routing that connects to the pin position.".into());
+    }
+    Ok(top)
+}
+
+/// `findLayerRangeOverPosition`: the layers of the segments whose box holds the point;
+/// `(i32::MAX, -1)` for none.
+fn layer_range_over_position(pos: (i32, i32), route: &[crate::GSegment]) -> (i32, i32) {
+    let (mut lo, mut hi) = (i32::MAX, -1);
+    for s in route {
+        let (x0, x1) = (s.init_x.min(s.final_x), s.init_x.max(s.final_x));
+        let (y0, y1) = (s.init_y.min(s.final_y), s.init_y.max(s.final_y));
+        if (x0..=x1).contains(&pos.0) && (y0..=y1).contains(&pos.1) {
+            lo = lo.min(s.init_layer).min(s.final_layer);
+            hi = hi.max(s.init_layer).max(s.final_layer);
+        }
+    }
+    (lo, hi)
+}
+
+/// `insertViasForConnection`: a via per layer step between the two layers, at the point.
+fn insert_vias_for_connection(route: &mut Vec<crate::GSegment>, pos: (i32, i32), layer: i32, conn_layer: i32) {
+    let (lo, hi) = (layer.min(conn_layer), layer.max(conn_layer));
+    for l in lo..hi {
+        route.push(crate::GSegment::new(pos.0, pos.1, l, pos.0, pos.1, l + 1));
+    }
+}
+
+/// `createConnectionForPositions`: in one line, a wire on the higher layer — moved one layer off
+/// (down above the min routing layer, else up) when that layer runs the other way; else an L:
+/// horizontal on the horizontal one of the pair, a via, vertical on the vertical one, with via
+/// stacks from each route up to them; then vias at each pin from its route's layer to the
+/// connection layer.
+fn create_connection_for_positions(a: &AfterRoute, p1: (i32, i32), p2: (i32, i32), layer1: i32, layer2: i32) -> Vec<crate::GSegment> {
+    use crate::layertable::LayerDir;
+    let mut c = Vec::new();
+    let mut conn_layer = layer1.max(layer2);
+    let dir = a.layer_dir.get((conn_layer - 1) as usize).copied().unwrap_or(LayerDir::Other);
+    let (vertical, horizontal) = (p1.0 == p2.0, p1.1 == p2.1);
+    let min_layer = a.min_routing_layer;
+    if vertical || horizontal {
+        let (x1, x2) = (p1.0.min(p2.0), p1.0.max(p2.0));
+        let (y1, y2) = (p1.1.min(p2.1), p1.1.max(p2.1));
+        if (vertical && dir != LayerDir::Vertical) || (horizontal && dir != LayerDir::Horizontal) {
+            if conn_layer > min_layer {
+                conn_layer -= 1;
+            } else {
+                conn_layer += 1;
+            }
+        }
+        c.push(crate::GSegment::new(x1, y1, conn_layer, x2, y2, conn_layer));
+    } else {
+        let fix = if conn_layer <= min_layer { 1 } else { -1 };
+        let hor = if dir == LayerDir::Horizontal { conn_layer } else { conn_layer + fix };
+        let ver = if dir == LayerDir::Vertical { conn_layer } else { conn_layer + fix };
+        let (x1, y1, x2, y2) = (p1.0, p1.1, p2.0, p2.1);
+        c.push(crate::GSegment::new(x1, y1, hor, x2, y1, hor));
+        c.push(crate::GSegment::new(x2, y1, conn_layer + fix, x2, y1, conn_layer));
+        c.push(crate::GSegment::new(x2, y1, ver, x2, y2, ver));
+        for l in layer1..hor {
+            c.push(crate::GSegment::new(x1, y1, l, x1, y1, l + 1));
+        }
+        for l in layer2..ver {
+            c.push(crate::GSegment::new(x2, y2, l, x2, y2, l + 1));
+        }
+    }
+    insert_vias_for_connection(&mut c, p1, layer1, conn_layer);
+    insert_vias_for_connection(&mut c, p2, layer2, conn_layer);
+    c
+}
+
+/// `FastRouteCore::hasAvailableResources`: on each unit of the wire, the 3D edge's free capacity at
+/// least the net's layer edge cost and the 2D edge's at least its edge cost.
+fn has_available_resources(a: &AfterRoute, x1: i32, y1: i32, x2: i32, y2: i32, layer: i32, id: usize) -> bool {
+    let (Some(g2), Some(g3)) = (a.final_2d.as_ref(), a.final_3d.as_ref()) else { return false };
+    let k = (layer - 1) as usize;
+    let n = &a.router_nets[id];
+    let lec = i32::from(a.layer_edge_cost.get(&n.name).and_then(|v| v.get(k).copied()).unwrap_or(1));
+    let ec = i32::from(n.edge_cost);
+    let xg = g3.x_grid;
+    if y1 == y2 {
+        (x1..x2).all(|x| {
+            let at = y1 as usize * xg + x as usize;
+            i32::from(g3.h_cap[k][at]) - i32::from(g3.h_usage[k][at]) >= lec && i32::from(g2.cap_h[at]) - i32::from(g2.est.usage_h(x as usize, y1 as usize)) >= ec
+        })
+    } else if x1 == x2 {
+        (y1..y2).all(|y| {
+            let at = y as usize * xg + x1 as usize;
+            i32::from(g3.v_cap[k][at]) - i32::from(g3.v_usage[k][at]) >= lec && i32::from(g2.cap_v[at]) - i32::from(g2.est.usage_v(x1 as usize, y as usize)) >= ec
+        })
+    } else {
+        true
+    }
+}
+
+/// `FastRouteCore::addTreeEdge`: a straight edge charged to the net (2D: its edge cost, NDR-aware;
+/// 3D: its layer edge cost) and appended to its tree. ⛔ Not straight: GRT-0216.
+fn add_tree_edge(a: &mut AfterRoute, x1: i32, y1: i32, x2: i32, y2: i32, layer: i32, id: usize) -> Res<()> {
+    use crate::full3d::Point3D;
+    let k = layer - 1;
+    let r = a.router_nets[id].clone();
+    let lec = a.layer_edge_cost.get(&r.name).and_then(|v| v.get(k as usize).copied()).unwrap_or(1);
+    let (min, max) = ((r.min_layer - 1) as usize, (r.max_layer - 1) as usize);
+    let net = crate::ndr_cost::NdrCostNet { id, edge_cost: r.edge_cost, min_layer: min, max_layer: max, layer_edge_cost: Some(net_range_edge_costs(&r)), soft_ndr: false };
+    let (Some(g2), Some(g3)) = (a.final_2d.as_mut(), a.final_3d.as_mut()) else { return Err("no graphs to charge a tree edge to".into()) };
+    let xg = g3.x_grid;
+    let mut grids = Vec::new();
+    let p = |x: i32, y: i32| Point3D { x: x as i16, y: y as i16, layer: k as i16 };
+    if x1 == x2 {
+        for y in y1..y2 {
+            crate::estimate::Usage2d::update_usage_v(&mut g2.for_net(&net), x1, y, f64::from(r.edge_cost));
+            let c = &mut g3.v_usage[k as usize][y as usize * xg + x1 as usize];
+            *c = c.wrapping_add(lec as u16);
+            grids.push(p(x1, y));
+        }
+        grids.push(p(x2, y2));
+    } else if y1 == y2 {
+        for x in x1..x2 {
+            crate::estimate::Usage2d::update_usage_h(&mut g2.for_net(&net), x, y1, f64::from(r.edge_cost));
+            let c = &mut g3.h_usage[k as usize][y1 as usize * xg + x as usize];
+            *c = c.wrapping_add(lec as u16);
+            grids.push(p(x, y1));
+        }
+        grids.push(p(x2, y1));
+    } else {
+        return Err("[ERROR GRT-0216] Cannot add tree edge: edge is not vertical or horizontal.".into());
+    }
+    let edge = crate::maze3d::Edge3D { n1: 0, n2: 0, n1a: 0, n2a: 0, len: 0, route_type: crate::full3d::RouteType::NoRoute, routelen: grids.len() as i32 - 1, grids };
+    a.final_state[id].tree3d.as_mut().ok_or("a tree edge added to a net with no 3D tree — not modelled")?.edges.push(edge);
+    Ok(())
+}
+
+/// `GlobalRouter::isConnected`: union-find over the route's segments, each joined to an earlier
+/// one its box touches (in 3D). ⛔ A segment that is not a line or a via is GRT-0264/0265.
+fn is_connected(route: &[crate::GSegment]) -> Res<bool> {
+    let n = route.len();
+    if n == 0 {
+        return Ok(true);
+    }
+    let is_line = |s: &crate::GSegment| i32::from(s.init_x != s.final_x) + i32::from(s.init_y != s.final_y) + i32::from(s.init_layer != s.final_layer) == 1;
+    let connect = |a: &crate::GSegment, b: &crate::GSegment| {
+        let r = |p: i32, q: i32| (p.min(q), p.max(q));
+        let ((ax0, ax1), (ay0, ay1), (az0, az1)) = (r(a.init_x, a.final_x), r(a.init_y, a.final_y), r(a.init_layer, a.final_layer));
+        let ((bx0, bx1), (by0, by1), (bz0, bz1)) = (r(b.init_x, b.final_x), r(b.init_y, b.final_y), r(b.init_layer, b.final_layer));
+        ax1 >= bx0 && ax0 <= bx1 && ay1 >= by0 && ay0 <= by1 && az1 >= bz0 && az0 <= bz1
+    };
+    if !is_line(&route[0]) {
+        return Err("[ERROR GRT-0264] a route segment is not a horizontal/vertical line or via".into());
+    }
+    let mut parent: Vec<usize> = (0..n).collect();
+    let mut rank = vec![0u32; n];
+    fn find(p: &mut [usize], x: usize) -> usize {
+        if p[x] != x {
+            let r = find(p, p[x]);
+            p[x] = r;
+        }
+        p[x]
+    }
+    let mut groups = 1;
+    for i in 1..n {
+        if !is_line(&route[i]) {
+            return Err("[ERROR GRT-0265] a route segment is not a horizontal/vertical line or via".into());
+        }
+        groups += 1;
+        let mut j = i;
+        while j > 0 && groups > 1 {
+            j -= 1;
+            if connect(&route[i], &route[j]) {
+                let (ru, rv) = (find(&mut parent, i), find(&mut parent, j));
+                if ru != rv {
+                    if rank[ru] > rank[rv] {
+                        parent[rv] = ru;
+                    } else if rank[ru] < rank[rv] {
+                        parent[ru] = rv;
+                    } else {
+                        parent[rv] = ru;
+                        rank[ru] += 1;
+                    }
+                    groups -= 1;
+                }
+            }
+        }
+    }
+    Ok(groups == 1)
 }
 
 /// `EstimateParasitics::estimateGlobalRouteRC(db_net)`: the net's RC network from its route as
@@ -1549,6 +1980,11 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         min_routing_layer: t.min_routing_layer,
         dead: std::collections::BTreeSet::new(),
         held_unrouted: std::collections::BTreeMap::new(),
+        // saveGuides' creation order (its closing `reverse()` undoes the head insertion).
+        db_guides: guides.iter().map(|ng| (ng.net.clone(), ng.guides.clone())).collect(),
+        restore_from_guides: std::collections::BTreeSet::new(),
+        eco: Vec::new(),
+        merged: std::collections::BTreeMap::new(),
     };
     let gcell_grid = ((t.core.area.x_min, t.core.x_grids, t.core.tile_size), (t.core.area.y_min, t.core.y_grids, t.core.tile_size));
     Ok(RouteResult { guides, layer_names, total_overflow, guide_is_congested, routes: raw_routes, clock_nets, parasitics, routed_parasitics, parasitic_pins, planar_routes, snapshot_edges, log, already_wired, after, gcell_grid })
@@ -1730,6 +2166,11 @@ pub fn restore_for_repair(db: &mut Db, opts: &RouteOptions) -> Res<AfterRoute> {
         min_routing_layer: t.min_routing_layer,
         dead: std::collections::BTreeSet::new(),
         held_unrouted: std::collections::BTreeMap::new(),
+        // ⚠️ Not kept here: antenna repair runs no journal, so no guide is restored from them.
+        db_guides: std::collections::BTreeMap::new(),
+        restore_from_guides: std::collections::BTreeSet::new(),
+        eco: Vec::new(),
+        merged: std::collections::BTreeMap::new(),
     })
 }
 
@@ -1795,7 +2236,11 @@ pub type IncrObserver<'a> = &'a mut dyn FnMut(&str, &AfterRoute);
 /// ⛔ Refused where the reference goes on: a resistance-aware net (`isResAware` skips the filter) and
 /// overflow after the re-route (the incremental congestion loop). A jumpered net releases through
 /// the tree the jumper pass relayered ([`crate::repair_antennas::update_route_grids_layer`]).
-pub fn update_dirty_routes_fast_route(db: &mut Db, opts: &RouteOptions, a: &mut AfterRoute, dirty: &[String], stt: SteinerBuilder<'_>, flutes: crate::brk_rsmt::Flutes<'_>, obs: IncrObserver<'_>) -> Res<Vec<String>> {
+///
+/// `save_guides`: `saveGuides(modified_nets)` after the run — `IncrementalGRoute::updateRoutes`'
+/// default (true); the antenna repair's own call passes false.
+#[allow(clippy::too_many_arguments)]
+pub fn update_dirty_routes_fast_route(db: &mut Db, opts: &RouteOptions, a: &mut AfterRoute, dirty: &[String], stt: SteinerBuilder<'_>, flutes: crate::brk_rsmt::Flutes<'_>, obs: IncrObserver<'_>, save_guides: bool) -> Res<Vec<String>> {
     if dirty.is_empty() {
         return Ok(Vec::new());
     }
@@ -1812,6 +2257,12 @@ pub fn update_dirty_routes_fast_route(db: &mut Db, opts: &RouteOptions, a: &mut 
     if a.total_overflow > 0 && !opts.allow_congestion {
         return Err("the incremental re-route left overflow: its congestion loop is not modelled".into());
     }
+    if save_guides {
+        let names: Vec<String> = dirty_nets.iter().map(|&id| a.router_nets[id].name.clone()).collect();
+        for name in names {
+            save_net_guides(a, &name)?;
+        }
+    }
     Ok(dirty_nets.iter().map(|&id| a.router_nets[id].name.clone()).collect())
 }
 
@@ -1820,14 +2271,20 @@ pub fn update_dirty_routes_fast_route(db: &mut Db, opts: &RouteOptions, a: &mut 
 /// net missing here has fewer than two pins. ⚠️ Recomputed whole — the database has moved under it
 /// — and checked: every such net is one the router holds (the first run's, or one `addNet` made).
 fn update_net_pins(db: &mut Db, opts: &RouteOptions, a: &AfterRoute) -> Res<std::collections::BTreeMap<String, RouterNet>> {
+    let fresh = fresh_net_pins(db, opts)?;
+    if let Some(n) = fresh.keys().find(|n| !holds(a, n)) {
+        return Err(format!("net {n}: routable now, and not one the router holds — not modelled").into());
+    }
+    Ok(fresh)
+}
+
+/// Every net FastRoute would route, read from the database now, by name.
+fn fresh_net_pins(db: &mut Db, opts: &RouteOptions) -> Res<std::collections::BTreeMap<String, RouterNet>> {
     let t = setup_tech(db, opts)?;
     let mut log = t.log.clone();
     let adj = setup_adjust(db, &t, opts, &mut log)?;
     let mut e = adj.edges;
     let nets = setup_nets(db, &t, &mut e, adj.has_macros_or_pads, opts, &mut log)?;
-    if let Some(n) = nets.iter().find(|n| !holds(a, &n.name)) {
-        return Err(format!("net {}: routable now, and not one the router holds — not modelled", n.name).into());
-    }
     Ok(nets.into_iter().map(|n| (n.name.clone(), n)).collect())
 }
 
@@ -1848,6 +2305,12 @@ fn update_dirty_nets(a: &mut AfterRoute, fresh: &std::collections::BTreeMap<Stri
     let mut out = Vec::new();
     for name in dirty {
         let now = fresh.get(name).map(pin_key).unwrap_or_default();
+        // `!loadRoutingFromDBGuides(db_net)` is the first test: a net an undo gave its guides back
+        // takes its route from them, and is not re-routed.
+        if a.restore_from_guides.contains(name) && a.db_guides.get(name).is_some_and(|g| !g.is_empty()) {
+            load_routing_from_db_guides(a, fresh, name)?;
+            continue;
+        }
         let Some(id) = live_id(a, name) else {
             let Some(stale) = a.held_unrouted.get(name) else { continue }; // not in db_net_map_
             if !crate::netlist::pin_positions_changed(stale, &now) {
@@ -1869,6 +2332,29 @@ fn update_dirty_nets(a: &mut AfterRoute, fresh: &std::collections::BTreeMap<Stri
         };
         let key = pin_key;
         let changed = crate::netlist::pin_positions_changed(&key(&a.router_nets[id]), &now);
+        // `(!isMergedNet || !netIsCovered)`: a merged net its joined route still covers keeps it
+        // (and must be connected: GRT-0267). The merged flag is cleared on every pass.
+        let merged = a.merged.remove(name).is_some();
+        let changed = if changed && merged {
+            let pins: Vec<crate::Pin> = fresh.get(name).map(|n| n.net_pins.iter().map(|p| crate::Pin { connection_layer: p.connection_layer, on_grid_x: p.on_grid.0, on_grid_y: p.on_grid.1 }).collect()).unwrap_or_default();
+            let route = a.net_routes.iter().find(|r| &r.name == name).map(|r| r.segments.clone()).unwrap_or_default();
+            if crate::restore::net_is_covered(&route, &pins).is_empty() {
+                if !is_connected(&route)? {
+                    return Err(format!("[ERROR GRT-0267] Net {name} has disconnected segments.").into());
+                }
+                false
+            } else {
+                true
+            }
+        } else {
+            changed
+        };
+        // A diagnostic: each dirty net's pins as compared (`VYGES_GRT_INCR_TRACE`, appended).
+        if let Ok(path) = std::env::var("VYGES_GRT_INCR_TRACE") {
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = std::io::Write::write_all(&mut f, format!("{name}|last={:?}|now={:?}|changed={}\n", key(&a.router_nets[id]), now, i32::from(changed)).as_bytes());
+            }
+        }
         // Upstream rule: `updateNetPins(net)` runs for EVERY dirty net, before the test — a net
         // that keeps its route still has its pins as they stand now, and the estimator attaches
         // them where they are (a pin replaced inside the same gcell moves its attachment).
@@ -1888,15 +2374,83 @@ fn update_dirty_nets(a: &mut AfterRoute, fresh: &std::collections::BTreeMap<Stri
                 update_net_resources(g2, g3, &a.jumper_grid, &a.router_nets[id], id, &lec, &segs, -1);
             }
             a.final_state[id].segments_restored = false;
-        } else {
+        } else if !merged {
+            // ⚠️ A merged net routed again keeps its tree's usage (the reference skips the release).
             clear_net_route(a, id);
         }
         if let Some(r) = a.net_routes.iter_mut().find(|r| &r.name == name) {
             r.segments.clear();
         }
+        // `routes_[db_net].clear(); db_net->clearGuides();`
+        clear_guides(a, name);
         out.push(id);
     }
     Ok(out)
+}
+
+/// `GlobalRouter::loadRoutingFromDBGuides(db_net)` on a net with guides and the restore flag: its
+/// current routing released (`updateNetResources(net, true)` for a route restored before, else
+/// `clearNetRoute`); `routes_` rebuilt from the guides in list order (`boxToGlobalRouting`), then
+/// `dedupViaSegments` and `addImplicitVias` — ⚠️ no `mergeSegments`, unlike the full guide load;
+/// the flag cleared, the net restored, `makeFastrouteNet` (its id reset, or the next one for a net
+/// the router has none for — one an undo created again) and `updateNetResources(net, false)`.
+///
+/// ⛔ A pin the rebuilt route does not cover (`updateUncoveredPinsPositions`' repair, or its
+/// GRT-0304 fallback to a re-route) is refused.
+fn load_routing_from_db_guides(a: &mut AfterRoute, fresh: &std::collections::BTreeMap<String, RouterNet>, name: &str) -> Res<()> {
+    let id_now = live_id(a, name);
+    if let Some(id) = id_now {
+        if a.final_state[id].segments_restored {
+            let segs = a.net_routes.iter().find(|r| r.name == name).map(|r| r.segments.clone()).unwrap_or_default();
+            let lec = a.layer_edge_cost.get(name).cloned().unwrap_or_default();
+            if let (Some(g2), Some(g3)) = (a.final_2d.as_mut(), a.final_3d.as_mut()) {
+                update_net_resources(g2, g3, &a.jumper_grid, &a.router_nets[id], id, &lec, &segs, -1);
+            }
+        } else {
+            clear_net_route(a, id);
+        }
+    }
+    let tile = a.jumper_grid.grid.tile_size;
+    let mut route = Vec::new();
+    for g in &a.db_guides[name] {
+        crate::restore::box_to_global_routing((g.box_.x_min, g.box_.y_min, g.box_.x_max, g.box_.y_max), g.layer, g.via_layer, tile, &mut route);
+    }
+    crate::restore::dedup_via_segments(&mut route);
+    crate::restore::add_implicit_vias(&mut route);
+    let n = fresh.get(name).ok_or_else(|| format!("net {name}: restored from guides with fewer than two pins — not modelled"))?.clone();
+    let pins: Vec<crate::Pin> = n.net_pins.iter().map(|p| crate::Pin { connection_layer: p.connection_layer, on_grid_x: p.on_grid.0, on_grid_y: p.on_grid.1 }).collect();
+    let uncovered = crate::restore::net_is_covered(&route, &pins);
+    if !uncovered.is_empty() {
+        return Err(format!("net {name}: {} pin(s) not covered by the guides an undo restored — updateUncoveredPinsPositions is not modelled", uncovered.len()).into());
+    }
+    a.restore_from_guides.remove(name);
+    let id = match id_now {
+        Some(id) => {
+            a.router_nets[id] = n.clone();
+            a.final_state[id] = crate::brk_rsmt::NetState::default();
+            id
+        }
+        None => {
+            a.router_nets.push(n.clone());
+            a.final_state.push(crate::brk_rsmt::NetState::default());
+            a.layer_edge_cost.insert(name.to_string(), all_layer_edge_costs(&n, a.caps.layers.len()));
+            a.held_unrouted.remove(name);
+            a.router_nets.len() - 1
+        }
+    };
+    a.final_state[id].segments_restored = true;
+    match a.net_routes.iter_mut().find(|r| r.name == name) {
+        Some(r) => {
+            r.segments = route.clone();
+            r.pins = pins;
+        }
+        None => a.net_routes.push(crate::NetRoute { name: name.to_string(), segments: route.clone(), pins, is_local: n.is_local }),
+    }
+    let lec = a.layer_edge_cost.get(name).cloned().unwrap_or_default();
+    if let (Some(g2), Some(g3)) = (a.final_2d.as_mut(), a.final_3d.as_mut()) {
+        update_net_resources(g2, g3, &a.jumper_grid, &a.router_nets[id], id, &lec, &route, 1);
+    }
+    Ok(())
 }
 
 /// `clearNetRoute` → `releaseNetResources`: walk the net's 3D tree and take back, per unit step on
