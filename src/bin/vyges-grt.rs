@@ -2213,7 +2213,7 @@ fn timing_of<'a>(opts: &'a mut RouteOptions, texts: &[(String, String)]) -> Resu
         if libs.is_empty() {
             return Err(Fail::Refused("a clock period with no liberty library to time it".into()));
         }
-        opts.timing = Some(vyges_grt::timer::Timing { libs, constraints: Default::default() });
+        opts.timing = Some(vyges_grt::timer::Timing { libs, constraints: Default::default(), sdc: None });
     }
     Ok(opts.timing.as_mut().expect("just made"))
 }

@@ -55,6 +55,9 @@ pub struct Constraints {
 pub struct Timing {
     pub libs: Vec<Library>,
     pub constraints: Constraints,
+    /// The constraints already in the timer's form, when the caller has them (the resizer replays
+    /// a design's whole SDC): read in place of `constraints`.
+    pub sdc: Option<Sdc>,
 }
 
 /// The netlist as the database holds it.
@@ -173,12 +176,20 @@ pub fn net_slacks(timing: &Timing, nl: &Netlist, parasitics: &BTreeMap<String, c
 /// The same, on networks already in the timer's form.
 pub fn net_slacks_on(timing: &Timing, nl: &Netlist, par: &HashMap<String, NetParasitics>) -> Result<HashMap<String, f32>, String> {
     let scale = timing.libs.first().ok_or("timing needs a library")?.time_scale;
-    let Some(sdc) = sdc(&timing.constraints, nl, scale)? else {
-        return Ok(nl.nets.iter().map(|n| (n.name.clone(), 1e30)).collect());
+    let built;
+    let sdc = match &timing.sdc {
+        Some(s) => s,
+        None => match sdc(&timing.constraints, nl, scale)? {
+            Some(s) => {
+                built = s;
+                &built
+            }
+            None => return Ok(nl.nets.iter().map(|n| (n.name.clone(), 1e30)).collect()),
+        },
     };
     let mut g = Graph::build(&timing.libs, nl)?;
     g.find_delays(par, None)?;
-    let mut s = Search::in_graph_order(&g, &sdc);
+    let mut s = Search::in_graph_order(&g, sdc);
     s.find_arrivals()?;
     s.find_requireds()?;
     let index: HashMap<&str, usize> = g.vertices.iter().enumerate().map(|(i, v)| (v.name.as_str(), i)).collect();

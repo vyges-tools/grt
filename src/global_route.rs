@@ -1388,8 +1388,12 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     }
     // `estimate_parasitics -global_routing` after the run: the same builder over the SAVED routes,
     // where each pin attaches from its own connection layer.
+    //
+    // Upstream rule (`EstimateParasitics::estimateGlobalRouteRC`): every net of `getRoutes()` with a
+    // non-empty route gets a network — whether or not the run ever read the timer. A run with no
+    // congestion loop (no partial-slack read) still has routes to estimate.
     let mut routed_parasitics = std::collections::BTreeMap::new();
-    if ov.trees.is_some() {
+    {
         let rc = layer_rc(db);
         for n in &nets {
             let Some(segs) = by_name.get(&n.name) else { continue };
