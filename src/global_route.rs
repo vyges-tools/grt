@@ -916,6 +916,81 @@ pub struct AfterRoute {
     /// `getLayerEdgeCost` per net, by 0-based layer.
     pub layer_edge_cost: std::collections::BTreeMap<String, Vec<i8>>,
     pub max_routing_layer: i32,
+    /// `MakeWireParasitics`' layer table and the router's min routing layer: what
+    /// `estimateGlobalRouteRC(db_net)` reads on a route as it stands ([`routed_network`]).
+    pub parasitic_rc: crate::parasitics::LayerRC,
+    pub min_routing_layer: i32,
+    /// FastRoute ids whose net was destroyed (`removeNet` → `deleteNet` nulls the slot; an id is
+    /// never given again — a net re-created under the same name takes a new one).
+    pub dead: std::collections::BTreeSet<usize>,
+    /// Nets GlobalRouter holds (`db_net_map_`) that FastRoute has no id for — made by `addNet`
+    /// during a repair, or left with fewer than two pins — with their pins as the last
+    /// `updateNetPins` left them (`addNet`'s runs before any terminal is connected: none).
+    pub held_unrouted: std::collections::BTreeMap<String, Vec<(i32, i32, i32)>>,
+}
+
+/// A net's FastRoute id, the live one (a destroyed net's id is dead).
+pub fn live_id(a: &AfterRoute, net: &str) -> Option<usize> {
+    a.router_nets.iter().enumerate().find(|(k, n)| n.name == net && !a.dead.contains(k)).map(|(k, _)| k)
+}
+
+/// Whether GlobalRouter holds the net (`db_net_map_`): `addDirtyNet` marks only such a net.
+pub fn holds(a: &AfterRoute, net: &str) -> bool {
+    live_id(a, net).is_some() || a.held_unrouted.contains_key(net)
+}
+
+/// `GRouteDbCbk::inDbNetCreate` → `GlobalRouter::addNet`: a routable net (not supply, not special,
+/// no special wires, not connected by abutment) is held from now on, with no pins yet. Returns
+/// whether it was (`made`).
+pub fn add_net(db: &Db, a: &mut AfterRoute, net: &str) -> bool {
+    let sig = db.net_sigtype(net);
+    let made = crate::init::is_routable(sig == "POWER" || sig == "GROUND", db.net_is_special(net), db.num_net_get_s_wires(net) > 0, db.net_is_connected_by_abutment(net));
+    if made {
+        a.held_unrouted.insert(net.to_string(), Vec::new());
+    }
+    made
+}
+
+/// `GRouteDbCbk::inDbNetDestroy` → `GlobalRouter::removeNet`, the router's side (the caller drops
+/// the net from its dirty set): with a FastRoute id, the route's usage is released now —
+/// `clearNetRoute`, or `updateNetResources(net, true)` for a route restored from guides — and the
+/// slot is nulled (`deleteNet`); `routes_` loses the net.
+///
+/// ⛔ A merged net (`isMergedNet`) takes other branches: refused.
+pub fn remove_net(a: &mut AfterRoute, net: &str) -> Res<()> {
+    a.held_unrouted.remove(net);
+    let Some(id) = live_id(a, net) else { return Ok(()) };
+    if a.final_state[id].segments_restored {
+        let segs = a.net_routes.iter().find(|r| r.name == net).map(|r| r.segments.clone()).unwrap_or_default();
+        let lec = a.layer_edge_cost.get(net).cloned().unwrap_or_default();
+        if let (Some(g2), Some(g3)) = (a.final_2d.as_mut(), a.final_3d.as_mut()) {
+            update_net_resources(g2, g3, &a.jumper_grid, &a.router_nets[id], id, &lec, &segs, -1);
+        }
+        a.final_state[id].segments_restored = false;
+    } else {
+        clear_net_route(a, id);
+    }
+    a.dead.insert(id);
+    a.net_routes.retain(|r| r.name != net);
+    Ok(())
+}
+
+/// `EstimateParasitics::estimateGlobalRouteRC(db_net)`: the net's RC network from its route as
+/// `routes_` holds it now, its pins as the router's last `updateNetPins` left them. `None` with no
+/// route or an empty one — the estimator then builds nothing, and the net keeps the parasitics it
+/// had.
+pub fn routed_network(a: &AfterRoute, net: &str) -> Option<crate::parasitics::Network> {
+    let r = a.net_routes.iter().find(|r| r.name == net)?;
+    if r.segments.is_empty() {
+        return None;
+    }
+    let n = &a.router_nets[live_id(a, net)?];
+    let route: Vec<crate::parasitics::Segment> = r
+        .segments
+        .iter()
+        .map(|g| crate::parasitics::Segment { init_x: g.init_x, init_y: g.init_y, init_layer: g.init_layer, final_x: g.final_x, final_y: g.final_y, final_layer: g.final_layer })
+        .collect();
+    Some(net_network(n, &route, &a.parasitic_rc, a.min_routing_layer, crate::parasitics::PinAttach::Routed).1)
 }
 
 /// `makeSteinerTree(net, …)`'s alpha: the net's own, else — ⛔ an else-if chain — the min-HPWL rule
@@ -1470,6 +1545,10 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         save_options: save,
         layer_edge_cost,
         max_routing_layer: t.max_routing_layer,
+        parasitic_rc: layer_rc(db),
+        min_routing_layer: t.min_routing_layer,
+        dead: std::collections::BTreeSet::new(),
+        held_unrouted: std::collections::BTreeMap::new(),
     };
     let gcell_grid = ((t.core.area.x_min, t.core.x_grids, t.core.tile_size), (t.core.area.y_min, t.core.y_grids, t.core.tile_size));
     Ok(RouteResult { guides, layer_names, total_overflow, guide_is_congested, routes: raw_routes, clock_nets, parasitics, routed_parasitics, parasitic_pins, planar_routes, snapshot_edges, log, already_wired, after, gcell_grid })
@@ -1647,6 +1726,10 @@ pub fn restore_for_repair(db: &mut Db, opts: &RouteOptions) -> Res<AfterRoute> {
         save_options,
         layer_edge_cost,
         max_routing_layer: t.max_routing_layer,
+        parasitic_rc: layer_rc_for(db, &t, opts),
+        min_routing_layer: t.min_routing_layer,
+        dead: std::collections::BTreeSet::new(),
+        held_unrouted: std::collections::BTreeMap::new(),
     })
 }
 
@@ -1733,47 +1816,85 @@ pub fn update_dirty_routes_fast_route(db: &mut Db, opts: &RouteOptions, a: &mut 
 }
 
 /// `updateNetPins`, for every net: the router's nets as the database stands now (discovery, pins,
-/// layer ranges), by FastRoute id. ⚠️ Recomputed whole — the database has moved under it — and
-/// checked to keep the ids the first run gave (a diode joins an existing net; it adds none).
-fn update_net_pins(db: &mut Db, opts: &RouteOptions, a: &AfterRoute) -> Res<Vec<RouterNet>> {
+/// layer ranges), by name — only the nets FastRoute would route (two pins or more, unwired); a held
+/// net missing here has fewer than two pins. ⚠️ Recomputed whole — the database has moved under it
+/// — and checked: every such net is one the router holds (the first run's, or one `addNet` made).
+fn update_net_pins(db: &mut Db, opts: &RouteOptions, a: &AfterRoute) -> Res<std::collections::BTreeMap<String, RouterNet>> {
     let t = setup_tech(db, opts)?;
     let mut log = t.log.clone();
     let adj = setup_adjust(db, &t, opts, &mut log)?;
     let mut e = adj.edges;
     let nets = setup_nets(db, &t, &mut e, adj.has_macros_or_pads, opts, &mut log)?;
-    if nets.len() != a.router_nets.len() || nets.iter().zip(&a.router_nets).any(|(n, m)| n.name != m.name) {
-        return Err("the router's nets changed under the incremental re-route — new nets are not modelled".into());
+    if let Some(n) = nets.iter().find(|n| !holds(a, &n.name)) {
+        return Err(format!("net {}: routable now, and not one the router holds — not modelled", n.name).into());
     }
-    Ok(nets)
+    Ok(nets.into_iter().map(|n| (n.name.clone(), n)).collect())
+}
+
+/// A net's pins as `pinPositionsChanged` compares them: `(on-grid x, y, connection layer)`.
+fn pin_key(n: &RouterNet) -> Vec<(i32, i32, i32)> {
+    n.net_pins.iter().map(|p| (p.on_grid.0, p.on_grid.1, p.connection_layer)).collect()
 }
 
 /// `updateDirtyNets`: of the dirty nets, those whose pins moved — `pinPositionsChanged`, the
 /// multiset of `(on-grid x, y, connection layer)` against the positions the net was dirtied with
 /// (`saveLastPinPositions`, from the router's own stale pins: the first run's) — are released
 /// (`clearNetRoute`) and their routes cleared; the rest keep theirs. In dbNet order.
-fn update_dirty_nets(a: &mut AfterRoute, fresh: &[RouterNet], dirty: &[String]) -> Res<Vec<usize>> {
+///
+/// A held net FastRoute has no id for (one `addNet` made) is compared against the pins it was held
+/// with; when they changed and it now has two pins or more, `initNetlist` → `makeFastrouteNet` gives
+/// it the next id (`FastRouteCore::addNet` appends) — assigned here, in the same order.
+fn update_dirty_nets(a: &mut AfterRoute, fresh: &std::collections::BTreeMap<String, RouterNet>, dirty: &[String]) -> Res<Vec<usize>> {
     let mut out = Vec::new();
     for name in dirty {
-        let Some(id) = a.router_nets.iter().position(|n| &n.name == name) else { continue }; // not in db_net_map_
-        let key = |n: &RouterNet| n.net_pins.iter().map(|p| (p.on_grid.0, p.on_grid.1, p.connection_layer)).collect::<Vec<_>>();
-        if crate::netlist::pin_positions_changed(&key(&a.router_nets[id]), &key(&fresh[id])) {
-            // A net restored from guides has no tree: `updateNetResources(net, true)` over its
-            // current routes_ releases it, and it is restored no longer.
-            if a.final_state[id].segments_restored {
-                let segs = a.net_routes.iter().find(|r| &r.name == name).map(|r| r.segments.clone()).unwrap_or_default();
-                let lec = a.layer_edge_cost.get(name).cloned().unwrap_or_default();
-                if let (Some(g2), Some(g3)) = (a.final_2d.as_mut(), a.final_3d.as_mut()) {
-                    update_net_resources(g2, g3, &a.jumper_grid, &a.router_nets[id], id, &lec, &segs, -1);
-                }
-                a.final_state[id].segments_restored = false;
-            } else {
-                clear_net_route(a, id);
+        let now = fresh.get(name).map(pin_key).unwrap_or_default();
+        let Some(id) = live_id(a, name) else {
+            let Some(stale) = a.held_unrouted.get(name) else { continue }; // not in db_net_map_
+            if !crate::netlist::pin_positions_changed(stale, &now) {
+                a.held_unrouted.insert(name.clone(), now);
+                continue;
             }
-            if let Some(r) = a.net_routes.iter_mut().find(|r| &r.name == name) {
-                r.segments.clear();
-            }
+            let Some(n) = fresh.get(name) else {
+                return Err(format!("net {name}: a held net with fewer than two pins re-routed — addRemainingGuides over it is not modelled").into());
+            };
+            let id = a.router_nets.len();
+            a.router_nets.push(n.clone());
+            a.final_state.push(crate::brk_rsmt::NetState::default());
+            a.layer_edge_cost.insert(name.clone(), all_layer_edge_costs(n, a.caps.layers.len()));
+            let pins = n.net_pins.iter().map(|p| crate::Pin { connection_layer: p.connection_layer, on_grid_x: p.on_grid.0, on_grid_y: p.on_grid.1 }).collect();
+            a.net_routes.push(crate::NetRoute { name: name.clone(), segments: Vec::new(), pins, is_local: n.is_local });
+            a.held_unrouted.remove(name);
             out.push(id);
+            continue;
+        };
+        let key = pin_key;
+        let changed = crate::netlist::pin_positions_changed(&key(&a.router_nets[id]), &now);
+        // Upstream rule: `updateNetPins(net)` runs for EVERY dirty net, before the test — a net
+        // that keeps its route still has its pins as they stand now, and the estimator attaches
+        // them where they are (a pin replaced inside the same gcell moves its attachment).
+        if !changed {
+            if let Some(n) = fresh.get(name) {
+                a.router_nets[id].net_pins = n.net_pins.clone();
+                a.router_nets[id].pin_is_driver = n.pin_is_driver.clone();
+            }
+            continue;
         }
+        // A net restored from guides has no tree: `updateNetResources(net, true)` over its
+        // current routes_ releases it, and it is restored no longer.
+        if a.final_state[id].segments_restored {
+            let segs = a.net_routes.iter().find(|r| &r.name == name).map(|r| r.segments.clone()).unwrap_or_default();
+            let lec = a.layer_edge_cost.get(name).cloned().unwrap_or_default();
+            if let (Some(g2), Some(g3)) = (a.final_2d.as_mut(), a.final_3d.as_mut()) {
+                update_net_resources(g2, g3, &a.jumper_grid, &a.router_nets[id], id, &lec, &segs, -1);
+            }
+            a.final_state[id].segments_restored = false;
+        } else {
+            clear_net_route(a, id);
+        }
+        if let Some(r) = a.net_routes.iter_mut().find(|r| &r.name == name) {
+            r.segments.clear();
+        }
+        out.push(id);
     }
     Ok(out)
 }
@@ -1820,10 +1941,12 @@ fn clear_net_route(a: &mut AfterRoute, id: usize) {
 /// `initFastRouteIncr` → `initNetlist(nets, true)`: `net_ids_` becomes the re-routed nets in order,
 /// each re-added (`addNet` keeps its id, resets it) with its pins as they stand — a net with fewer
 /// than two pins, or a local one, is added but not routed.
-fn init_fast_route_incr(a: &mut AfterRoute, fresh: &[RouterNet], dirty_nets: &[usize]) {
+fn init_fast_route_incr(a: &mut AfterRoute, fresh: &std::collections::BTreeMap<String, RouterNet>, dirty_nets: &[usize]) {
     a.net_ids.clear();
     for &id in dirty_nets {
-        a.router_nets[id] = fresh[id].clone();
+        // A net down to fewer than two pins is not re-added (`initNetlist` skips it): no pins.
+        let name = a.router_nets[id].name.clone();
+        a.router_nets[id] = fresh.get(&name).cloned().unwrap_or_else(|| RouterNet { pins: Vec::new(), net_pins: Vec::new(), pin_is_driver: Vec::new(), ..a.router_nets[id].clone() });
         a.final_state[id] = crate::brk_rsmt::NetState::default();
         let n = &a.router_nets[id];
         if n.net_pins.len() > 1 && !n.is_local {
