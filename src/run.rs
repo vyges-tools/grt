@@ -257,7 +257,7 @@ pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn 
             calls: 0,
         })
     });
-    let layer = LayerParams { layer_dir: inp.layer_dir, resistance_aware: inp.resistance_aware, liberty: inp.liberty, has_2d_overflow: end.has_2d_overflow, ra: ra.as_ref() };
+    let layer = LayerParams { layer_dir: inp.layer_dir, resistance_aware: inp.resistance_aware, liberty: inp.liberty, has_2d_overflow: end.has_2d_overflow, ra: ra.as_ref(), incremental: inp.resume.is_some() };
     let mut order = layer_assignment(ids, nets, attrs, state, &mut g3, &layer)?;
     let overflow = get_overflow_3d_all(&g2d, &g3);
     let past_cong = scan.total_overflow;

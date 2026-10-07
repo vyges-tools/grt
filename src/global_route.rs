@@ -843,6 +843,20 @@ pub fn setup_nets_counted(db: &Db, t: &TechSetup, e: &mut RouterEdges, has_macro
     Ok((out, already_wired))
 }
 
+/// `preProcessTechLayers`: each routing layer (by level, up to the router's layers) and the cut layer
+/// above it — their widths and resistances as the database holds them now (after any `set_layer_rc`).
+fn pricing_tech(db: &Db, t: &TechSetup, num_layers: usize) -> Res<crate::pricing::TechLayers> {
+    let mut tech = crate::pricing::TechLayers { dbu_per_micron: db.tech_get_db_units_per_micron(), width: Vec::new(), resistance: Vec::new(), via_resistance: Vec::new() };
+    for level in 1..=num_layers as i32 {
+        let l = t.tech.routing_layers.iter().find(|r| r.routing_level == level).ok_or_else(|| format!("no routing layer at level {level}"))?;
+        tech.width.push(db.layer_get_width(&l.name) as i32);
+        tech.resistance.push(db.layer_get_resistance(&l.name));
+        let cut = db.layer_get_upper_layer(&l.name);
+        tech.via_resistance.push((!cut.is_empty()).then(|| db.layer_get_resistance(&cut)));
+    }
+    Ok(tech)
+}
+
 /// What a whole `global_route` produced.
 #[derive(Debug, Clone)]
 pub struct RouteResult {
@@ -938,6 +952,80 @@ pub struct AfterRoute {
     /// `Net::isMergedNet` / `getMergedNet`: set on both nets by a routing merge (buffer removal),
     /// cleared when `updateDirtyNets` next passes the net.
     pub merged: std::collections::BTreeMap<String, String>,
+    /// `GlobalRouter::resistance_aware_` (`setResistanceAware`): once set, every later incremental
+    /// run is resistance-aware.
+    pub resistance_aware: bool,
+    /// `Net::isResAware` (GlobalRouter's flag, `setNetIsResAware`): such a net is routed again
+    /// whatever its pins. ⚠️ Not FastRoute's own flag (`NetState::res_aware`), which `updateSlacks`
+    /// sets and an `addNet` reset keeps.
+    pub res_aware_nets: std::collections::BTreeSet<String>,
+    /// `preProcessTechLayers`' table, for resistance-aware pricing and a net's resistance.
+    pub res_tech: crate::pricing::TechLayers,
+    /// `tile_size_`.
+    pub tile_size: i32,
+}
+
+/// `GlobalRouter::setResistanceAware(true)`.
+pub fn set_resistance_aware(a: &mut AfterRoute) {
+    a.resistance_aware = true;
+}
+
+/// `GlobalRouter::setNetIsResAware(db_net, true)` (GRT-0103, a warning, for a net the router does
+/// not hold — nothing set).
+pub fn set_net_res_aware(a: &mut AfterRoute, net: &str) {
+    if holds(a, net) {
+        a.res_aware_nets.insert(net.to_string());
+    }
+}
+
+/// `GlobalRouter::isNetResAware(db_net)`.
+pub fn is_net_res_aware(a: &AfterRoute, net: &str) -> bool {
+    a.res_aware_nets.contains(net)
+}
+
+/// `FastRouteCore::getNetResistanceOnLayer(db_net, layer)` on the net's routed (3D) tree: each
+/// wire on `layer` when given, else on its own; each layer change a via stack. 0 for a net
+/// FastRoute has no tree for (one restored from guides).
+pub fn net_resistance_on_layer(a: &AfterRoute, net: &str, layer: Option<i32>) -> f32 {
+    let Some(id) = live_id(a, net) else { return 0.0 };
+    let Some(t) = a.final_state[id].tree3d.as_ref() else { return 0.0 };
+    let n = &a.router_nets[id];
+    let (lo, hi) = a.final_state[id].layer_range.map_or(((n.min_layer - 1) as usize, (n.max_layer - 1) as usize), |r| r);
+    let wn = crate::pricing::WireNet { ndr_width: None, min_layer: lo as i32, max_layer: hi as i32 };
+    let mut total = 0.0f32;
+    for e in &t.edges {
+        if e.len == 0 && e.routelen == 0 {
+            continue;
+        }
+        for i in 0..e.routelen.max(0) as usize {
+            let (p, q) = (e.grids[i], e.grids[i + 1]);
+            if p.layer == q.layer {
+                let seg = i32::from((p.x - q.x).abs() + (p.y - q.y).abs());
+                let wire_layer = layer.unwrap_or(i32::from(p.layer));
+                total += crate::pricing::get_wire_resistance(&a.res_tech, wire_layer, seg * a.tile_size, wn);
+            } else {
+                total += crate::pricing::get_via_resistance(&a.res_tech, i32::from(p.layer), i32::from(q.layer));
+            }
+        }
+    }
+    total
+}
+
+/// `GlobalRouter::getFRNetResistanceOnMinResistanceLayer`: the net's resistance with every wire on
+/// the routing layer (min..max routing layer) of least resistance per width — the first of equals.
+pub fn net_resistance_on_min_resistance_layer(a: &AfterRoute, net: &str) -> f32 {
+    let mut min_res_layer = a.min_routing_layer;
+    let mut min_res_per_width = f32::MAX;
+    for level in a.min_routing_layer..=a.max_routing_layer {
+        let k = (level - 1) as usize;
+        let (Some(&w), Some(&r)) = (a.res_tech.width.get(k), a.res_tech.resistance.get(k)) else { continue };
+        let (w, r) = (w as f32, r as f32);
+        if w > 0.0 && r > 0.0 && r / w < min_res_per_width {
+            min_res_per_width = r / w;
+            min_res_layer = level;
+        }
+    }
+    net_resistance_on_layer(a, net, Some(min_res_layer - 1))
 }
 
 /// One journaled guide edit.
@@ -993,6 +1081,8 @@ pub fn undo_eco(a: &mut AfterRoute) -> Vec<String> {
                     a.db_guides.entry(net.clone()).or_default().insert(0, *g);
                     if holds(a, &net) {
                         a.restore_from_guides.insert(net.clone());
+                        // `fr_net->setIsResAware(false)` (GlobalRouter's net).
+                        a.res_aware_nets.remove(&net);
                     }
                     fired.push(net.clone());
                 }
@@ -1063,6 +1153,7 @@ pub fn remove_net(a: &mut AfterRoute, net: &str) -> Res<()> {
     // `dbNet::destroy` deletes the net's guides (journaled).
     clear_guides(a, net);
     a.restore_from_guides.remove(net);
+    a.res_aware_nets.remove(net);
     a.held_unrouted.remove(net);
     let Some(id) = live_id(a, net) else { return Ok(()) };
     // A net merged into its survivor (`isMergedNet`): FastRoute's `mergeNet` moves its tree into
@@ -1745,16 +1836,9 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     if opts.resistance_aware && nets.iter().any(|n| n.has_ndr) {
         return Err("resistance-aware routing of a net with an NDR: the per-layer NDR width is not wired".into());
     }
+    let res_tech = pricing_tech(db, &t, num_layers)?;
     let res_aware = if opts.resistance_aware {
-        let mut tech = crate::pricing::TechLayers { dbu_per_micron: db.tech_get_db_units_per_micron(), width: Vec::new(), resistance: Vec::new(), via_resistance: Vec::new() };
-        for level in 1..=num_layers as i32 {
-            let l = t.tech.routing_layers.iter().find(|r| r.routing_level == level).ok_or_else(|| format!("no routing layer at level {level}"))?;
-            tech.width.push(db.layer_get_width(&l.name) as i32);
-            tech.resistance.push(db.layer_get_resistance(&l.name));
-            let cut = db.layer_get_upper_layer(&l.name);
-            tech.via_resistance.push((!cut.is_empty()).then(|| db.layer_get_resistance(&cut)));
-        }
-        Some(crate::run::ResAwareInputs { tech, tile_size: t.core.tile_size, fixed_percentage: opts.res_aware_nets_percentage, update_slacks })
+        Some(crate::run::ResAwareInputs { tech: res_tech.clone(), tile_size: t.core.tile_size, fixed_percentage: opts.res_aware_nets_percentage, update_slacks })
     } else {
         None
     };
@@ -1985,6 +2069,10 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         restore_from_guides: std::collections::BTreeSet::new(),
         eco: Vec::new(),
         merged: std::collections::BTreeMap::new(),
+        resistance_aware: opts.resistance_aware,
+        res_aware_nets: std::collections::BTreeSet::new(),
+        res_tech,
+        tile_size: t.core.tile_size,
     };
     let gcell_grid = ((t.core.area.x_min, t.core.x_grids, t.core.tile_size), (t.core.area.y_min, t.core.y_grids, t.core.tile_size));
     Ok(RouteResult { guides, layer_names, total_overflow, guide_is_congested, routes: raw_routes, clock_nets, parasitics, routed_parasitics, parasitic_pins, planar_routes, snapshot_edges, log, already_wired, after, gcell_grid })
@@ -2171,6 +2259,10 @@ pub fn restore_for_repair(db: &mut Db, opts: &RouteOptions) -> Res<AfterRoute> {
         restore_from_guides: std::collections::BTreeSet::new(),
         eco: Vec::new(),
         merged: std::collections::BTreeMap::new(),
+        resistance_aware: opts.resistance_aware,
+        res_aware_nets: std::collections::BTreeSet::new(),
+        res_tech: pricing_tech(db, &t, num_layers)?,
+        tile_size: tile,
     })
 }
 
@@ -2223,6 +2315,10 @@ pub fn router_state_text(tag: &str, a: &AfterRoute) -> Result<String, String> {
     Ok(t)
 }
 
+/// The timer's slack of a net by name (`sta_->slack(net, max)`; `sta::INF` when unconstrained), as
+/// a resistance-aware incremental run's `updateSlacks` reads it.
+pub type NetSlack<'a> = &'a dyn Fn(&str) -> f32;
+
 /// Where the incremental re-route lets an observer look: `(tag, state)` at `run()`'s entry
 /// (`incr`) and exit (`incrend`), as the reference's trace does.
 pub type IncrObserver<'a> = &'a mut dyn FnMut(&str, &AfterRoute);
@@ -2240,7 +2336,7 @@ pub type IncrObserver<'a> = &'a mut dyn FnMut(&str, &AfterRoute);
 /// `save_guides`: `saveGuides(modified_nets)` after the run — `IncrementalGRoute::updateRoutes`'
 /// default (true); the antenna repair's own call passes false.
 #[allow(clippy::too_many_arguments)]
-pub fn update_dirty_routes_fast_route(db: &mut Db, opts: &RouteOptions, a: &mut AfterRoute, dirty: &[String], stt: SteinerBuilder<'_>, flutes: crate::brk_rsmt::Flutes<'_>, obs: IncrObserver<'_>, save_guides: bool) -> Res<Vec<String>> {
+pub fn update_dirty_routes_fast_route(db: &mut Db, opts: &RouteOptions, a: &mut AfterRoute, dirty: &[String], stt: SteinerBuilder<'_>, flutes: crate::brk_rsmt::Flutes<'_>, obs: IncrObserver<'_>, save_guides: bool, net_slack: Option<NetSlack<'_>>) -> Res<Vec<String>> {
     if dirty.is_empty() {
         return Ok(Vec::new());
     }
@@ -2252,7 +2348,7 @@ pub fn update_dirty_routes_fast_route(db: &mut Db, opts: &RouteOptions, a: &mut 
     }
     // setCriticalNetsPercentage(0); initFastRouteIncr; findRouting; mergeResults.
     init_fast_route_incr(a, &fresh, &dirty_nets);
-    let routes = find_routing(db, opts, a, &dirty_nets, stt, flutes, obs)?;
+    let routes = find_routing(db, opts, a, &dirty_nets, stt, flutes, obs, net_slack)?;
     merge_results(a, routes);
     if a.total_overflow > 0 && !opts.allow_congestion {
         return Err("the incremental re-route left overflow: its congestion loop is not modelled".into());
@@ -2305,9 +2401,12 @@ fn update_dirty_nets(a: &mut AfterRoute, fresh: &std::collections::BTreeMap<Stri
     let mut out = Vec::new();
     for name in dirty {
         let now = fresh.get(name).map(pin_key).unwrap_or_default();
-        // `!loadRoutingFromDBGuides(db_net)` is the first test: a net an undo gave its guides back
+        // `isResAware ||` comes first: a net a reroute marked is routed again whatever its pins (and
+        // its guides are not read).
+        let res_aware = a.res_aware_nets.contains(name);
+        // `!loadRoutingFromDBGuides(db_net)` is the next test: a net an undo gave its guides back
         // takes its route from them, and is not re-routed.
-        if a.restore_from_guides.contains(name) && a.db_guides.get(name).is_some_and(|g| !g.is_empty()) {
+        if !res_aware && a.restore_from_guides.contains(name) && a.db_guides.get(name).is_some_and(|g| !g.is_empty()) {
             load_routing_from_db_guides(a, fresh, name)?;
             continue;
         }
@@ -2331,11 +2430,11 @@ fn update_dirty_nets(a: &mut AfterRoute, fresh: &std::collections::BTreeMap<Stri
             continue;
         };
         let key = pin_key;
-        let changed = crate::netlist::pin_positions_changed(&key(&a.router_nets[id]), &now);
+        let changed = res_aware || crate::netlist::pin_positions_changed(&key(&a.router_nets[id]), &now);
         // `(!isMergedNet || !netIsCovered)`: a merged net its joined route still covers keeps it
         // (and must be connected: GRT-0267). The merged flag is cleared on every pass.
         let merged = a.merged.remove(name).is_some();
-        let changed = if changed && merged {
+        let changed = if changed && merged && !res_aware {
             let pins: Vec<crate::Pin> = fresh.get(name).map(|n| n.net_pins.iter().map(|p| crate::Pin { connection_layer: p.connection_layer, on_grid_x: p.on_grid.0, on_grid_y: p.on_grid.1 }).collect()).unwrap_or_default();
             let route = a.net_routes.iter().find(|r| &r.name == name).map(|r| r.segments.clone()).unwrap_or_default();
             if crate::restore::net_is_covered(&route, &pins).is_empty() {
@@ -2501,7 +2600,9 @@ fn init_fast_route_incr(a: &mut AfterRoute, fresh: &std::collections::BTreeMap<S
         // A net down to fewer than two pins is not re-added (`initNetlist` skips it): no pins.
         let name = a.router_nets[id].name.clone();
         a.router_nets[id] = fresh.get(&name).cloned().unwrap_or_else(|| RouterNet { pins: Vec::new(), net_pins: Vec::new(), pin_is_driver: Vec::new(), ..a.router_nets[id].clone() });
-        a.final_state[id] = crate::brk_rsmt::NetState::default();
+        // `FrNet::reset` keeps `is_res_aware_` (FastRoute's flag, which `updateSlacks` sets).
+        let res_aware = a.final_state[id].res_aware;
+        a.final_state[id] = crate::brk_rsmt::NetState { res_aware, ..Default::default() };
         let n = &a.router_nets[id];
         if n.net_pins.len() > 1 && !n.is_local {
             a.net_ids.push(id);
@@ -2511,7 +2612,8 @@ fn init_fast_route_incr(a: &mut AfterRoute, fresh: &std::collections::BTreeMap<S
 
 /// `findRouting(dirty_nets, …)`: `run()` from the state the first run, the jumpers and the rip-ups
 /// left, then the post-processing over those nets (remaining guides, pad pins, `mergeSegments`).
-fn find_routing(db: &Db, opts: &RouteOptions, a: &mut AfterRoute, dirty_nets: &[usize], stt: SteinerBuilder<'_>, flutes: crate::brk_rsmt::Flutes<'_>, obs: IncrObserver<'_>) -> Res<std::collections::BTreeMap<String, Vec<crate::GSegment>>> {
+#[allow(clippy::too_many_arguments)]
+fn find_routing(db: &Db, opts: &RouteOptions, a: &mut AfterRoute, dirty_nets: &[usize], stt: SteinerBuilder<'_>, flutes: crate::brk_rsmt::Flutes<'_>, obs: IncrObserver<'_>, net_slack: Option<NetSlack<'_>>) -> Res<std::collections::BTreeMap<String, Vec<crate::GSegment>>> {
     use crate::brk_rsmt::RsmtNet;
     use crate::run::{fastroute_run, RunEnd, RunInputs, RunObserver, Stage};
     obs("incr", a);
@@ -2530,6 +2632,25 @@ fn find_routing(db: &Db, opts: &RouteOptions, a: &mut AfterRoute, dirty_nets: &[
         .map(|n| NetLayerAttrs { pin_layers: n.pins.iter().map(|p| (p.2 - 1) as i16).collect(), has_ndr: n.has_ndr, is_clock: n.is_clock, is_res_aware: false, layer_edge_cost: all_layer_edge_costs(n, num_layers), sta_slack: 0.0 })
         .collect();
     let slack = vec![(0.0f32, false); nets.len()];
+    // `setResistanceAware(resistance_aware_)`: once a reroute turned it on, every incremental run is
+    // resistance-aware, and its `updateSlacks` asks the timer for each routed net's slack.
+    // ⚠️ With one net routed the slack decides only whether it is constrained (INF or not): its
+    // ordering score has nothing to order. Several nets are refused — the timer's mid-update slacks
+    // would order them.
+    let res_slacks: Vec<f32>;
+    let ra_inputs = if a.resistance_aware {
+        if a.net_ids.len() > 1 {
+            return Err(format!("a resistance-aware incremental re-route of {} nets: the timer's slacks mid-update order them — not modelled", a.net_ids.len()).into());
+        }
+        let f = net_slack.ok_or("a resistance-aware incremental re-route with no timer bound")?;
+        res_slacks = (0..nets.len()).map(|k| if a.net_ids.contains(&k) { f(&nets[k].name) } else { 1e30 }).collect();
+        if let Some(k) = (0..nets.len()).find(|&k| res_slacks[k].is_nan()) {
+            return Err(format!("net {}: routed resistance-aware with no slack the timer can give mid-update — not modelled", nets[k].name).into());
+        }
+        Some(crate::run::ResAwareInputs { tech: a.res_tech.clone(), tile_size: a.tile_size, fixed_percentage: opts.res_aware_nets_percentage, update_slacks: crate::congestion_loop::TimerSlack::Every(&res_slacks) })
+    } else {
+        None
+    };
     // The min-HPWL rule reads the instances where the legalization left them.
     let hpwl: Vec<Option<i32>> = match opts.min_hpwl_alpha.filter(|&(h, _)| h > 0) {
         Some(_) => (0..nets.len())
@@ -2566,10 +2687,10 @@ fn find_routing(db: &Db, opts: &RouteOptions, a: &mut AfterRoute, dirty_nets: &[
         // setCriticalNetsPercentage(0) for the incremental run.
         critical_nets_percentage: 0.0,
         layer_dir: &layer_dir,
-        resistance_aware: false,
+        resistance_aware: a.resistance_aware,
         liberty: opts.liberty.is_some(),
         timer_slack: crate::congestion_loop::TimerSlack::None,
-        res_aware: None,
+        res_aware: ra_inputs,
         origin: crate::routes::GridOrigin { tile_size: a.jumper_grid.grid.tile_size, x_corner: a.jumper_grid.grid.area.x_min, y_corner: a.jumper_grid.grid.area.y_min },
         db_id: &db_id,
         resume: Some((&g2, &g3)),

@@ -124,6 +124,9 @@ pub struct LayerParams<'a> {
     pub has_2d_overflow: bool,
     /// The resistance-aware state — `None` when the router is not resistance-aware.
     pub ra: Option<&'a std::cell::RefCell<ResAware<'a>>>,
+    /// `is_incremental_grt_`: an incremental re-route (all of `updateSlacks`' list taken, positive
+    /// slacks kept, the low detour penalty, retry passes).
+    pub incremental: bool,
 }
 
 /// `layerAssignment` — the whole of R16 bar the `getOverflow3D` that follows it in run().
@@ -230,7 +233,7 @@ fn update_slacks(net_ids: &[usize], nets: &[RsmtNet<'_>], attrs: &[NetLayerAttrs
         return Err(format!("net {id} is resistance-aware on entry to the run: not wired"));
     }
     let Some(ra_cell) = p.ra else {
-        return update_slacks_without_resistances(net_ids, nets, attrs, state);
+        return update_slacks_without_resistances(net_ids, nets, attrs, state, p.incremental);
     };
     let mut ra = ra_cell.borrow_mut();
     let k = ra.calls;
@@ -254,7 +257,7 @@ fn update_slacks(net_ids: &[usize], nets: &[RsmtNet<'_>], attrs: &[NetLayerAttrs
         is_res_aware: state[id].res_aware,
         resistance: res,
     }).collect();
-    let sp = crate::slacks::SlackParams { enabled: true, is_incremental: false, percentage: ra.percentage, infinity: STA_INF };
+    let sp = crate::slacks::SlackParams { enabled: true, is_incremental: p.incremental, percentage: ra.percentage, infinity: STA_INF };
     let up = crate::slacks::update_slacks(&input, &sp);
     for o in &up.nets {
         let st = &mut state[o.net_id];
@@ -272,7 +275,7 @@ fn update_slacks(net_ids: &[usize], nets: &[RsmtNet<'_>], attrs: &[NetLayerAttrs
 /// `updateSlacks` for a caller that binds no resistances (the replay): each net's slack from its
 /// attributes, and ⛔ refused as soon as a net survives the skip rules — its resistance would be
 /// read.
-fn update_slacks_without_resistances(net_ids: &[usize], nets: &[RsmtNet<'_>], attrs: &[NetLayerAttrs], state: &mut [NetState]) -> Result<(), String> {
+fn update_slacks_without_resistances(net_ids: &[usize], nets: &[RsmtNet<'_>], attrs: &[NetLayerAttrs], state: &mut [NetState], incremental: bool) -> Result<(), String> {
     let lens: Vec<Vec<i32>> = net_ids.iter().map(|&id| match &state[id].tree3d {
         Some(t) => t.edges.iter().map(|e| e.len).collect(),
         None => state[id].tree.as_ref().map(|t| t.edges.iter().map(|e| e.len).collect()).unwrap_or_default(),
@@ -287,7 +290,7 @@ fn update_slacks_without_resistances(net_ids: &[usize], nets: &[RsmtNet<'_>], at
         is_res_aware: state[id].res_aware,
         resistance: f32::NAN,
     }).collect();
-    let sp = crate::slacks::SlackParams { enabled: true, is_incremental: false, percentage: 0.0, infinity: STA_INF };
+    let sp = crate::slacks::SlackParams { enabled: true, is_incremental: incremental, percentage: 0.0, infinity: STA_INF };
     let up = crate::slacks::update_slacks(&input, &sp);
     if let Some(o) = up.nets.iter().find(|o| o.resistance.is_some()) {
         return Err(format!("updateSlacks: net {} survives the skip rules and needs its resistance from the database: not wired", o.net_id));
@@ -627,7 +630,7 @@ pub struct Maze3dParams<'a> {
 /// ⛔ A net routed resistance-aware prices its moves from the technology's resistances — not wired,
 /// refused (as is any net `updateSlacks` would keep, as in R16).
 pub fn maze_route_msmd_order_3d_all(order: &[usize], nets: &[RsmtNet<'_>], attrs: &[NetLayerAttrs], state: &mut [NetState], g2d: &mut Graph2d, g3: &mut Graph3d, p: &Maze3dParams<'_>) -> Result<(Vec<usize>, usize), String> {
-    let call = Maze3DCall { ripup_lb: p.ripup_lb, ripup_ub: p.ripup_ub, resistance_aware: p.layer.resistance_aware, incremental: false };
+    let call = Maze3DCall { ripup_lb: p.ripup_lb, ripup_ub: p.ripup_ub, resistance_aware: p.layer.resistance_aware, incremental: p.layer.incremental };
     let mut order = order.to_vec();
     // The prelude: updateSlacks (over net_ids_, in id order — the worst metrics accumulate in it),
     // then 100% unless fixed, then netpinOrderInc.
