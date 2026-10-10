@@ -2633,17 +2633,18 @@ fn find_routing(db: &Db, opts: &RouteOptions, a: &mut AfterRoute, dirty_nets: &[
         .collect();
     let slack = vec![(0.0f32, false); nets.len()];
     // `setResistanceAware(resistance_aware_)`: once a reroute turned it on, every incremental run is
-    // resistance-aware, and its `updateSlacks` asks the timer for each routed net's slack.
-    // ⚠️ With one net routed the slack decides only whether it is constrained (INF or not): its
-    // ordering score has nothing to order. Several nets are refused — the timer's mid-update slacks
-    // would order them.
+    // resistance-aware, and its `updateSlacks` asks the timer for each routed net's slack
+    // (`getNetSlack` → `sta_->slack(net, max)`), in `net_ids_` order — the timer as the estimator's
+    // update found it (nets marked invalid, none estimated yet). The values order the nets (the
+    // resistance-aware score) and set the rip-up's critical slack; NaN: the caller has no timer.
     let res_slacks: Vec<f32>;
     let ra_inputs = if a.resistance_aware {
-        if a.net_ids.len() > 1 {
-            return Err(format!("a resistance-aware incremental re-route of {} nets: the timer's slacks mid-update order them — not modelled", a.net_ids.len()).into());
-        }
         let f = net_slack.ok_or("a resistance-aware incremental re-route with no timer bound")?;
-        res_slacks = (0..nets.len()).map(|k| if a.net_ids.contains(&k) { f(&nets[k].name) } else { 1e30 }).collect();
+        let mut v = vec![1e30f32; nets.len()];
+        for &k in &a.net_ids {
+            v[k] = f(&nets[k].name);
+        }
+        res_slacks = v;
         if let Some(k) = (0..nets.len()).find(|&k| res_slacks[k].is_nan()) {
             return Err(format!("net {}: routed resistance-aware with no slack the timer can give mid-update — not modelled", nets[k].name).into());
         }
