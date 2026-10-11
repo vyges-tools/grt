@@ -162,6 +162,7 @@ fn cost_is_OVERFLOW_ONLY_and_includes_the_BLOCKAGE() {
 }
 
 #[test]
+#[allow(clippy::excessive_precision)] // the literal is the reference's captured value, verbatim
 fn the_capacity_bound_is_computed_in_THIRTY_TWO_BIT_float() {
     // ⛔ The reference computes `float LB = 0.9; lb = LB * capacity` in single precision. The
     // captured value proves it: 0.9 * 39 is 35.1 exactly in decimal, but the reference reports

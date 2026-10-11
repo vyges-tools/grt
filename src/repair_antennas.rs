@@ -546,11 +546,9 @@ impl LibcxxIntSet {
                 let at = b.map_or(0, |p| p + 1);
                 out.insert(at, h);
                 // Positions after the insertion point shift by one.
-                for v in before.values_mut() {
-                    if let Some(p) = v {
-                        if *p >= at {
-                            *p += 1;
-                        }
+                for p in before.values_mut().flatten() {
+                    if *p >= at {
+                        *p += 1;
                     }
                 }
             } else {
@@ -751,7 +749,7 @@ fn find_pos_to_jumper(
         t.push(format!("cand|{}|{c}|win={w}|parent={},{}", seg_node.seg_id, parent_pos.0, parent_pos.1));
     }
     let pos = select_jumper_position(&mut candidate_positions, &free_windows, is_horizontal, parent_pos, (seg_init_x, seg_init_y), layer_level, net, sizes, router);
-    if let Some(t) = trace.as_deref_mut() {
+    if let Some(t) = trace {
         t.push(format!("sel|{}|{pos}", seg_node.seg_id));
     }
     (pos != -1).then_some(pos)

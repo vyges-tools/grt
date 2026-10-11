@@ -25,6 +25,9 @@ use crate::maze3d::{
 };
 use crate::softndr::UsageGrid;
 
+/// One 2D charge: (net index, horizontal, x, y, amount).
+pub type Charge2d = (usize, bool, i16, i16, i32);
+
 /// The router state the pass reads and writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PassGrid {
@@ -47,7 +50,7 @@ pub struct PassGrid {
     /// When set, every 2D charge in the order made: (net index, horizontal, x, y, amount). The
     /// reference charges 2D through `updateUsageH/V` — NDR-aware, and inserting into the used-grid
     /// sets on a positive charge — which a caller holding the real 2D graph replays from this.
-    pub log_2d: Option<Vec<(usize, bool, i16, i16, i32)>>,
+    pub log_2d: Option<Vec<Charge2d>>,
     /// The net being routed (its index in the pass's net slice), for the log.
     pub current_net: usize,
 }

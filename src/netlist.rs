@@ -112,12 +112,10 @@ pub fn find_fastroute_pins(pins: &[RouterPinFacts], grid: NetlistGrid, max_routi
         let conn = p.connection_layer.min(max_routing_layer);
         let x = (p.on_grid.0 - grid.x_min) / grid.tile_size;
         let y = (p.on_grid.1 - grid.y_min) / grid.tile_size;
-        if x >= 0 && x < grid.x_grids && y >= -1 && y < grid.y_grids && conn <= grid.num_layers && conn > 0 {
-            if !out.contains(&(x, y, conn)) {
-                out.push((x, y, conn));
-                if p.is_driver {
-                    root = out.len() - 1;
-                }
+        if x >= 0 && x < grid.x_grids && y >= -1 && y < grid.y_grids && conn <= grid.num_layers && conn > 0 && !out.contains(&(x, y, conn)) {
+            out.push((x, y, conn));
+            if p.is_driver {
+                root = out.len() - 1;
             }
         }
     }

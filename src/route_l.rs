@@ -116,7 +116,7 @@ pub fn spiral_route_all(
     for &id in net_ids {
         let nn = nets[id].ndr_net(id);
         let t = state[id].tree.as_mut().expect("tree");
-        let routed: Vec<((i32, i32), (i32, i32), crate::ripup_route::RoutedShape)> = t
+        let routed: Vec<crate::ripup_route::RoutedEdge> = t
             .edges
             .iter()
             .zip(&t.routes)

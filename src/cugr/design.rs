@@ -420,7 +420,8 @@ impl Design {
     /// technology's order wins. Cuts are boxes on the lower layer's upper (cut) layer; the
     /// enclosure area sums the boxes on the two metal layers.
     fn choose_via_for_pair<'a>(f: &'a DesignFacts, lower: &str, upper: &str, cut: &str) -> Option<&'a TechViaFacts> {
-        let mut best: Option<(&TechViaFacts, (bool, i32, bool, i64))> = None;
+        type Rank = (bool, i32, bool, i64);
+        let mut best: Option<(&TechViaFacts, Rank)> = None;
         for via in &f.vias {
             if via.bottom != lower || via.top != upper {
                 continue;
@@ -434,7 +435,7 @@ impl Design {
                 }
             }
             let key = (!via.or_default, cuts, !via.is_default, enc_area);
-            if best.as_ref().map_or(true, |(_, b)| key < *b) {
+            if best.as_ref().is_none_or(|(_, b)| key < *b) {
                 best = Some((via, key));
             }
         }

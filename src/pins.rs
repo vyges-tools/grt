@@ -182,6 +182,7 @@ pub fn make_iterm_pin(
 /// ⛔ A box outside the die is CLIPPED to it — but only when VERBOSE (the clip sits inside the
 /// warning's `if`). A quiet run keeps the box as it is. Same never-assigned `last_layer` as
 /// [`make_iterm_pin`]: the position is the last box's lower-left, after any clip.
+#[allow(clippy::too_many_arguments)]
 pub fn make_bterm_pin(
     name: &str,
     placed: bool,
@@ -351,6 +352,9 @@ pub fn port_access_points(per_pin: Vec<Vec<AccessPoint>>) -> Vec<AccessPoint> {
     out
 }
 
+/// `(on-grid positions (x, y, layer), moved to the edge, the edge point)`.
+pub type OnGridPositions = (Vec<(i32, i32, i32)>, bool, (i32, i32));
+
 /// `findOnGridPositions` → `(positions on grid as (x, y, level), has_access_points, pos_on_grid)`.
 ///
 /// With access points: every one, by LEVEL ascending (a `std::map`), each in its order; the last
@@ -362,7 +366,7 @@ pub fn find_on_grid_positions(
     pin: &NetPin,
     access_points: &[AccessPoint],
     reachable: &mut dyn FnMut(&NetPin, (i32, i32)) -> bool,
-) -> (Vec<(i32, i32, i32)>, bool, (i32, i32)) {
+) -> OnGridPositions {
     let mut out = Vec::new();
     let mut pos_on_grid = (0, 0);
     if !access_points.is_empty() {

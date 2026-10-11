@@ -16,6 +16,7 @@ use serde_json::Value;
 use vyges_grt::{relax_adjacent, MazeSearch, RelaxInputs, BIG_INT};
 use vyges_grt::mazecost::CostParams;
 
+#[allow(dead_code)] // the full reference record is parsed; not every field is asserted on
 struct Relax {
     design: String,
     cur: (i32, i32),

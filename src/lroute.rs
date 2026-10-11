@@ -115,6 +115,7 @@ pub enum EdgeRoute {
 /// ⚠️ **The full edge cost is charged here, not half.** The first pass charged half to each
 /// candidate because it had pre-loaded both; this pass rips up the previous route first, so the
 /// chosen path takes the whole cost and the other takes none.
+#[allow(clippy::too_many_arguments)]
 pub fn route_edge<G: Usage2d + ?Sized>(
     grid: &mut G,
     nodes: &mut [TreeNode],

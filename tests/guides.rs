@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The guide-writing rules, one test per rule, with the rule stated at the site.
 
+// The capitals in test names mark the rule each test pins.
+#![allow(non_snake_case)]
+
 use vyges_grt::*;
 
 fn grid() -> Grid {

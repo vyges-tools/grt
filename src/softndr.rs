@@ -303,7 +303,7 @@ pub fn compute_congested_ndr_nets(
 /// Transcribed as written; recorded as finding 9, and a test asserts the captured corpus has no
 /// ties so the difference cannot bite here.
 pub fn sort_congested_ndr_nets(nets: &mut [CongestedNdr]) {
-    nets.sort_unstable_by(|a, b| b.num_edges.cmp(&a.num_edges));
+    nets.sort_unstable_by_key(|n| std::cmp::Reverse(n.num_edges));
 }
 
 /// Take the given fraction of the most congested nets.

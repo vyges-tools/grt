@@ -6,6 +6,7 @@
 //! capacities from tracks → obstacles deducted → the per-layer resource totals → the user's
 //! adjustment. Capacities are doubles: an obstacle that blocks part of an edge's span removes that
 //! FRACTION of the track, so the sums below must run in the reference's order.
+#![allow(clippy::needless_range_loop)] // index loops walk the grids by the coordinates the traces report
 
 use std::rc::Rc;
 
@@ -731,15 +732,14 @@ impl GridGraph {
                         continue;
                     }
                     let mut capacity = 0.0;
-                    let effective;
-                    if ndr_active {
+                    let effective = if ndr_active {
                         let mut best = f64::MIN;
                         for &l in &layers {
                             let e = &self.graph_edges[l][x][y];
                             capacity += e.capacity;
                             best = best.max(e.capacity - e.demand);
                         }
-                        effective = best - (net_factor - 1.0);
+                        best - (net_factor - 1.0)
                     } else {
                         let mut demand = 0.0;
                         for &l in &layers {
@@ -747,8 +747,8 @@ impl GridGraph {
                             capacity += e.capacity;
                             demand += e.demand;
                         }
-                        effective = capacity - demand;
-                    }
+                        capacity - demand
+                    };
                     let length = f64::from(self.edge_length(direction, edge_index));
                     view[direction][x][y] = length
                         * (self.unit_length_wire_cost

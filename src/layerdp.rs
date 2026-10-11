@@ -21,6 +21,7 @@
 //! ⚠️ **The two directions are not mirror images.** Which end is fixed changes the index the
 //! availability test reads, the order the chosen layers are read back in, and whether the far
 //! end's layer is overwritten afterwards. Each difference is transcribed rather than levelled.
+#![allow(clippy::needless_range_loop)] // index loops walk the grids by the coordinates the traces report
 
 /// The reference's `BIG_INT`, here as the integer it is declared as.
 pub const BIG_INT: i64 = 1_000_000_000;

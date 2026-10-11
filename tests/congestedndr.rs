@@ -229,7 +229,7 @@ fn this_scan_counts_a_layer_change_that_the_other_skips() {
     let view = Both { overflow: 5 };
 
     assert_eq!(
-        compute_congested_ndr_nets(&[net.clone()], &view),
+        compute_congested_ndr_nets(std::slice::from_ref(&net), &view),
         vec![CongestedNdr { net_id: 0, num_edges: 1 }],
         "this scan must count the step although its layer changes"
     );

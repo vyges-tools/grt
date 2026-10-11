@@ -40,6 +40,9 @@ pub struct Region {
 /// An axis-aligned rectangle, `(x0, y0, x1, y1)` with `x0 <= x1`, `y0 <= y1`.
 pub type R = (i32, i32, i32, i32);
 
+/// Per scan position with a boundary: `(x, left edges, right edges)`.
+pub type ScanEdges = (i32, Vec<(i32, i32)>, Vec<(i32, i32)>);
+
 impl Region {
     /// `(∪ add) − (∪ sub)` — what a sequence of `+=` then `-=` leaves, whatever the order within
     /// each. Degenerate rectangles contribute nothing.
@@ -106,7 +109,7 @@ impl Region {
 
     /// Per scan position with a boundary: `(x, left edges, right edges)`, each list the maximal
     /// `[low, high]` intervals in ascending order. A LEFT edge has solid to its right.
-    pub fn edges(&self) -> Vec<(i32, Vec<(i32, i32)>, Vec<(i32, i32)>)> {
+    pub fn edges(&self) -> Vec<ScanEdges> {
         let ny = self.ys.len().saturating_sub(1);
         let mut out = Vec::new();
         for i in 0..self.xs.len() {
@@ -179,7 +182,7 @@ impl ScanLine {
         self.lines[l].state & VERTICAL_HEAD != 0
     }
     fn odd_length(&self, l: usize) -> bool {
-        (self.lines[l].ptdata.len() - 1) % 2 != 0
+        !(self.lines[l].ptdata.len() - 1).is_multiple_of(2)
     }
     fn tail_orient(&self, l: usize) -> bool {
         self.vertical_head(l) ^ self.odd_length(l)

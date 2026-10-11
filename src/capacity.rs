@@ -411,6 +411,9 @@ pub fn set_capacities(
     c
 }
 
+/// One edge's `(cap, cap_ndr)`.
+pub type CapNdr = (u16, f64);
+
 /// I12 — `initEdgesCapacityPerLayer`: the per-layer capacity the 2D phases monitor, copied from the
 /// 3D edges into `Cap3D { cap, cap_ndr }` — indexed `[layer][x][y]`, TRANSPOSED from the 3D edges'
 /// `[layer][y][x]`. Only real edges are copied (`x < x_grid - 1` horizontal, `y < y_grid - 1`
@@ -418,7 +421,7 @@ pub fn set_capacities(
 ///
 /// Returns `(horizontal, vertical)`, each flattened `(l * x_grid + x) * y_grid + y`, as
 /// `(cap, cap_ndr)`.
-pub fn init_edges_capacity_per_layer(c: &EdgeCapacities) -> (Vec<(u16, f64)>, Vec<(u16, f64)>) {
+pub fn init_edges_capacity_per_layer(c: &EdgeCapacities) -> (Vec<CapNdr>, Vec<CapNdr>) {
     let (xg, yg, nl) = (c.x_grid, c.y_grid, c.num_layers);
     let n = (nl * xg * yg) as usize;
     let (mut h, mut v) = (vec![(0u16, 0.0f64); n], vec![(0u16, 0.0f64); n]);

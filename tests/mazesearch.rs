@@ -98,7 +98,7 @@ fn searches_reach_the_same_meeting_point() {
     let (mut expansions, mut multi) = (0usize, 0usize);
 
     for s in &all {
-        let (x1, x2, _y1, y2) = s.region;
+        let (x1, _x2, _y1, y2) = s.region;
         // ⛔ The row stride is the distance grid's allocated width, which the flat cell index is
         // decomposed with — not the design's grid width.
         let mut st = MazeSearch::new(s.x_range, (y2 + 2) as usize);

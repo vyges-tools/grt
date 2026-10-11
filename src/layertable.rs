@@ -25,6 +25,7 @@
 //! The per-step free resource is captured; the table is derived from it. The reference reads the
 //! resource out of the 3D capacity and usage arrays, indexed by the step's own position — which
 //! is a database walk, not a rule. Splitting there keeps this piece about the rules.
+#![allow(clippy::needless_range_loop)] // index loops walk the grids by the coordinates the traces report
 
 /// A routing layer's preferred wire direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +87,7 @@ pub const BARRED: i32 = i32::MIN;
 ///
 /// ⚠️ `bound` moves only when the layer just examined is what pushed the best over the net's
 /// cost, so the widened bound names the **first** layer that sufficed, not the last one tried.
+#[allow(clippy::too_many_arguments)]
 fn fix_edge_assignment(
     bound: &mut usize,
     l: usize,

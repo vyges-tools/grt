@@ -45,7 +45,7 @@ fn unrle(v: &Value) -> Vec<EdgeState> {
         .iter()
         .flat_map(|p| {
             let e = EdgeState { cap: int(&p[0]) as u16, red: int(&p[1]) as u16, real_cap: int(&p[2]) as u16 };
-            std::iter::repeat(e).take(int(&p[3]) as usize)
+            std::iter::repeat_n(e, int(&p[3]) as usize)
         })
         .collect()
 }
@@ -60,7 +60,7 @@ struct State {
     vb: HashMap<(i32, i32, i32), IntervalSet>,
 }
 
-fn state(st: &Value, xg: i32, yg: i32, nl: i32) -> State {
+fn state(st: &Value, _xg: i32, yg: i32, nl: i32) -> State {
     let (mut h3, mut v3, mut h2, mut v2) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for l in 0..nl {
         for y in 0..yg {
@@ -211,7 +211,7 @@ fn replay(g: &Value) -> Seen {
                 }
             }
             seen.calls += 1;
-            log.extend(e.log.drain(..));
+            log.append(&mut e.log);
         }
         if !r["quiet"].as_bool().expect("flag") {
             let want: Vec<&str> = arr(&r["log"]).iter().map(|l| l.as_str().expect("line")).collect();

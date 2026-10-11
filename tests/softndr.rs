@@ -329,7 +329,7 @@ fn a_negative_step_count_is_skipped() {
         layer_edge_cost: None,
         edges: vec![NdrEdge { len: 10, routelen: -1, grids: vec![p(0, 0, 2), p(1, 0, 2)] }],
     };
-    assert!(congested_ndr_nets(&[n.clone()], &g).is_empty(), "the scan must skip it");
+    assert!(congested_ndr_nets(std::slice::from_ref(&n), &g).is_empty(), "the scan must skip it");
 
     // And so do both usage updates.
     let mut sink = Grid::default();

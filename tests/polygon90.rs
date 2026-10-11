@@ -22,6 +22,7 @@ fn formation_matches_boost() {
 }
 
 /// Every `CASE add|sub` of a probe corpus, compared polygon by polygon: `(cases, polygons)`.
+#[allow(clippy::type_complexity)]
 fn replay(text: &str) -> (usize, usize) {
     let (mut cases, mut polys) = (0, 0);
     let mut lines = text.lines();

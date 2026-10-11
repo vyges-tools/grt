@@ -76,21 +76,20 @@ pub fn planar_route(edges: &[PlanarEdge<'_>], net_min_layer: usize, layer_dir: &
         record_layer_and_bridge(last_x, last_y, last_l, &mut seen, &mut out);
         for i in 1..=e.routelen.max(0) as usize {
             let (xreal, yreal) = dbu(e.grids[i]);
-            let seg;
-            if last_x == xreal {
+            let seg = if last_x == xreal {
                 // A vertical step: change layer first if the walk was horizontal.
                 if last_l == layer_h {
                     push_unique(&mut out, Segment::new(last_x, last_y, last_l + 1, last_x, last_y, layer_v + 1));
                 }
                 last_l = layer_v;
-                seg = Segment::new(last_x, last_y, last_l + 1, xreal, yreal, last_l + 1);
+                Segment::new(last_x, last_y, last_l + 1, xreal, yreal, last_l + 1)
             } else {
                 if last_l == layer_v {
                     push_unique(&mut out, Segment::new(last_x, last_y, last_l + 1, last_x, last_y, layer_h + 1));
                 }
                 last_l = layer_h;
-                seg = Segment::new(last_x, last_y, last_l + 1, xreal, yreal, last_l + 1);
-            }
+                Segment::new(last_x, last_y, last_l + 1, xreal, yreal, last_l + 1)
+            };
             (last_x, last_y) = (xreal, yreal);
             push_unique(&mut out, seg);
             // Per hop: this edge may pass through a point an earlier edge left on another layer.

@@ -158,7 +158,7 @@ fn the_reachable_path_exercises_only_part_of_the_cluster() {
          this note says"
     );
     assert!(
-        all.iter().all(|c| c.soft_before == false),
+        all.iter().all(|c| !c.soft_before),
         "a net was demoted twice — the reference should have skipped it"
     );
     // ⚠️ The layered bracket and the congestion scan of R17 remain pinned by constructed cases

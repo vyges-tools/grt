@@ -103,12 +103,12 @@ fn an_edge_on_the_pin_layer_leaves_the_sentinel() {
     // Both ends arrive on layer 3, exactly the pin layer.
     record_layer_extremes(&mut nodes, &[EdgeLayers { n1: 0, n2: 1, len: 5, first: 3, last: 3 }]);
 
-    for d in 0..2 {
-        let e = layer_extremes(&nodes[d]);
+    for node in nodes.iter().take(2) {
+        let e = layer_extremes(node);
         assert_eq!((e.top_layer, e.bot_layer), (3, 3), "the pin layer is unchanged");
         assert_eq!(e.h_id, NONE, "nothing rises above the pin");
         assert_eq!(e.l_id, NONE, "nor drops below it");
-        assert_eq!(nodes[d].edges, vec![0], "but the edge is still recorded");
+        assert_eq!(node.edges, vec![0], "but the edge is still recorded");
     }
 }
 
@@ -141,6 +141,7 @@ fn a_later_edge_on_the_same_layer_does_not_displace_the_first() {
 
 /// ⚠️ A degenerate edge contributes nothing at all — not even to the edge list.
 #[test]
+#[allow(clippy::needless_range_loop)]
 fn a_degenerate_edge_is_not_recorded() {
     let mut nodes: Vec<SpiralNode> = (0..2).map(|d| SpiralNode {
         x: 0, y: 0, top_layer: -1, bot_layer: 0, assigned: false,

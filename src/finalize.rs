@@ -8,6 +8,7 @@
 //! `layerAssignmentV4` (the net order, the breadth-first walk calling `assignEdge`, the layer
 //! extremes) and `ConvertToFull3DType2` — then `getOverflow3D`. Each is one function below, in the
 //! reference's order, named after it.
+#![allow(clippy::needless_range_loop)] // index loops walk the grids by the coordinates the traces report
 
 use std::collections::VecDeque;
 

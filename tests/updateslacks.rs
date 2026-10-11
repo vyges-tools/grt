@@ -242,6 +242,7 @@ fn no_incremental_call_produces_candidates() {
     assert!(all.iter().any(|c| c.is_incremental), "no incremental call at all");
 }
 
+#[allow(dead_code)] // constructor kept for building further constructed cases
 fn one_net(id: usize, slack: f32, len: i32, pins: i32) -> (Vec<i32>, usize, f32, i32) {
     (vec![len], id, slack, pins)
 }
@@ -293,7 +294,7 @@ fn the_marked_count_rounds_up() {
 /// ⛔ Disabled, the pass writes **nothing** — not the slack, not the length, not the marks.
 #[test]
 fn a_disabled_pass_touches_nothing() {
-    let lens = vec![vec![40], vec![40]];
+    let lens = [vec![40], vec![40]];
     let nets: Vec<NetSlackInput> = (0..2).map(|i| NetSlackInput {
         net_id: i, slack: -5.0, edge_len: &lens[i], num_pins: 9,
         is_clock: true, has_ndr: true, is_res_aware: false, resistance: 7.0,
@@ -314,7 +315,7 @@ fn a_disabled_pass_touches_nothing() {
 /// the percentage. It still contributes to the worst metrics.
 #[test]
 fn a_clock_or_ndr_net_is_marked_outright_and_never_competes() {
-    let lens = vec![vec![40], vec![40], vec![40]];
+    let lens = [vec![40], vec![40], vec![40]];
     let nets = vec![
         NetSlackInput { net_id: 0, slack: -5.0, edge_len: &lens[0], num_pins: 9,
                         is_clock: true, has_ndr: false, is_res_aware: false, resistance: 7.0 },
@@ -370,7 +371,7 @@ fn no_incremental_net_is_kept_only_by_the_incremental_exemption() {
 /// ⛔ An incremental run keeps a positive-slack net that a normal run would filter out.
 #[test]
 fn an_incremental_run_keeps_a_positive_slack_net() {
-    let lens = vec![vec![40]];
+    let lens = [vec![40]];
     let net = |incremental: bool| {
         let nets = vec![NetSlackInput {
             net_id: 0,
@@ -418,7 +419,7 @@ fn no_captured_net_has_exactly_zero_slack() {
 /// zero".
 #[test]
 fn a_net_with_exactly_zero_slack_is_kept() {
-    let lens = vec![vec![40]];
+    let lens = [vec![40]];
     let nets = vec![NetSlackInput {
         net_id: 0, slack: 0.0, edge_len: &lens[0], num_pins: 4,
         is_clock: false, has_ndr: false, is_res_aware: false, resistance: 2.0,

@@ -181,7 +181,9 @@ fn real(tile: i32, j: i32, corner: i32) -> i32 {
 /// so sorted by `(x, y)`), each with the nets whose routed steps ALONG that direction start there
 /// (a step's congestion lives at its lower-left end: `(min x, min y)`).
 fn congestion_grid(cells: &[CongestedCell], nets: &[CrossingNet<'_>], vertical: bool, tile: i32, corner: (i32, i32)) -> Vec<CongestionMarker> {
-    let mut map: BTreeMap<(i32, i32), (i32, i32, BTreeSet<(u32, String)>)> = BTreeMap::new();
+    // Per cell: its capacity, its usage, the nets stepping from it.
+    type Cell = (i32, i32, BTreeSet<(u32, String)>);
+    let mut map: BTreeMap<(i32, i32), Cell> = BTreeMap::new();
     for &(j, i, cap, usage) in cells {
         map.insert((real(tile, j, corner.0), real(tile, i, corner.1)), (cap, usage, BTreeSet::new()));
     }

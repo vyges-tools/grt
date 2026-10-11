@@ -30,6 +30,7 @@ fn pwl_reads_inside_past_the_end_and_below_the_start() {
 
 /// The trace prints with `%.17g`; the formatter must agree with printf on every shape of number.
 #[test]
+#[allow(clippy::excessive_precision)] // golden literals copied verbatim from the reference's %.17g output
 fn g17_matches_printf() {
     assert_eq!(fmt_g17(0.0), "0");
     assert_eq!(fmt_g17(1.7408108108108109), "1.7408108108108109");

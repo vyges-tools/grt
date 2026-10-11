@@ -27,7 +27,7 @@ fn edges(rows: &Value, l: i32, ny: i32) -> Vec<(u16, u16)> {
         .flat_map(|y| {
             arr(&rows[format!("{l},{y}")])
                 .iter()
-                .flat_map(|p| std::iter::repeat((int(&p[0]) as u16, int(&p[1]) as u16)).take(int(&p[2]) as usize))
+                .flat_map(|p| std::iter::repeat_n((int(&p[0]) as u16, int(&p[1]) as u16), int(&p[2]) as usize))
                 .collect::<Vec<_>>()
         })
         .collect()
@@ -137,8 +137,8 @@ fn the_finish_reports_match_the_reference_exhaustively() {
 fn a_hopeless_horizontal_cell_abandons_the_suggestion() {
     let bad = CongestedGrid { real_cap: 5, usage: 8, layer_real_caps: vec![5] };
     let ok = CongestedGrid { real_cap: 20, usage: 10, layer_real_caps: vec![20] };
-    assert_eq!(compute_suggested_adjustment(&[bad], &[ok.clone()]), None);
-    assert_eq!(compute_suggested_adjustment(&[ok.clone()], &[]), Some(50));
+    assert_eq!(compute_suggested_adjustment(&[bad], std::slice::from_ref(&ok)), None);
+    assert_eq!(compute_suggested_adjustment(std::slice::from_ref(&ok), &[]), Some(50));
 }
 
 /// ⛔ GRT-704 — suppressed by the corpus harness (`suppress_message GRT 704`), so its text is pinned

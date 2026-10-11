@@ -39,7 +39,7 @@ fn unrle(row: &Value) -> Vec<Vec<f64>> {
         .flat_map(|p| {
             let p = arr(p);
             let vals: Vec<f64> = p[..p.len() - 1].iter().map(|v| v.as_f64().expect("number")).collect();
-            std::iter::repeat(vals).take(int(&p[p.len() - 1]) as usize)
+            std::iter::repeat_n(vals, int(&p[p.len() - 1]) as usize)
         })
         .collect()
 }
@@ -198,7 +198,7 @@ fn check_grid(at: &str, b: &Value, scan: &Overflow2DScan, g2d: &Graph2d, seen: &
     }
     for (dir, rows) in [("H", &b["est"]["H"]), ("V", &b["est"]["V"])] {
         for (y, row) in arr(rows).iter().enumerate() {
-            let flat: Vec<f64> = arr(row).iter().flat_map(|p| std::iter::repeat(p[0].as_f64().expect("f")).take(int(&p[1]) as usize)).collect();
+            let flat: Vec<f64> = arr(row).iter().flat_map(|p| std::iter::repeat_n(p[0].as_f64().expect("f"), int(&p[1]) as usize)).collect();
             for (x, &want) in flat.iter().enumerate() {
                 let ours = if dir == "H" { g2d.est.h(x, y) } else { g2d.est.v(x, y) };
                 assert_eq!(ours, want, "{at}: estimated usage {dir} ({x}, {y})");
@@ -207,7 +207,7 @@ fn check_grid(at: &str, b: &Value, scan: &Overflow2DScan, g2d: &Graph2d, seen: &
     }
     for (dir, rows) in [("H", &b["usage"]["H"]), ("V", &b["usage"]["V"])] {
         for (y, row) in arr(rows).iter().enumerate() {
-            let flat: Vec<i32> = arr(row).iter().flat_map(|p| std::iter::repeat(int(&p[0])).take(int(&p[1]) as usize)).collect();
+            let flat: Vec<i32> = arr(row).iter().flat_map(|p| std::iter::repeat_n(int(&p[0]), int(&p[1]) as usize)).collect();
             for (x, &want) in flat.iter().enumerate() {
                 let ours = if dir == "H" { g2d.est.usage_h(x, y) } else { g2d.est.usage_v(x, y) };
                 assert_eq!(ours as i32, want, "{at}: committed usage {dir} ({x}, {y})");
@@ -219,7 +219,7 @@ fn check_grid(at: &str, b: &Value, scan: &Overflow2DScan, g2d: &Graph2d, seen: &
         let Some(rows) = b.get(key) else { continue };
         for (dir, rows) in [("H", &rows["H"]), ("V", &rows["V"])] {
             for (y, row) in arr(rows).iter().enumerate() {
-                let flat: Vec<i32> = arr(row).iter().flat_map(|p| std::iter::repeat(int(&p[0])).take(int(&p[1]) as usize)).collect();
+                let flat: Vec<i32> = arr(row).iter().flat_map(|p| std::iter::repeat_n(int(&p[0]), int(&p[1]) as usize)).collect();
                 for (x, &want) in flat.iter().enumerate() {
                     let ours = match (key, dir) {
                         ("last", "H") => g2d.est.last_usage_h(x, y) as i32,
@@ -288,6 +288,7 @@ fn check_net_2d(at: &str, tag: &str, id: &str, n: &Value, b: &Value, state: &[Ne
 ///
 /// ⚠️ Not compared: an edge's xFirst / HVH / Zpoint and `last_routelen` — 2D-stage fields nothing
 /// reads after R16, which the 3D tree does not carry.
+#[allow(clippy::too_many_arguments)]
 fn check_boundary_3d(at: &str, b: &Value, scan: &Overflow2DScan, g2d: &Graph2d, g3: &Graph3d, state: &[NetState], nets: &[RsmtNet<'_>], seen: &mut Seen) {
     assert!(check_grid(at, b, scan, g2d, seen), "{at}: a 3D boundary is never thinned");
     let at = format!("{at} {}", b["tag"].as_str().expect("tag"));
@@ -525,7 +526,7 @@ fn replay_run(r: &Value, bounds: Option<&Value>, seen: &mut Seen) {
     let calls = arr(&r["calls"]);
     let ndr = calls.iter().flat_map(|c| arr(&c["nets"])).any(|n| int(&n["cost"]) != 1);
     let max_id = calls.iter().flat_map(|c| arr(&c["nets"])).map(|n| int(&n["id"]) as usize).max().unwrap_or(0);
-    assert!(calls.len() % 2 == 0, "{who}: gen_brk_RSMT calls come in pairs (R5, R7)");
+    assert!(calls.len().is_multiple_of(2), "{who}: gen_brk_RSMT calls come in pairs (R5, R7)");
     let group: Vec<&Value> = bounds.map(|b| arr(&b["boundaries"]).iter().collect()).unwrap_or_default();
     // Each `global_route` is one (R5, R7) pair and one group of boundaries.
     for (pass, pair) in calls.chunks(2).enumerate() {
@@ -593,7 +594,7 @@ fn replay_chain(who: &str, pass: usize, c5: &Value, c7: &Value, group: &[&Value]
     if let Some(b7) = at_b("B7") {
         for (d, cap) in [("H", &mut cap_h), ("V", &mut cap_v)] {
             for (y, row) in arr(&b7["cap"][d]).iter().enumerate() {
-                let flat: Vec<u16> = arr(row).iter().flat_map(|p| std::iter::repeat(int(&p[0]) as u16).take(int(&p[1]) as usize)).collect();
+                let flat: Vec<u16> = arr(row).iter().flat_map(|p| std::iter::repeat_n(int(&p[0]) as u16, int(&p[1]) as usize)).collect();
                 for (x, c) in flat.into_iter().enumerate() {
                     cap[y * xg + x] = c;
                 }
@@ -1413,6 +1414,7 @@ fn copy_br_restores_the_saved_routes_and_their_usage() {
 /// edge ONCE per net and gives it back WHOLE: an edge the loop crosses and the kept path also
 /// crosses is left uncharged. Transcribed, not levelled — pinned by the second half.
 #[test]
+#[allow(clippy::needless_range_loop)]
 fn remove_loops_all_cuts_the_detour_and_gives_back_its_usage() {
     use vyges_grt::estimate::Usage2d as _;
     let pins = [(0, 0), (4, 0)];
@@ -1476,6 +1478,7 @@ impl LaNet {
 
 /// Run R16 on constructed nets: each edge routed straight from its `n1` to its `n2`, every pin on
 /// layer 0, the 3D capacity from `cap(horizontal, layer, x, y)` and no usage.
+#[allow(clippy::too_many_arguments)]
 fn la_case(dirs: &[LayerDir], xg: usize, yg: usize, spec: &[LaNet], cap: impl Fn(bool, usize, usize, usize) -> u16, ids: &[usize], resistance_aware: bool, has_2d_overflow: bool) -> (Vec<NetState>, Graph3d) {
     let nl = dirs.len();
     let mut state: Vec<NetState> = spec.iter().map(|n| st_tree(n.pins.len(), &n.branches, &n.pins)).collect();

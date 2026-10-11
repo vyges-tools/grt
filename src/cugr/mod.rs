@@ -389,7 +389,7 @@ impl Cugr {
     ///
     /// ⚠️ The list is sorted IN PLACE, as upstream's is: an incremental route hands the sorted
     /// list on to stages 3 and 4.
-    pub fn pattern_route(&mut self, order: &mut Vec<usize>, alphas: &[f32], stt: pattern_route::SteinerBuilder<'_>, log: &mut Vec<String>, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
+    pub fn pattern_route(&mut self, order: &mut [usize], alphas: &[f32], stt: pattern_route::SteinerBuilder<'_>, log: &mut Vec<String>, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
         self.sort_net_indices(order, false, 1, None)?;
         if let Some(t) = trace.as_deref_mut() {
             trace::order(t, self, order, 1);
@@ -439,7 +439,7 @@ impl Cugr {
 
     /// `patternRouteWithDetours` (stage 3): the overflow view taken ONCE, the congested nets in the
     /// neutral order, each ripped up and pattern-routed again with detours through the view.
-    pub fn pattern_route_with_detours(&mut self, nets: &mut Vec<usize>, alphas: &[f32], stt: pattern_route::SteinerBuilder<'_>, log: &mut Vec<String>, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
+    pub fn pattern_route_with_detours(&mut self, nets: &mut [usize], alphas: &[f32], stt: pattern_route::SteinerBuilder<'_>, log: &mut Vec<String>, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
         if nets.is_empty() {
             return Ok(());
         }
@@ -483,7 +483,7 @@ impl Cugr {
     /// ripped up first, then the wire-cost view taken, the nets in the neutral order, each routed
     /// on a sparsified grid whose offset steps after every net, its tree laid onto layers by
     /// pattern routing, committed, and the view re-priced along it.
-    pub fn maze_route(&mut self, nets: &mut Vec<usize>, stage: i32, log: &mut Vec<String>, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
+    pub fn maze_route(&mut self, nets: &mut [usize], stage: i32, log: &mut Vec<String>, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
         if nets.is_empty() {
             return Ok(());
         }
@@ -516,7 +516,7 @@ impl Cugr {
             if has_ndr {
                 self.grid.extract_wire_cost_view(&mut ndr_view, &self.nets[k].ndr_costs, &self.constants, self.cost_multiplier);
             }
-            let (sparse, arena, found, steiner) = maze_route::maze_tree(&selected, if has_ndr { &ndr_view } else { &view }, &grid, &self.grid).map_err(|e| StageError::Maze(e))?;
+            let (sparse, arena, found, steiner) = maze_route::maze_tree(&selected, if has_ndr { &ndr_view } else { &view }, &grid, &self.grid).map_err(StageError::Maze)?;
             let cx = pattern_route::CostContext { grid: &self.grid, design: &self.design, constants: &self.constants, cost_multiplier: self.cost_multiplier };
             let mut route = pattern_route::pattern_route_tree(&mut self.nets[k], steiner, &cx).map_err(StageError::Pattern)?;
             route.maze = Some((sparse, arena, found));
@@ -675,6 +675,7 @@ impl Cugr {
     /// `CUGR::updateNet(net)` for a net the router holds: its tree's demand released (with its
     /// adopted flag), the net rebuilt from `net_facts` as new — no preferred access points, slack
     /// 0 — with its rule's factors, kept at 1 if it was soft-demoted; queued for the next route.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_net(&mut self, k: usize, pins: Vec<design::CugrPin>, layer_range: design::LayerRange, driver_term: &str, ndr_costs: Vec<f64>, ndr_widths: Vec<i32>, queue: &mut Vec<usize>) -> Result<(), StageError> {
         let was_soft = self.nets[k].soft_ndr;
         if self.nets[k].routing_tree.is_some() {

@@ -52,7 +52,7 @@ pub fn order_trees_for_ripup(nets: &[OrderTree]) -> Vec<OrderTree> {
     let mut v: Vec<OrderTree> = nets.to_vec();
 
     // 1 · descending congestion, STABLE
-    v.sort_by(|a, b| b.xmin.cmp(&a.xmin));
+    v.sort_by_key(|t| std::cmp::Reverse(t.xmin));
 
     // 2 · de-prioritise uncongested non-critical nets in the tail
     //
@@ -75,7 +75,7 @@ pub fn order_trees_for_ripup(nets: &[OrderTree]) -> Vec<OrderTree> {
 /// ⚠️ Without this, a mismatch in the final order says only "somewhere in three steps".
 pub fn order_by_congestion(nets: &[OrderTree]) -> Vec<String> {
     let mut v: Vec<OrderTree> = nets.to_vec();
-    v.sort_by(|a, b| b.xmin.cmp(&a.xmin));
+    v.sort_by_key(|t| std::cmp::Reverse(t.xmin));
     v.into_iter().map(|t| t.net).collect()
 }
 

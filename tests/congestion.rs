@@ -27,7 +27,7 @@ fn rows(g: &Value, dir: &str, k: &str, yg: i32) -> Vec<CongestionEdge> {
                 .iter()
                 .flat_map(|p| {
                     let e = CongestionEdge { cap: int(&p[0]) as u16, red: int(&p[1]) as u16, usage: int(&p[2]) as u16 };
-                    std::iter::repeat(e).take(int(&p[3]) as usize)
+                    std::iter::repeat_n(e, int(&p[3]) as usize)
                 })
                 .collect::<Vec<_>>()
         })
@@ -55,7 +55,7 @@ fn replay(g: &Value) -> Seen {
                 let got = update_db_congestion(xg, yg, &layer);
                 let want: Vec<(f32, f32)> = arr(&cells["rle"])
                     .iter()
-                    .flat_map(|p| std::iter::repeat((p[0].as_f64().expect("f") as f32, p[1].as_f64().expect("f") as f32)).take(int(&p[2]) as usize))
+                    .flat_map(|p| std::iter::repeat_n((p[0].as_f64().expect("f") as f32, p[1].as_f64().expect("f") as f32), int(&p[2]) as usize))
                     .collect();
                 assert_eq!(got.len(), want.len(), "{who}: layer {k} cell count");
                 if let Some(i) = got.iter().zip(&want).position(|(a, b)| a != b) {

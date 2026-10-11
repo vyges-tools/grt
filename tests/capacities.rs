@@ -27,7 +27,7 @@ fn arr(v: &Value) -> &Vec<Value> {
 
 /// `[[value, count], ...]` → the row.
 fn unrle(v: &Value) -> Vec<u16> {
-    arr(v).iter().flat_map(|p| std::iter::repeat(int(&p[0]) as u16).take(int(&p[1]) as usize)).collect()
+    arr(v).iter().flat_map(|p| std::iter::repeat_n(int(&p[0]) as u16, int(&p[1]) as usize)).collect()
 }
 
 fn direction(d: &str) -> Option<Direction> {
@@ -160,7 +160,7 @@ fn replay(g: &Value) -> Seen {
                         let want: Vec<(u16, f64)> = arr(&cp[key][format!("{l},{x}")])
                             .iter()
                             .flat_map(|p| {
-                                std::iter::repeat((int(&p[0]) as u16, p[1].as_f64().expect("f"))).take(int(&p[2]) as usize)
+                                std::iter::repeat_n((int(&p[0]) as u16, p[1].as_f64().expect("f")), int(&p[2]) as usize)
                             })
                             .collect();
                         let base = ((l * xg + x) * yg) as usize;

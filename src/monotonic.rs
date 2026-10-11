@@ -196,6 +196,7 @@ impl Grid2D {
 ///
 /// ⚠️ Each run stops **before** its destination; the destination is emitted by the run that
 /// follows, and the final endpoint is appended once at the end. So no corner is emitted twice.
+#[allow(clippy::too_many_arguments)]
 fn walk<G: crate::estimate::Usage2d + ?Sized>(
     grid: &mut G,
     points: &mut Vec<(i32, i32)>,

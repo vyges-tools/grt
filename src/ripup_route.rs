@@ -14,6 +14,9 @@
 
 use crate::estimate::Usage2d;
 
+/// One routed edge: its two ends and the shape it was routed with.
+pub type RoutedEdge = ((i32, i32), (i32, i32), RoutedShape);
+
 /// A route as the rip-up code finds it.
 ///
 /// ⚠️ Deliberately separate from the symbolic shapes fed to the expansion stage: by this point a
@@ -135,7 +138,7 @@ fn give_back_walked<G: Usage2d + ?Sized>(
 /// It is [`new_ripup`] over each edge, and is kept separate only because the reference does.
 pub fn new_ripup_net<G: Usage2d + ?Sized>(
     grid: &mut G,
-    edges: &[((i32, i32), (i32, i32), RoutedShape)],
+    edges: &[RoutedEdge],
     edge_cost: i8,
 ) {
     for (p1, p2, shape) in edges {

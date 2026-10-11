@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! One routing layer as CUGR models it (`MetalLayer`): tracks, the min-length and spacing rules its
 //! capacity and via-demand models read, and the user's capacity adjustment.
+#![allow(clippy::needless_range_loop)] // index loops walk the grids by the coordinates the traces report
 
 use super::geo::Interval;
 

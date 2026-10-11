@@ -30,7 +30,7 @@ pub fn netedge_order_dec(routelens: &[i32]) -> Vec<OrderNetEdge> {
         .enumerate()
         .map(|(edge_id, &length)| OrderNetEdge { length, edge_id })
         .collect();
-    out.sort_by(|a, b| b.length.cmp(&a.length));
+    out.sort_by_key(|e| std::cmp::Reverse(e.length));
     out
 }
 
@@ -1186,10 +1186,8 @@ pub fn remove_loops<G: crate::estimate::Usage2d + ?Sized>(
             }
         }
 
-        let mut cnt = 1usize;
-        for k in i + 1..=*routelen {
+        for (cnt, k) in (1usize..).zip(i + 1..=*routelen) {
             grids[j + cnt] = grids[k];
-            cnt += 1;
         }
         *routelen -= i - j;
         removed += 1;

@@ -173,7 +173,7 @@ fn replay(g: &Value, full_runs_only_log: bool) -> Seen {
     for r in arr(&g["runs"]) {
         let who = r["design"].as_str().expect("design");
         let contexts = arr(&r["contexts"]);
-        let complete = r.get("complete").map_or(true, |c| c.as_bool().expect("flag"));
+        let complete = r.get("complete").is_none_or(|c| c.as_bool().expect("flag"));
         let mut log = Vec::new();
         // Nets per context, in order.
         let mut by_ctx: BTreeMap<i32, Vec<&Value>> = BTreeMap::new();
@@ -208,10 +208,10 @@ fn replay(g: &Value, full_runs_only_log: bool) -> Seen {
                     if !replay_net(n, ctx, &mut seen, &mut log, who) {
                         break;
                     }
-                } else if next.peek().is_some_and(|n| n["name"].as_str() == Some(c.name.as_str())) {
-                    if !replay_net(next.next().expect("peeked"), ctx, &mut seen, &mut log, who) {
-                        break;
-                    }
+                } else if next.peek().is_some_and(|n| n["name"].as_str() == Some(c.name.as_str()))
+                    && !replay_net(next.next().expect("peeked"), ctx, &mut seen, &mut log, who)
+                {
+                    break;
                 }
             }
             // updateNetPins from later callers (incremental): no findNets around them.

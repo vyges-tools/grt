@@ -173,6 +173,7 @@ fn no_captured_edge_reaches_outside_its_layer_range() {
 /// ⚠️ The column past the last step is never written; [`vyges_grt::layerdp`]'s backward direction
 /// reads its orientation. Asserted on both sides so the two cannot drift apart.
 #[test]
+#[allow(clippy::needless_range_loop)]
 fn the_column_past_the_last_step_is_left_alone() {
     for c in &cases() {
         let (got, _) = run(c);

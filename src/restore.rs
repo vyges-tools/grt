@@ -109,6 +109,14 @@ pub fn net_is_covered(route: &[GSegment], pins: &[crate::Pin]) -> Vec<usize> {
     (0..pins.len()).filter(|&k| !route.iter().any(|s| segment_covers_pin(s, &pins[k]))).collect()
 }
 
+/// `loadGuidesFromDB`'s tail for one net's route, the same under both engines:
+/// `dedupViaSegments`, `addImplicitVias`, then `mergeSegments` against the net's pins.
+pub fn finish_loaded_route(route: &mut Vec<GSegment>, pins: &[crate::findrouting::GridPin], block_min_routing_layer: i32) {
+    dedup_via_segments(route);
+    add_implicit_vias(route);
+    crate::findrouting::merge_segments(pins, route, block_min_routing_layer);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,12 +186,3 @@ mod tests {
         assert_eq!(net_is_covered(&[s], &[at(50, 50, 1), at(250, 50, 1)]), vec![1]);
     }
 }
-
-/// `loadGuidesFromDB`'s tail for one net's route, the same under both engines:
-/// `dedupViaSegments`, `addImplicitVias`, then `mergeSegments` against the net's pins.
-pub fn finish_loaded_route(route: &mut Vec<GSegment>, pins: &[crate::findrouting::GridPin], block_min_routing_layer: i32) {
-    dedup_via_segments(route);
-    add_implicit_vias(route);
-    crate::findrouting::merge_segments(pins, route, block_min_routing_layer);
-}
-

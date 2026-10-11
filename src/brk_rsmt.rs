@@ -506,19 +506,18 @@ pub fn coeff_adj(net: &RsmtNet<'_>, grid: &BrkGrid<'_>) -> f32 {
     let cap = |x: i32, y: i32, h: bool| grid.caps.edge_capacity(net.min_layer, net.max_layer, x, y, h);
     let (mut hcap, mut vcap) = (0i32, 0i32);
     let (mut husage, mut vusage) = (0f32, 0f32);
-    let coef: f32;
-    if xmin == xmax {
+    let coef: f32 = if xmin == xmax {
         for j in ymin..ymax {
             vcap += cap(xmin, j, false);
             vusage = (vusage as f64 + grid.g.est.v(xmin as usize, j as usize)) as f32;
         }
-        coef = 1.0;
+        1.0
     } else if ymin == ymax {
         for i in xmin..xmax {
             hcap += cap(i, ymin, true);
             husage = (husage as f64 + grid.g.est.h(i as usize, ymin as usize)) as f32;
         }
-        coef = 1.0;
+        1.0
     } else {
         for j in ymin..=ymax {
             for i in xmin..xmax {
@@ -532,12 +531,12 @@ pub fn coeff_adj(net: &RsmtNet<'_>, grid: &BrkGrid<'_>) -> f32 {
                 vusage = (vusage as f64 + grid.g.est.v(i as usize, j as usize)) as f32;
             }
         }
-        coef = if husage * vcap as f32 > 0.0 {
+        if husage * vcap as f32 > 0.0 {
             (hcap as f32 * vusage) / (husage * vcap as f32)
         } else {
             1.2
-        };
-    }
+        }
+    };
     (coef as f64).max(1.2) as f32
 }
 

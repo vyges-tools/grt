@@ -127,6 +127,9 @@ pub struct LvRound {
     pub scan: Overflow2DScan,
 }
 
+/// A caller's look at each layer-assignment round as it ends.
+pub type RoundHook<'a> = dyn FnMut(usize, &LvRound, &Graph2d, &[NetState]) + 'a;
+
 /// run()'s LV block (R12) — `costheight_` from the pattern phase's `maxOverflow`, then three rounds
 /// of `routeMonotonicAll(newTH, enlarge_, logistic_coef)` + `getOverflow2Dmaze`.
 ///
@@ -142,7 +145,7 @@ pub fn lv_rounds(
     nets: &[RsmtNet<'_>],
     state: &mut [NetState],
     grid: &mut BrkGrid<'_>,
-    on_round: &mut dyn FnMut(usize, &LvRound, &Graph2d, &[NetState]),
+    on_round: &mut RoundHook<'_>,
 ) -> (i32, Vec<LvRound>) {
     const COSHEIGHT: i32 = 4;
     const LV_ITER: usize = 3;

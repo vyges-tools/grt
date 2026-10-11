@@ -6,6 +6,7 @@
 //! The checker's geometry is Boost.Polygon's, and only the REGION of each layer decides it — see
 //! [`crate::polygon90`] for why the polygons, their order and their hole slits still come out
 //! exactly as the reference's.
+#![allow(clippy::needless_range_loop)] // index loops walk the grids by the coordinates the traces report
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -182,7 +183,7 @@ pub fn save_gates(nodes: &mut LayerNodes, pins: &[PinFacts], tech: &TechLayers) 
     }
     // Highest level first, popped from the back: lowest first. (`std::sort`; ties are pins of one
     // level, whose order no union depends on.)
-    pin_polys.sort_by(|a, b| b.0.cmp(&a.0));
+    pin_polys.sort_by_key(|p| std::cmp::Reverse(p.0));
     let mut dsu = Dsu::new(node_count);
     let mut iter = tech.find_routing_layer(1);
     while let Some(t) = iter {
@@ -589,7 +590,7 @@ pub fn fmt_g17(v: f64) -> String {
             s.to_string()
         }
     };
-    if exp < -4 || exp >= 17 {
+    if !(-4..17).contains(&exp) {
         format!("{}e{}{:02}", strip(mant), if exp < 0 { '-' } else { '+' }, exp.abs())
     } else {
         let decimals = (16 - exp).max(0) as usize;

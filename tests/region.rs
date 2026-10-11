@@ -132,7 +132,7 @@ fn a_critical_net_narrows_its_region_from_the_seventh_iteration() {
     // ⛔ Capped at half the allowance, so the region cannot invert however late the iteration.
     let late = maze_edge_region((40, 40), (60, 40), 9999, 700, 1, true, (999, 999));
     assert!(late.0 <= late.1 && late.2 <= late.3, "the region inverted: {late:?}");
-    let enlarge = 9999i32.min((700 / 6 + 3) * 1);
+    let enlarge = 700 / 6 + 3; // min(9999, (700/6 + 3) * 1): the 9999 cap never binds and the factor is 1
     // ⚠️ and still clamped to the grid afterwards, which is what keeps it non-negative.
     assert_eq!(late.0, (40 - enlarge + enlarge / 2).max(0), "capped at half, then clamped");
 }

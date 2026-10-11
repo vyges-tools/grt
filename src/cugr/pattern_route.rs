@@ -5,6 +5,7 @@
 //!
 //! [`pattern_route_net`] is the stage's per-net sequence and nothing else; each step is its own
 //! function, named after the reference's, in the reference's order.
+#![allow(clippy::needless_range_loop)] // index loops walk the grids by the coordinates the traces report
 
 use std::collections::BTreeMap;
 
@@ -488,7 +489,7 @@ pub fn construct_detours(dag: &mut Dag, view: &super::grid_graph::View<bool>, si
             let mut shift = Interval::point(trunk_pos);
             let max_increase = (f64::from(trunk.range()) * c.max_detour_ratio) as i32;
             let size = sizes[1 - d] as i32;
-            while shift.low - 1 >= 0 && stem_length(&stems, shift.low - 1) - original <= max_increase {
+            while shift.low >= 1 && stem_length(&stems, shift.low - 1) - original <= max_increase {
                 shift.low -= 1;
             }
             while shift.high + 1 < size && stem_length(&stems, shift.high - 1) - original <= max_increase {
@@ -1019,7 +1020,7 @@ pub(crate) mod tests {
         c.nets.push(n);
         let stt = |x: &[i32], y: &[i32], _: usize, _: f32| vec![(x[0], y[0], 1), (x[1], y[1], 1)];
         let mut log = Vec::new();
-        c.pattern_route(&mut vec![0], &[0.3], &stt, &mut log, None).unwrap();
+        c.pattern_route(&mut [0], &[0.3], &stt, &mut log, None).unwrap();
         let t = c.nets[0].routing_tree.as_ref().unwrap();
         let s: Vec<(i32, i32, i32)> = t.preorder().iter().map(|&i| (t.nodes[i].layer, t.nodes[i].p.x, t.nodes[i].p.y)).collect();
         assert_eq!(s, vec![(0, 1, 2), (2, 1, 2), (2, 4, 2), (0, 4, 2)]);
