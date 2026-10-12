@@ -227,8 +227,9 @@ fn a_reinit_keeps_the_sets_and_capacities_but_not_the_overflow() {
     assert_eq!(l.get_cost_ndr_aware(&ndr(0, 3), 1, 1, 1.0, true), 0.0, "net 0 is still counted as present");
 }
 
-/// `copyRoutingStateFrom` takes capacities and overflow counts with the edges; the NDR sets only
-/// when asked, and otherwise clears its own.
+/// `copyRoutingStateFrom` takes capacities and overflow counts with the edges; the NDR records only
+/// when asked. Without them (since 27288f5) the records, the NDR capacity they reserved and the NDR
+/// overflow counts are reset together — a reservation with no record could never be released.
 #[test]
 fn a_copy_takes_the_sets_only_when_asked() {
     let mut src = ledger();
@@ -240,7 +241,9 @@ fn a_copy_takes_the_sets_only_when_asked() {
     without.copy_routing_state_from(&src, false);
     assert!(with.has_net(true, 1, 1, 0) && !with.has_net(true, 2, 2, 5));
     assert!(!without.has_net(true, 1, 1, 0) && !without.has_net(true, 2, 2, 5));
-    assert_eq!(without.cap(true, 0, 1, 1).cap_ndr, 7.0, "capacities come across either way");
+    assert_eq!(with.cap(true, 0, 1, 1).cap_ndr, 7.0, "with the records, the reservation comes across");
+    assert_eq!(without.cap(true, 0, 1, 1).cap_ndr, 10.0, "without them, the NDR capacity is reset to the capacity");
+    assert_eq!(without.overflow(true, 1, 1), 0);
 }
 
 /// `clearNDRnets` empties the sets and nothing else.
