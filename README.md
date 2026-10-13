@@ -159,11 +159,10 @@ that is *distinguishable* from a plain name sort, because on many designs it is 
 
 Each of these is pinned by a test that states the rule.
 
-## Relationship to OpenROAD
+## Provenance
 
-This engine reimplements behaviour published by the [OpenROAD](https://github.com/The-OpenROAD-Project/OpenROAD)
-project's global router. It is a reimplementation from published behaviour, not a transliteration,
-and carries no OpenROAD source.
+This engine reimplements published global-routing behaviour. It is a reimplementation, not a
+transliteration, and carries no third-party source.
 
 ## Licence
 

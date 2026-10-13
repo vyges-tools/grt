@@ -1702,11 +1702,8 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 }
                 std::fs::write(path, text).map_err(at(path))?;
             }
-            // The same networks as SPEF, for a timer that reads one.
-            //
-            // ⛔ Every node's ground capacitance is written, pin nodes included — OpenROAD's own
-            // writer emits `*CAP` only for nodes with no pin, so its file understates the load
-            // and no longer sums to its own `*D_NET` total (OpenROAD #11482).
+            // The same networks as SPEF, for a timer that reads one. Every node's ground
+            // capacitance is written, pin nodes included, so the file sums to its `*D_NET` total.
             "write_spef" => {
                 let path = step["path"].as_str().ok_or_else(|| err("path"))?;
                 // "partial" (the default): the planar routes the router's own slacks were read

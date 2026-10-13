@@ -5,8 +5,7 @@
 //! emitted as **route guides** — one rectangle per segment, on a layer — and guides are what the
 //! next stage consumes. This crate turns a routed net's segments into those guide records.
 //!
-//! Reimplemented from behaviour published by the OpenROAD project's global router, not
-//! transliterated from it.
+//! Reimplemented from published global-routing behaviour, not transliterated from any source.
 //!
 //! # Shape
 //!

@@ -2,7 +2,7 @@
 //! The second global router, `global_route -use_cugr`.
 //!
 //! Reimplemented from the behaviour of CUGR 2.0 (the Chinese University of Hong Kong; the EDGE
-//! global router) as the OpenROAD project's global router embeds it — no source is carried over.
+//! global router) as an open-source global router embeds it — no source is carried over.
 //!
 //! Built one stage at a time, earliest first. What exists:
 //!
