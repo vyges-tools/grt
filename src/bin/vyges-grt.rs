@@ -1702,8 +1702,10 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 }
                 std::fs::write(path, text).map_err(at(path))?;
             }
-            // The same networks as SPEF, for a timer that reads one. Every node's ground
-            // capacitance is written, pin nodes included, so the file sums to its `*D_NET` total.
+            // The same networks as SPEF, for a timer that reads one: `SpefWriter`'s file, written
+            // by est's writer — header and ports, then each net in the BLOCK's net order. A pin
+            // node is keyed as `PinIdLess` keys it, so `*CONN` and `*CAP` walk the pins in the
+            // reference's order; a route point `i` is the Steiner node `net:<i+1>`.
             "write_spef" => {
                 let path = step["path"].as_str().ok_or_else(|| err("path"))?;
                 // "partial" (the default): the planar routes the router's own slacks were read
@@ -1713,53 +1715,48 @@ fn run(job: &Value) -> Result<Value, Fail> {
                     "routed" => &routed_parasitics,
                     other => return Err(err(format!("write_spef source {other:?}: expected partial or routed"))),
                 };
-                let mut text = String::from(
-                    "*SPEF \"ieee 1481-1999\"\n*DESIGN \"vyges-grt\"\n*DATE \"\"\n*VENDOR \"Vyges\"\n*PROGRAM \"vyges-grt\"\n*VERSION \"1.0\"\n\
-                     *DESIGN_FLOW \"NAME_SCOPE LOCAL\" \"PIN_CAP NONE\"\n*DIVIDER /\n*DELIMITER :\n*BUS_DELIMITER []\n\
-                     *T_UNIT 1 NS\n*C_UNIT 1 PF\n*R_UNIT 1 KOHM\n*L_UNIT 1 HENRY\n\n",
-                );
-                for (net, g) in parasitics {
-                    // A parasitic node is `<instance>:<terminal>` for a pin, `<net>:<id>` otherwise.
-                    let pin_name = |p: &str| match p.rfind('/') {
-                        Some(i) => format!("{}:{}", &p[..i], &p[i + 1..]),
-                        None => p.to_string(),
-                    };
-                    let node_name = |n: &vyges_grt::parasitics::NodeId| match n {
-                        vyges_grt::parasitics::NodeId::Pin(p) => pin_name(p),
-                        vyges_grt::parasitics::NodeId::Point(i) => format!("{net}:{}", i + 1),
-                    };
-                    // ⚠️ Only `$` is escaped; the database's names already carry their bracket escapes.
-                    let esc = |s: &str| s.replace('$', "\\$");
-                    let total: f64 = g.nodes.iter().map(|(_, c)| f64::from(*c)).sum();
-                    text.push_str(&format!("*D_NET {} {}\n*CONN\n", esc(net), total * 1e12));
-                    let pins = parasitic_pins.get(net).cloned().unwrap_or_default();
-                    for (n, _) in &g.nodes {
-                        if let vyges_grt::parasitics::NodeId::Pin(p) = n {
-                            let pin = pins.iter().find(|q| q.name == *p);
-                            let dir = if pin.is_some_and(|q| q.is_driver) { "O" } else { "I" };
-                            // A port is `*P`, an instance terminal `*I`; a port's direction is
-                            // the other way round, since a driving port feeds the net.
-                            if pin.is_some_and(|q| q.is_port) {
-                                text.push_str(&format!("*P {} {}\n", esc(p), if dir == "O" { "I" } else { "O" }));
-                            } else {
-                                text.push_str(&format!("*I {} {}\n", esc(&pin_name(p)), dir));
+                let u = opts.liberty.as_ref().and_then(|l| l.units).ok_or_else(|| Fail::Refused("write_spef without a liberty library: the timer's default units are not modelled".into()))?;
+                let su = vyges_est::spef::SpefUnits { time: u.time, capacitance: u.capacitance, resistance: u.resistance };
+                let mut text = vyges_est::spef::header(&db, su);
+                for net in db.block_get_nets() {
+                    let Some(g) = parasitics.get(&net) else { continue };
+                    let pins = parasitic_pins.get(&net).cloned().unwrap_or_default();
+                    let mut p = vyges_est::network::Parasitic::default();
+                    let node = |n: &vyges_grt::parasitics::NodeId, p: &mut vyges_est::network::Parasitic| -> Result<vyges_est::network::Node, Fail> {
+                        Ok(match n {
+                            vyges_grt::parasitics::NodeId::Point(i) => {
+                                let id = u32::try_from(*i + 1).map_err(err)?;
+                                p.sub_nodes.entry(id).or_insert(0.0);
+                                vyges_est::network::Node::Sub(id)
                             }
+                            vyges_grt::parasitics::NodeId::Pin(name) => {
+                                let is_port = pins.iter().find(|q| q.name == *name).is_some_and(|q| q.is_port);
+                                let loc = vyges_est::placement::PinLoc { name: name.clone(), is_port, x: 0, y: 0, placed: false };
+                                let key = vyges_est::placement::pin_key(&db, &loc).map_err(err)?;
+                                p.pin_nodes.entry(key).or_insert_with(|| {
+                                    let (io_type, master) = if is_port {
+                                        (db.bterm_get_io_type(name), String::new())
+                                    } else {
+                                        let (inst, term) = name.rsplit_once('/').unwrap_or((name, ""));
+                                        (db.iterm_get_io_type(inst, term), db.inst_get_master(inst))
+                                    };
+                                    vyges_est::network::PinNode { name: name.clone(), is_port, io_type, master, cap: 0.0 }
+                                });
+                                vyges_est::network::Node::Pin(key)
+                            }
+                        })
+                    };
+                    for (n, c) in &g.nodes {
+                        match node(n, &mut p)? {
+                            vyges_est::network::Node::Sub(id) => *p.sub_nodes.get_mut(&id).expect("made") += *c,
+                            vyges_est::network::Node::Pin(k) => p.pin_nodes.get_mut(&k).expect("made").cap += *c,
                         }
                     }
-                    let caps: Vec<&(vyges_grt::parasitics::NodeId, f32)> = g.nodes.iter().filter(|(_, c)| *c != 0.0).collect();
-                    if !caps.is_empty() {
-                        text.push_str("*CAP\n");
-                        for (i, (n, c)) in caps.iter().enumerate() {
-                            text.push_str(&format!("{} {} {}\n", i + 1, esc(&node_name(n)), f64::from(*c) * 1e12));
-                        }
+                    for (a, b, r) in &g.resistors {
+                        let (a, b) = (node(a, &mut p)?, node(b, &mut p)?);
+                        p.resistors.push((a, b, *r));
                     }
-                    if !g.resistors.is_empty() {
-                        text.push_str("*RES\n");
-                        for (i, (a, b, v)) in g.resistors.iter().enumerate() {
-                            text.push_str(&format!("{} {} {} {}\n", i + 1, esc(&node_name(a)), esc(&node_name(b)), f64::from(*v) / 1000.0));
-                        }
-                    }
-                    text.push_str("*END\n\n");
+                    text.push_str(&vyges_est::spef::write_net(&net, &p, su));
                 }
                 std::fs::write(path, text).map_err(at(path))?;
             }
