@@ -39,10 +39,12 @@ JOB (JSON):
     { "cmd": "write_guides", "path": ".." }
     { "cmd": "write_db", "path": ".." }            (the database as global_route leaves it: guides, gcell grid, what detailed routing reads)
     { "cmd": "antenna_wires", "path": ".." }      (the wires antenna checking synthesises from the guides)
-    { "cmd": "repair_antennas", "violations": "..", "jumper_only": b, "diode_only": b, "iterations": n,
-      "allow_congestion": b, "trace": ".." }
-      violations: the reference checker's, captured (`VYGA|viol|…` lines) — an ORACLE; the
-      violation check itself is not modelled. Diode insertion is refused.
+    { "cmd": "repair_antennas", "diode_cell": s, "iterations": n, "ratio_margin": f, "jumper_only": b,
+      "diode_only": b, "allow_congestion": b, "violations": "..", "trace": ".." }
+      diode_cell: the master to repair with (its one signal terminal); without it, the first
+      CORE ANTENNACELL with diffusion area. Jumpers, then diodes legalized in place, then the
+      dirty nets rerouted. violations (optional): the reference checker's answers, captured
+      (`VYGA|viol|…` lines), in place of this engine's own check.
 
 OPTIONS:
   -o FILE      write the JSON report to FILE instead of stdout

@@ -273,7 +273,23 @@ pub struct NetRoute {
     pub segments: Vec<GSegment>,
     pub pins: Vec<Pin>,
     /// A net entirely inside one grid cell. Local nets take the two-guide via form.
+    ///
+    /// ⚠️ A CACHE of `Net::isLocal()`, which the reference computes from the net's pins on every
+    /// call: replace the pins with [`NetRoute::set_pins`], never by assigning `pins`.
     pub is_local: bool,
+}
+
+impl NetRoute {
+    /// The net's pins as they stand now, and `is_local` from them.
+    ///
+    /// Upstream rule (`Net::isLocal`, read live by `saveGuides`): a net that a moved instance
+    /// spreads over two grid cells is no longer local, so its vias take the one-guide form. A
+    /// stale flag wrote the two-guide form for every via of `_0042_` on rv_plic_lite after
+    /// antenna repair's legalization moved a cell (2026-10-14).
+    pub fn set_pins(&mut self, pins: Vec<Pin>) {
+        self.is_local = is_local(&pins);
+        self.pins = pins;
+    }
 }
 
 /// A guide record: one rectangle, on a layer, with the layer a via rises to.

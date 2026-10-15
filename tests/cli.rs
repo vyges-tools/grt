@@ -164,3 +164,47 @@ fn write_db_leaves_guides_and_the_gcell_grid_in_the_database() {
     assert!(db.gcell_grid_pattern_x(1).is_err() && db.gcell_grid_pattern_y(1).is_err(), "one pattern per axis");
     assert_eq!(db.block_bool_property("grt_use_cugr").unwrap(), Some(false));
 }
+
+/// tiny.lef plus `DIODE0`: a CORE ANTENNACELL whose one signal terminal has NO diffusion area.
+fn lef_with_dead_diode() -> String {
+    let lef = std::fs::read_to_string(data("tiny.lef")).unwrap();
+    let cut = lef.rfind("END LIBRARY").unwrap();
+    let diode = "MACRO DIODE0\n  CLASS CORE ANTENNACELL ;\n  ORIGIN 0 0 ;\n  SIZE 0.5 BY 1.2 ;\n  SITE core ;\n  PIN DIODE\n    DIRECTION INPUT ;\n    USE SIGNAL ;\n    PORT\n      LAYER M1 ;\n        RECT 0.1 0.25 0.4 0.45 ;\n    END\n  END DIODE\nEND DIODE0\n\n";
+    let path = tmp("dead-diode.lef");
+    std::fs::write(&path, format!("{}{diode}{}", &lef[..cut], &lef[cut..])).unwrap();
+    path.to_str().unwrap().to_string()
+}
+
+fn repair_with(name: &str, repair: serde_json::Value) -> (Output, serde_json::Value) {
+    route(name, serde_json::json!({
+        "lefs": [lef_with_dead_diode()], "def": data("tiny.def"),
+        "steps": [{ "cmd": "global_route" }, repair]
+    }), &[])
+}
+
+/// `repair_antennas [diode_cell]` resolves the cell in its Tcl, before the C++ runs: `findMaster`
+/// (GRT-69 when absent), then the master's terminals that are neither POWER nor GROUND — exactly
+/// one, or GRT-73. Upstream `GlobalRouter.tcl`, `proc repair_antennas`.
+#[test]
+fn a_named_diode_cell_must_exist_and_have_one_signal_terminal() {
+    let (o, r) = repair_with("diode-missing.json", serde_json::json!({ "cmd": "repair_antennas", "diode_cell": "NOPE" }));
+    assert_eq!(o.status.code(), Some(2), "{r}");
+    assert_eq!(r["reason"], "[ERROR GRT-0069] Diode cell NOPE not found.", "{r}");
+    let (o, r) = repair_with("diode-two.json", serde_json::json!({ "cmd": "repair_antennas", "diode_cell": "BUF" }));
+    assert_eq!(o.status.code(), Some(2), "{r}");
+    assert_eq!(r["reason"], "[ERROR GRT-0073] Diode cell has more than one non power/ground port.", "{r}");
+}
+
+/// The named cell is used AS GIVEN: `findDiodeMTerm` (which skips a terminal with no diffusion
+/// area) is only the fallback when no cell is named. So naming `DIODE0` reaches the C++'s
+/// `diffArea(diode_mterm) == 0.0` error (GRT-244), while naming nothing finds no usable diode and
+/// warns (GRT-246) and does nothing. Upstream `GlobalRouter::repairAntennas`.
+#[test]
+fn a_named_diode_bypasses_the_search_and_its_diffusion_area_is_checked() {
+    let (o, r) = repair_with("diode-dead.json", serde_json::json!({ "cmd": "repair_antennas", "diode_cell": "DIODE0" }));
+    assert_eq!(o.status.code(), Some(2), "{r}");
+    assert_eq!(r["reason"], "[ERROR GRT-0244] Diode DIODE0/DIODE ANTENNADIFFAREA is zero.", "{r}");
+    let (o, r) = repair_with("diode-none.json", serde_json::json!({ "cmd": "repair_antennas" }));
+    assert_eq!(o.status.code(), Some(0), "{r}");
+    assert!(r["log"].as_array().unwrap().iter().any(|l| l == "GRT-0246: No diode with LEF class CORE ANTENNACELL found."), "{r}");
+}

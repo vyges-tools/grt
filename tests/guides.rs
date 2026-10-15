@@ -103,6 +103,21 @@ fn a_via_on_a_LOCAL_net_writes_TWO_guides_in_both_layer_directions() {
     assert_eq!(g[0].box_, g[1].box_, "both guides cover the same box");
 }
 
+/// `Net::isLocal()` is computed from the net's CURRENT pins each time `saveGuides` asks. A net
+/// that was local, then had a pin moved to another grid cell (antenna repair's legalization moving
+/// an instance, before the incremental re-route), writes each via as ONE guide — the cached flag
+/// must follow the pins (`NetRoute::set_pins`). Witness: `_0042_`, rv_plic_lite, 2026-10-14.
+#[test]
+fn a_net_whose_pins_moved_apart_is_no_longer_local() {
+    let mut n = net(vec![]);
+    n.set_pins(vec![Pin { connection_layer: 1, on_grid_x: 300, on_grid_y: 300 }, Pin { connection_layer: 1, on_grid_x: 300, on_grid_y: 300 }]);
+    assert!(n.is_local);
+    assert_eq!(guides_for_segment(&n, &via(300, 300, 2, 3), &grid(), &opts()).unwrap().len(), 2);
+    n.set_pins(vec![Pin { connection_layer: 1, on_grid_x: 300, on_grid_y: 300 }, Pin { connection_layer: 1, on_grid_x: 900, on_grid_y: 300 }]);
+    assert!(!n.is_local);
+    assert_eq!(guides_for_segment(&n, &via(300, 300, 2, 3), &grid(), &opts()).unwrap().len(), 1);
+}
+
 #[test]
 fn a_via_covering_a_pin_also_writes_TWO_guides() {
     // is_covering_pin compares the segment's FINAL point and its TOP layer.

@@ -2541,7 +2541,7 @@ fn load_routing_from_db_guides(a: &mut AfterRoute, fresh: &std::collections::BTr
     match a.net_routes.iter_mut().find(|r| r.name == name) {
         Some(r) => {
             r.segments = route.clone();
-            r.pins = pins;
+            r.set_pins(pins);
         }
         None => a.net_routes.push(crate::NetRoute { name: name.to_string(), segments: route.clone(), pins, is_local: n.is_local }),
     }
@@ -2743,7 +2743,7 @@ fn merge_results(a: &mut AfterRoute, routes: std::collections::BTreeMap<String, 
         let Some(segs) = routes.get(&r.name) else { continue };
         r.segments = segs.clone();
         if let Some(n) = a.router_nets.iter().find(|n| n.name == r.name) {
-            r.pins = n.net_pins.iter().map(|p| crate::Pin { connection_layer: p.connection_layer, on_grid_x: p.on_grid.0, on_grid_y: p.on_grid.1 }).collect();
+            r.set_pins(n.net_pins.iter().map(|p| crate::Pin { connection_layer: p.connection_layer, on_grid_x: p.on_grid.0, on_grid_y: p.on_grid.1 }).collect());
         }
     }
 }

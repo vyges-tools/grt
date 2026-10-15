@@ -54,10 +54,12 @@ JOB (JSON):
     { \"cmd\": \"write_guides\", \"path\": \"..\" }
     { \"cmd\": \"write_db\", \"path\": \"..\" }            (the database as global_route leaves it: guides, gcell grid, what detailed routing reads)
     { \"cmd\": \"antenna_wires\", \"path\": \"..\" }      (the wires antenna checking synthesises from the guides)
-    { \"cmd\": \"repair_antennas\", \"violations\": \"..\", \"jumper_only\": b, \"diode_only\": b, \"iterations\": n,
-      \"allow_congestion\": b, \"trace\": \"..\" }
-      violations: the reference checker's, captured (`VYGA|viol|…` lines) — an ORACLE; the
-      violation check itself is not modelled. Diode insertion is refused.
+    { \"cmd\": \"repair_antennas\", \"diode_cell\": s, \"iterations\": n, \"ratio_margin\": f, \"jumper_only\": b,
+      \"diode_only\": b, \"allow_congestion\": b, \"violations\": \"..\", \"trace\": \"..\" }
+      diode_cell: the master to repair with (its one signal terminal); without it, the first
+      CORE ANTENNACELL with diffusion area. Jumpers, then diodes legalized in place, then the
+      dirty nets rerouted. violations (optional): the reference checker's answers, captured
+      (`VYGA|viol|…` lines), in place of this engine's own check.
 
 OPTIONS:
   -o FILE      write the JSON report to FILE instead of stdout
@@ -101,7 +103,7 @@ const DESCRIBE: &str = r#"{
     "input_hash covers the argument vector, not the content of the job file or of the design files it names.",
     "Correlated end to end on the guide files it writes, compared against a fresh reference run: 85 of 85 cases of the reference router's own global-routing regression suite, 2026-09-25 -- 80 exact from the scripts' inputs, and 5 exact on a database whose pin access points vyges-drt pin_access wrote. Both routers are covered (the default one and the CUGR one), with timing-driven routing timed by this engine's own timer and no captured slacks. The correlation harness is not part of this repository.",
     "write_db is correlated on the database it writes: on 84 of 84 comparable cases of the same suite it equals the reference's database right after global routing -- every net's guides in order, the gcell grid, the routing layers and the grt_use_cugr property -- 2026-09-26. Detailed-routing that database with vyges-drt gives a DEF byte-identical to the reference's global_route plus detailed_route on 67 of them, antenna-repair jumper routes included, and differs on none; of the rest the detailed router refuses 9 and the reference itself routes nothing on 8. Not written: the gcell grid's per-cell capacity and usage, which nothing downstream reads.",
-    "One input is an ORACLE: repair_antennas takes the antenna violations as the reference checker reports them (its `violations` file); the violation check itself is not modelled. Diode insertion is refused. timer_slacks, when given, also answers the timer's reads from a captured file instead of computing them.",
+    "repair_antennas checks the antennas itself and inserts jumpers and diodes; a captured `violations` file can stand in for its check, as an ORACLE. timer_slacks, when given, also answers the timer's reads from a captured file instead of computing them.",
     "REFUSED rather than approximated: reading pin access points during antenna checking or antenna-wire synthesis; a second repair iteration; incremental routing with no CUGR route in the session; database edits the incremental bracket does not model (named); RC commands before any liberty library; a clock period with no liberty library to time it; any step not listed in --help.",
     "Global routing that ends congested without allow_congestion is an error, as it is in the reference (after the guides are saved).",
     "The Steiner trees are built by vyges-stt and the placement parasitics by vyges-est, each correlated separately."
@@ -440,12 +442,12 @@ impl vyges_grt::wire_codec::CodecTech for DbCodec {
 /// each wired net checked — its violations as `(net, routing level, gate names)`, nets in block
 /// order (the violation map's order), each net's in the checker's order.
 #[allow(clippy::type_complexity)]
-fn check_design(db: &Db, db_guides: &BTreeMap<String, Vec<vyges_grt::Guide>>, with_diode: bool, ratio_margin: f32) -> Result<Vec<Viol>, Fail> {
+fn check_design(db: &Db, db_guides: &BTreeMap<String, Vec<vyges_grt::Guide>>, diode: Option<&(String, String)>, ratio_margin: f32) -> Result<Vec<Viol>, Fail> {
     let (nets, wtech, vias) = ant_nets(db, db_guides)?;
     let wires = vyges_grt::wire_builder::make_net_wires_from_guides(&nets, db.block_get_g_cell_tile_size(), &wtech).map_err(|e| Fail::Refused(format!("{e:?}")))?;
     let codec = DbCodec::read(db, &vias)?;
     let tech = tech_layers(db)?;
-    let mut checker = Checker::read(db, with_diode, ratio_margin)?;
+    let mut checker = Checker::read(db, diode, ratio_margin)?;
     let mut out = Vec::new();
     for w in &wires {
         let ops = vyges_grt::wire_codec::encode(&w.ops, &codec).map_err(|e| Fail::Refused(format!("net {}: {e}", w.net)))?;
@@ -472,7 +474,7 @@ struct Checker {
 }
 
 impl Checker {
-    fn read(db: &Db, with_diode: bool, ratio_margin: f32) -> Result<Self, Fail> {
+    fn read(db: &Db, diode: Option<&(String, String)>, ratio_margin: f32) -> Result<Self, Fail> {
         use vyges_grt::antenna_check::{AntennaRule, LayerAntenna};
         use vyges_opendb::DiffCurve;
         let layers = db
@@ -500,21 +502,8 @@ impl Checker {
                 thickness_dbu: db.layer_thickness(l).max(0) as u32,
             })
             .collect();
-        // findDiodeMTerm: the first CORE ANTENNACELL master's first terminal with diffusion area.
-        let mut diode_diff_area = None;
-        if with_diode {
-            'masters: for (m, t) in db.masters_with_types().map_err(err)? {
-                if t == "CORE ANTENNACELL" {
-                    for (term, _) in db.master_mterms(&m).map_err(err)? {
-                        let d = db.mterm_antenna_diff_area(&m, &term);
-                        if d > 0.0 {
-                            diode_diff_area = Some(d);
-                            break 'masters;
-                        }
-                    }
-                }
-            }
-        }
+        // The diode the checker counts with: the one repair_antennas resolved.
+        let diode_diff_area = diode.map(|(m, t)| db.mterm_antenna_diff_area(m, t));
         Ok(Checker { layers, dbu_per_micron: f64::from(db.tech_get_db_units_per_micron()), diode_diff_area, ratio_margin, text: String::new() })
     }
 
@@ -626,6 +615,40 @@ fn read_violation_blocks(path: &str) -> Result<Vec<Vec<Viol>>, Fail> {
     Ok(blocks)
 }
 
+/// `RepairAntennas::findDiodeMTerm`: the first CORE ANTENNACELL master, in library order, and its
+/// first terminal with diffusion area (`diffArea` > 0).
+fn find_diode_mterm(db: &Db) -> Result<Option<(String, String)>, Fail> {
+    for (m, t) in db.masters_with_types().map_err(err)? {
+        // ⚠️ `dbMasterType::getString` spells it with a SPACE.
+        if t == "CORE ANTENNACELL" {
+            for (term, _) in db.master_mterms(&m).map_err(err)? {
+                if db.mterm_antenna_diff_area(&m, &term) > 0.0 {
+                    return Ok(Some((m, term)));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The diode `repair_antennas` repairs with, as its Tcl resolves it before the C++ runs: with a
+/// `diode_cell` argument, that master (`findMaster`, GRT-69) and its one terminal that is neither
+/// POWER nor GROUND (GRT-73 when there are more); without one, `findDiodeMTerm`. `None` is the
+/// GRT-246 case: no argument and no CORE ANTENNACELL with diffusion area.
+fn repair_diode_mterm(db: &Db, step: &Value) -> Result<Option<(String, String)>, Fail> {
+    let Some(cell) = step["diode_cell"].as_str() else { return find_diode_mterm(db) };
+    if !db.masters_with_types().map_err(err)?.iter().any(|(m, _)| m == cell) {
+        return Err(Fail::Error(format!("[ERROR GRT-0069] Diode cell {cell} not found.")));
+    }
+    let signal: Vec<String> = db.master_mterms(cell).map_err(err)?.into_iter().filter(|(_, sig)| sig != "POWER" && sig != "GROUND").map(|(t, _)| t).collect();
+    match signal.as_slice() {
+        [term] => Ok(Some((cell.to_string(), term.clone()))),
+        // The Tcl's loop leaves `diode_mterm` unset: a Tcl error, not a coded one.
+        [] => Err(Fail::Refused(format!("diode cell {cell} has no signal terminal"))),
+        _ => Err(Fail::Error("[ERROR GRT-0073] Diode cell has more than one non power/ground port.".into())),
+    }
+}
+
 /// `repair_antennas` as `GlobalRouter::repairAntennas` runs it, with the CHECKER's answers captured.
 ///
 /// One iteration: the violations of the first check → `jumperInsertion` (unless `-diode_only`) →
@@ -642,7 +665,7 @@ enum RepairRouter<'a> {
 /// `saved_guides` is set when a `saveGuides` ran (the jumper pass, or a diode iteration) — which is
 /// what writes the block's `grt_use_cugr` property in the reference, even when no guide changed.
 #[allow(clippy::too_many_arguments)]
-fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, router: RepairRouter<'_>, db_guides: &BTreeMap<String, Vec<vyges_grt::Guide>>, has_access_points: bool, padding: (i32, i32), log: &mut Vec<String>, saved_guides: &mut bool) -> Result<Vec<vyges_grt::NetGuides>, Fail> {
+fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, diode: Option<&(String, String)>, router: RepairRouter<'_>, db_guides: &BTreeMap<String, Vec<vyges_grt::Guide>>, has_access_points: bool, padding: (i32, i32), log: &mut Vec<String>, saved_guides: &mut bool) -> Result<Vec<vyges_grt::NetGuides>, Fail> {
     let (mut fast, mut cugr) = match router {
         RepairRouter::FastRoute(s, t) => (Some((s, t)), None),
         RepairRouter::Cugr(c, g) => (None, Some((c, g))),
@@ -653,19 +676,13 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, router: Repai
     let iterations = step["iterations"].as_i64().unwrap_or(1);
     // The Tcl sets the router's allow_congestion from THIS command's flag.
     let allow_congestion = step["allow_congestion"].as_bool().unwrap_or(false);
-    // findDiodeMTerm: the first CORE ANTENNACELL master, in library order, with a terminal that has
-    // diffusion area. Without one the command warns (GRT-246) and does nothing at all.
-    let mut has_diode = false;
-    for (m, t) in db.masters_with_types().map_err(err)? {
-        // ⚠️ `dbMasterType::getString` spells it with a SPACE.
-        if t == "CORE ANTENNACELL" && db.master_mterms(&m).map_err(err)?.iter().any(|(term, _)| db.mterm_antenna_diff_area(&m, term) > 0.0) {
-            has_diode = true;
-            break;
-        }
-    }
-    if !has_diode {
+    // No diode found: the command warns and does nothing at all (after the router is set up).
+    let Some(diode) = diode else {
         log.push("GRT-0246: No diode with LEF class CORE ANTENNACELL found.".into());
         return Ok(Vec::new());
+    };
+    if db.mterm_antenna_diff_area(&diode.0, &diode.1) == 0.0 {
+        return Err(Fail::Error(format!("[ERROR GRT-0244] Diode {}/{} ANTENNADIFFAREA is zero.", diode.0, diode.1)));
     }
     let ratio_margin = step["ratio_margin"].as_f64().unwrap_or(0.0) as f32;
     // The checker's answers: ours, or — with "violations" — the reference's, captured.
@@ -677,7 +694,7 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, router: Repai
     let order = db.net_names();
     let mut first = match &oracle {
         Some(blocks) => blocks.first().cloned().unwrap_or_default(),
-        None => check_design(db, db_guides, true, ratio_margin)?,
+        None => check_design(db, db_guides, Some(diode), ratio_margin)?,
     };
     first.sort_by_key(|(n, ..)| order.iter().position(|m| m == n).unwrap_or(usize::MAX));
     let tech = tech_layers(db)?;
@@ -786,10 +803,14 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, router: Repai
             for ng in &saved {
                 after.insert(ng.net.clone(), ng.guides.clone());
             }
-            check_design(db, &after, true, ratio_margin)?
+            check_design(db, &after, Some(diode), ratio_margin)?
         }
     };
     second.sort_by_key(|(n, ..)| order.iter().position(|m| m == n).unwrap_or(usize::MAX));
+    // Every checkAntennaViolations call logs its count — the one after the jumpers too.
+    if jumpers_ran {
+        log.push(format!("GRT-0012: Found {} antenna violations.", second.iter().map(|v| &v.0).collect::<BTreeSet<_>>().len()));
+    }
     // The command's `while (violations && itr < iterations)`: each pass inserts diodes for the
     // violations it holds and reroutes the dirty nets; a later pass first re-checks ONLY those
     // nets (`nets_to_repair` = the dirty nets), on the guides the previous pass saved.
@@ -799,7 +820,7 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, router: Repai
     while !second.is_empty() && !jumper_only {
         // What the router's callbacks will see move: every instance's location and orientation.
         let placed_before: BTreeMap<String, ((i32, i32), String)> = db.inst_names().into_iter().map(|i| (i.clone(), (db.inst_location(&i), db.inst_get_orient(&i)))).collect();
-        let diodes = insert_diodes(db, &second, padding, &mut text, log)?;
+        let diodes = insert_diodes(db, &second, diode, padding, &mut text, log)?;
         // "Diode insertion deletes the jumpers in guides": a net given diodes loses its jumpers
         // mark (`db_net->setJumpers(false)`), so the detailed router routes it at the ordinary
         // off-guide cost again.
@@ -862,7 +883,7 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, router: Repai
                     for ng in &saved {
                         after.insert(ng.net.clone(), ng.guides.clone());
                     }
-                    check_design(db, &after, true, ratio_margin)?
+                    check_design(db, &after, Some(diode), ratio_margin)?
                 }
             };
             checks += 1;
@@ -905,10 +926,31 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, router: Repai
         let modified: Vec<vyges_grt::NetRoute> = nets_to_repair.iter().filter_map(|n| state.net_routes.iter().find(|r| &r.name == n).cloned()).collect();
         *saved_guides = true;
         saved.extend(vyges_grt::save_guides(&modified, &state.jumper_grid.grid, &sopts).map_err(|e| err(format!("{e:?}")))?);
-        if iterations > 1 {
+        if itr >= iterations {
+            break;
+        }
+        // The next pass opens with its check — over the dirty nets only, on the guides just saved —
+        // and the loop ends when it finds nothing: `while (violations && itr < iterations)`. Only a
+        // violation left over is a second repair. ⛔ Refusing on `iterations > 1` alone refused the
+        // open flow's `-iterations 3` on a design the reference finishes in one pass (rv_plic_lite:
+        // 35 → 7 jumpers → 29 → 31 diodes → "Found 0 antenna violations.").
+        itr += 1;
+        second = match &oracle {
+            Some(blocks) => blocks.get(checks).cloned().unwrap_or_default(),
+            None => {
+                let mut after = db_guides.clone();
+                for ng in &saved {
+                    after.insert(ng.net.clone(), ng.guides.clone());
+                }
+                check_design(db, &after, Some(diode), ratio_margin)?
+            }
+        };
+        checks += 1;
+        second = vyges_grt::repair_antennas::recheck_scope(second, |v| &v.0, &nets_to_repair, &order);
+        log.push(format!("GRT-0012: Found {} antenna violations.", second.iter().map(|v| &v.0).collect::<BTreeSet<_>>().len()));
+        if !second.is_empty() {
             return Err(Fail::Refused("a second repair iteration after a FastRoute route is not modelled".into()));
         }
-        break;
     }
     if jumper_only && !second.is_empty() && iterations > 1 {
         return Err(Fail::Refused("a second repair iteration is not modelled".into()));
@@ -920,22 +962,10 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, router: Repai
 /// fixed instances and hard blockages collected, then per violation, per gate, per diode needed, a
 /// diode created beside the gate (`insertDiode`), placed, marked, connected — and itself added to
 /// the fixed set the next one avoids.
-fn insert_diodes(db: &mut Db, violations: &[Viol], padding: (i32, i32), text: &mut String, log: &mut Vec<String>) -> Result<Vec<String>, Fail> {
+fn insert_diodes(db: &mut Db, violations: &[Viol], diode: &(String, String), padding: (i32, i32), text: &mut String, log: &mut Vec<String>) -> Result<Vec<String>, Fail> {
     use vyges_grt::repair_antennas::{place_diode, DiodeFloor, DiodeGate, DiodeRow};
     let r = |v: &[i32]| vyges_grt::Rect { x_min: v[0], y_min: v[1], x_max: v[2], y_max: v[3] };
-    // findDiodeMTerm
-    let mut diode = None;
-    'm: for (m, t) in db.masters_with_types().map_err(err)? {
-        if t == "CORE ANTENNACELL" {
-            for (term, _) in db.master_mterms(&m).map_err(err)? {
-                if db.mterm_antenna_diff_area(&m, &term) > 0.0 {
-                    diode = Some((m.clone(), term));
-                    break 'm;
-                }
-            }
-        }
-    }
-    let (diode_master, diode_term) = diode.ok_or_else(|| err("no diode master"))?;
+    let (diode_master, diode_term) = (diode.0.clone(), diode.1.clone());
     let mut rows = Vec::new();
     let mut site_width = -1;
     for i in 0..db.num_rows().map_err(err)? {
@@ -1826,7 +1856,8 @@ fn run(job: &Value) -> Result<Value, Fail> {
                     // With "checker": the ratios and the verdict, `VYGC|<net>|info|…` and `…|viol|…`.
                     // "checker_diode" answers as repair_antennas does (with its diode), otherwise as
                     // check_antennas (none).
-                    let mut checker = step["checker"].as_str().map(|_| Checker::read(&db, step["checker_diode"].as_bool().unwrap_or(false), step["ratio_margin"].as_f64().unwrap_or(0.0) as f32)).transpose()?;
+                    let diode = if step["checker_diode"].as_bool().unwrap_or(false) { find_diode_mterm(&db)? } else { None };
+                    let mut checker = step["checker"].as_str().map(|_| Checker::read(&db, diode.as_ref(), step["ratio_margin"].as_f64().unwrap_or(0.0) as f32)).transpose()?;
                     let codec = DbCodec::read(&db, &vias)?;
                     let tech = tech_layers(&db)?;
                     let mut text = String::new();
@@ -1902,6 +1933,11 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 padding = (step["left"].as_i64().unwrap_or(0) as i32, step["right"].as_i64().unwrap_or(0) as i32);
             }
             "repair_antennas" => {
+                // The Tcl resolves `diode_cell` before the router is touched — after GRT-45 only.
+                if after.is_none() && !routed_by_cugr && !from_db {
+                    return Err(Fail::Error("[ERROR GRT-0045] Run global_route before repair_antennas.".into()));
+                }
+                let diode = repair_diode_mterm(&db, step)?;
                 // No route in this session, over a database a CUGR route was saved to: the engine
                 // is the block's `grt_use_cugr` property (`ensureEngineSelected`), and the router is
                 // set up around the database's guides (`loadGuidesFromDB`, `initCUGR`, adoption).
@@ -1918,7 +1954,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 if routed_by_cugr {
                     let (cugr, cg) = cugr_state.as_mut().ok_or_else(|| Fail::Refused("cugr: no router state".into()))?;
                     let mut saved = false;
-                    let repaired = repair_antennas(&mut db, &opts, step, RepairRouter::Cugr(cugr, cg), &db_guides, has_access_points, padding, &mut log, &mut saved)?;
+                    let repaired = repair_antennas(&mut db, &opts, step, diode.as_ref(), RepairRouter::Cugr(cugr, cg), &db_guides, has_access_points, padding, &mut log, &mut saved)?;
                     if saved {
                         used_cugr = Some(true);
                     }
@@ -1943,7 +1979,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 }
                 let (state, total_overflow) = after.as_mut().expect("set above");
                 let mut saved = false;
-                let repaired = repair_antennas(&mut db, &opts, step, RepairRouter::FastRoute(state, *total_overflow), &db_guides, has_access_points, padding, &mut log, &mut saved)?;
+                let repaired = repair_antennas(&mut db, &opts, step, diode.as_ref(), RepairRouter::FastRoute(state, *total_overflow), &db_guides, has_access_points, padding, &mut log, &mut saved)?;
                 if saved {
                     used_cugr = Some(false);
                 }
