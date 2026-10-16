@@ -11,7 +11,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::brk_rsmt::{gen_brk_rsmt, BrkFlags, BrkGrid, BrkSummary, Caps3D, Flutes, NetState, RsmtNet, RsmtTree};
+use crate::brk_rsmt::{gen_brk_rsmt, BrkFlags, BrkGrid, BrkSummary, Caps3D, Flutes, NetState, RsmtNet, RsmtTree, StTree};
 use crate::checks3d::Overflow3D;
 use crate::congestion_loop::{congestion_loop, LoopEnd, LoopEvent, LoopStart};
 use crate::estimate::EstimateGrid;
@@ -260,11 +260,27 @@ pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn 
     let layer = LayerParams { layer_dir: inp.layer_dir, resistance_aware: inp.resistance_aware, liberty: inp.liberty, has_2d_overflow: end.has_2d_overflow, ra: ra.as_ref(), incremental: inp.resume.is_some() };
     let mut order = layer_assignment(ids, nets, attrs, state, &mut g3, &layer)?;
     let overflow = get_overflow_3d_all(&g2d, &g3);
-    let past_cong = scan.total_overflow;
+    let mut past_cong = scan.total_overflow;
     stop_unless!(Stage::B16 { past_cong, overflow: &overflow }, Some(&g3));
-    // R17
-    if past_cong != overflow.total {
-        return Err("R17: 2D and 3D overflow differ — disableNDRForCongestedNets is not wired".into());
+    // R17 — 2D and 3D overflow disagree: `disableNDRForCongestedNets(net_ids_)`, then
+    // `long_edge_len = BIG_INT` and both overflows read again.
+    let r17 = past_cong != overflow.total;
+    if r17 {
+        // The scan skips a net with no rule and a net already soft. With none left it returns
+        // before warning (GRT-0297) — ascon_core, where the loop had demoted all nine clock nets.
+        // A pending net is demoted only when a step of its layered route sits on a 2D overflow or
+        // an oversubscribed 3D edge (`congested_ndr_nets`); the demotion itself (3D usage out,
+        // `applySoftNDR`, 3D usage back) is not wired — refused if the scan finds one.
+        let pending: Vec<crate::softndr::NdrNet> = ids
+            .iter()
+            .filter(|&&id| start.has_ndr.get(id).copied().unwrap_or(false) && !state[id].soft_ndr)
+            .map(|&id| r17_ndr_net(id, nets[id].edge_cost, state[id].tree.as_ref()))
+            .collect();
+        let congested = crate::softndr::congested_ndr_nets(&pending, &R17View { g2d: &g2d, g3: &g3 });
+        if !congested.is_empty() {
+            return Err(format!("R17: 2D and 3D overflow differ and {} NDR net(s) sit on congested edges — the demotion's 3D usage re-accounting is not wired", congested.len()));
+        }
+        past_cong = g2d.get_overflow_2d_maze().total_overflow;
     }
     // R18 — costheight_ 3, via_cost_ 1; run()'s local enlarge_ as the loop left it.
     if past_cong == 0 {
@@ -272,7 +288,7 @@ pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn 
         // by resistance awareness).
         // ⚠️ The soft-NDR half is UNWITNESSED: both scripts that demote end congested, so this pass
         // (`past_cong == 0`) never runs after a demotion — a mutant leaving 40 survives them.
-        let long = if inp.resistance_aware || !end.soft_ndr.is_empty() { BIG_INT } else { 40 };
+        let long = if inp.resistance_aware || !end.soft_ndr.is_empty() || r17 { BIG_INT } else { 40 };
         let short = if inp.resistance_aware { BIG_INT } else { 12 };
         for (tag, ub) in [("B18a", long), ("B18b", short)] {
             let mp = Maze3dParams { layer: &layer, expand: end.enlarge, ripup_lb: 0, ripup_ub: ub, via_cost: 1 };
@@ -285,6 +301,56 @@ pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn 
     stop_unless!(Stage::B19(&fin), Some(&g3));
     // R20
     Ok(RunEnd::Routed(get_routes_all(ids, state, inp.db_id, inp.origin)))
+}
+
+/// R17's view of a net: its tree's routes as layer assignment left them (each grid point with its
+/// layer).
+fn r17_ndr_net(id: usize, edge_cost: i8, tree: Option<&StTree>) -> crate::softndr::NdrNet {
+    use crate::full3d::Point3D;
+    crate::softndr::NdrNet {
+        net_id: id,
+        has_ndr: true,
+        is_soft_ndr: false,
+        edge_cost,
+        layer_edge_cost: None,
+        edges: tree.map_or_else(Vec::new, |t| {
+            t.edges
+                .iter()
+                .zip(&t.routes)
+                .map(|(e, r)| crate::softndr::NdrEdge {
+                    len: e.len,
+                    routelen: r.routelen,
+                    grids: r.grids.iter().zip(&r.layers).map(|(&(x, y), &layer)| Point3D { x: x as i16, y: y as i16, layer }).collect(),
+                })
+                .collect()
+        }),
+    }
+}
+
+/// What R17's scan reads: the 2D overflow (`graph2d_.getOverflowV/H`) and each layer's capacity
+/// less usage (`v_edges_3D_` / `h_edges_3D_`).
+struct R17View<'a> {
+    g2d: &'a Graph2d,
+    g3: &'a Graph3d,
+}
+
+impl crate::softndr::CongestionView for R17View<'_> {
+    fn overflow_v(&self, x: i16, y: i16) -> i32 {
+        let (x, y) = (x as usize, y as usize);
+        i32::from(self.g2d.est.usage_v(x, y)) - i32::from(self.g2d.cap_v[y * self.g2d.est.x_grids + x])
+    }
+    fn overflow_h(&self, x: i16, y: i16) -> i32 {
+        let (x, y) = (x as usize, y as usize);
+        i32::from(self.g2d.est.usage_h(x, y)) - i32::from(self.g2d.cap_h[y * self.g2d.est.x_grids + x])
+    }
+    fn available_v(&self, layer: i16, x: i16, y: i16) -> i32 {
+        let i = self.g3.at(i32::from(x), i32::from(y));
+        i32::from(self.g3.v_cap[layer as usize][i]) - i32::from(self.g3.v_usage[layer as usize][i])
+    }
+    fn available_h(&self, layer: i16, x: i16, y: i16) -> i32 {
+        let i = self.g3.at(i32::from(x), i32::from(y));
+        i32::from(self.g3.h_cap[layer as usize][i]) - i32::from(self.g3.h_usage[layer as usize][i])
+    }
 }
 
 /// The 2D graph at entry: the estimated usage, the capacities, and the NDR ledger's per-layer

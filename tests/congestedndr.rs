@@ -155,7 +155,7 @@ fn the_congested_edge_counts_match_the_reference() {
 fn the_order_and_the_fractions_match_the_reference() {
     for c in &calls() {
         let mut got = compute_congested_ndr_nets(&c.nets, &c.reads);
-        sort_congested_ndr_nets(&mut got);
+        sort_congested_ndr_nets(&mut got).unwrap();
         let order: Vec<usize> = got.iter().map(|n| n.net_id).collect();
         assert_eq!(order, c.want_sorted, "sorted order on {}", c.design);
 
@@ -171,24 +171,17 @@ fn the_order_and_the_fractions_match_the_reference() {
     }
 }
 
-/// ⛔ **The sort's instability cannot bite here, because no call has a tie** — asserted, because
-/// the reference uses an unstable sort over a single-key comparator with no tie-break, the only
-/// ordering in this engine that is not stable. Recorded as finding 9.
+/// ⛔ **The reference's sort is unstable, over a single-key comparator with no tie-break** (finding
+/// 9): libc++'s introsort keeps tied nets in their scan order below 24 elements, and Rust's
+/// `sort_unstable` does not promise to. Two ties among a few nets, as a design produced them
+/// (ascon_core: the first witness, 2026-10-16).
 #[test]
-fn no_call_has_two_nets_with_the_same_count() {
-    for c in &calls() {
-        let mut counts: Vec<u16> = c.want_counts.iter()
-            .map(|(_, n)| *n).filter(|n| *n > 0).collect();
-        let before = counts.len();
-        counts.sort_unstable();
-        counts.dedup();
-        assert_eq!(
-            counts.len(), before,
-            "{} now has two NDR nets with the same congested-edge count — the unstable sort's \
-             order becomes unspecified and our answer may differ from the reference's",
-            c.design
-        );
-    }
+fn tied_counts_keep_the_scan_order_as_libcxx_does() {
+    let n = |net_id, num_edges| vyges_grt::CongestedNdr { net_id, num_edges };
+    let mut got = vec![n(3, 10), n(7, 25), n(9, 10), n(12, 4), n(15, 25)];
+    sort_congested_ndr_nets(&mut got).unwrap();
+    let order: Vec<usize> = got.iter().map(|c| c.net_id).collect();
+    assert_eq!(order, vec![7, 15, 3, 9, 12]);
 }
 
 // ─── The two scans, side by side ────────────────────────────────────────────────────────────

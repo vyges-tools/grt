@@ -8,9 +8,16 @@
 //!
 //! ⚠️ **Only the congestion loop's selection and `applySoftNDR` fire in the corpus**
 //! ([`crate::congestion_loop::soft_ndr_demotion`]): `soft_ndr_4w_6s` demotes 2 nets and
-//! `soft_ndr_escalation` 6, each once, both exact end to end. R17's
-//! [`disable_ndr_for_congested_nets`] (GRT-0297, 2D and 3D overflow disagreeing) fires on neither
-//! and stays pinned by constructed cases only.
+//! `soft_ndr_escalation` 6, each once, both exact end to end. R17 (2D and 3D overflow disagreeing)
+//! fires on a fresh design, ascon_core (2026-10-16): the loop had demoted nine of its ten clock NDR
+//! nets, the tenth sits on no congested edge, so the scan returns before warning (no GRT-0297) and
+//! the guides are byte-identical. The demotion itself ([`disable_ndr_for_congested_nets`]'s usage
+//! re-accounting) is still unwitnessed and REFUSED in `run`.
+//!
+//! ⛔ **A demoted net stays soft across an incremental re-route** (`FrNet::reset` restores the edge
+//! cost and per-layer costs but not `is_soft_ndr_`): its edge cost is the fresh NDR one again, its
+//! per-layer costs read 1. Dropping the flag moved 397 of ascon_core's nets after the first antenna
+//! pass.
 //!
 //! ⛔ **The re-accounting is a BRACKET, and the order inside it is the behaviour.** Usage is
 //! removed at the old cost, the net is demoted, and usage is re-added at the new one. Both the
@@ -298,12 +305,15 @@ pub fn compute_congested_ndr_nets(
 
 /// Order the congested nets, most congested first.
 ///
-/// ⛔ **An UNSTABLE sort over a comparator with ONE key and no tie-break** — the only ordering in
-/// this engine that is not stable. Two nets with the same count therefore have unspecified order.
-/// Transcribed as written; recorded as finding 9, and a test asserts the captured corpus has no
-/// ties so the difference cannot bite here.
-pub fn sort_congested_ndr_nets(nets: &mut [CongestedNdr]) {
-    nets.sort_unstable_by_key(|n| std::cmp::Reverse(n.num_edges));
+/// ⛔ **An UNSTABLE sort over a comparator with ONE key and no tie-break** (`std::ranges::sort`,
+/// `a.num_edges > b.num_edges`) — the only ordering in this engine that is not stable (finding 9).
+/// Two nets with the same count are ordered as libc++'s introsort leaves them, which
+/// [`crate::order::libcxx_sort_by`] transcribes: in input (net id scan) order below 24 nets. The
+/// first tie witnessed was a fresh design's (ascon_core, 2026-10-16). Past introsort's depth
+/// limit the heap-sort fallback is not transcribed: refused.
+pub fn sort_congested_ndr_nets(nets: &mut [CongestedNdr]) -> Result<(), String> {
+    crate::order::libcxx_sort_by(nets, |a, b| a.num_edges > b.num_edges)
+        .map_err(|h| format!("soft-NDR: sorting {} congested NDR nets reaches libc++'s heap-sort fallback, which is not modelled", h.len))
 }
 
 /// Take the given fraction of the most congested nets.

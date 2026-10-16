@@ -67,7 +67,7 @@ pub struct Graph3d {
 }
 
 impl Graph3d {
-    fn at(&self, x: i32, y: i32) -> usize {
+    pub(crate) fn at(&self, x: i32, y: i32) -> usize {
         y as usize * self.x_grid + x as usize
     }
 }

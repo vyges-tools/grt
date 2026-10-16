@@ -93,6 +93,7 @@ pub mod rsmt;
 pub mod brk_rsmt;
 pub mod ndr_cost;
 pub mod graph2d;
+pub mod order;
 pub use graph2d::{Graph2d, NetUsage};
 pub mod route_l;
 pub mod maze_phase;

@@ -444,9 +444,9 @@ static SOFT_LAYER_EDGE_COST: [i8; 256] = [1; 256];
 /// `getCostNDRAware`): the refund removes the net from each edge's NDR set and gives back its cost
 /// — ×100 while the edge is in NDR overflow — and the re-charge at cost 1 passes straight through.
 ///
-/// ⛔ `sortCongestedNDRnets` is an UNSTABLE `std::ranges::sort` on the congested-edge count alone.
-/// Two nets with the same count would be ordered by libc++'s algorithm, which is not modelled: a
-/// tie is REFUSED. The two witnesses have none (counts 25/10, and 25/22/16/15/14/10).
+/// ⛔ `sortCongestedNDRnets` is an UNSTABLE `std::ranges::sort` on the congested-edge count alone:
+/// two nets with the same count are ordered by libc++'s algorithm, transcribed (see
+/// [`crate::softndr::sort_congested_ndr_nets`]).
 pub fn soft_ndr_demotion(
     net_ids: &[usize],
     nets: &mut [RsmtNet<'_>],
@@ -490,10 +490,7 @@ pub fn soft_ndr_demotion(
         })
         .collect();
     let mut congested = compute_congested_ndr_nets(&scan_nets, &View(grid.g));
-    sort_congested_ndr_nets(&mut congested);
-    if congested.windows(2).any(|w| w[0].num_edges == w[1].num_edges) {
-        return Err("soft-NDR: two congested NDR nets tie on their count — libc++'s unstable sort order is not modelled".into());
-    }
+    sort_congested_ndr_nets(&mut congested)?;
     let ids = congested_ndr_nets_by_fraction(&congested, 1.0);
     // applySoftNDR: updateSoftNDRNetUsage(-edge cost), setSoftNDR, updateSoftNDRNetUsage(+edge cost).
     let charge = |grid: &mut BrkGrid<'_>, net: &RsmtNet<'_>, id: usize, t: &StTree, amount: f64| {

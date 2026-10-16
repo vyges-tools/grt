@@ -2600,13 +2600,33 @@ fn init_fast_route_incr(a: &mut AfterRoute, fresh: &std::collections::BTreeMap<S
         // A net down to fewer than two pins is not re-added (`initNetlist` skips it): no pins.
         let name = a.router_nets[id].name.clone();
         a.router_nets[id] = fresh.get(&name).cloned().unwrap_or_else(|| RouterNet { pins: Vec::new(), net_pins: Vec::new(), pin_is_driver: Vec::new(), ..a.router_nets[id].clone() });
-        // `FrNet::reset` keeps `is_res_aware_` (FastRoute's flag, which `updateSlacks` sets).
-        let res_aware = a.final_state[id].res_aware;
-        a.final_state[id] = crate::brk_rsmt::NetState { res_aware, ..Default::default() };
+        a.final_state[id] = reset_net_state(&a.final_state[id]);
         let n = &a.router_nets[id];
         if n.net_pins.len() > 1 && !n.is_local {
             a.net_ids.push(id);
         }
+    }
+}
+
+/// `FrNet::reset`: the net's routing state cleared, but `is_res_aware_` (FastRoute's flag, which
+/// `updateSlacks` sets) and `is_soft_ndr_` kept — a demoted net re-added stays soft: its edge cost
+/// is the fresh one again (`edge_cost_ = cost`), its per-layer costs read 1 (`getLayerEdgeCost`
+/// bypasses them; see `find_routing`).
+fn reset_net_state(prev: &crate::brk_rsmt::NetState) -> crate::brk_rsmt::NetState {
+    crate::brk_rsmt::NetState { res_aware: prev.res_aware, soft_ndr: prev.soft_ndr, ..Default::default() }
+}
+
+#[cfg(test)]
+mod reset_net_state_tests {
+    /// Rule (`FrNet::reset`): `is_soft_ndr_` is not among the fields reset, so a net the first run
+    /// demoted is still soft when an incremental re-route adds it again (ascon_core: dropping it
+    /// moved 397 nets after the first antenna pass); the tree goes.
+    #[test]
+    fn a_demoted_net_stays_soft_when_re_added() {
+        let prev = crate::brk_rsmt::NetState { soft_ndr: true, res_aware: true, critical: true, ..Default::default() };
+        let got = super::reset_net_state(&prev);
+        assert!(got.soft_ndr && got.res_aware);
+        assert!(!got.critical && got.tree.is_none());
     }
 }
 
@@ -2621,7 +2641,9 @@ fn find_routing(db: &Db, opts: &RouteOptions, a: &mut AfterRoute, dirty_nets: &[
     let (xg, yg) = (a.jumper_grid.x_grids as usize, a.jumper_grid.y_grids as usize);
     let num_layers = a.caps.layers.len();
     let pins: Vec<(Vec<i32>, Vec<i32>)> = nets.iter().map(|n| n.pins.iter().map(|p| (p.0, p.1)).unzip()).collect();
-    let lecs: Vec<Vec<i8>> = nets.iter().map(net_range_edge_costs).collect();
+    // A soft net's per-layer costs read 1 (`FrNet::getLayerEdgeCost`), whatever `reset` put back.
+    let soft = |k: usize| a.final_state.get(k).is_some_and(|s| s.soft_ndr);
+    let lecs: Vec<Vec<i8>> = nets.iter().enumerate().map(|(k, n)| if soft(k) { vec![1; net_range_edge_costs(n).len()] } else { net_range_edge_costs(n) }).collect();
     let rnets: Vec<RsmtNet<'_>> = nets
         .iter()
         .enumerate()
@@ -2629,7 +2651,12 @@ fn find_routing(db: &Db, opts: &RouteOptions, a: &mut AfterRoute, dirty_nets: &[
         .collect();
     let attrs: Vec<NetLayerAttrs> = nets
         .iter()
-        .map(|n| NetLayerAttrs { pin_layers: n.pins.iter().map(|p| (p.2 - 1) as i16).collect(), has_ndr: n.has_ndr, is_clock: n.is_clock, is_res_aware: false, layer_edge_cost: all_layer_edge_costs(n, num_layers), sta_slack: 0.0 })
+        .enumerate()
+        .map(|(k, n)| {
+            let lec = all_layer_edge_costs(n, num_layers);
+            let layer_edge_cost = if soft(k) { vec![1; lec.len()] } else { lec };
+            NetLayerAttrs { pin_layers: n.pins.iter().map(|p| (p.2 - 1) as i16).collect(), has_ndr: n.has_ndr, is_clock: n.is_clock, is_res_aware: false, layer_edge_cost, sta_slack: 0.0 }
+        })
         .collect();
     let slack = vec![(0.0f32, false); nets.len()];
     // `setResistanceAware(resistance_aware_)`: once a reroute turned it on, every incremental run is
