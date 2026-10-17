@@ -129,7 +129,7 @@ fn the_technology_reads_match_what_the_reference_fed_i6() {
 
 /// Unroll `[[value, count], …]`.
 fn unrle(v: &Value) -> Vec<i32> {
-    arr(v).iter().flat_map(|p| std::iter::repeat(int(&p[0])).take(int(&p[1]) as usize)).collect()
+    arr(v).iter().flat_map(|p| std::iter::repeat_n(int(&p[0]), int(&p[1]) as usize)).collect()
 }
 
 /// G3 and I3–I9 over our database — [`vyges_grt::global_route::setup_tech`] — against what the
@@ -254,7 +254,7 @@ fn load_with(dir: &str, lefs: &[&str], def: &str, cmds: &[Cmd]) -> (Db, vyges_gr
 
 /// Unroll `[[a, b, count], …]` rows of an R5 entry's usage dump into per-edge reductions.
 fn entry_reductions(rows: &Value) -> Vec<Vec<i32>> {
-    arr(rows).iter().map(|row| arr(row).iter().flat_map(|p| std::iter::repeat(int(&p[1])).take(int(&p[2]) as usize)).collect()).collect()
+    arr(rows).iter().map(|row| arr(row).iter().flat_map(|p| std::iter::repeat_n(int(&p[1]), int(&p[2]) as usize)).collect()).collect()
 }
 
 /// The whole setup up to the router's input — G3, I3–I10 — against run()'s ENTRY as the reference
@@ -600,7 +600,7 @@ fn a_second_global_route_reaches_its_entry() {
 
 /// Unroll a state row `[[cap, red, real_cap, count], …]`.
 fn unrle_state(v: &Value) -> Vec<(u16, u16, u16)> {
-    arr(v).iter().flat_map(|p| std::iter::repeat((int(&p[0]) as u16, int(&p[1]) as u16, int(&p[2]) as u16)).take(int(&p[3]) as usize)).collect()
+    arr(v).iter().flat_map(|p| std::iter::repeat_n((int(&p[0]) as u16, int(&p[1]) as u16, int(&p[2]) as u16), int(&p[3]) as usize)).collect()
 }
 
 /// The MACRO path of I10 — extension halo, layer±1 blocking, transition layers — on the three

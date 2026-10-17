@@ -2361,7 +2361,7 @@ mod tests {
         assert_eq!(settle(true, &[]), ("routed", 0));
         // GRT-0007: no global_route found a routable net — nothing routed, nothing checked
         let none = json!({ "nets": 0, "already_wired": 0, "routable_nets": 0 });
-        assert_eq!(settle(true, &[none.clone()]), ("vacuous", 2));
+        assert_eq!(settle(true, std::slice::from_ref(&none)), ("vacuous", 2));
         // ...but one call that did route keeps the run routed
         assert_eq!(settle(true, &[none, call(4, 0)]), ("routed", 0));
     }

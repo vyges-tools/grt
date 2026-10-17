@@ -387,7 +387,7 @@ pub fn setup_adjust(db: &mut Db, t: &TechSetup, opts: &RouteOptions, log: &mut V
         let use_pitch = t.tracks.iter().find(|r| r.layer_index == layer).map_or(-1, |r| r.use_pitch());
         compute_region_adjustments(&mut e, region, layer, adjustment, dir(layer), use_pitch).map_err(|_| format!("GRT: region adjustment on layer {layer} outside the die"))?;
     }
-    log.extend(e.log.drain(..));
+    log.append(&mut e.log);
     Ok(Adjusted { edges: e, has_macros_or_pads, stream, extensions, transition_layers })
 }
 
@@ -634,7 +634,7 @@ pub(crate) fn discover_net_pins<'a>(
         t.tech.routing_layers.iter().map(|l| (l.routing_level, l.direction)).collect();
     let die = t.core.area;
     let layer_name = |level: i32| t.tech.routing_layers.iter().find(|l| l.routing_level == level).map(|l| l.name.clone()).unwrap_or_default();
-    let added = find_nets(&candidates, opts.skip_large_fanout, log);
+    let added = find_nets(candidates, opts.skip_large_fanout, log);
     // addNet → updateNetPins: every terminal's pin, then findPins.
     let mut masters: std::collections::HashMap<String, MasterShapes> = std::collections::HashMap::new();
     let pin_grid = PinGrid {
@@ -786,14 +786,14 @@ pub fn setup_nets_counted(db: &Db, t: &TechSetup, e: &mut RouterEdges, has_macro
         let rules: Option<Vec<NdrLayerRule>> = if ndr.is_empty() {
             None
         } else {
-            Some(ndr_layer_rules.iter().cloned().map(|(layer, width, spacing)| {
-                let level = db.layer_get_routing_level(&layer);
+            Some(ndr_layer_rules.iter().map(|(layer, width, spacing)| {
+                let level = db.layer_get_routing_level(layer);
                 NdrLayerRule {
                     level,
-                    default_width: db.layer_get_width(&layer) as i32,
+                    default_width: db.layer_get_width(layer) as i32,
                     default_pitch: t.tracks.iter().find(|r| r.layer_index == level).map_or(0, |r| r.track_pitch),
-                    ndr_spacing: spacing,
-                    ndr_width: width,
+                    ndr_spacing: *spacing,
+                    ndr_width: *width,
                 }
             }).collect())
         };
@@ -990,7 +990,7 @@ pub fn net_resistance_on_layer(a: &AfterRoute, net: &str, layer: Option<i32>) ->
     let Some(id) = live_id(a, net) else { return 0.0 };
     let Some(t) = a.final_state[id].tree3d.as_ref() else { return 0.0 };
     let n = &a.router_nets[id];
-    let (lo, hi) = a.final_state[id].layer_range.map_or(((n.min_layer - 1) as usize, (n.max_layer - 1) as usize), |r| r);
+    let (lo, hi) = a.final_state[id].layer_range.unwrap_or(((n.min_layer - 1) as usize, (n.max_layer - 1) as usize));
     let wn = crate::pricing::WireNet { ndr_width: None, min_layer: lo as i32, max_layer: hi as i32 };
     let mut total = 0.0f32;
     for e in &t.edges {
@@ -1525,7 +1525,7 @@ fn steiner_alpha(opts: &RouteOptions, n: &RouterNet, hpwl: Option<i32>) -> f32 {
         if hpwl.expect("computed for every net the min-HPWL rule decides") >= min { a } else { n.alpha }
     } else {
         match opts.min_fanout_alpha {
-            Some((min_fanout, a)) if min_fanout > 0 && n.term_count - 1 >= min_fanout => a,
+            Some((min_fanout, a)) if min_fanout > 0 && n.term_count > min_fanout => a,
             _ => n.alpha,
         }
     }
@@ -1542,7 +1542,7 @@ pub(crate) fn net_steiner_alpha(db: &Db, opts: &RouteOptions, net: &str) -> Resu
         return Ok(if compute_hpwl(db, net)? >= min { a } else { opts.alpha });
     }
     Ok(match opts.min_fanout_alpha {
-        Some((min_fanout, a)) if min_fanout > 0 && db.net_get_term_count(net) as i32 - 1 >= min_fanout => a,
+        Some((min_fanout, a)) if min_fanout > 0 && db.net_get_term_count(net) as i32 > min_fanout => a,
         _ => opts.alpha,
     })
 }
@@ -2089,6 +2089,7 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
 ///
 /// ⚠️ Horizontal is tested first (`y1 == y2`), so a span inside one tile is "horizontal" and
 /// charges nothing. The 3D usage is `uint16_t` charged by `int8_t` products — it wraps.
+#[allow(clippy::too_many_arguments)] // the reference's own argument list
 fn update_net_resources(g2: &mut crate::graph2d::Graph2d, g3: &mut Graph3d, grid: &crate::repair_antennas::JumperGrid, n: &RouterNet, id: usize, lec: &[i8], segments: &[crate::GSegment], used: i32) {
     let (lo, hi) = ((n.min_layer - 1).max(0) as usize, (n.max_layer - 1).max(0) as usize);
     let nn = crate::ndr_cost::NdrCostNet { id, edge_cost: n.edge_cost, min_layer: lo, max_layer: hi, layer_edge_cost: Some(net_range_edge_costs(n)), soft_ndr: false };
@@ -2616,20 +2617,6 @@ fn reset_net_state(prev: &crate::brk_rsmt::NetState) -> crate::brk_rsmt::NetStat
     crate::brk_rsmt::NetState { res_aware: prev.res_aware, soft_ndr: prev.soft_ndr, ..Default::default() }
 }
 
-#[cfg(test)]
-mod reset_net_state_tests {
-    /// Rule (`FrNet::reset`): `is_soft_ndr_` is not among the fields reset, so a net the first run
-    /// demoted is still soft when an incremental re-route adds it again (ascon_core: dropping it
-    /// moved 397 nets after the first antenna pass); the tree goes.
-    #[test]
-    fn a_demoted_net_stays_soft_when_re_added() {
-        let prev = crate::brk_rsmt::NetState { soft_ndr: true, res_aware: true, critical: true, ..Default::default() };
-        let got = super::reset_net_state(&prev);
-        assert!(got.soft_ndr && got.res_aware);
-        assert!(!got.critical && got.tree.is_none());
-    }
-}
-
 /// `findRouting(dirty_nets, …)`: `run()` from the state the first run, the jumpers and the rip-ups
 /// left, then the post-processing over those nets (remaining guides, pad pins, `mergeSegments`).
 #[allow(clippy::too_many_arguments)]
@@ -2772,5 +2759,19 @@ fn merge_results(a: &mut AfterRoute, routes: std::collections::BTreeMap<String, 
         if let Some(n) = a.router_nets.iter().find(|n| n.name == r.name) {
             r.set_pins(n.net_pins.iter().map(|p| crate::Pin { connection_layer: p.connection_layer, on_grid_x: p.on_grid.0, on_grid_y: p.on_grid.1 }).collect());
         }
+    }
+}
+
+#[cfg(test)]
+mod reset_net_state_tests {
+    /// Rule (`FrNet::reset`): `is_soft_ndr_` is not among the fields reset, so a net the first run
+    /// demoted is still soft when an incremental re-route adds it again (ascon_core: dropping it
+    /// moved 397 nets after the first antenna pass); the tree goes.
+    #[test]
+    fn a_demoted_net_stays_soft_when_re_added() {
+        let prev = crate::brk_rsmt::NetState { soft_ndr: true, res_aware: true, critical: true, ..Default::default() };
+        let got = super::reset_net_state(&prev);
+        assert!(got.soft_ndr && got.res_aware);
+        assert!(!got.critical && got.tree.is_none());
     }
 }

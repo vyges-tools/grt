@@ -75,3 +75,7 @@ path = "src/lib.rs"
 name = "vyges-grt"
 path = "src/bin/vyges-grt.rs"
 required-features = ["cli"]
+
+# Guide, route and result maps are spelled out where they are used; naming each would hide them.
+[lints.clippy]
+type_complexity = "allow"

@@ -261,7 +261,7 @@ pub fn route_cugr(db: &mut Db, opts: &RouteOptions, call: usize, stt: SteinerBui
     ci.cugr.maze_route(&mut nets, 4, &mut log, trace.as_deref_mut()).map_err(fail)?;
     let mut nets = ci.cugr.congested_nets(4, trace.as_deref_mut());
     ci.cugr.iterative_rrr(&mut nets, opts.congestion_iterations, &mut log, trace.as_deref_mut()).map_err(fail)?;
-    if let Some(t) = trace.as_deref_mut() {
+    if let Some(t) = trace {
         t.push("VYGC|routed".into());
     }
     Ok(CugrRoute { init: ci, log, alphas, slack: constant })
@@ -751,7 +751,7 @@ pub fn update_dirty_routes_cugr(
             rerouted.push(name.clone());
         }
     }
-    cugr.route_incremental(queued, cg.iterations, &cg.alphas, stt, log, trace.as_deref_mut()).map_err(|e| format!("cugr: {e:?}"))?;
+    cugr.route_incremental(queued, cg.iterations, &cg.alphas, stt, log, trace).map_err(|e| format!("cugr: {e:?}"))?;
     // findRoutingCugr over the rerouted nets.
     let grid_pins = |pins: &[crate::pins::NetPin]| -> Vec<crate::findrouting::GridPin> { pins.iter().map(|p| (p.on_grid.0, p.on_grid.1, p.connection_layer)).collect() };
     let pin_grid = crate::pins::PinGrid {
@@ -853,7 +853,7 @@ mod tests {
         let (a, b) = (pin((1, 1), 2), pin((2, 1), 2));
         assert!(!pins_moved(&[a.clone(), b.clone()], &[b.clone(), a.clone()]), "order is not a move");
         assert!(pins_moved(&[a.clone(), a.clone(), b.clone()], &[a.clone(), b.clone(), b.clone()]), "same set, other multiset");
-        assert!(pins_moved(&[a.clone()], &[pin((1, 1), 3)]), "a layer change is a move");
-        assert!(pins_moved(&[a.clone()], &[a.clone(), b]), "an added pin (a diode) is a move");
+        assert!(pins_moved(std::slice::from_ref(&a), &[pin((1, 1), 3)]), "a layer change is a move");
+        assert!(pins_moved(std::slice::from_ref(&a), &[a.clone(), b]), "an added pin (a diode) is a move");
     }
 }
