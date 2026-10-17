@@ -465,7 +465,7 @@ pub fn restore_cugr_for_repair(db: &mut Db, opts: &RouteOptions, mut trace: Opti
             }
         }
         for (name, route) in routes.iter_mut() {
-            let p = pins.get(name).ok_or_else(|| format!("[ERROR GRT-0127] net_id for db_net {name} not found — not modelled"))?;
+            let p = pins.get(name).ok_or_else(|| format!("[ERROR GRT-0127] net_id for db_net {name} not found while updating GRT resources usage."))?;
             let grid_pins: Vec<crate::findrouting::GridPin> = p.iter().map(|p| (p.on_grid.0, p.on_grid.1, p.connection_layer)).collect();
             crate::restore::finish_loaded_route(route, &grid_pins, block_min);
         }

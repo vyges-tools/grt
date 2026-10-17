@@ -509,7 +509,7 @@ fn assign_edge(net: &RsmtNet<'_>, attrs: &NetLayerAttrs, res_aware: bool, range:
         pin(&mut walk[far], lfar);
     }
     if dir && walk[n2a].assigned && (lr > walk[n2a].top_layer || lr < walk[n2a].bot_layer) {
-        return Err(format!("GRT-0202: target ending layer ({lr}) out of range"));
+        return Err(format!("GRT-0202: Target ending layer ({lr}) out of range."));
     }
     for k in 0..rl {
         let ((x1, y1), (x2, y2), l) = (route.grids[k], route.grids[k + 1], route.layers[k] as usize);

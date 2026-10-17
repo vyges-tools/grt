@@ -62,7 +62,7 @@ impl JumperRouter for CugrJumpers<'_> {
     fn has_available_resources(&mut self, _is_horizontal: bool, x: i32, y: i32, layer_level: i32, net: &str) -> bool {
         let layer = layer_level - 1;
         if layer < 0 {
-            self.unmodelled = Some(format!("GRT-0705: invalid layer index {layer_level}"));
+            self.unmodelled = Some(format!("GRT-0705: Invalid layer index {layer_level} in hasAvailableResources."));
             return false;
         }
         let (gx, gy) = (self.grid.dbu_to_tile(x, true), self.grid.dbu_to_tile(y, false));
@@ -135,7 +135,8 @@ impl JumperRouter for CugrJumpers<'_> {
     /// reroute (GRT-0311), which is not modelled.
     fn restore_net_demand(&mut self, route: &[GSegment], net: &str) {
         if !self.restore(route, net) && self.unmodelled.is_none() {
-            self.unmodelled = Some(format!("cugr: net {net} could not be re-adopted after a rejected jumper (GRT-0311) — the reroute is not modelled"));
+            // ours, not the reference's GRT-0311 (where it schedules the reroute this does not model)
+            self.unmodelled = Some(format!("cugr: net {net} could not be re-adopted after a rejected jumper — the reroute is not modelled"));
         }
     }
 

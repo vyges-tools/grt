@@ -377,7 +377,7 @@ pub fn steiner_tree(g: &SparseGraph, arena: &[Solution], found: &[usize]) -> Res
     // (3) no co-located child may remain.
     for n in t.preorder() {
         if t.nodes[n].children.iter().any(|&c| t.nodes[c].p == t.nodes[n].p) {
-            return Err("GRT-0276: duplicated tree nodes encountered".into());
+            return Err("GRT-0276: Duplicated tree nodes encountered.".into());
         }
     }
     Ok(t)

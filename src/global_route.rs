@@ -169,7 +169,7 @@ pub fn setup_tech(db: &mut Db, opts: &RouteOptions) -> Res<TechSetup> {
         tech.min_layer_for_clock,
         tech.max_layer_for_clock,
     )
-    .ok_or("GRT-0701: the lowest routing layer has no track grid")?;
+    .ok_or("GRT-0701: Missing track structure for routing layers.")?;
     if block_max != tech.block_max_routing_layer {
         db.block_set_max_routing_layer(block_max)?;
     }
@@ -798,7 +798,7 @@ pub fn setup_nets_counted(db: &Db, t: &TechSetup, e: &mut RouterEdges, has_macro
             }).collect())
         };
         let (edge_cost, lec) = compute_track_consumption(rules.as_deref(), min, max, t.core.num_layers)
-            .map_err(|e| format!("[ERROR GRT-0272] NDR consumption {} exceeds 127 and is unsupported", e.0))?;
+            .map_err(|e| format!("[ERROR GRT-0272] NDR consumption {} exceeds {} and is unsupported", e.0, 127))?;
         out.push(RouterNet {
             name: n.name.clone(),
             pins: on_grid,
@@ -1295,7 +1295,7 @@ fn connect_routing(db: &mut Db, opts: &RouteOptions, a: &mut AfterRoute, net1: &
     if !crate::restore::net_is_covered(&route1, &pins).is_empty() {
         return Ok(false);
     }
-    if !is_connected(&route1)? {
+    if !is_connected(&route1, net1)? {
         return Err(format!("[ERROR GRT-0298] Net {net1} has disconnected segments after merge.").into());
     }
     Ok(true)
@@ -1445,7 +1445,7 @@ fn add_tree_edge(a: &mut AfterRoute, x1: i32, y1: i32, x2: i32, y2: i32, layer: 
 
 /// `GlobalRouter::isConnected`: union-find over the route's segments, each joined to an earlier
 /// one its box touches (in 3D). ⛔ A segment that is not a line or a via is GRT-0264/0265.
-fn is_connected(route: &[crate::GSegment]) -> Res<bool> {
+fn is_connected(route: &[crate::GSegment], net: &str) -> Res<bool> {
     let n = route.len();
     if n == 0 {
         return Ok(true);
@@ -1458,7 +1458,7 @@ fn is_connected(route: &[crate::GSegment]) -> Res<bool> {
         ax1 >= bx0 && ax0 <= bx1 && ay1 >= by0 && ay0 <= by1 && az1 >= bz0 && az0 <= bz1
     };
     if !is_line(&route[0]) {
-        return Err("[ERROR GRT-0264] a route segment is not a horizontal/vertical line or via".into());
+        return Err(format!("[ERROR GRT-0264] Segment {} of net {net} is not a horizontal/vertical line or via.", 0).into());
     }
     let mut parent: Vec<usize> = (0..n).collect();
     let mut rank = vec![0u32; n];
@@ -1472,7 +1472,7 @@ fn is_connected(route: &[crate::GSegment]) -> Res<bool> {
     let mut groups = 1;
     for i in 1..n {
         if !is_line(&route[i]) {
-            return Err("[ERROR GRT-0265] a route segment is not a horizontal/vertical line or via".into());
+            return Err(format!("[ERROR GRT-0265] Segment {i} of net {net} is not a horizontal/vertical line or via.").into());
         }
         groups += 1;
         let mut j = i;
@@ -2188,7 +2188,7 @@ pub fn restore_for_repair(db: &mut Db, opts: &RouteOptions) -> Res<AfterRoute> {
         }
     }
     for (name, route) in routes.iter_mut() {
-        let n = nets.iter().find(|n| &n.name == name).ok_or_else(|| format!("[ERROR GRT-0127] net_id for db_net {name} not found — not modelled"))?;
+        let n = nets.iter().find(|n| &n.name == name).ok_or_else(|| format!("[ERROR GRT-0127] net_id for db_net {name} not found while updating GRT resources usage."))?;
         let grid_pins: Vec<crate::findrouting::GridPin> = n.net_pins.iter().map(|p| (p.on_grid.0, p.on_grid.1, p.connection_layer)).collect();
         crate::restore::finish_loaded_route(route, &grid_pins, block_min);
         // ensurePinsPositions: only a net some pin of which no segment covers has anything to do.
@@ -2438,7 +2438,7 @@ fn update_dirty_nets(a: &mut AfterRoute, fresh: &std::collections::BTreeMap<Stri
             let pins: Vec<crate::Pin> = fresh.get(name).map(|n| n.net_pins.iter().map(|p| crate::Pin { connection_layer: p.connection_layer, on_grid_x: p.on_grid.0, on_grid_y: p.on_grid.1 }).collect()).unwrap_or_default();
             let route = a.net_routes.iter().find(|r| &r.name == name).map(|r| r.segments.clone()).unwrap_or_default();
             if crate::restore::net_is_covered(&route, &pins).is_empty() {
-                if !is_connected(&route)? {
+                if !is_connected(&route, name)? {
                     return Err(format!("[ERROR GRT-0267] Net {name} has disconnected segments.").into());
                 }
                 false
