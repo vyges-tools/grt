@@ -170,7 +170,10 @@ fn lef_with_dead_diode() -> String {
     let lef = std::fs::read_to_string(data("tiny.lef")).unwrap();
     let cut = lef.rfind("END LIBRARY").unwrap();
     let diode = "MACRO DIODE0\n  CLASS CORE ANTENNACELL ;\n  ORIGIN 0 0 ;\n  SIZE 0.5 BY 1.2 ;\n  SITE core ;\n  PIN DIODE\n    DIRECTION INPUT ;\n    USE SIGNAL ;\n    PORT\n      LAYER M1 ;\n        RECT 0.1 0.25 0.4 0.45 ;\n    END\n  END DIODE\nEND DIODE0\n\n";
-    let path = tmp("dead-diode.lef");
+    // ⛔ one file PER CALL: the tests run in parallel, and a shared path was read by one test while
+    // another rewrote it (an empty LEF: "undefined site (core)") — flaky on a loaded machine.
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let path = tmp(&format!("dead-diode-{}.lef", SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     std::fs::write(&path, format!("{}{diode}{}", &lef[..cut], &lef[cut..])).unwrap();
     path.to_str().unwrap().to_string()
 }
