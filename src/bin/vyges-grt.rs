@@ -589,7 +589,9 @@ fn tech_layers(db: &Db) -> Result<vyges_grt::repair_antennas::TechLayers, Fail> 
 }
 
 /// Captured violations: `VYGA|viol|<net>|level=<n>|excess=<r>|diodes=<n>|gates=<inst>/<pin>,…`, in
-/// blocks — one per checker call, each ended by any other line.
+/// blocks — one per checker call, each ended by any other line except another antenna tracer's
+/// (`VYGW|`, `VYGC|`, `VYGD|`, `VYGI|`): with every tracer in one build the checker's per-net
+/// state prints between the violation lines of the SAME call.
 /// One violation as the repair reads it: `(net, routing level, gate names, diodes per gate)`.
 type Viol = (String, i32, Vec<String>, i32);
 
@@ -597,6 +599,9 @@ fn read_violation_blocks(path: &str) -> Result<Vec<Vec<Viol>>, Fail> {
     let mut blocks: Vec<Vec<Viol>> = Vec::new();
     let mut open = false;
     for line in std::fs::read_to_string(path).map_err(at(path))?.lines() {
+        if ["VYGW|", "VYGC|", "VYGD|", "VYGI|"].iter().any(|p| line.starts_with(p)) {
+            continue;
+        }
         let Some(rest) = line.strip_prefix("VYGA|viol|") else {
             open = false;
             continue;
@@ -2318,6 +2323,26 @@ fn placement_networks(db: &Db, rc: &mut vyges_est::rc::Rc, opts: &RouteOptions) 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn violation_blocks_span_other_tracers_lines() {
+        let p = std::env::temp_dir().join(format!("vyg-viol-{}.ant", std::process::id()));
+        std::fs::write(
+            &p,
+            "VYGA|viol|a|level=2|excess=1.1|diodes=1|gates=u1/A,\n\
+             VYGC|1|b|shape|x\n\
+             VYGA|viol|b|level=2|excess=1.2|diodes=1|gates=u2/B,\n\
+             [INFO GRT-0012] Found 2 antenna violations.\n\
+             VYGA|viol|a|level=3|excess=1.3|diodes=2|gates=u1/A,\n",
+        )
+        .unwrap();
+        let Ok(b) = read_violation_blocks(p.to_str().unwrap()) else { panic!("read failed") };
+        std::fs::remove_file(&p).ok();
+        // one checker call's two violations stay one block across the checker's own trace line;
+        // an ordinary log line still ends it
+        assert_eq!(b.iter().map(Vec::len).collect::<Vec<_>>(), [2, 1]);
+        assert_eq!(b[0][1].0, "b");
+    }
+
     use super::*;
 
     // Rule: a pass word never comes from a run that did nothing; a run that routed nothing because
