@@ -71,6 +71,11 @@ pub fn netlist(db: &Db) -> Netlist {
     }
     let mut port_index = HashMap::new();
     for bterm in db.bterm_names() {
+        // A POWER or GROUND terminal is no timing port (`dbNetwork::dbToSta(sig_type, io_type)`
+        // gives it direction power / ground; the graph makes no vertex for it).
+        if matches!(db.bterm_get_sig_type(&bterm).as_str(), "POWER" | "GROUND") {
+            continue;
+        }
         port_index.insert(bterm.clone(), nl.ports.len());
         let dir = match db.bterm_get_io_type(&bterm).as_str() {
             "INPUT" => PortDir::Input,
