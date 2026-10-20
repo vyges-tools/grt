@@ -1148,7 +1148,7 @@ pub fn add_net(db: &Db, a: &mut AfterRoute, net: &str) -> bool {
 /// `clearNetRoute`, or `updateNetResources(net, true)` for a route restored from guides — and the
 /// slot is nulled (`deleteNet`); `routes_` loses the net.
 ///
-/// ⛔ A merged net (`isMergedNet`) takes other branches: refused.
+/// A merged net (`isMergedNet`) takes the branches named in the body.
 pub fn remove_net(a: &mut AfterRoute, net: &str) -> Res<()> {
     // `dbNet::destroy` deletes the net's guides (journaled).
     clear_guides(a, net);
@@ -1160,18 +1160,31 @@ pub fn remove_net(a: &mut AfterRoute, net: &str) -> Res<()> {
     // the survivor's (nodes and edges appended; its usage stays, now the survivor's) and drops it.
     if let Some(preserved) = a.merged.get(net).cloned() {
         let pid = live_id(a, &preserved).ok_or_else(|| format!("net {net}: merged into {preserved}, which the router no longer holds"))?;
-        if a.final_state[id].segments_restored || a.final_state[pid].segments_restored {
-            return Err(format!("net {net}: a merged net with segments restored from guides — not modelled").into());
-        }
-        let moved = a.final_state[id].tree3d.take();
-        match (moved, a.final_state[pid].tree3d.as_mut()) {
-            (Some(t2), Some(t1)) => {
-                t1.num_terminals += t2.num_terminals;
-                t1.nodes.extend(t2.nodes);
-                t1.edges.extend(t2.edges);
+        match merged_removal(a.final_state[pid].segments_restored, a.final_state[id].segments_restored) {
+            MergedRemoval::DropRemoved => clear_net_route(a, id),
+            MergedRemoval::ChargeRemovedRoute => {
+                clear_net_route(a, id);
+                charge_net_route(a, id, net, 1);
             }
-            (None, _) => {}
-            (Some(_), None) => return Err(format!("net {preserved}: no 3D tree to merge {net} into — GRT-0013").into()),
+            MergedRemoval::RestoreSurvivor => {
+                clear_net_route(a, pid);
+                clear_net_route(a, id);
+                charge_net_route(a, id, net, -1);
+                a.final_state[pid].segments_restored = true;
+                charge_net_route(a, pid, &preserved, 1);
+            }
+            MergedRemoval::MergeTrees => {
+                let moved = a.final_state[id].tree3d.take();
+                match (moved, a.final_state[pid].tree3d.as_mut()) {
+                    (Some(t2), Some(t1)) => {
+                        t1.num_terminals += t2.num_terminals;
+                        t1.nodes.extend(t2.nodes);
+                        t1.edges.extend(t2.edges);
+                    }
+                    (None, _) => {}
+                    (Some(_), None) => return Err(format!("net {preserved}: no 3D tree to merge {net} into — GRT-0013").into()),
+                }
+            }
         }
         a.final_state[id].tree = None;
         a.merged.remove(net);
@@ -1180,11 +1193,7 @@ pub fn remove_net(a: &mut AfterRoute, net: &str) -> Res<()> {
         return Ok(());
     }
     if a.final_state[id].segments_restored {
-        let segs = a.net_routes.iter().find(|r| r.name == net).map(|r| r.segments.clone()).unwrap_or_default();
-        let lec = a.layer_edge_cost.get(net).cloned().unwrap_or_default();
-        if let (Some(g2), Some(g3)) = (a.final_2d.as_mut(), a.final_3d.as_mut()) {
-            update_net_resources(g2, g3, &a.jumper_grid, &a.router_nets[id], id, &lec, &segs, -1);
-        }
+        charge_net_route(a, id, net, -1);
         a.final_state[id].segments_restored = false;
     } else {
         clear_net_route(a, id);
@@ -1192,6 +1201,63 @@ pub fn remove_net(a: &mut AfterRoute, net: &str) -> Res<()> {
     a.dead.insert(id);
     a.net_routes.retain(|r| r.name != net);
     Ok(())
+}
+
+/// How `removeNet` drops a net merged into a survivor. A net with segments restored from guides
+/// has no tree in the router — its usage is charged per wire from its route
+/// (`updateNetResources`) — so the books are kept by which side was restored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MergedRemoval {
+    /// Both restored: the removed net's usage is already inside the survivor's charged route.
+    DropRemoved,
+    /// The survivor only: the removed net's tree released, its route charged instead.
+    ChargeRemovedRoute,
+    /// The removed net only: both trees released, the removed net's route uncharged, and the
+    /// survivor becomes a restored net charged over its whole (merged) route.
+    RestoreSurvivor,
+    /// Neither: FastRoute's `mergeNet` (the removed tree appended to the survivor's).
+    MergeTrees,
+}
+
+fn merged_removal(survivor_restored: bool, removed_restored: bool) -> MergedRemoval {
+    match (survivor_restored, removed_restored) {
+        (true, true) => MergedRemoval::DropRemoved,
+        (true, false) => MergedRemoval::ChargeRemovedRoute,
+        (false, true) => MergedRemoval::RestoreSurvivor,
+        (false, false) => MergedRemoval::MergeTrees,
+    }
+}
+
+/// How `connectRouting` charges the wires that join two routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionCharge {
+    /// Neither net restored: `addTreeEdge` per wire (into net1's tree).
+    TreeEdges,
+    /// net1 restored: net2's removal will not recharge net1's route, so each wire is charged
+    /// here (`updateResources`, used 1).
+    Resources,
+    /// net2 alone restored: nothing — its removal recharges the whole merged route.
+    Nothing,
+}
+
+fn connection_charge(net1_restored: bool, net2_restored: bool) -> ConnectionCharge {
+    if !net1_restored && !net2_restored {
+        ConnectionCharge::TreeEdges
+    } else if net1_restored {
+        ConnectionCharge::Resources
+    } else {
+        ConnectionCharge::Nothing
+    }
+}
+
+/// `updateNetResources(net, release)`: the net's whole route charged (`used` 1) or released (-1)
+/// wire by wire, at the net's own edge costs.
+fn charge_net_route(a: &mut AfterRoute, id: usize, net: &str, used: i32) {
+    let segs = a.net_routes.iter().find(|r| r.name == net).map(|r| r.segments.clone()).unwrap_or_default();
+    let lec = a.layer_edge_cost.get(net).cloned().unwrap_or_default();
+    if let (Some(g2), Some(g3)) = (a.final_2d.as_mut(), a.final_3d.as_mut()) {
+        update_net_resources(g2, g3, &a.jumper_grid, &a.router_nets[id], id, &lec, &segs, used);
+    }
 }
 
 /// `GRouteDbCbk::inDbNetPostMerge(preserved, removed)` → `GlobalRouter::mergeNetsRouting`: a buffer
@@ -1216,8 +1282,8 @@ pub fn merge_nets_routing(db: &mut Db, opts: &RouteOptions, a: &mut AfterRoute, 
 /// bridged with vias, net1's route += net2's; then `updateNetPins(net1)`, `netIsCovered` (not →
 /// not joined: the extended route stays) and `isConnected` (not → GRT-0298).
 ///
-/// ⛔ A net with segments restored from guides takes `updateResources` instead of `addTreeEdge`:
-/// refused.
+/// A net with segments restored from guides has no tree: when net1 is one, the connection is
+/// charged with `updateResources` instead of `addTreeEdge`; when only net2 is, it is not charged.
 fn connect_routing(db: &mut Db, opts: &RouteOptions, a: &mut AfterRoute, net1: &str, net2: &str) -> Res<bool> {
     let (Some(id1), Some(id2)) = (live_id(a, net1), live_id(a, net2)) else {
         return Err(format!("merging {net2} into {net1}: a net with no FastRoute net — not modelled").into());
@@ -1251,16 +1317,21 @@ fn connect_routing(db: &mut Db, opts: &RouteOptions, a: &mut AfterRoute, net1: &
                 return Ok(false);
             }
         }
-        if a.final_state[id1].segments_restored || a.final_state[id2].segments_restored {
-            return Err(format!("merging {net2} into {net1}: segments restored from guides (updateResources) — not modelled").into());
-        }
-        let (xmin, ymin, tile) = (a.jumper_grid.grid.area.x_min, a.jumper_grid.grid.area.y_min, a.jumper_grid.grid.tile_size);
-        for seg in connection.iter().filter(|s| !s.is_via()) {
-            let x1 = (seg.init_x.min(seg.final_x) - xmin) / tile;
-            let y1 = (seg.init_y.min(seg.final_y) - ymin) / tile;
-            let x2 = (seg.init_x.max(seg.final_x) - xmin) / tile;
-            let y2 = (seg.init_y.max(seg.final_y) - ymin) / tile;
-            add_tree_edge(a, x1, y1, x2, y2, seg.init_layer, id1)?;
+        let charge = connection_charge(a.final_state[id1].segments_restored, a.final_state[id2].segments_restored);
+        if charge == ConnectionCharge::TreeEdges {
+            let (xmin, ymin, tile) = (a.jumper_grid.grid.area.x_min, a.jumper_grid.grid.area.y_min, a.jumper_grid.grid.tile_size);
+            for seg in connection.iter().filter(|s| !s.is_via()) {
+                let x1 = (seg.init_x.min(seg.final_x) - xmin) / tile;
+                let y1 = (seg.init_y.min(seg.final_y) - ymin) / tile;
+                let x2 = (seg.init_x.max(seg.final_x) - xmin) / tile;
+                let y2 = (seg.init_y.max(seg.final_y) - ymin) / tile;
+                add_tree_edge(a, x1, y1, x2, y2, seg.init_layer, id1)?;
+            }
+        } else if charge == ConnectionCharge::Resources {
+            let lec = a.layer_edge_cost.get(net1).cloned().unwrap_or_default();
+            if let (Some(g2), Some(g3)) = (a.final_2d.as_mut(), a.final_3d.as_mut()) {
+                update_net_resources(g2, g3, &a.jumper_grid, &a.router_nets[id1], id1, &lec, &connection, 1);
+            }
         }
         route1.extend(route2);
         route1.extend(connection);
@@ -2773,5 +2844,34 @@ mod reset_net_state_tests {
         let got = super::reset_net_state(&prev);
         assert!(got.soft_ndr && got.res_aware);
         assert!(!got.critical && got.tree.is_none());
+    }
+}
+
+#[cfg(test)]
+mod merged_restored_tests {
+    use super::{connection_charge, merged_removal, ConnectionCharge, MergedRemoval};
+
+    /// Rule (`GlobalRouter::removeNet`, merged net): both restored → only the removed net is
+    /// dropped (its usage is inside the survivor's route); the survivor alone → the removed tree
+    /// is released and its route charged; the removed net alone → both trees released, the
+    /// removed route uncharged and the survivor turned restored and charged over the merged
+    /// route; neither → FastRoute's mergeNet.
+    #[test]
+    fn a_merged_removal_follows_which_side_was_restored() {
+        assert_eq!(merged_removal(true, true), MergedRemoval::DropRemoved);
+        assert_eq!(merged_removal(true, false), MergedRemoval::ChargeRemovedRoute);
+        assert_eq!(merged_removal(false, true), MergedRemoval::RestoreSurvivor);
+        assert_eq!(merged_removal(false, false), MergedRemoval::MergeTrees);
+    }
+
+    /// Rule (`GlobalRouter::connectRouting`): neither restored → addTreeEdge; net1 restored →
+    /// updateResources per wire (whatever net2 is); net2 alone restored → the connection is not
+    /// charged at all (net2's removal recharges the merged route).
+    #[test]
+    fn a_connection_is_charged_by_the_survivor_first() {
+        assert_eq!(connection_charge(false, false), ConnectionCharge::TreeEdges);
+        assert_eq!(connection_charge(true, false), ConnectionCharge::Resources);
+        assert_eq!(connection_charge(true, true), ConnectionCharge::Resources);
+        assert_eq!(connection_charge(false, true), ConnectionCharge::Nothing);
     }
 }
