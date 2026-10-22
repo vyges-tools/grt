@@ -67,7 +67,7 @@ pub fn netlist(db: &Db) -> Netlist {
     for inst in db.inst_names() {
         inst_index.insert(inst.clone(), nl.insts.len());
         let master = db.inst_master(&inst);
-        nl.insts.push((inst, master));
+        nl.insts.push(vyges_sta::netlist::inst(inst, master));
     }
     let mut port_index = HashMap::new();
     for bterm in db.bterm_names() {
@@ -101,7 +101,7 @@ pub fn netlist(db: &Db) -> Netlist {
             }
         }
         if !pins.is_empty() {
-            nl.nets.push(Net { name: net, pins });
+            nl.nets.push(Net { name: net, pins }.into());
         }
     }
     nl
