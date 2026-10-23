@@ -265,23 +265,50 @@ pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn 
     // R17 — 2D and 3D overflow disagree: `disableNDRForCongestedNets(net_ids_)`, then
     // `long_edge_len = BIG_INT` and both overflows read again.
     let r17 = past_cong != overflow.total;
+    let mut r17_demoted = Vec::new();
     if r17 {
         // The scan skips a net with no rule and a net already soft. With none left it returns
         // before warning (GRT-0297) — ascon_core, where the loop had demoted all nine clock nets.
         // A pending net is demoted only when a step of its layered route sits on a 2D overflow or
-        // an oversubscribed 3D edge (`congested_ndr_nets`); the demotion itself (3D usage out,
-        // `applySoftNDR`, 3D usage back) is not wired — refused if the scan finds one.
+        // an oversubscribed 3D edge (`congested_ndr_nets`).
         let pending: Vec<crate::softndr::NdrNet> = ids
             .iter()
             .filter(|&&id| start.has_ndr.get(id).copied().unwrap_or(false) && !state[id].soft_ndr)
-            .map(|&id| r17_ndr_net(id, nets[id].edge_cost, state[id].tree.as_ref()))
+            .map(|&id| r17_ndr_net(id, nets[id].edge_cost, state[id].tree.as_ref(), &attrs[id].layer_edge_cost))
             .collect();
         let congested = crate::softndr::congested_ndr_nets(&pending, &R17View { g2d: &g2d, g3: &g3 });
-        if !congested.is_empty() {
-            return Err(format!("R17: 2D and 3D overflow differ and {} NDR net(s) sit on congested edges — the demotion's 3D usage re-accounting is not wired", congested.len()));
+        // The demotion, per congested net in `net_ids_` order (GRT-0297, then GRT-0273 per net):
+        // `is_3d_step_` is always set here (layerAssignment raised it), so the layered usage is
+        // refunded at the old per-layer cost, the net demoted (`applySoftNDR`: planar refund,
+        // soft, planar charge at 1), and the layered usage charged again — at 1 on every layer.
+        // Witnessed by the reference's ibex_sky130hs flow (without pin_access), in the incremental
+        // reroute after the first antenna pass's diodes: 7 nets over 2 calls, guides byte-identical
+        // on the reference's slacks; dropping the layered refund leaves overflow (2026-10-23).
+        for net in pending.into_iter().filter(|n| congested.contains(&n.net_id)) {
+            let id = net.net_id;
+            crate::softndr::update_net_3d_usage(&net, -1, &mut Usage3d(&mut g3));
+            crate::congestion_loop::apply_soft_ndr(&mut g2d, &mut nets_own, state, id)?;
+            let soft = crate::softndr::NdrNet { is_soft_ndr: true, ..net };
+            crate::softndr::update_net_3d_usage(&soft, 1, &mut Usage3d(&mut g3));
+            r17_demoted.push(id);
         }
         past_cong = g2d.get_overflow_2d_maze().total_overflow;
     }
+    // A net R17 demoted reads 1 on every layer from here on, as the loop's demotions do.
+    let nets = &nets_own[..];
+    let attrs_r17: Vec<NetLayerAttrs>;
+    let attrs: &[NetLayerAttrs] = if r17_demoted.is_empty() {
+        attrs
+    } else {
+        attrs_r17 = attrs.iter().enumerate().map(|(id, a)| {
+            let mut a = a.clone();
+            if r17_demoted.contains(&id) {
+                a.layer_edge_cost = vec![1; a.layer_edge_cost.len()];
+            }
+            a
+        }).collect();
+        &attrs_r17
+    };
     // R18 — costheight_ 3, via_cost_ 1; run()'s local enlarge_ as the loop left it.
     if past_cong == 0 {
         // long_edge_len: 40, raised to BIG_INT by a soft-NDR demotion in R14 (and, with short_edge_len,
@@ -305,14 +332,14 @@ pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn 
 
 /// R17's view of a net: its tree's routes as layer assignment left them (each grid point with its
 /// layer).
-fn r17_ndr_net(id: usize, edge_cost: i8, tree: Option<&StTree>) -> crate::softndr::NdrNet {
+fn r17_ndr_net(id: usize, edge_cost: i8, tree: Option<&StTree>, layer_edge_cost: &[i8]) -> crate::softndr::NdrNet {
     use crate::full3d::Point3D;
     crate::softndr::NdrNet {
         net_id: id,
         has_ndr: true,
         is_soft_ndr: false,
         edge_cost,
-        layer_edge_cost: None,
+        layer_edge_cost: Some(layer_edge_cost.to_vec()),
         edges: tree.map_or_else(Vec::new, |t| {
             t.edges
                 .iter()
@@ -324,6 +351,29 @@ fn r17_ndr_net(id: usize, edge_cost: i8, tree: Option<&StTree>) -> crate::softnd
                 })
                 .collect()
         }),
+    }
+}
+
+/// `updateEdge3DUsage` on the layered graph: `edge.usage += delta`, a `uint16_t` (wrapping).
+/// Only the layered half of [`crate::softndr::UsageGrid`] is ever called on it.
+struct Usage3d<'a>(&'a mut Graph3d);
+
+impl crate::softndr::UsageGrid for Usage3d<'_> {
+    fn add_usage_v_2d(&mut self, _: i16, _: i16, _: i32) {
+        unreachable!("R17's layered update charges no planar edge")
+    }
+    fn add_usage_h_2d(&mut self, _: i16, _: i16, _: i32) {
+        unreachable!("R17's layered update charges no planar edge")
+    }
+    fn add_usage_v_3d(&mut self, layer: i16, x: i16, y: i16, delta: i32) {
+        let i = self.0.at(i32::from(x), i32::from(y));
+        let u = &mut self.0.v_usage[layer as usize][i];
+        *u = (i32::from(*u) + delta) as u16;
+    }
+    fn add_usage_h_3d(&mut self, layer: i16, x: i16, y: i16, delta: i32) {
+        let i = self.0.at(i32::from(x), i32::from(y));
+        let u = &mut self.0.h_usage[layer as usize][i];
+        *u = (i32::from(*u) + delta) as u16;
     }
 }
 

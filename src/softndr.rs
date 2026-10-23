@@ -11,8 +11,9 @@
 //! `soft_ndr_escalation` 6, each once, both exact end to end. R17 (2D and 3D overflow disagreeing)
 //! fires on a fresh design, ascon_core (2026-10-16): the loop had demoted nine of its ten clock NDR
 //! nets, the tenth sits on no congested edge, so the scan returns before warning (no GRT-0297) and
-//! the guides are byte-identical. The demotion itself ([`disable_ndr_for_congested_nets`]'s usage
-//! re-accounting) is still unwitnessed and REFUSED in `run`.
+//! the guides are byte-identical. The demotion itself fires in the reference's ibex_sky130hs
+//! flow (2026-10-23), in the incremental reroute after the first antenna pass's diodes; `run`
+//! re-accounts it on the router's own graphs (layered refund, `applySoftNDR`, layered charge).
 //!
 //! ⛔ **A demoted net stays soft across an incremental re-route** (`FrNet::reset` restores the edge
 //! cost and per-layer costs but not `is_soft_ndr_`): its edge cost is the fresh NDR one again, its

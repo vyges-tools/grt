@@ -37,6 +37,7 @@ JOB (JSON):
     { \"cmd\": \"layer_adjustment\", \"layers\": [lo, hi], \"value\": f }      (one layer: lo == hi)
     { \"cmd\": \"global_adjustment\", \"value\": f }                         (the `*` form)
     { \"cmd\": \"region_adjustment\", \"rect_um\": [x0, y0, x1, y1], \"layer\": l, \"value\": f }
+    { \"cmd\": \"macro_extension\", \"value\": n }                         (set_macro_extension: tiles)
     { \"cmd\": \"routing_alpha\", \"alpha\": f, \"nets\": [..] | \"min_fanout\": n | \"min_hpwl\": um | \"clock_nets\": true }
     { \"cmd\": \"nets_to_route\", \"patterns\": [..] }                        (Tcl globs)
     { \"cmd\": \"global_route\", \"verbose\": b, \"allow_congestion\": b, \"grid_origin\": [x, y],
@@ -1482,6 +1483,10 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 }
             }
             "global_adjustment" => opts.adjustment = step["value"].as_f64().ok_or_else(|| err("value"))? as f32,
+            // set_macro_extension: each macro obstruction grows by this many tiles past its layer's
+            // own extension. The flows that set it route no macro design in the corpus, so at 2 on
+            // a macro-free design it is carried and changes nothing (the ibex flow scores exact).
+            "macro_extension" => opts.macro_extension = step["value"].as_i64().ok_or_else(|| err("value"))? as i32,
             "region_adjustment" => {
                 let r: Vec<f64> = step["rect_um"].as_array().ok_or_else(|| err("rect_um"))?.iter().filter_map(Value::as_f64).collect();
                 let dbu = f64::from(db.dbu_per_micron());

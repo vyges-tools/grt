@@ -22,6 +22,7 @@ JOB (JSON):
     { "cmd": "layer_adjustment", "layers": [lo, hi], "value": f }      (one layer: lo == hi)
     { "cmd": "global_adjustment", "value": f }                         (the `*` form)
     { "cmd": "region_adjustment", "rect_um": [x0, y0, x1, y1], "layer": l, "value": f }
+    { "cmd": "macro_extension", "value": n }                         (set_macro_extension: tiles)
     { "cmd": "routing_alpha", "alpha": f, "nets": [..] | "min_fanout": n | "min_hpwl": um | "clock_nets": true }
     { "cmd": "nets_to_route", "patterns": [..] }                        (Tcl globs)
     { "cmd": "global_route", "verbose": b, "allow_congestion": b, "grid_origin": [x, y],

@@ -492,36 +492,49 @@ pub fn soft_ndr_demotion(
     let mut congested = compute_congested_ndr_nets(&scan_nets, &View(grid.g));
     sort_congested_ndr_nets(&mut congested)?;
     let ids = congested_ndr_nets_by_fraction(&congested, 1.0);
-    // applySoftNDR: updateSoftNDRNetUsage(-edge cost), setSoftNDR, updateSoftNDRNetUsage(+edge cost).
-    let charge = |grid: &mut BrkGrid<'_>, net: &RsmtNet<'_>, id: usize, t: &StTree, amount: f64| {
-        let nn = net.ndr_net(id);
-        let mut g = grid.g.for_net(&nn);
-        for r in &t.routes {
-            if r.routelen <= 0 || r.grids.is_empty() {
-                continue;
-            }
-            for k in 0..r.routelen as usize {
-                let ((ax, ay), (bx, by)) = (r.grids[k], r.grids[k + 1]);
-                if (ax, ay) == (bx, by) {
-                    continue;
-                }
-                if ax == bx {
-                    g.update_usage_v(ax, ay.min(by), amount);
-                } else if ay == by {
-                    g.update_usage_h(ax.min(bx), ay, amount);
-                }
-            }
-        }
-    };
     for &id in &ids {
-        let t = state[id].tree.clone().ok_or_else(|| format!("soft-NDR: net {id} has no 2D tree"))?;
-        charge(grid, &nets[id], id, &t, -f64::from(nets[id].edge_cost));
-        nets[id].edge_cost = 1;
-        nets[id].layer_edge_cost = &SOFT_LAYER_EDGE_COST[..nets[id].layer_edge_cost.len()];
-        state[id].soft_ndr = true;
-        charge(grid, &nets[id], id, &t, f64::from(nets[id].edge_cost));
+        apply_soft_ndr(grid.g, nets, state, id)?;
     }
     Ok(ids)
+}
+
+/// `applySoftNDR` on the router's own state: `updateSoftNDRNetUsage(-edge cost)`, `setSoftNDR`
+/// (edge cost 1, every per-layer cost 1), `updateSoftNDRNetUsage(+edge cost)` — the congestion
+/// loop's demotion and R17's (`disableNDRForCongestedNets`) both.
+///
+/// ⛔ Both usage passes go through the NDR-aware charge (`updatePlanarNetUsage` →
+/// `Graph2D::updateUsageV/H`), and the cost is read on each side of the demotion.
+pub fn apply_soft_ndr(g: &mut crate::graph2d::Graph2d, nets: &mut [RsmtNet<'_>], state: &mut [NetState], id: usize) -> Result<(), String> {
+    let t = state[id].tree.clone().ok_or_else(|| format!("soft-NDR: net {id} has no 2D tree"))?;
+    update_planar_net_usage(g, &nets[id], id, &t, -f64::from(nets[id].edge_cost));
+    nets[id].edge_cost = 1;
+    nets[id].layer_edge_cost = &SOFT_LAYER_EDGE_COST[..nets[id].layer_edge_cost.len()];
+    state[id].soft_ndr = true;
+    update_planar_net_usage(g, &nets[id], id, &t, f64::from(nets[id].edge_cost));
+    Ok(())
+}
+
+/// `updatePlanarNetUsage`: every step of every routed edge charged `amount` on its 2D edge — a
+/// step whose x and y both repeat (a via) skipped.
+fn update_planar_net_usage(g: &mut crate::graph2d::Graph2d, net: &RsmtNet<'_>, id: usize, t: &StTree, amount: f64) {
+    let nn = net.ndr_net(id);
+    let mut g = g.for_net(&nn);
+    for r in &t.routes {
+        if r.routelen <= 0 || r.grids.is_empty() {
+            continue;
+        }
+        for k in 0..r.routelen as usize {
+            let ((ax, ay), (bx, by)) = (r.grids[k], r.grids[k + 1]);
+            if (ax, ay) == (bx, by) {
+                continue;
+            }
+            if ax == bx {
+                g.update_usage_v(ax, ay.min(by), amount);
+            } else if ay == by {
+                g.update_usage_h(ax.min(bx), ay, amount);
+            }
+        }
+    }
 }
 
 /// `copyRS` — save every net's tree (topology and routes) as the best so far.
