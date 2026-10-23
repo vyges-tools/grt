@@ -104,7 +104,7 @@ const DESCRIBE: &str = r#"{
     "Correlated end to end on the guide files it writes, compared against a fresh reference run: 85 of 85 cases of the reference router's own global-routing regression suite, 2026-09-25 -- 80 exact from the scripts' inputs, and 5 exact on a database whose pin access points vyges-drt pin_access wrote. Both routers are covered (the default one and the CUGR one), with timing-driven routing timed by this engine's own timer and no captured slacks. The correlation harness is not part of this repository.",
     "write_db is correlated on the database it writes: on 84 of 84 comparable cases of the same suite it equals the reference's database right after global routing -- every net's guides in order, the gcell grid, the routing layers and the grt_use_cugr property -- 2026-09-26. Detailed-routing that database with vyges-drt gives a DEF byte-identical to the reference's global_route plus detailed_route on 67 of them, antenna-repair jumper routes included, and differs on none; of the rest the detailed router refuses 9 and the reference itself routes nothing on 8. Not written: the gcell grid's per-cell capacity and usage, which nothing downstream reads.",
     "repair_antennas checks the antennas itself and inserts jumpers and diodes; a captured `violations` file can stand in for its check, as an ORACLE. timer_slacks, when given, also answers the timer's reads from a captured file instead of computing them.",
-    "REFUSED rather than approximated: reading pin access points during antenna checking or antenna-wire synthesis; a later repair iteration's jumper pass under CUGR, and -jumper_only with violations left after the first; incremental routing with no CUGR route in the session; database edits the incremental bracket does not model (named); RC commands before any liberty library; a clock period with no liberty library to time it; any step not listed in --help.",
+    "REFUSED rather than approximated: reading pin access points during antenna checking or antenna-wire synthesis; incremental routing with no CUGR route in the session; database edits the incremental bracket does not model (named); RC commands before any liberty library; a clock period with no liberty library to time it; any step not listed in --help.",
     "Global routing that ends congested without allow_congestion is an error, as it is in the reference (after the guides are saved).",
     "The Steiner trees are built by vyges-stt and the placement parasitics by vyges-est, each correlated separately."
   ],
@@ -656,9 +656,10 @@ fn repair_diode_mterm(db: &Db, step: &Value) -> Result<Option<(String, String)>,
 
 /// `repair_antennas` as `GlobalRouter::repairAntennas` runs it, with the CHECKER's answers captured.
 ///
-/// One iteration: the violations of the first check → `jumperInsertion` (unless `-diode_only`) →
-/// `saveGuides` over the nets that got jumpers → the second check. Diode insertion, and a second
-/// iteration with violations left, are refused.
+/// Each iteration, as `while (violations && itr < iterations)`: the check → `jumperInsertion`
+/// (unless `-diode_only`) → `saveGuides` over the nets that got jumpers → the check again → unless
+/// `-jumper_only`, diodes and the incremental reroute of the dirty nets, which a later iteration
+/// checks alone.
 #[allow(clippy::too_many_arguments)]
 /// The router `repair_antennas` asks and re-routes with: FastRoute's state after its run (and its
 /// total overflow), or CUGR's after its route.
@@ -675,7 +676,6 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, diode: Option
         RepairRouter::FastRoute(s, t) => (Some((s, t)), None),
         RepairRouter::Cugr(c, g) => (None, Some((c, g))),
     };
-    use vyges_grt::repair_antennas::{jumper_insertion, JumperInputs};
     let jumper_only = step["jumper_only"].as_bool().unwrap_or(false);
     let diode_only = step["diode_only"].as_bool().unwrap_or(false);
     let iterations = step["iterations"].as_i64().unwrap_or(1);
@@ -712,39 +712,7 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, diode: Option
         if let Some((state, total_overflow)) = fast.as_mut() {
             saved.extend(fast_route_jumpers(db, state, *total_overflow, &by_net, &tech, step, allow_congestion, 1, log, saved_guides)?);
         } else if let Some((cugr, cg)) = cugr.as_mut() {
-            // Under CUGR the pass asks CUGR (`hasAvailableResources`, `hasJumperResources`) and
-            // re-adopts each jumpered route into it (`restoreNetRoute`); `routes_` persists.
-            let inp = JumperInputs { tech: &tech, grid: cg.jumper_grid, max_routing_layer: cg.max_routing_layer };
-            let index = cugr.nets.iter().enumerate().map(|(k, n)| (n.name.clone(), k)).collect();
-            let mut router = vyges_grt::cugr::jumpers::CugrJumpers { cugr, grid: cg.jumper_grid, index, restores: Vec::new(), commits: Vec::new(), unmodelled: None };
-            let mut trace = step["trace"].as_str().map(|_| Vec::new());
-            let res = jumper_insertion(&by_net, &mut cg.routes, &inp, &mut router, trace.as_mut()).map_err(Fail::Refused)?;
-            if let Some(u) = router.unmodelled.take() {
-                return Err(Fail::Refused(u));
-            }
-            if let (Some(p), Some(t)) = (step["trace"].as_str(), &trace) {
-                std::fs::write(p, t.iter().map(|l| format!("VYGJ|{l}\n")).collect::<String>()).map_err(at(p))?;
-            }
-            if let Ok(path) = std::env::var("VYGC_OUT") {
-                let lines: String = router.restores.iter().map(|(net, r)| vyges_grt::cugr::trace::restore(net, r) + "\n").collect();
-                let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(at(&path))?;
-                std::io::Write::write_all(&mut f, lines.as_bytes()).map_err(err)?;
-            }
-            log.push(format!("GRT-0302: Inserted {} jumpers for {} nets.", res.total_jumpers, res.net_with_jumpers));
-            // saveGuides(nets_with_jumpers): a CUGR guide is never marked congested.
-            let mut modified = Vec::new();
-            // addJumperOnSegments > 0 → `db_net->setJumpers(true)`: the detailed router reads it
-            // (`hasJumpers`) and routes the net at ten times the off-guide cost.
-            for name in &res.modified_nets {
-                db.net_set_jumpers(name, true).map_err(err)?;
-            }
-            for name in &res.modified_nets {
-                let nr = cg.net_routes.iter_mut().find(|n| &n.name == name).ok_or_else(|| err(format!("net {name} has no route")))?;
-                nr.segments = cg.routes[name].clone();
-                modified.push(nr.clone());
-            }
-            *saved_guides = true;
-            saved = vyges_grt::save_guides(&modified, &cg.jumper_grid.grid, &cg.save).map_err(|e| err(format!("{e:?}")))?;
+            saved.extend(cugr_jumpers(db, cugr, cg, &by_net, &tech, step, 1, log, saved_guides)?);
         }
     }
     // antenna_violations_ as the diodes see it: the first check's when no jumper pass ran, else the
@@ -828,9 +796,6 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, diode: Option
             if itr >= iterations {
                 break;
             }
-            if !diode_only {
-                return Err(Fail::Refused("a later repair iteration with the jumper pass (hasNewViolations) is not modelled".into()));
-            }
             itr += 1;
             second = match &oracle {
                 Some(blocks) => blocks.get(checks).cloned().unwrap_or_default(),
@@ -845,6 +810,25 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, diode: Option
             checks += 1;
             second = vyges_grt::repair_antennas::recheck_scope(second, |v| &v.0, &nets_to_repair, &order);
             log.push(format!("GRT-0012: Found {} antenna violations.", second.iter().map(|v| &v.0).collect::<BTreeSet<_>>().len()));
+            // Violations left: the jumper pass again, as under FastRoute below — CUGR asked, each
+            // jumpered route re-adopted, its guides saved, the dirty nets checked again.
+            if !second.is_empty() && !diode_only {
+                let by_net = net_violations(db, &second, &number_to_index)?;
+                saved.extend(cugr_jumpers(db, c, cg, &by_net, &tech, step, itr as usize, log, saved_guides)?);
+                second = match &oracle {
+                    Some(blocks) => blocks.get(checks).cloned().unwrap_or_default(),
+                    None => {
+                        let mut after = db_guides.clone();
+                        for ng in &saved {
+                            after.insert(ng.net.clone(), ng.guides.clone());
+                        }
+                        check_design(db, &after, Some(diode), ratio_margin)?
+                    }
+                };
+                checks += 1;
+                second = vyges_grt::repair_antennas::recheck_scope(second, |v| &v.0, &nets_to_repair, &order);
+                log.push(format!("GRT-0012: Found {} antenna violations.", second.iter().map(|v| &v.0).collect::<BTreeSet<_>>().len()));
+            }
             continue;
         }
         let Some((state, total_overflow)) = fast.as_mut() else { return Err(Fail::Refused("no router state".into())) };
@@ -925,8 +909,39 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, diode: Option
             log.push(format!("GRT-0012: Found {} antenna violations.", second.iter().map(|v| &v.0).collect::<BTreeSet<_>>().len()));
         }
     }
-    if jumper_only && !second.is_empty() && iterations > 1 {
-        return Err(Fail::Refused("a second repair iteration is not modelled".into()));
+    // -jumper_only: no diodes, so `nets_to_repair` is never narrowed to the dirty nets — each later
+    // iteration checks EVERY net (on the guides saved so far) and, finding any violation, runs the
+    // jumper pass again and checks again. Every net counts as new to it: the violations are cleared
+    // after each jumper pass and at the end of each iteration, so the check that opens one has no
+    // `last_nets` to compare with.
+    if jumper_only {
+        while !second.is_empty() && itr < iterations {
+            itr += 1;
+            for pass_check in 0..2 {
+                second = match &oracle {
+                    Some(blocks) => blocks.get(checks).cloned().unwrap_or_default(),
+                    None => {
+                        let mut after = db_guides.clone();
+                        for ng in &saved {
+                            after.insert(ng.net.clone(), ng.guides.clone());
+                        }
+                        check_design(db, &after, Some(diode), ratio_margin)?
+                    }
+                };
+                checks += 1;
+                second.sort_by_key(|(n, ..)| order.iter().position(|m| m == n).unwrap_or(usize::MAX));
+                log.push(format!("GRT-0012: Found {} antenna violations.", second.iter().map(|v| &v.0).collect::<BTreeSet<_>>().len()));
+                if pass_check == 1 || second.is_empty() || diode_only {
+                    break;
+                }
+                let by_net = net_violations(db, &second, &number_to_index)?;
+                match (fast.as_mut(), cugr.as_mut()) {
+                    (Some((state, total_overflow)), _) => saved.extend(fast_route_jumpers(db, state, *total_overflow, &by_net, &tech, step, allow_congestion, itr as usize, log, saved_guides)?),
+                    (None, Some((c, cg))) => saved.extend(cugr_jumpers(db, c, cg, &by_net, &tech, step, itr as usize, log, saved_guides)?),
+                    (None, None) => return Err(Fail::Refused("no router state".into())),
+                }
+            }
+        }
     }
     Ok(saved)
 }
@@ -998,6 +1013,47 @@ fn fast_route_jumpers(db: &mut Db, state: &mut vyges_grt::global_route::AfterRou
     }
     *saved_guides = true;
     vyges_grt::save_guides(&modified, &state.jumper_grid.grid, &opts).map_err(|e| err(format!("{e:?}")))
+}
+
+/// The jumper pass under CUGR: it asks CUGR (`hasAvailableResources`, `hasJumperResources`) and
+/// re-adopts each jumpered route into it (`restoreNetRoute`); `routes_` persists. `pass` > 1 (a
+/// later iteration's pass) appends to the jumper trace, as `fast_route_jumpers` does.
+#[allow(clippy::too_many_arguments)]
+fn cugr_jumpers(db: &mut Db, cugr: &mut vyges_grt::cugr::Cugr, cg: &mut vyges_grt::cugr::route::CugrGuides, by_net: &[vyges_grt::repair_antennas::NetViolations], tech: &vyges_grt::repair_antennas::TechLayers, step: &Value, pass: usize, log: &mut Vec<String>, saved_guides: &mut bool) -> Result<Vec<vyges_grt::NetGuides>, Fail> {
+    use vyges_grt::repair_antennas::{jumper_insertion, JumperInputs};
+    let inp = JumperInputs { tech, grid: cg.jumper_grid, max_routing_layer: cg.max_routing_layer };
+    let index = cugr.nets.iter().enumerate().map(|(k, n)| (n.name.clone(), k)).collect();
+    let mut router = vyges_grt::cugr::jumpers::CugrJumpers { cugr, grid: cg.jumper_grid, index, restores: Vec::new(), commits: Vec::new(), unmodelled: None };
+    let mut trace = step["trace"].as_str().map(|_| Vec::new());
+    let res = jumper_insertion(by_net, &mut cg.routes, &inp, &mut router, trace.as_mut()).map_err(Fail::Refused)?;
+    if let Some(u) = router.unmodelled.take() {
+        return Err(Fail::Refused(u));
+    }
+    if let (Some(p), Some(t)) = (step["trace"].as_str(), &trace) {
+        let lines: String = t.iter().map(|l| format!("VYGJ|{l}\n")).collect();
+        let mut f = std::fs::OpenOptions::new().create(true).write(true).append(pass > 1).truncate(pass == 1).open(p).map_err(at(p))?;
+        std::io::Write::write_all(&mut f, lines.as_bytes()).map_err(at(p))?;
+    }
+    if let Ok(path) = std::env::var("VYGC_OUT") {
+        let lines: String = router.restores.iter().map(|(net, r)| vyges_grt::cugr::trace::restore(net, r) + "\n").collect();
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(at(&path))?;
+        std::io::Write::write_all(&mut f, lines.as_bytes()).map_err(err)?;
+    }
+    log.push(format!("GRT-0302: Inserted {} jumpers for {} nets.", res.total_jumpers, res.net_with_jumpers));
+    // saveGuides(nets_with_jumpers): a CUGR guide is never marked congested.
+    let mut modified = Vec::new();
+    // addJumperOnSegments > 0 → `db_net->setJumpers(true)`: the detailed router reads it
+    // (`hasJumpers`) and routes the net at ten times the off-guide cost.
+    for name in &res.modified_nets {
+        db.net_set_jumpers(name, true).map_err(err)?;
+    }
+    for name in &res.modified_nets {
+        let nr = cg.net_routes.iter_mut().find(|n| &n.name == name).ok_or_else(|| err(format!("net {name} has no route")))?;
+        nr.segments = cg.routes[name].clone();
+        modified.push(nr.clone());
+    }
+    *saved_guides = true;
+    vyges_grt::save_guides(&modified, &cg.jumper_grid.grid, &cg.save).map_err(|e| err(format!("{e:?}")))
 }
 
 /// `RepairAntennas::repairAntennas` up to `legalizePlacedCells`: the violating gates made FIRM, the

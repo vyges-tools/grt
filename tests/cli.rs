@@ -211,3 +211,68 @@ fn a_named_diode_bypasses_the_search_and_its_diffusion_area_is_checked() {
     assert_eq!(o.status.code(), Some(0), "{r}");
     assert!(r["log"].as_array().unwrap().iter().any(|l| l == "GRT-0246: No diode with LEF class CORE ANTENNACELL found."), "{r}");
 }
+
+/// tiny.lef plus `DIODE1`: a CORE ANTENNACELL whose signal terminal HAS diffusion area.
+fn lef_with_live_diode() -> String {
+    let lef = std::fs::read_to_string(data("tiny.lef")).unwrap();
+    let cut = lef.rfind("END LIBRARY").unwrap();
+    let diode = "MACRO DIODE1\n  CLASS CORE ANTENNACELL ;\n  ORIGIN 0 0 ;\n  SIZE 0.5 BY 1.2 ;\n  SITE core ;\n  PIN DIODE\n    DIRECTION INPUT ;\n    USE SIGNAL ;\n    ANTENNADIFFAREA 0.1 ;\n    PORT\n      LAYER M1 ;\n        RECT 0.1 0.25 0.4 0.45 ;\n    END\n  END DIODE\nEND DIODE1\n\n";
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let path = tmp(&format!("live-diode-{}.lef", SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    std::fs::write(&path, format!("{}{diode}{}", &lef[..cut], &lef[cut..])).unwrap();
+    path.to_str().unwrap().to_string()
+}
+
+/// The checker's answers, one block per check in call order (`true`: net n1 violates at u2/A).
+fn violation_blocks(name: &str, blocks: &[bool]) -> String {
+    let text: String = blocks.iter().map(|&v| if v { "VYGA|viol|n1|level=1|ratio=9|diodes=1|gates=u2/A\n--\n" } else { "--\n" }).collect();
+    let path = tmp(name);
+    std::fs::write(&path, text).unwrap();
+    path.to_str().unwrap().to_string()
+}
+
+/// The repair's own lines, codes only, in order.
+fn repair_codes(r: &serde_json::Value) -> Vec<String> {
+    r["log"].as_array().unwrap().iter().filter_map(|l| l.as_str()?.split(':').next().filter(|c| c.starts_with("GRT-00") || c.starts_with("GRT-03")).map(str::to_string)).collect()
+}
+
+/// `-jumper_only` past the first iteration: with no diodes `nets_to_repair` is never narrowed, so
+/// each iteration while violations remain checks every net, runs the jumper pass (every net is new:
+/// the violations were cleared at the end of the last iteration) and checks again — and the loop
+/// ends when a check finds nothing. Upstream `GlobalRouter::repairAntennas`, `while (violations &&
+/// itr < iterations)`; witnessed on every fresh ascon/picorv32 job with `-jumper_only` (10-23).
+#[test]
+fn jumper_only_runs_the_jumper_pass_every_iteration_while_violations_remain() {
+    let pass = ["GRT-0012", "GRT-0302", "GRT-0012"];
+    for (blocks, passes) in [(&[true; 6][..], 3), (&[true, true, true, false][..], 2)] {
+        let v = violation_blocks(&format!("jo-{passes}.viol"), blocks);
+        let (o, r) = route(&format!("jo-{passes}.json"), serde_json::json!({
+            "lefs": [lef_with_live_diode()], "def": data("tiny.def"),
+            "steps": [{ "cmd": "global_route" }, { "cmd": "repair_antennas", "diode_cell": "DIODE1", "iterations": 3, "jumper_only": true, "violations": v }]
+        }), &[]);
+        assert_eq!(o.status.code(), Some(0), "{r}");
+        assert_eq!(repair_codes(&r), pass.repeat(passes), "{r}");
+    }
+}
+
+/// Under CUGR a later iteration runs the jumper pass too: after the diodes and the incremental
+/// reroute, the next iteration checks the dirty nets, and violations there are new (cleared at the
+/// end of the last iteration) — so CUGR is asked for jumpers again, then the nets checked again.
+/// Upstream `GlobalRouter::repairAntennas`; witnessed on every fresh ascon/picorv32 job routed
+/// with `-use_cugr` (10-23: 13 then 2 jumpers on ascon, 26 then 7 on picorv32).
+#[test]
+fn a_later_cugr_iteration_runs_the_jumper_pass_again() {
+    // tiny.def on a die a CUGR gcell fits in (15 M2 pitches = 3000 > its 2400 height).
+    let def = std::fs::read_to_string(data("tiny.def")).unwrap()
+        .replace("DIEAREA ( 0 0 ) ( 4000 2400 )", "DIEAREA ( 0 0 ) ( 8000 8000 )")
+        .replace("DO 12 STEP 200", "DO 40 STEP 200").replace("DO 20 STEP 200 LAYER", "DO 40 STEP 200 LAYER");
+    let big = tmp("cugr-later.def");
+    std::fs::write(&big, def).unwrap();
+    let v = violation_blocks("cugr-later.viol", &[true, true, true, false]);
+    let (o, r) = route("cugr-later.json", serde_json::json!({
+        "lefs": [lef_with_live_diode()], "def": big.to_str().unwrap(),
+        "steps": [{ "cmd": "global_route", "use_cugr": true }, { "cmd": "repair_antennas", "diode_cell": "DIODE1", "iterations": 2, "violations": v }]
+    }), &[]);
+    assert_eq!(o.status.code(), Some(0), "{r}");
+    assert_eq!(repair_codes(&r), ["GRT-0012", "GRT-0302", "GRT-0012", "GRT-0015", "GRT-0012", "GRT-0302", "GRT-0012"], "{r}");
+}
