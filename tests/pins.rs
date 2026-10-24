@@ -88,7 +88,7 @@ struct Seen {
 /// One net: build its pins, then place each; compare with the reference's final pins. Returns
 /// false where the engine stopped with an error — which must be where the reference did (a net with
 /// no final pins recorded).
-fn replay_net(n: &Value, ctx: &Value, seen: &mut Seen, log: &mut Vec<String>, who: &str) -> bool {
+fn replay_net(n: &Value, ctx: &Value, seen: &mut Seen, log: &mut Vec<vyges_grt::log::Msg>, who: &str) -> bool {
     let aborted = arr(&n["pins"]).is_empty() && !arr(&n["terms"]).is_empty();
     let g = grid(ctx);
     let verbose = int(&ctx["verbose"]) == 1;
@@ -223,7 +223,7 @@ fn replay(g: &Value, full_runs_only_log: bool) -> Seen {
         }
         if complete && !r["quiet"].as_bool().expect("flag") && (!full_runs_only_log || complete) {
             let want: Vec<&str> = arr(&r["log"]).iter().map(|l| l.as_str().expect("line")).collect();
-            assert_eq!(log, want, "{who}: GRT-0280/0281/0034/0035/0036 lines");
+            assert_eq!(vyges_grt::log::lines(&log), want, "{who}: GRT-0280/0281/0034/0035/0036 lines");
             seen.log_runs += 1;
         }
     }
@@ -275,7 +275,7 @@ fn ports_sharing_a_position_on_a_layer_are_invalid() {
     assert!(log.is_empty());
     assert!(check_pin_placement(&[&a, &b, &c, &d], &|l| format!("m{l}"), 1000, &mut log).is_err());
     assert_eq!(log.len(), 3, "c meets a; d meets a and c");
-    assert_eq!(log[0], "[WARNING GRT-0031] At least 2 pins in position (1.00um, 2.00um), layer m2, port c.");
+    assert_eq!(vyges_grt::log::lines(&log)[0], "[WARNING GRT-0031] At least 2 pins in position (1.00um, 2.00um), layer m2, port c.");
 }
 
 /// ⛔ The pin position is the LAST routing box's lower-left — across pins too: `last_layer` is never
@@ -329,7 +329,7 @@ fn cand(name: &str, supply: bool, special: bool, terms: i32) -> NetCandidate {
 fn only_supply_and_special_nets_escape_the_fanout_skip() {
     let mut log = Vec::new();
     let added = find_nets(&[cand("s", true, false, 50), cand("at", false, false, 10), cand("pg", true, true, 50)], 10, &mut log);
-    assert_eq!(log, ["[INFO GRT-0280] Skipping net s with 50 terminals."], "supply alone is skipped; 10 is not above 10");
+    assert_eq!(vyges_grt::log::lines(&log), ["[INFO GRT-0280] Skipping net s with 50 terminals."], "supply alone is skipped; 10 is not above 10");
     assert_eq!(added, [1], "`at` is added; `pg` passes the skip but addNet rejects supply");
 }
 

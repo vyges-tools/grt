@@ -205,7 +205,7 @@ fn grt_0088_matches_the_reference_logs() {
                 &mut log,
             );
         }
-        assert_eq!(log, want, "{}: GRT-0088 lines", r["design"]);
+        assert_eq!(vyges_grt::log::lines(&log), want, "{}: GRT-0088 lines", r["design"]);
         checked += want.len();
     }
     assert!(checked >= 1000, "only {checked} GRT-0088 lines checked");

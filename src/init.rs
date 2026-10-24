@@ -184,10 +184,10 @@ pub struct FastRouteConfig {
 ///
 /// ⛔ With no Liberty loaded the critical-nets percentage is FORCED to 0, with GRT-300 — every run,
 /// whatever it was (a warning even when it already was 0). The value persists in the router.
-pub fn config_fast_route(opts: &SetupOptions, log: &mut Vec<String>) -> FastRouteConfig {
+pub fn config_fast_route(opts: &SetupOptions, log: &mut dyn crate::log::Sink) -> FastRouteConfig {
     let mut critical_nets_percentage = opts.critical_nets_percentage;
     if !opts.has_liberty {
-        log.push("[WARNING GRT-0300] Timing is not available, setting critical nets percentage to 0.".into());
+        log.warn("GRT", 300, "Timing is not available, setting critical nets percentage to 0.");
         critical_nets_percentage = 0.0;
     }
     FastRouteConfig { critical_nets_percentage }
@@ -197,12 +197,12 @@ pub fn config_fast_route(opts: &SetupOptions, log: &mut Vec<String>) -> FastRout
 ///
 /// ⛔ `int(adjustment_ * 100)` multiplies in `float` and TRUNCATES: 0.29f × 100 is 29.0f (29%),
 /// where the same product in `double` is 28.99999… (28%).
-pub fn report_layer_settings(opts: &SetupOptions, log: &mut Vec<String>) {
+pub fn report_layer_settings(opts: &SetupOptions, log: &mut dyn crate::log::Sink) {
     if opts.verbose {
-        log.push(format!("[INFO GRT-0020] Min routing layer: {}", opts.min_layer_name));
-        log.push(format!("[INFO GRT-0021] Max routing layer: {}", opts.max_layer_name));
-        log.push(format!("[INFO GRT-0022] Global adjustment: {}%", (opts.adjustment * 100.0f32) as i32));
-        log.push(format!("[INFO GRT-0023] Grid origin: ({}, {})", opts.grid_origin.0, opts.grid_origin.1));
+        log.info("GRT", 20, format!("Min routing layer: {}", opts.min_layer_name));
+        log.info("GRT", 21, format!("Max routing layer: {}", opts.max_layer_name));
+        log.info("GRT", 22, format!("Global adjustment: {}%", (opts.adjustment * 100.0f32) as i32));
+        log.info("GRT", 23, format!("Grid origin: ({}, {})", opts.grid_origin.0, opts.grid_origin.1));
     }
 }
 
@@ -250,7 +250,7 @@ pub struct SetupReport {
     pub config: FastRouteConfig,
     pub grid: CoreGrid,
     /// The reference's log lines the stages emit, in order.
-    pub log: Vec<String>,
+    pub log: Vec<crate::log::Msg>,
     /// ⬜ The stages of the published order this engine does not run yet, in that order.
     pub absent: Vec<AbsentStage>,
 }

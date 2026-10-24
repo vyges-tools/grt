@@ -31,17 +31,17 @@ pub struct NetCandidate {
 /// ⛔ Two DIFFERENT predicates. The fanout checks exempt only nets that are supply AND special;
 /// `addNet` rejects a net that is supply OR special OR has special wires OR is connected by
 /// abutment. The warning threshold is a hard-coded 1000, the skip is `skip_large_fanout`.
-pub fn find_nets(candidates: &[NetCandidate], skip_large_fanout: i32, log: &mut Vec<String>) -> Vec<usize> {
+pub fn find_nets(candidates: &[NetCandidate], skip_large_fanout: i32, log: &mut dyn crate::log::Sink) -> Vec<usize> {
     const LARGE_FANOUT_THRESHOLD: i32 = 1000;
     let mut added = Vec::new();
     for (i, n) in candidates.iter().enumerate() {
         let is_special = n.is_supply && n.is_special;
         if !is_special && n.term_count > skip_large_fanout {
-            log.push(format!("[INFO GRT-0280] Skipping net {} with {} terminals.", n.name, n.term_count));
+            log.info("GRT", 280, format!("Skipping net {} with {} terminals.", n.name, n.term_count));
             continue;
         }
         if !is_special && n.term_count > LARGE_FANOUT_THRESHOLD {
-            log.push(format!("[WARNING GRT-0281] Net {} has a large fanout of {} terminals.", n.name, n.term_count));
+            log.warn("GRT", 281, format!("Net {} has a large fanout of {} terminals.", n.name, n.term_count));
         }
         if crate::is_routable(n.is_supply, n.is_special, n.has_special_wires, n.connected_by_abutment) {
             added.push(i);
@@ -135,10 +135,10 @@ pub fn make_iterm_pin(
     max_routing_layer: i32,
     directions: &BTreeMap<i32, Option<Direction>>,
     verbose: bool,
-    log: &mut Vec<String>,
+    log: &mut dyn crate::log::Sink,
 ) -> Result<NetPin, PinError> {
     if class == MasterClass::Cover && verbose {
-        log.push("[WARNING GRT-0034] Net connected to instance of class COVER added for routing.".into());
+        log.warn("GRT", 34, "Net connected to instance of class COVER added for routing.");
     }
     let connected = matches!(class, MasterClass::Pad | MasterClass::Block);
     if !placed {
@@ -148,7 +148,7 @@ pub fn make_iterm_pin(
     let mut pin_pos = (0, 0);
     for b in boxes.iter().filter(|b| b.routing) {
         if !contains(die, b.rect) && verbose {
-            log.push(format!("[WARNING GRT-0035] Pin {name} is outside die area."));
+            log.warn("GRT", 35, format!("Pin {name} is outside die area."));
         }
         pin_boxes.entry(b.level).or_default().push(b.rect);
         pin_pos = (b.rect.x_min, b.rect.y_min);
@@ -191,7 +191,7 @@ pub fn make_bterm_pin(
     directions: &BTreeMap<i32, Option<Direction>>,
     check_pin_placement: bool,
     verbose: bool,
-    log: &mut Vec<String>,
+    log: &mut dyn crate::log::Sink,
 ) -> Result<Option<NetPin>, PinError> {
     // ⚠️ Checked per pin BEFORE its boxes; the capture folds it to "every pin placed".
     if !placed {
@@ -202,7 +202,7 @@ pub fn make_bterm_pin(
     for b in boxes.iter().filter(|b| b.routing) {
         let mut rect = b.rect;
         if !contains(die, rect) && verbose {
-            log.push(format!("[WARNING GRT-0036] Pin {name} is outside die area."));
+            log.warn("GRT", 36, format!("Pin {name} is outside die area."));
             rect = intersection(rect, die);
             if (rect.x_max - rect.x_min) as i64 * (rect.y_max - rect.y_min) as i64 == 0 {
                 return Err(PinError::OutsideDie { pin: name.into() });
@@ -528,7 +528,7 @@ pub fn check_pin_placement(
     ports: &[&NetPin],
     layer_name: &dyn Fn(i32) -> String,
     dbu_per_micron: i32,
-    log: &mut Vec<String>,
+    log: &mut dyn crate::log::Sink,
 ) -> Result<(), InvalidPinPlacement> {
     let mut invalid = false;
     let mut layer_positions: BTreeMap<i32, Vec<(i32, i32)>> = BTreeMap::new();
@@ -538,8 +538,8 @@ pub fn check_pin_placement(
         for &pos in seen.iter() {
             if pos == port.position {
                 let um = |d: i32| d as f64 / dbu_per_micron as f64;
-                log.push(format!(
-                    "[WARNING GRT-0031] At least 2 pins in position ({:.2}um, {:.2}um), layer {}, port {}.",
+                log.warn("GRT", 31, format!(
+                    "At least 2 pins in position ({:.2}um, {:.2}um), layer {}, port {}.",
                     um(pos.0),
                     um(pos.1),
                     layer_name(layer),

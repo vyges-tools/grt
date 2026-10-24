@@ -164,7 +164,7 @@ pub struct CugrRoute {
     pub alphas: Vec<f32>,
     pub slack: f32,
     /// The stages' log lines (GRT-0274, GRT-0277, GRT-0305, GRT-0118).
-    pub log: Vec<String>,
+    pub log: Vec<crate::log::Msg>,
 }
 
 /// `CUGR::route(false)`: `initCUGR`, then stage 1, then — each only while congested nets remain —
@@ -303,7 +303,7 @@ pub struct CugrGuides {
 /// exports nothing for (local, or under two pins) is left to `addRemainingGuides`. Unlike
 /// FastRoute's tail there is no `connectPadPins` and no `mergeSegments`, and a CUGR guide is never
 /// marked congested. `isLocal` is asked of the pins AFTER they moved.
-pub fn cugr_guides(db: &mut Db, opts: &RouteOptions, cugr: &Cugr, clock_nets: &BTreeSet<String>, alphas: &[f32], slack: f32, log: &mut Vec<String>) -> Res<CugrGuides> {
+pub fn cugr_guides(db: &mut Db, opts: &RouteOptions, cugr: &Cugr, clock_nets: &BTreeSet<String>, alphas: &[f32], slack: f32, log: &mut dyn crate::log::Sink) -> Res<CugrGuides> {
     use crate::findrouting::{add_remaining_guides, RemainingNet};
     if opts.nets_to_route.is_some() {
         return Err("cugr: set_nets_to_route (incremental routing) is not modelled".into());
@@ -684,7 +684,7 @@ pub fn update_dirty_routes_cugr(
     cg: &mut CugrGuides,
     dirty: &[String],
     stt: SteinerBuilder<'_>,
-    log: &mut Vec<String>,
+    log: &mut dyn crate::log::Sink,
     mut trace: Option<&mut Vec<String>>,
 ) -> Res<Vec<crate::NetGuides>> {
     use crate::findrouting::{add_remaining_guides, RemainingNet};

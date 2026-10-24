@@ -104,9 +104,9 @@ fn replay(g: &Value) -> Seen {
         // ⚠️ The corpus harness (`helpers.tcl`) runs `suppress_message GRT 704` (and 303): the logger
         // drops those lines. The engine still emits GRT-704 — its suggestion is checked above against
         // the captured result — and the harness's suppression is applied here, as the logger would.
-        log.retain(|l| !l.contains("GRT-0704]"));
+        log.retain(|l| !l.line().contains("GRT-0704]"));
         let want: Vec<&str> = arr(&r["log"]).iter().map(|l| l.as_str().expect("line")).collect();
-        assert_eq!(log, want, "{who}: GRT-0096 / 0018 / 0014 / 0115 / 0116 lines");
+        assert_eq!(vyges_grt::log::lines(&log), want, "{who}: GRT-0096 / 0018 / 0014 / 0115 / 0116 lines");
         seen.log_runs += 1;
     }
     seen
@@ -148,7 +148,7 @@ fn a_hopeless_horizontal_cell_abandons_the_suggestion() {
 fn grt_704_names_the_smallest_nonzero_adjustment() {
     let mut log = Vec::new();
     suggest_adjustment(&[0.0, 0.95, 1.0], Some(84), &mut log);
-    assert_eq!(log, ["[WARNING GRT-0704] Try reduce the layer adjustment from 95% to 84%"]);
+    assert_eq!(vyges_grt::log::lines(&log), ["[WARNING GRT-0704] Try reduce the layer adjustment from 95% to 84%"]);
     log.clear();
     suggest_adjustment(&[0.84], Some(84), &mut log);
     assert!(log.is_empty(), "equal is not above");
@@ -162,10 +162,10 @@ fn grt_704_names_the_smallest_nonzero_adjustment() {
 fn cugr_congestion_is_only_a_warning() {
     let mut log = Vec::new();
     assert!(congestion_verdict(true, false, true, &mut log));
-    assert!(log[0].starts_with("[WARNING GRT-0115]"));
+    assert!(vyges_grt::log::lines(&log)[0].starts_with("[WARNING GRT-0115]"));
     log.clear();
     assert!(!congestion_verdict(true, false, false, &mut log));
-    assert!(log[0].starts_with("[ERROR GRT-0116]"));
+    assert!(vyges_grt::log::lines(&log)[0].starts_with("[ERROR GRT-0116]"));
     log.clear();
     assert!(congestion_verdict(false, false, false, &mut log) && log.is_empty());
 }

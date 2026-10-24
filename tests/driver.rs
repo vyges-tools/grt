@@ -52,7 +52,7 @@ fn replay(g: &Value) -> Seen {
             if got {
                 assert!(!has_routable_nets(nets[..nets.len() - 1].iter().copied()), "{who}: G1 stops at the FIRST routable net");
             } else {
-                log.push(GRT_7.to_string());
+                log.push(vyges_grt::log::Msg::Coded { level: vyges_grt::log::Level::Warning, tool: "GRT", id: 7, text: GRT_7.into() });
             }
             seen.scans += 1;
         }
@@ -95,7 +95,7 @@ fn replay(g: &Value) -> Seen {
             continue;
         }
         let want: Vec<&str> = arr(&r["log"]).iter().map(|l| l.as_str().expect("line")).collect();
-        assert_eq!(log, want, "{who}: GRT-0007 / GRT-0053 table lines");
+        assert_eq!(vyges_grt::log::lines(&log), want, "{who}: GRT-0007 / GRT-0053 table lines");
         seen.log_runs += 1;
     }
     seen
@@ -147,5 +147,5 @@ fn the_reduction_is_computed_through_a_double() {
     let h: Vec<(u16, u16)> = vec![(59, 160)];
     let mut log = Vec::new();
     report_resources(&[ResourceLayer { name: "m1", horizontal: true, h_edges: &h, v_edges: &[] }], &mut log);
-    assert_eq!(log[5], "m1         Horizontal        160            59          63.12%");
+    assert_eq!(vyges_grt::log::lines(&log)[5], "m1         Horizontal        160            59          63.12%");
 }

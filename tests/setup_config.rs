@@ -60,7 +60,7 @@ fn the_setup_config_and_layer_report_match_the_reference() {
             continue;
         }
         let want: Vec<&str> = r["log"].as_array().expect("log").iter().map(|l| l.as_str().expect("line")).collect();
-        assert_eq!(log, want, "{who}: GRT-0300 / GRT-0020..0023 lines");
+        assert_eq!(vyges_grt::log::lines(&log), want, "{who}: GRT-0300 / GRT-0020..0023 lines");
         runs += 1;
     }
     // ⛔ Not vacuous: both branches of each stage are exercised.
@@ -87,7 +87,7 @@ fn the_global_adjustment_percentage_is_a_float_product() {
     };
     let mut log = Vec::new();
     report_layer_settings(&o, &mut log);
-    assert_eq!(log[2], "[INFO GRT-0022] Global adjustment: 29%");
+    assert_eq!(vyges_grt::log::lines(&log)[2], "[INFO GRT-0022] Global adjustment: 29%");
     assert_eq!((0.29f32 as f64 * 100.0) as i32, 28, "the double reading differs");
 }
 
@@ -124,10 +124,10 @@ fn the_layer_report_truncates_and_prints_x_then_y() {
     };
     let mut log = Vec::new();
     report_layer_settings(&o, &mut log);
-    assert_eq!(log[2], "[INFO GRT-0022] Global adjustment: 25%");
-    assert_eq!(log[3], "[INFO GRT-0023] Grid origin: (100, 250)");
+    assert_eq!(vyges_grt::log::lines(&log)[2], "[INFO GRT-0022] Global adjustment: 25%");
+    assert_eq!(vyges_grt::log::lines(&log)[3], "[INFO GRT-0023] Grid origin: (100, 250)");
     o.adjustment = -0.257;
     log.clear();
     report_layer_settings(&o, &mut log);
-    assert_eq!(log[2], "[INFO GRT-0022] Global adjustment: -25%");
+    assert_eq!(vyges_grt::log::lines(&log)[2], "[INFO GRT-0022] Global adjustment: -25%");
 }

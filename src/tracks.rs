@@ -328,7 +328,7 @@ pub fn init_routing_tracks(
     pitches: &[(i32, i32)],
     dbu_per_micron: i32,
     verbose: bool,
-    log: &mut Vec<String>,
+    log: &mut dyn crate::log::Sink,
 ) -> Result<Vec<RoutingTracks>, TrackError> {
     let mut out = Vec::new();
     for layer in layers {
@@ -349,8 +349,8 @@ pub fn init_routing_tracks(
         out.push(t);
         if verbose {
             let um = |dbu: i32| dbu as f64 / dbu_per_micron as f64;
-            log.push(format!(
-                "[INFO GRT-0088] Layer {:<7} Track-Pitch = {:.4}  line-2-Via Pitch: {:.4}",
+            log.info("GRT", 88, format!(
+                "Layer {:<7} Track-Pitch = {:.4}  line-2-Via Pitch: {:.4}",
                 layer.name,
                 um(t.track_pitch),
                 um(t.line_to_via_pitch())

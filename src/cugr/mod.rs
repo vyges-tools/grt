@@ -345,7 +345,7 @@ impl Cugr {
     /// `patternRouteResAware` (stage 2), with resistance-aware routing and critical nets only: the
     /// critical nets updated and marked on the stage-1 trees, then every marked net — in the
     /// res-aware order — ripped up and pattern-routed again (no detours), its res-aware costs on.
-    pub fn pattern_route_res_aware(&mut self, alphas: &[f32], stt: pattern_route::SteinerBuilder<'_>, log: &mut Vec<String>, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
+    pub fn pattern_route_res_aware(&mut self, alphas: &[f32], stt: pattern_route::SteinerBuilder<'_>, log: &mut dyn crate::log::Sink, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
         if !self.res_aware_order() {
             return Ok(());
         }
@@ -389,7 +389,7 @@ impl Cugr {
     ///
     /// ⚠️ The list is sorted IN PLACE, as upstream's is: an incremental route hands the sorted
     /// list on to stages 3 and 4.
-    pub fn pattern_route(&mut self, order: &mut [usize], alphas: &[f32], stt: pattern_route::SteinerBuilder<'_>, log: &mut Vec<String>, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
+    pub fn pattern_route(&mut self, order: &mut [usize], alphas: &[f32], stt: pattern_route::SteinerBuilder<'_>, log: &mut dyn crate::log::Sink, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
         self.sort_net_indices(order, false, 1, None)?;
         if let Some(t) = trace.as_deref_mut() {
             trace::order(t, self, order, 1);
@@ -439,7 +439,7 @@ impl Cugr {
 
     /// `patternRouteWithDetours` (stage 3): the overflow view taken ONCE, the congested nets in the
     /// neutral order, each ripped up and pattern-routed again with detours through the view.
-    pub fn pattern_route_with_detours(&mut self, nets: &mut [usize], alphas: &[f32], stt: pattern_route::SteinerBuilder<'_>, log: &mut Vec<String>, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
+    pub fn pattern_route_with_detours(&mut self, nets: &mut [usize], alphas: &[f32], stt: pattern_route::SteinerBuilder<'_>, log: &mut dyn crate::log::Sink, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
         if nets.is_empty() {
             return Ok(());
         }
@@ -483,7 +483,7 @@ impl Cugr {
     /// ripped up first, then the wire-cost view taken, the nets in the neutral order, each routed
     /// on a sparsified grid whose offset steps after every net, its tree laid onto layers by
     /// pattern routing, committed, and the view re-priced along it.
-    pub fn maze_route(&mut self, nets: &mut [usize], stage: i32, log: &mut Vec<String>, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
+    pub fn maze_route(&mut self, nets: &mut [usize], stage: i32, log: &mut dyn crate::log::Sink, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
         if nets.is_empty() {
             return Ok(());
         }
@@ -547,7 +547,7 @@ impl Cugr {
     /// taking the congested nets again (stopping when none), demoting an NDR net congested two
     /// rounds running to the default rule, raising the logistic slope by 1 up to 6, and maze-
     /// routing the congested set. The multiplier is reset after.
-    pub fn iterative_rrr(&mut self, nets: &mut Vec<usize>, iterations: i32, log: &mut Vec<String>, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
+    pub fn iterative_rrr(&mut self, nets: &mut Vec<usize>, iterations: i32, log: &mut dyn crate::log::Sink, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
         if self.grid.total_overflow() == 0 {
             return Ok(());
         }
@@ -580,7 +580,7 @@ impl Cugr {
                 }
             }
             if !demoted.is_empty() {
-                log.push(format!("[WARNING GRT-0305] Demoted {} NDR net(s) to default rule to reduce congestion (use debug 'softNDR' for net list).", demoted.len()));
+                log.warn("GRT", 305, format!("Demoted {} NDR net(s) to default rule to reduce congestion (use debug 'softNDR' for net list).", demoted.len()));
             }
             if multiplier < 6.0 {
                 multiplier += 1.0;
@@ -599,7 +599,7 @@ impl Cugr {
         self.cost_multiplier = 1.0;
         let residual = self.grid.total_overflow();
         if residual > 0 && self.incremental_candidates.is_none() {
-            log.push(format!("[WARNING GRT-0118] Iterative RRR finished with congestion remaining ({residual})."));
+            log.warn("GRT", 118, format!("Iterative RRR finished with congestion remaining ({residual})."));
         }
         Ok(())
     }
@@ -712,7 +712,7 @@ impl Cugr {
 
     /// `CUGR::route(true)`: the queued nets only — stage 1 on them (sorted in place), then stages
     /// 3 and 4 on ALL of them (no congested-set narrowing), then RRR scoped to them; no GRT-0118.
-    pub fn route_incremental(&mut self, queued: Vec<usize>, iterations: i32, alphas: &[f32], stt: pattern_route::SteinerBuilder<'_>, log: &mut Vec<String>, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
+    pub fn route_incremental(&mut self, queued: Vec<usize>, iterations: i32, alphas: &[f32], stt: pattern_route::SteinerBuilder<'_>, log: &mut dyn crate::log::Sink, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
         if let Some(t) = trace.as_deref_mut() {
             t.push("VYGC|route|1".into());
         }

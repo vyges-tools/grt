@@ -188,7 +188,7 @@ fn replay(g: &Value) -> Seen {
         }
         if !r["quiet"].as_bool().expect("flag") {
             let want: Vec<&str> = arr(&r["log"]).iter().map(|l| l.as_str().expect("line")).collect();
-            assert_eq!(log, want, "{who}: GRT-0001/0002 lines");
+            assert_eq!(vyges_grt::log::lines(&log), want, "{who}: GRT-0001/0002 lines");
             seen.log_runs += 1;
         }
     }
@@ -249,7 +249,7 @@ fn the_root_is_the_last_driver() {
 fn an_empty_netlist_reports_zero_degrees() {
     let mut log = Vec::new();
     report_net_degree(&[(1, false)], true, &mut log);
-    assert_eq!(log, ["[INFO GRT-0001] Minimum degree: 0", "[INFO GRT-0002] Maximum degree: 0"]);
+    assert_eq!(vyges_grt::log::lines(&log), ["[INFO GRT-0001] Minimum degree: 0", "[INFO GRT-0002] Maximum degree: 0"]);
     assert_eq!(compute_net_degree(&[(1, false)]), (i32::MAX, 1));
 }
 

@@ -39,9 +39,6 @@ pub enum PatternError {
     DegenerateSteinerTree { net: String },
 }
 
-/// Log lines the stage emits (`GRT-0274`).
-pub type Log = Vec<String>;
-
 // ---------------------------------------------------------------- access points ----
 
 /// `selectShapeAccessPoint(net, pin)`: of the cells the pin's shapes touch, the most accessible —
@@ -52,7 +49,7 @@ pub type Log = Vec<String>;
 /// below the min routing layer is accessible (1). Strictly better accessibility, or equal and
 /// strictly nearer, wins — the first such cell in the pin's order. Every cell of the chosen
 /// location, on any layer, widens the pin's layer interval.
-fn select_shape_access_point(net: &mut GrNet, pin: usize, grid: &GridGraph, map: &mut AccessPointMap, log: &mut Log) -> Result<(), PatternError> {
+fn select_shape_access_point(net: &mut GrNet, pin: usize, grid: &GridGraph, map: &mut AccessPointMap, log: &mut dyn crate::log::Sink) -> Result<(), PatternError> {
     let center = Point::new(net.bounding_box.cx(), net.bounding_box.cy());
     let points = &net.pin_access_points[pin];
     let (mut best_acc, mut best_dist, mut best_index) = (0, i32::MAX, None);
@@ -75,7 +72,7 @@ fn select_shape_access_point(net: &mut GrNet, pin: usize, grid: &GridGraph, map:
         }
     }
     if best_acc == 0 {
-        log.push(format!("[WARNING GRT-0274] Pin {pin} of net {} is hard to access.", net.name));
+        log.warn("GRT", 274, format!("Pin {pin} of net {} is hard to access.", net.name));
     }
     let best = best_index.ok_or_else(|| PatternError::NoAccessPoint { net: net.name.clone(), pin })?;
     let selected = points[best].p;
@@ -113,7 +110,7 @@ pub fn select_access_point(aps: &[(Point, Interval)]) -> (Point, Interval) {
 /// gridline taking the upper cell's low; clamped to the grid) on its layer (level − 1, clamped);
 /// the pin takes the FIRST of those with strictly the most identical copies (`selectAccessPoint`),
 /// its layers unioned into the cell's entry.
-pub fn select_access_points(net: &mut GrNet, grid: &GridGraph, log: &mut Log) -> Result<AccessPointMap, PatternError> {
+pub fn select_access_points(net: &mut GrNet, grid: &GridGraph, log: &mut dyn crate::log::Sink) -> Result<AccessPointMap, PatternError> {
     let mut map = AccessPointMap::new();
     net.shape_ap_choices.clear();
     net.odb_ap_choices.clear();
@@ -350,7 +347,7 @@ struct Scaffold {
 ///   (truncated to an int) — upward the test reads the stems at `high - 1`, not `high + 1`;
 /// - the step widens until fewer than `target_detour_count` shifts remain on either side;
 /// - a pinned node is copied (its pins stay) and joined to its shifted twin.
-pub fn construct_detours(dag: &mut Dag, view: &super::grid_graph::View<bool>, sizes: [usize; 2], c: &Constants, log: &mut Log) {
+pub fn construct_detours(dag: &mut Dag, view: &super::grid_graph::View<bool>, sizes: [usize; 2], c: &Constants, log: &mut dyn crate::log::Sink) {
     use super::grid_graph::view_check;
     let n0 = dag.nodes.len();
     let mut sc: Vec<Scaffold> = Vec::new();
@@ -537,7 +534,7 @@ pub fn construct_detours(dag: &mut Dag, view: &super::grid_graph::View<bool>, si
                             }
                         }
                     } else {
-                        log.push("[WARNING GRT-0277] The root doesn't have exactly one child.".into());
+                        log.warn("GRT", 277, "The root doesn't have exactly one child.");
                     }
                 }
             }
@@ -766,7 +763,7 @@ pub fn pattern_route_net(
     stt: SteinerBuilder<'_>,
     cx: &CostContext<'_>,
     detours: Option<&super::grid_graph::View<bool>>,
-    log: &mut Log,
+    log: &mut dyn crate::log::Sink,
 ) -> Result<NetRoute, PatternError> {
     let selected = select_access_points(net, cx.grid, log)?;
     let steiner = construct_steiner_tree(net, &selected, alpha, stt)?;

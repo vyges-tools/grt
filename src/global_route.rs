@@ -153,7 +153,7 @@ pub struct TechSetup {
     pub core: CoreGrid,
     pub fast_route: FastRouteGrid,
     pub capacities: EdgeCapacities,
-    pub log: Vec<String>,
+    pub log: Vec<crate::log::Msg>,
 }
 
 /// G3 `getMinMaxLayer`, then `initFastRoute` up to `setCapacities` (I3–I9).
@@ -214,7 +214,7 @@ pub fn setup_tech(db: &mut Db, opts: &RouteOptions) -> Res<TechSetup> {
 /// extension, layer±1 blocking, transition layers — and `has_macros_or_pads_`), and a net with
 /// routed wires (`findNetsObstructions` decodes them). `perturbCapacities` is inert at its default
 /// (0%); `findLayerExtensions` feeds only the macro branch.
-pub fn setup_adjust(db: &mut Db, t: &TechSetup, opts: &RouteOptions, log: &mut Vec<String>) -> Res<Adjusted> {
+pub fn setup_adjust(db: &mut Db, t: &TechSetup, opts: &RouteOptions, log: &mut dyn crate::log::Sink) -> Res<Adjusted> {
     let c = &t.capacities;
     let (min, max) = (t.min_routing_layer, t.max_routing_layer);
     let state = |cap: &[u16]| cap.iter().map(|&cap| EdgeState { cap, red: 0, real_cap: 0 }).collect::<Vec<_>>();
@@ -246,7 +246,7 @@ pub fn setup_adjust(db: &mut Db, t: &TechSetup, opts: &RouteOptions, log: &mut V
         if in_range(level) {
             let rect = Rect { x_min: x0, y_min: y0, x_max: x1, y_max: y1 };
             if !contains(&rect) && opts.verbose {
-                log.push("[WARNING GRT-0037] Found blockage outside die area.".into());
+                log.warn("GRT", 37, "Found blockage outside die area.");
             }
             { stream.push((rect, level, false)); apply_obstruction_adjustment(&mut e, rect, level, dir(level), false); }
         }
@@ -300,7 +300,7 @@ pub fn setup_adjust(db: &mut Db, t: &TechSetup, opts: &RouteOptions, log: &mut V
             if in_range(level) {
                 let rect = transform_rect(&orient, origin, r);
                 if !contains(&rect) && opts.verbose {
-                    log.push(format!("[WARNING GRT-0038] Found blockage outside die area in instance {inst}."));
+                    log.warn("GRT", 38, format!("Found blockage outside die area in instance {inst}."));
                 }
                 { stream.push((rect, level, false)); apply_obstruction_adjustment(&mut e, rect, level, dir(level), false); }
             }
@@ -311,7 +311,7 @@ pub fn setup_adjust(db: &mut Db, t: &TechSetup, opts: &RouteOptions, log: &mut V
             }
             let rect = transform_rect(&orient, origin, *r);
             if !contains(&rect) && !*supply {
-                log.push(format!("[WARNING GRT-0039] Found pin {term} outside die area in instance {inst}."));
+                log.warn("GRT", 39, format!("Found pin {term} outside die area in instance {inst}."));
                 pins_out_of_die += 1;
             }
             { stream.push((rect, *level, false)); apply_obstruction_adjustment(&mut e, rect, *level, dir(*level), false); }
@@ -343,7 +343,7 @@ pub fn setup_adjust(db: &mut Db, t: &TechSetup, opts: &RouteOptions, log: &mut V
             if in_range(level) {
                 let rect = Rect { x_min: x0, y_min: y0, x_max: x1, y_max: y1 };
                 if !contains(&rect) && opts.verbose {
-                    log.push(format!("[WARNING GRT-0041] Net {net} has wires/vias outside die area."));
+                    log.warn("GRT", 41, format!("Net {net} has wires/vias outside die area."));
                 }
                 { stream.push((rect, level, false)); apply_obstruction_adjustment(&mut e, rect, level, dir(level), false); }
             }
@@ -387,7 +387,7 @@ pub fn setup_adjust(db: &mut Db, t: &TechSetup, opts: &RouteOptions, log: &mut V
         let use_pitch = t.tracks.iter().find(|r| r.layer_index == layer).map_or(-1, |r| r.use_pitch());
         compute_region_adjustments(&mut e, region, layer, adjustment, dir(layer), use_pitch).map_err(|_| format!("GRT: region adjustment on layer {layer} outside the die"))?;
     }
-    log.append(&mut e.log);
+    log.replay(std::mem::take(&mut e.log));
     Ok(Adjusted { edges: e, has_macros_or_pads, stream, extensions, transition_layers })
 }
 
@@ -527,7 +527,7 @@ fn find_transition_layers(t: &TechSetup) -> Vec<i32> {
 /// `addLayerAdjustment(level, adjustment)` — what `set_global_routing_layer_adjustment <layer> <adj>`
 /// does for one layer: stored ON THE TECH LAYER, unless the layer is above the block's max routing
 /// layer AT THE TIME OF THE CALL (and that max is set), when it is ignored (GRT-30, verbose).
-pub fn add_layer_adjustment(db: &mut Db, level: i32, adjustment: f32, verbose: bool, log: &mut Vec<String>) -> Res<()> {
+pub fn add_layer_adjustment(db: &mut Db, level: i32, adjustment: f32, verbose: bool, log: &mut dyn crate::log::Sink) -> Res<()> {
     let name_of = |db: &Db, level: i32| -> Res<String> {
         let tech = read_tech(db)?;
         Ok(tech.routing_layers.iter().find(|l| l.routing_level == level).map(|l| l.name.clone()).unwrap_or_default())
@@ -535,8 +535,8 @@ pub fn add_layer_adjustment(db: &mut Db, level: i32, adjustment: f32, verbose: b
     let max = db.block_get_max_routing_layer();
     if level > max && max > 0 {
         if verbose {
-            log.push(format!(
-                "[WARNING GRT-0030] Specified layer {} for adjustment is greater than max routing layer {} and will be ignored.",
+            log.warn("GRT", 30, format!(
+                "Specified layer {} for adjustment is greater than max routing layer {} and will be ignored.",
                 name_of(db, level)?,
                 name_of(db, max)?
             ));
@@ -626,7 +626,7 @@ pub(crate) fn discover_net_pins<'a>(
     candidates: &[NetCandidate],
     opts: &RouteOptions,
     edge_capacity: Option<&dyn Fn(i32, i32, i32, i32, i32) -> i32>,
-    log: &mut Vec<String>,
+    log: &mut dyn crate::log::Sink,
 ) -> Res<Vec<(&'a NetFacts, Vec<(NetPin, bool)>)>> {
     let max = t.max_routing_layer;
     let clk_max = t.tech.max_layer_for_clock;
@@ -711,12 +711,12 @@ pub(crate) fn discover_net_pins<'a>(
 /// ⛔ Refused as in I10: a pad or macro terminal, a net with a wire. A block terminal with no
 /// routing geometry is GRT-42 (`check_pin_placement_` is true: only the Rudy path clears it, and
 /// this engine has no Rudy step), and `checkPinPlacement` runs after the pins (GRT-31 / GRT-80).
-pub fn setup_nets(db: &Db, t: &TechSetup, e: &mut RouterEdges, has_macros_or_pads: bool, opts: &RouteOptions, log: &mut Vec<String>) -> Res<Vec<RouterNet>> {
+pub fn setup_nets(db: &Db, t: &TechSetup, e: &mut RouterEdges, has_macros_or_pads: bool, opts: &RouteOptions, log: &mut dyn crate::log::Sink) -> Res<Vec<RouterNet>> {
     Ok(setup_nets_counted(db, t, e, has_macros_or_pads, opts, log)?.0)
 }
 
 /// [`setup_nets`], and how many routable nets it left out because they already have wiring.
-pub fn setup_nets_counted(db: &Db, t: &TechSetup, e: &mut RouterEdges, has_macros_or_pads: bool, opts: &RouteOptions, log: &mut Vec<String>) -> Res<(Vec<RouterNet>, usize)> {
+pub fn setup_nets_counted(db: &Db, t: &TechSetup, e: &mut RouterEdges, has_macros_or_pads: bool, opts: &RouteOptions, log: &mut dyn crate::log::Sink) -> Res<(Vec<RouterNet>, usize)> {
     let (min, max) = (t.min_routing_layer, t.max_routing_layer);
     let (clk_min, clk_max) = (t.tech.min_layer_for_clock, t.tech.max_layer_for_clock);
     let directions: std::collections::BTreeMap<i32, Option<crate::capacity::Direction>> =
@@ -884,7 +884,7 @@ pub struct RouteResult {
     /// The 2D tree those routes were read from, per net: each edge's ends, length and grid points
     /// IN ORDER — what a route-by-route comparison against the reference needs.
     pub snapshot_edges: std::collections::BTreeMap<String, Vec<SnapshotEdge>>,
-    pub log: Vec<String>,
+    pub log: Vec<crate::log::Msg>,
     /// Routable nets left out because they already have wiring (the reference's initNetlist skip).
     pub already_wired: usize,
     /// The router's state as a later command in the same session reads it.

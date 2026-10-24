@@ -11,19 +11,19 @@ pub fn compute_net_wirelength(segment_lengths: &[i32], tile_size: i32) -> i32 {
 
 /// X4 — `computeWirelength`: the routes' total, in DEF units, divided (INTEGER division, `int64_t`)
 /// by the DEF units per micron — GRT-18 when verbose. Returns the reported microns.
-pub fn compute_wirelength(routes: &[Vec<i32>], tile_size: i32, def_units: i32, verbose: bool, log: &mut Vec<String>) -> i64 {
+pub fn compute_wirelength(routes: &[Vec<i32>], tile_size: i32, def_units: i32, verbose: bool, log: &mut dyn crate::log::Sink) -> i64 {
     let total: i64 = routes.iter().map(|r| compute_net_wirelength(r, tile_size) as i64).sum();
     let um = total / def_units as i64;
     if verbose {
-        log.push(format!("[INFO GRT-0018] Total wirelength: {um} um"));
+        log.info("GRT", 18, format!("Total wirelength: {um} um"));
     }
     um
 }
 
 /// X5 — GRT-14, the size of the route map (nets given guides included), when verbose.
-pub fn report_routed_nets(routes: usize, verbose: bool, log: &mut Vec<String>) {
+pub fn report_routed_nets(routes: usize, verbose: bool, log: &mut dyn crate::log::Sink) {
     if verbose {
-        log.push(format!("[INFO GRT-0014] Routed nets: {routes}"));
+        log.info("GRT", 14, format!("Routed nets: {routes}"));
     }
 }
 
@@ -41,11 +41,11 @@ pub struct CongestionLayer<'a> {
 /// Per layer over BOTH directions: resource = Σ cap, demand = Σ usage, overflow = Σ max(usage −
 /// cap, 0); the largest horizontal and vertical overflow; usage `(float) d / (float) r`, then
 /// `*= 100` in float (0 without resources). The total's usage is `(float) d / (float) r * 100`.
-pub fn report_congestion(layers: &[CongestionLayer<'_>], log: &mut Vec<String>) {
-    log.push(String::new());
-    log.push("[INFO GRT-0096] Final congestion report:".into());
-    log.push("Layer         Resource        Demand        Usage (%)    Max H / Max V / Total Congestion".into());
-    log.push("---------------------------------------------------------------------------------------".into());
+pub fn report_congestion(layers: &[CongestionLayer<'_>], log: &mut dyn crate::log::Sink) {
+    log.report("");
+    log.info("GRT", 96, "Final congestion report:");
+    log.report("Layer         Resource        Demand        Usage (%)    Max H / Max V / Total Congestion");
+    log.report("---------------------------------------------------------------------------------------");
     let (mut tr, mut td, mut to, mut th, mut tv) = (0i32, 0i32, 0i32, 0i32, 0i32);
     for l in layers {
         let (mut r, mut d, mut o, mut mh, mut mv) = (0i32, 0i32, 0i32, 0i32, 0i32);
@@ -66,12 +66,12 @@ pub fn report_congestion(layers: &[CongestionLayer<'_>], log: &mut Vec<String>) 
         to += o;
         th += mh;
         tv += mv;
-        log.push(format!("{:<7}      {:>9}       {:>7}        {:>8.2}%            {:>2} / {:>2} / {:>2}", l.name, r, d, usage, mh, mv, o));
+        log.report(format!("{:<7}      {:>9}       {:>7}        {:>8.2}%            {:>2} / {:>2} / {:>2}", l.name, r, d, usage, mh, mv, o));
     }
     let total_usage = if tr == 0 { 0.0f32 } else { td as f32 / tr as f32 * 100.0 };
-    log.push("---------------------------------------------------------------------------------------".into());
-    log.push(format!("Total        {:>9}       {:>7}        {:>8.2}%            {:>2} / {:>2} / {:>2}", tr, td, total_usage, th, tv, to));
-    log.push(String::new());
+    log.report("---------------------------------------------------------------------------------------");
+    log.report(format!("Total        {:>9}       {:>7}        {:>8.2}%            {:>2} / {:>2} / {:>2}", tr, td, total_usage, th, tv, to));
+    log.report("");
 }
 
 /// One overflowing used grid cell as `computeSuggestedAdjustment` reads it.
@@ -128,7 +128,7 @@ pub fn compute_suggested_adjustment(horizontal: &[CongestedGrid], vertical: &[Co
 
 /// X7 — `suggestAdjustment`: GRT-704 when a suggestion exists BELOW the smallest non-zero layer
 /// adjustment in range (as a float percentage, starting from 1.0 = 100%).
-pub fn suggest_adjustment(layer_adjustments: &[f32], suggestion: Option<i32>, log: &mut Vec<String>) {
+pub fn suggest_adjustment(layer_adjustments: &[f32], suggestion: Option<i32>, log: &mut dyn crate::log::Sink) {
     let mut min_adjustment = 1.0f32;
     for &a in layer_adjustments {
         if a != 0.0 {
@@ -138,23 +138,23 @@ pub fn suggest_adjustment(layer_adjustments: &[f32], suggestion: Option<i32>, lo
     min_adjustment *= 100.0;
     if let Some(s) = suggestion {
         if min_adjustment > s as f32 {
-            log.push(format!("[WARNING GRT-0704] Try reduce the layer adjustment from {min_adjustment}% to {s}%"));
+            log.warn("GRT", 704, format!("Try reduce the layer adjustment from {min_adjustment}% to {s}%"));
         }
     }
 }
 
 /// X7 — the verdict on a congested run: a warning (GRT-115) with `-allow_congestion` or CUGR, else
 /// an error (GRT-116). Returns false on the error.
-pub fn congestion_verdict(congested: bool, allow_congestion: bool, use_cugr: bool, log: &mut Vec<String>) -> bool {
+pub fn congestion_verdict(congested: bool, allow_congestion: bool, use_cugr: bool, log: &mut dyn crate::log::Sink) -> bool {
     if !congested {
         return true;
     }
     const MSG: &str = "Global routing finished with congestion. Check the congestion regions in the DRC Viewer.";
     if allow_congestion || use_cugr {
-        log.push(format!("[WARNING GRT-0115] {MSG}"));
+        log.warn("GRT", 115, MSG);
         true
     } else {
-        log.push(format!("[ERROR GRT-0116] {MSG}"));
+        log.error("GRT", 116, MSG);
         false
     }
 }

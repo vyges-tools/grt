@@ -182,7 +182,7 @@ pub fn compute_net_degree(nets: &[(usize, bool)]) -> (i32, i32) {
 }
 
 /// `reportNetDegree`: GRT-1 / GRT-2 when verbose — zeros when no net passed the gate.
-pub fn report_net_degree(nets: &[(usize, bool)], verbose: bool, log: &mut Vec<String>) {
+pub fn report_net_degree(nets: &[(usize, bool)], verbose: bool, log: &mut dyn crate::log::Sink) {
     if !verbose {
         return;
     }
@@ -191,8 +191,8 @@ pub fn report_net_degree(nets: &[(usize, bool)], verbose: bool, log: &mut Vec<St
         min = 0;
         max = 0;
     }
-    log.push(format!("[INFO GRT-0001] Minimum degree: {min}"));
-    log.push(format!("[INFO GRT-0002] Maximum degree: {max}"));
+    log.info("GRT", 1, format!("Minimum degree: {min}"));
+    log.info("GRT", 2, format!("Maximum degree: {max}"));
 }
 
 /// A pin as `addResourcesForPinAccess` reads it.

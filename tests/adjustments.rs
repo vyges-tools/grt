@@ -215,7 +215,7 @@ fn replay(g: &Value) -> Seen {
         }
         if !r["quiet"].as_bool().expect("flag") {
             let want: Vec<&str> = arr(&r["log"]).iter().map(|l| l.as_str().expect("line")).collect();
-            assert_eq!(log, want, "{who}: GRT-0113/0114 lines");
+            assert_eq!(vyges_grt::log::lines(&log), want, "{who}: GRT-0113/0114 lines");
         }
     }
     seen

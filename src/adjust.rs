@@ -14,6 +14,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use crate::capacity::Direction;
+use crate::log::{Level, Msg};
 use crate::Rect;
 
 /// One 3D or 2D edge's capacity state — all `uint16_t` in the reference.
@@ -83,7 +84,7 @@ pub struct RouterEdges {
     pub vertical_blocked: HashMap<Tile, IntervalSet>,
     pub verbose: bool,
     /// GRT-113 / GRT-114, in order.
-    pub log: Vec<String>,
+    pub log: Vec<Msg>,
 }
 
 impl RouterEdges {
@@ -127,8 +128,8 @@ impl RouterEdges {
         let reduced = reduced_cap as i32;
         let reduce = if cap - reduced < 0 {
             if is_reduce && self.verbose {
-                let id = if horizontal { 113 } else { 114 };
-                self.log.push(format!("[WARNING GRT-0{id}] Underflow in reduce: cap, reducedCap: {cap}, {reduced}"));
+                let id: u16 = if horizontal { 113 } else { 114 };
+                self.log.push(Msg::Coded { level: Level::Warning, tool: "GRT", id, text: format!("Underflow in reduce: cap, reducedCap: {cap}, {reduced}") });
             }
             0
         } else {

@@ -14,6 +14,7 @@
 //! rules live in [`guides_for_segment`], the geometry in [`global_routing_to_box`].
 
 pub mod cugr;
+pub mod log;
 pub mod estimate;
 pub mod lroute;
 pub mod spiral;

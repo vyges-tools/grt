@@ -10,7 +10,7 @@ pub fn has_routable_nets(nets: impl IntoIterator<Item = (usize, usize)>) -> bool
 }
 
 /// The GRT-7 warning G1 issues before returning.
-pub const GRT_7: &str = "[WARNING GRT-0007] Design does not have any routable net (with at least 2 terms)";
+pub const GRT_7: &str = "Design does not have any routable net (with at least 2 terms)";
 
 /// `computeMaxRoutingLayer`: the last routing level of the unbroken run, from level 1, that has a
 /// track grid (GRT-701 when level 1 has none: `None`).
@@ -53,18 +53,18 @@ pub struct ResourceLayer<'a> {
 /// (`computeCongestionInformation`'s `cap_per_layer_`); reduction
 /// `(1.0 - (float) derated / (float) original) * 100` — the `1.0` is a `double`, the result stored
 /// in a `float` — and 0 when there is no original resource.
-pub fn report_resources(layers: &[ResourceLayer<'_>], log: &mut Vec<String>) {
-    log.push(String::new());
-    log.push("[INFO GRT-0053] Routing resources analysis:".into());
-    log.push("          Routing      Original      Derated      Resource".into());
-    log.push("Layer     Direction    Resources     Resources    Reduction (%)".into());
-    log.push("---------------------------------------------------------------".into());
+pub fn report_resources(layers: &[ResourceLayer<'_>], log: &mut dyn crate::log::Sink) {
+    log.report("");
+    log.info("GRT", 53, "Routing resources analysis:");
+    log.report("          Routing      Original      Derated      Resource");
+    log.report("Layer     Direction    Resources     Resources    Reduction (%)");
+    log.report("---------------------------------------------------------------");
     for l in layers {
         let preferred = if l.horizontal { l.h_edges } else { l.v_edges };
         let original: i32 = preferred.iter().map(|e| e.1 as i32).sum();
         let derated: i32 = l.h_edges.iter().chain(l.v_edges).map(|e| e.0 as i32).sum();
         let reduction = if original > 0 { ((1.0 - (derated as f32 / original as f32) as f64) * 100.0) as f32 } else { 0.0 };
-        log.push(format!(
+        log.report(format!(
             "{:<7}    {:<10}   {:>8}      {:>8}          {:>3.2}%",
             l.name,
             if l.horizontal { "Horizontal" } else { "Vertical" },
@@ -73,6 +73,6 @@ pub fn report_resources(layers: &[ResourceLayer<'_>], log: &mut Vec<String>) {
             reduction
         ));
     }
-    log.push("---------------------------------------------------------------".into());
-    log.push(String::new());
+    log.report("---------------------------------------------------------------");
+    log.report("");
 }
