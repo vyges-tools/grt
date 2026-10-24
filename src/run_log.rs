@@ -19,8 +19,8 @@ impl RunLines {
         RunLines { verbose, overflow_iterations, started: false, lines: Vec::new() }
     }
 
-    fn info(&mut self, id: u16, text: String) {
-        self.lines.push(Msg::Coded { level: crate::log::Level::Info, tool: "GRT", id, text });
+    fn info(&mut self, tool: &'static str, id: u16, text: String) {
+        self.lines.push(Msg::Coded { level: crate::log::Level::Info, tool, id, text });
     }
 
     /// One stage event.
@@ -39,14 +39,14 @@ impl RunLines {
             Stage::Loop(LoopEvent::Before { params, .. }) => {
                 if !self.started {
                     self.started = true;
-                    self.info(101, "Running extra iterations to remove congestion.".into());
+                    self.info("GRT", 101, "Running extra iterations to remove congestion.".into());
                 }
-                self.info(102, format!("Start extra iteration {}/{}", params.iter, self.overflow_iterations));
+                self.info("GRT", 102, format!("Start extra iteration {}/{}", params.iter, self.overflow_iterations));
             }
             Stage::B19(fin) => {
-                self.info(197, format!("Via related to pin nodes: {}", fin.vias.pin_nodes));
-                self.info(198, format!("Via related Steiner nodes: {}", fin.vias.steiner_nodes));
-                self.info(199, "Via filling finished.".into());
+                self.info("GRT", 197, format!("Via related to pin nodes: {}", fin.vias.pin_nodes));
+                self.info("GRT", 198, format!("Via related Steiner nodes: {}", fin.vias.steiner_nodes));
+                self.info("GRT", 199, "Via filling finished.".into());
             }
             _ => {}
         }
