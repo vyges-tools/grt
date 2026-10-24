@@ -206,6 +206,21 @@ pub fn report_layer_settings(opts: &SetupOptions, log: &mut dyn crate::log::Sink
     }
 }
 
+/// `reportMacrosAndBlockages`: GRT-3 / GRT-4, verbose only, after the obstruction adjustments.
+pub fn report_macros_and_blockages(verbose: bool, macros: usize, blockages: usize, log: &mut dyn crate::log::Sink) {
+    if verbose {
+        log.info("GRT", 3, format!("Macros: {macros}"));
+        log.info("GRT", 4, format!("Blockages: {blockages}"));
+    }
+}
+
+/// `initClockNets`: GRT-19, verbose only — the timer's clock nets, none without a Liberty library.
+pub fn report_clock_nets(verbose: bool, found: usize, log: &mut dyn crate::log::Sink) {
+    if verbose {
+        log.info("GRT", 19, format!("Found {found} clock nets."));
+    }
+}
+
 /// A stage of the setup sequence that this engine does not implement yet.
 ///
 /// 🔑 **Named, not omitted.** A stage that simply is not called produces no diff to chase — it

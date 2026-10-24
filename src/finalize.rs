@@ -730,6 +730,8 @@ pub fn maze_route_msmd_order_3d_all(order: &[usize], nets: &[RsmtNet<'_>], attrs
 /// What R19 leaves besides the rewritten trees.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Finish3d {
+    /// `fillVIA`'s counters (GRT-197 / GRT-198).
+    pub vias: crate::fillvia::ViaCounts,
     /// `getOverflow3D` after `fillVIA`: the overflow it stores and the usage it returns
     /// (`finallength`).
     pub overflow: Overflow3D,
@@ -747,16 +749,16 @@ pub struct Finish3d {
 /// ⛔ `checkRoute3D` raises two defects as errors (a floating pin, a negative layer) — returned as
 /// `Err` here, as is `fillVIA`'s "no previous routing".
 pub fn finish_3d(net_ids: &[usize], nets: &[RsmtNet<'_>], attrs: &[NetLayerAttrs], state: &mut [NetState], g2d: &Graph2d, g3: &Graph3d) -> Result<Finish3d, String> {
-    fill_via_all(net_ids, nets, attrs, state, g3.num_layers)?;
+    let vias = fill_via_all(net_ids, nets, attrs, state, g3.num_layers)?;
     let overflow = get_overflow_3d_all(g2d, g3);
     let num_via = three_d_via_all(net_ids, state);
     let defects = check_route_3d_all(net_ids, state)?;
     let pin_stacks = ensure_pin_coverage_all(net_ids, state, g3.num_layers);
-    Ok(Finish3d { overflow, num_via, defects, pin_stacks })
+    Ok(Finish3d { vias, overflow, num_via, defects, pin_stacks })
 }
 
 /// `fillVIA` — the via stacks at every node, through [`fill_via`].
-fn fill_via_all(net_ids: &[usize], nets: &[RsmtNet<'_>], attrs: &[NetLayerAttrs], state: &mut [NetState], num_layers: usize) -> Result<(), String> {
+fn fill_via_all(net_ids: &[usize], nets: &[RsmtNet<'_>], attrs: &[NetLayerAttrs], state: &mut [NetState], num_layers: usize) -> Result<crate::fillvia::ViaCounts, String> {
     let mut via_nets: Vec<ViaNet> = net_ids.iter().map(|&id| {
         let t = state[id].tree3d.as_ref().expect("a 3D tree");
         ViaNet {
@@ -766,14 +768,14 @@ fn fill_via_all(net_ids: &[usize], nets: &[RsmtNet<'_>], attrs: &[NetLayerAttrs]
             pins: nets[id].pins_x.iter().zip(nets[id].pins_y).zip(&attrs[id].pin_layers).map(|((&x, &y), &l)| ViaPin { x, y, layer: i32::from(l) }).collect(),
         }
     }).collect();
-    fill_via(&mut via_nets, num_layers as i16).map_err(|e| format!("net {}: edge {} has no previous routing", net_ids[e.net], e.edge))?;
+    let (counts, _) = fill_via(&mut via_nets, num_layers as i16).map_err(|e| format!("net {}: edge {} has no previous routing", net_ids[e.net], e.edge))?;
     for (&id, vn) in net_ids.iter().zip(via_nets) {
         let t = state[id].tree3d.as_mut().expect("a 3D tree");
         for (e, ve) in t.edges.iter_mut().zip(vn.edges) {
             (e.route_type, e.routelen, e.grids) = (ve.route_type, ve.routelen, ve.grids);
         }
     }
-    Ok(())
+    Ok(counts)
 }
 
 fn routed_edges(t: &Tree3D) -> Vec<RoutedEdge> {

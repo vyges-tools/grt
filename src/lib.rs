@@ -109,6 +109,7 @@ pub mod planar_route;
 pub use vyges_est::clk_network;
 pub mod finalize;
 pub mod run;
+pub mod run_log;
 pub mod wire_builder;
 pub mod wire_codec;
 pub mod polygon90;

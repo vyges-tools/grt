@@ -240,10 +240,14 @@ pub fn setup_adjust(db: &mut Db, t: &TechSetup, opts: &RouteOptions, log: &mut d
     let die = t.core.area;
     let mut stream: Vec<(Rect, i32, bool)> = Vec::new();
     let contains = |r: &Rect| die.x_min <= r.x_min && die.y_min <= r.y_min && r.x_max <= die.x_max && r.y_max <= die.y_max;
+    // reportMacrosAndBlockages' counts: block masters; obstruction boxes in range, the block's and
+    // every master's (a macro's too).
+    let (mut macros_cnt, mut blockages_cnt) = (0usize, 0usize);
     // findObstructions — the block's own (DEF) obstructions.
     for (n, x0, y0, x1, y1) in db.obstruction_boxes()? {
         let level = db.layer_get_routing_level(&db.layer_name_by_number(n));
         if in_range(level) {
+            blockages_cnt += 1;
             let rect = Rect { x_min: x0, y_min: y0, x_max: x1, y_max: y1 };
             if !contains(&rect) && opts.verbose {
                 log.warn("GRT", 37, "Found blockage outside die area.");
@@ -264,6 +268,8 @@ pub fn setup_adjust(db: &mut Db, t: &TechSetup, opts: &RouteOptions, log: &mut d
         }
         let m = &masters[&master];
         has_macros_or_pads |= m.is_block || m.is_pad;
+        macros_cnt += usize::from(m.is_block);
+        blockages_cnt += m.obstructions.iter().filter(|(level, _)| in_range(*level)).count();
         let (orient, origin) = (db.inst_get_orient(&inst), (db.inst_get_origin_x(&inst), db.inst_get_origin_y(&inst)));
         if m.is_block {
             // The macro branch: obstructions grouped per layer, layer±1 blocking, then each widened
@@ -367,6 +373,8 @@ pub fn setup_adjust(db: &mut Db, t: &TechSetup, opts: &RouteOptions, log: &mut d
         }
         crate::adjust::adjust_tile_set(&mut e, &tiles, layer, dir(layer));
     }
+    log.replay(std::mem::take(&mut e.log));
+    crate::init::report_macros_and_blockages(opts.verbose, macros_cnt, blockages_cnt, log);
     init_blocked_intervals(&mut e);
     save_resources_before_adjustments(&mut e);
     // computeUserGlobalAdjustments — WRITES the layer adjustment into the database.
@@ -1755,6 +1763,7 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
             db.net_set_sig_type(net, "CLOCK")?;
         }
     }
+    crate::init::report_clock_nets(opts.verbose, clock_nets.len(), &mut log);
     let (nets, already_wired) = setup_nets_counted(db, &t, &mut e, adj.has_macros_or_pads, opts, &mut log)?;
     let (xg, yg) = (e.x_grid as usize, e.y_grid as usize);
     // The router's grid, in run()'s layout (`[y * xg + x]` for both directions).
@@ -1978,9 +1987,12 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         g3: Option<Graph3d>,
         /// The 2D graph at R19, for the same reason: an incremental re-route starts from it.
         g2d: Option<crate::graph2d::Graph2d>,
+        /// run()'s own log lines, in order (written after it returns).
+        lines: crate::run_log::RunLines,
     }
     impl RunObserver for Observer {
         fn stage(&mut self, s: Stage<'_>, g2d: &crate::graph2d::Graph2d, g3: Option<&Graph3d>, st: &[NetState]) -> bool {
+            self.lines.stage(&s);
             match s {
                 Stage::B19(fin) => {
                     self.overflow = fin.overflow.total;
@@ -1999,8 +2011,9 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         }
     }
     let mut state = vec![NetState::default(); nets.len()];
-    let mut ov = Observer { overflow: 0, cnp: t.config.critical_nets_percentage, res_aware: opts.resistance_aware, trees: None, g3: None, g2d: None };
+    let mut ov = Observer { overflow: 0, cnp: t.config.critical_nets_percentage, res_aware: opts.resistance_aware, trees: None, g3: None, g2d: None, lines: crate::run_log::RunLines::new(opts.verbose, opts.congestion_iterations) };
     let run = fastroute_run(&inp, &mut state, &mut ov);
+    ov.lines.write(&mut log);
     if let Some(path) = &opts.timer_trace {
         std::fs::write(path, timer_trace.borrow().as_str())?;
     }
@@ -2214,11 +2227,14 @@ pub fn restore_for_repair(db: &mut Db, opts: &RouteOptions) -> Res<AfterRoute> {
     let mut log = t.log.clone();
     let adj = setup_adjust(db, &t, opts, &mut log)?;
     let mut e = adj.edges;
+    let mut found = 0;
     if let Some(lib) = &opts.liberty {
         for net in crate::clk_network::find_clk_nets(db, lib, &opts.clock_sources)? {
             db.net_set_sig_type(&net, "CLOCK")?;
+            found += 1;
         }
     }
+    crate::init::report_clock_nets(opts.verbose, found, &mut log);
     let nets = setup_nets(db, &t, &mut e, adj.has_macros_or_pads, opts, &mut log)?;
     let (xg, yg) = (e.x_grid as usize, e.y_grid as usize);
     // The router's grid, as route_design lays it out.
