@@ -1663,6 +1663,8 @@ fn run(job: &Value) -> Result<Value, Fail> {
                     continue;
                 }
                 let res = route_design(&mut db, &opts, &stt, &flutes).map_err(|e| classify(e.to_string()))?;
+                // The setup's lines (layers, tracks, blockages, pins, net degrees), where the command prints them.
+                (&mut log as &mut dyn vyges_grt::log::Sink).replay(res.log.clone());
                 gcell_grid = Some(res.gcell_grid);
                 used_cugr = Some(false);
                 // saveGuides replaces the guides of every net it routes; the others keep theirs.

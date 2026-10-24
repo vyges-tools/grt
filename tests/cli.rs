@@ -233,8 +233,9 @@ fn violation_blocks(name: &str, blocks: &[bool]) -> String {
 
 /// The repair's own lines, codes only, in order: `[INFO GRT-0012] …` → `GRT-0012`.
 fn repair_codes(r: &serde_json::Value) -> Vec<String> {
+    const REPAIR: [&str; 6] = ["GRT-0012", "GRT-0015", "GRT-0027", "GRT-0243", "GRT-0246", "GRT-0302"];
     let code = |l: &str| l.strip_prefix('[')?.split(']').next()?.split(' ').nth(1).map(str::to_string);
-    r["log"].as_array().unwrap().iter().filter_map(|l| code(l.as_str()?)).filter(|c| c.starts_with("GRT-00") || c.starts_with("GRT-03")).collect()
+    r["log"].as_array().unwrap().iter().filter_map(|l| code(l.as_str()?)).filter(|c| REPAIR.contains(&c.as_str())).collect()
 }
 
 /// `-jumper_only` past the first iteration: with no diodes `nets_to_repair` is never narrowed, so
