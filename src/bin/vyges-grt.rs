@@ -704,7 +704,7 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, diode: Option
     let allow_congestion = step["allow_congestion"].as_bool().unwrap_or(false);
     // No diode found: the command warns and does nothing at all (after the router is set up).
     let Some(diode) = diode else {
-        log.report("GRT-0246: No diode with LEF class CORE ANTENNACELL found.");
+        log.warn("GRT", 246, "No diode with LEF class CORE ANTENNACELL found.");
         return Ok(Vec::new());
     };
     if db.mterm_antenna_diff_area(&diode.0, &diode.1) == 0.0 {
@@ -726,7 +726,7 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, diode: Option
     let tech = tech_layers(db)?;
     let number_to_index: BTreeMap<i64, usize> = tech.0.iter().enumerate().map(|(i, l)| (i64::from(db.layer_get_number(&l.name)), i)).collect();
     let by_net = net_violations(db, &first, &number_to_index)?;
-    log.report(format!("GRT-0012: Found {} antenna violations.", by_net.len()));
+    log.info("GRT", 12, format!("Found {} antenna violations.", by_net.len()));
     let mut saved = Vec::new();
     // hasNewViolations: every net is new on the first iteration.
     if !diode_only && !by_net.is_empty() {
@@ -754,7 +754,7 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, diode: Option
     second.sort_by_key(|(n, ..)| order.iter().position(|m| m == n).unwrap_or(usize::MAX));
     // Every checkAntennaViolations call logs its count — the one after the jumpers too.
     if jumpers_ran {
-        log.report(format!("GRT-0012: Found {} antenna violations.", second.iter().map(|v| &v.0).collect::<BTreeSet<_>>().len()));
+        log.info("GRT", 12, format!("Found {} antenna violations.", second.iter().map(|v| &v.0).collect::<BTreeSet<_>>().len()));
     }
     // The command's `while (violations && itr < iterations)`: each pass inserts diodes for the
     // violations it holds and reroutes the dirty nets; a later pass first re-checks ONLY those
@@ -778,7 +778,7 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, diode: Option
             std::fs::write(path, &text).map_err(at(path))?;
         }
         legalized?;
-        log.report(format!("GRT-0015: Inserted {} diodes.", diodes.len()));
+        log.info("GRT", 15, format!("Inserted {} diodes.", diodes.len()));
         // dirty_nets_ (a PtrSet: dbNet order) — the nets given diodes (addDirtyNet, and the diode's
         // inDbITermPostConnect), and every net on an instance the legalization moved or flipped
         // (inDbPostMoveInst; updateDbInstLocations writes only what changed). Special nets and
@@ -830,7 +830,7 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, diode: Option
             };
             checks += 1;
             second = vyges_grt::repair_antennas::recheck_scope(second, |v| &v.0, &nets_to_repair, &order);
-            log.report(format!("GRT-0012: Found {} antenna violations.", second.iter().map(|v| &v.0).collect::<BTreeSet<_>>().len()));
+            log.info("GRT", 12, format!("Found {} antenna violations.", second.iter().map(|v| &v.0).collect::<BTreeSet<_>>().len()));
             // Violations left: the jumper pass again, as under FastRoute below — CUGR asked, each
             // jumpered route re-adopted, its guides saved, the dirty nets checked again.
             if !second.is_empty() && !diode_only {
@@ -848,7 +848,7 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, diode: Option
                 };
                 checks += 1;
                 second = vyges_grt::repair_antennas::recheck_scope(second, |v| &v.0, &nets_to_repair, &order);
-                log.report(format!("GRT-0012: Found {} antenna violations.", second.iter().map(|v| &v.0).collect::<BTreeSet<_>>().len()));
+                log.info("GRT", 12, format!("Found {} antenna violations.", second.iter().map(|v| &v.0).collect::<BTreeSet<_>>().len()));
             }
             continue;
         }
@@ -908,7 +908,7 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, diode: Option
         };
         checks += 1;
         second = vyges_grt::repair_antennas::recheck_scope(second, |v| &v.0, &nets_to_repair, &order);
-        log.report(format!("GRT-0012: Found {} antenna violations.", second.iter().map(|v| &v.0).collect::<BTreeSet<_>>().len()));
+        log.info("GRT", 12, format!("Found {} antenna violations.", second.iter().map(|v| &v.0).collect::<BTreeSet<_>>().len()));
         // Violations left: this pass runs as the first did — jumpers on every violating net (the
         // loop clears the violations before each check, so `hasNewViolations` holds whenever any
         // are found), their guides saved, and the same nets checked again for the diodes.
@@ -927,7 +927,7 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, diode: Option
             };
             checks += 1;
             second = vyges_grt::repair_antennas::recheck_scope(second, |v| &v.0, &nets_to_repair, &order);
-            log.report(format!("GRT-0012: Found {} antenna violations.", second.iter().map(|v| &v.0).collect::<BTreeSet<_>>().len()));
+            log.info("GRT", 12, format!("Found {} antenna violations.", second.iter().map(|v| &v.0).collect::<BTreeSet<_>>().len()));
         }
     }
     // -jumper_only: no diodes, so `nets_to_repair` is never narrowed to the dirty nets — each later
@@ -951,7 +951,7 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, diode: Option
                 };
                 checks += 1;
                 second.sort_by_key(|(n, ..)| order.iter().position(|m| m == n).unwrap_or(usize::MAX));
-                log.report(format!("GRT-0012: Found {} antenna violations.", second.iter().map(|v| &v.0).collect::<BTreeSet<_>>().len()));
+                log.info("GRT", 12, format!("Found {} antenna violations.", second.iter().map(|v| &v.0).collect::<BTreeSet<_>>().len()));
                 if pass_check == 1 || second.is_empty() || diode_only {
                     break;
                 }
@@ -1017,7 +1017,7 @@ fn fast_route_jumpers(db: &mut Db, state: &mut vyges_grt::global_route::AfterRou
         let mut f = std::fs::OpenOptions::new().create(true).write(true).append(pass > 1).truncate(pass == 1).open(p).map_err(at(p))?;
         std::io::Write::write_all(&mut f, lines.as_bytes()).map_err(at(p))?;
     }
-    log.report(format!("GRT-0302: Inserted {} jumpers for {} nets.", res.total_jumpers, res.net_with_jumpers));
+    log.info("GRT", 302, format!("Inserted {} jumpers for {} nets.", res.total_jumpers, res.net_with_jumpers));
     // saveGuides(nets_with_jumpers), with the congestion mark as the command left it.
     let mut opts = state.save_options;
     opts.guide_is_congested = total_overflow > 0 && !allow_congestion;
@@ -1060,7 +1060,7 @@ fn cugr_jumpers(db: &mut Db, cugr: &mut vyges_grt::cugr::Cugr, cg: &mut vyges_gr
         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(at(&path))?;
         std::io::Write::write_all(&mut f, lines.as_bytes()).map_err(err)?;
     }
-    log.report(format!("GRT-0302: Inserted {} jumpers for {} nets.", res.total_jumpers, res.net_with_jumpers));
+    log.info("GRT", 302, format!("Inserted {} jumpers for {} nets.", res.total_jumpers, res.net_with_jumpers));
     // saveGuides(nets_with_jumpers): a CUGR guide is never marked congested.
     let mut modified = Vec::new();
     // addJumperOnSegments > 0 → `db_net->setJumpers(true)`: the detailed router reads it
@@ -1094,7 +1094,7 @@ fn insert_diodes(db: &mut Db, violations: &[Viol], diode: &(String, String), pad
             if site_width == -1 {
                 site_width = w;
             } else if site_width != w {
-                log.report("GRT-0027: Design has rows with different site widths.");
+                log.warn("GRT", 27, "Design has rows with different site widths.");
             }
         }
         rows.push(DiodeRow { bbox: r(&bbox), orient });
@@ -1181,7 +1181,7 @@ fn insert_diodes(db: &mut Db, violations: &[Viol], diode: &(String, String), pad
         }
     }
     if failures {
-        log.report("GRT-0243: Unable to repair antennas on net with diodes.");
+        log.warn("GRT", 243, "Unable to repair antennas on net with diodes.");
     }
     Ok(diodes_made)
 }

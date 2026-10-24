@@ -209,7 +209,7 @@ fn a_named_diode_bypasses_the_search_and_its_diffusion_area_is_checked() {
     assert_eq!(r["reason"], "[ERROR GRT-0244] Diode DIODE0/DIODE ANTENNADIFFAREA is zero.", "{r}");
     let (o, r) = repair_with("diode-none.json", serde_json::json!({ "cmd": "repair_antennas" }));
     assert_eq!(o.status.code(), Some(0), "{r}");
-    assert!(r["log"].as_array().unwrap().iter().any(|l| l == "GRT-0246: No diode with LEF class CORE ANTENNACELL found."), "{r}");
+    assert!(r["log"].as_array().unwrap().iter().any(|l| l == "[WARNING GRT-0246] No diode with LEF class CORE ANTENNACELL found."), "{r}");
 }
 
 /// tiny.lef plus `DIODE1`: a CORE ANTENNACELL whose signal terminal HAS diffusion area.
@@ -231,9 +231,10 @@ fn violation_blocks(name: &str, blocks: &[bool]) -> String {
     path.to_str().unwrap().to_string()
 }
 
-/// The repair's own lines, codes only, in order.
+/// The repair's own lines, codes only, in order: `[INFO GRT-0012] …` → `GRT-0012`.
 fn repair_codes(r: &serde_json::Value) -> Vec<String> {
-    r["log"].as_array().unwrap().iter().filter_map(|l| l.as_str()?.split(':').next().filter(|c| c.starts_with("GRT-00") || c.starts_with("GRT-03")).map(str::to_string)).collect()
+    let code = |l: &str| l.strip_prefix('[')?.split(']').next()?.split(' ').nth(1).map(str::to_string);
+    r["log"].as_array().unwrap().iter().filter_map(|l| code(l.as_str()?)).filter(|c| c.starts_with("GRT-00") || c.starts_with("GRT-03")).collect()
 }
 
 /// `-jumper_only` past the first iteration: with no diodes `nets_to_repair` is never narrowed, so
