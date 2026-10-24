@@ -140,8 +140,9 @@ const DESCRIBE: &str = r#"{
 /// | `GRT-DONE` | the run finished; a census of what it did (global_route calls, nets routed, files written). `warn` when the status is not a pass word (`routed`, `up_to_date`) |
 /// | `GRT-REFUSED` | a step this engine does not model; the reason names it |
 /// | `GRT-ERROR` | usage, unreadable input, a failed write, congestion, or an input the reference rejects |
+/// | `GRT-NNNN`, `ODB-NNNN` | one of the run's message lines (the report's `log`), at its level |
 /// The run's message lines, written by the suite's logger in the reference's format, with its
-/// per-code print limits and counts. The library's stages hand it their messages through
+/// per-code print limits and counts. Each line is also an event on the trail, under its own code. The library's stages hand it their messages through
 /// [`vyges_grt::log::Sink`].
 struct Log(vyges_events::logger::Logger);
 
@@ -1462,7 +1463,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
     let mut planar_routes: BTreeMap<String, Vec<vyges_grt::parasitics::Segment>> = BTreeMap::new();
     let mut snapshot_edges: BTreeMap<String, Vec<vyges_grt::global_route::SnapshotEdge>> = BTreeMap::new();
     let mut calls = Vec::new();
-    let mut log = Log(vyges_events::logger::Logger::new());
+    let mut log = Log(vyges_events::logger::Logger::new().events("vyges-grt"));
     // The router as a later command finds it: the last global_route's state.
     let mut after: Option<(vyges_grt::global_route::AfterRoute, i32)> = None;
     // The last global_route was CUGR's: the router state a later command reads (repair,

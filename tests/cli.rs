@@ -210,6 +210,9 @@ fn a_named_diode_bypasses_the_search_and_its_diffusion_area_is_checked() {
     let (o, r) = repair_with("diode-none.json", serde_json::json!({ "cmd": "repair_antennas" }));
     assert_eq!(o.status.code(), Some(0), "{r}");
     assert!(r["log"].as_array().unwrap().iter().any(|l| l == "[WARNING GRT-0246] No diode with LEF class CORE ANTENNACELL found."), "{r}");
+    // The same line is an event on stderr, under its code and at its level.
+    let events: Vec<serde_json::Value> = String::from_utf8_lossy(&o.stderr).lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+    assert!(events.iter().any(|e| e["code"] == "GRT-0246" && e["severity"] == "warn" && e["raw_msg"] == "No diode with LEF class CORE ANTENNACELL found."), "{events:?}");
 }
 
 /// tiny.lef plus `DIODE1`: a CORE ANTENNACELL whose signal terminal HAS diffusion area.
