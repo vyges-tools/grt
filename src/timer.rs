@@ -89,7 +89,9 @@ pub fn netlist(db: &Db) -> Netlist {
         nl.ports.push((bterm, dir));
     }
     for net in db.net_names() {
-        if db.net_is_special(&net) {
+        // A special POWER / GROUND net connects no timing pin (`isPGSupply`); a special SIGNAL
+        // net (a pad's connection to its terminal, as a pad ring writes it) is a net like any.
+        if db.net_is_special(&net) && matches!(db.net_get_sig_type(&net).as_str(), "POWER" | "GROUND") {
             continue;
         }
         let mut pins = Vec::new();
