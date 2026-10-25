@@ -2262,7 +2262,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
     Ok(json!({ "status": "routed", "global_route": calls, "log": log.0.lines() }))
 }
 
-fn main() -> ExitCode {
+pub fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // `-o FILE` — the value is consumed here so it never reaches the positional scan.
     let mut out: Option<String> = None;

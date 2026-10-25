@@ -13,6 +13,10 @@
 //! stage runs, so a divergence can be pointed at one line rather than bisected. The per-segment
 //! rules live in [`guides_for_segment`], the geometry in [`global_routing_to_box`].
 
+// The crate's own name inside it: the command-line entry ([`cli_main`]) is built into the
+// library too, and its `vyges_grt::…` paths resolve here.
+extern crate self as vyges_grt;
+
 pub mod cugr;
 pub mod log;
 pub mod estimate;
@@ -577,3 +581,10 @@ pub fn save_guides(
     }
     Ok(out)
 }
+
+/// The `vyges-grt` command-line entry (the binary's `main`), built into the library too so a
+/// suite binary can link every engine and run the one it is invoked as.
+#[cfg(feature = "suite")]
+#[doc(hidden)]
+#[path = "bin/vyges-grt.rs"]
+pub mod cli_main;
