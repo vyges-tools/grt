@@ -1750,6 +1750,7 @@ fn net_network(
 pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, flutes: crate::brk_rsmt::Flutes<'_>) -> Res<RouteResult> {
     use crate::brk_rsmt::{CapLayer, Caps3D, NetState, RsmtNet};
     use crate::run::{fastroute_run, RunEnd, RunInputs, RunObserver, Stage};
+    let started = std::time::Instant::now();
     let t = setup_tech(db, opts)?;
     let mut log = t.log.clone();
     let adj = setup_adjust(db, &t, opts, &mut log)?;
@@ -1766,6 +1767,30 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     crate::init::report_clock_nets(opts.verbose, clock_nets.len(), &mut log);
     let (nets, already_wired) = setup_nets_counted(db, &t, &mut e, adj.has_macros_or_pads, opts, &mut log)?;
     let (xg, yg) = (e.x_grid as usize, e.y_grid as usize);
+    let layer_name = |l: usize| t.tech.routing_layers.iter().find(|r| r.routing_level == l as i32 + 1).map_or(String::new(), |r| r.name.clone());
+    // `initNetlist`'s reportNetDegree (over the nets it made), then `globalRoute`'s
+    // reportResources on the capacities as initFastRoute left them — both verbose only.
+    if opts.verbose {
+        let degrees: Vec<(usize, bool)> = nets.iter().map(|n| (n.net_pins.len(), true)).collect();
+        crate::netlist::report_net_degree(&degrees, true, &mut log);
+        let edges = |v: &[crate::adjust::EdgeState], l: usize, horizontal: bool| -> Vec<(u16, u16)> {
+            (0..yg).flat_map(|y| (0..xg).map(move |x| (x, y)))
+                .filter(|&(x, y)| if horizontal { x + 1 < xg } else { y + 1 < yg })
+                .map(|(x, y)| { let s = v[(l * yg + y) * xg + x]; (s.cap, s.real_cap) })
+                .collect()
+        };
+        let per_layer: Vec<(String, bool, Vec<(u16, u16)>, Vec<(u16, u16)>)> = (0..e.num_layers as usize)
+            .map(|l| {
+                let horizontal = t.tech.routing_layers.iter().find(|r| r.routing_level == l as i32 + 1)
+                    .is_some_and(|r| r.direction == Some(crate::capacity::Direction::Horizontal));
+                (layer_name(l), horizontal, edges(&e.h3, l, true), edges(&e.v3, l, false))
+            })
+            .collect();
+        let layers: Vec<crate::driver::ResourceLayer<'_>> = per_layer.iter()
+            .map(|(name, horizontal, h, v)| crate::driver::ResourceLayer { name, horizontal: *horizontal, h_edges: h, v_edges: v })
+            .collect();
+        crate::driver::report_resources(&layers, &mut log);
+    }
     // The router's grid, in run()'s layout (`[y * xg + x]` for both directions).
     let (mut red_h, mut red_v, mut cap_h, mut cap_v) = (vec![0u16; xg * yg], vec![0u16; xg * yg], vec![0u16; xg * yg], vec![0u16; xg * yg]);
     for y in 0..yg {
@@ -2094,6 +2119,32 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
             };
             routed_parasitics.insert(n.name.clone(), crate::parasitics::estimate_net(&np, &rc));
         }
+    }
+    // X — finishGlobalRouting's reports, verbose only: reportCongestion on the final 3D usage,
+    // computeWirelength over the routes, GRT-14; GRT-303 closes `globalRoute`.
+    if opts.verbose {
+        if let Some(g3) = &ov.g3 {
+            let edges = |cap: &[u16], usage: &[u16], horizontal: bool| -> Vec<(u16, u16)> {
+                (0..yg).flat_map(|y| (0..xg).map(move |x| (x, y)))
+                    .filter(|&(x, y)| if horizontal { x + 1 < xg } else { y + 1 < yg })
+                    .map(|(x, y)| (cap[y * xg + x], usage[y * xg + x]))
+                    .collect()
+            };
+            let per_layer: Vec<(String, Vec<(u16, u16)>, Vec<(u16, u16)>)> = (0..g3.num_layers)
+                .map(|l| (layer_name(l), edges(&g3.h_cap[l], &g3.h_usage[l], true), edges(&g3.v_cap[l], &g3.v_usage[l], false)))
+                .collect();
+            let layers: Vec<crate::finish::CongestionLayer<'_>> = per_layer.iter()
+                .map(|(name, h, v)| crate::finish::CongestionLayer { name, h_edges: h, v_edges: v })
+                .collect();
+            crate::finish::report_congestion(&layers, &mut log);
+        }
+        let lengths: Vec<Vec<i32>> = by_name.values()
+            .map(|r| r.iter().map(|g| (g.final_x - g.init_x).abs() + (g.final_y - g.init_y).abs()).collect())
+            .collect();
+        crate::finish::compute_wirelength(&lengths, t.core.tile_size, db.tech_get_db_units_per_micron(), true, &mut log);
+        crate::finish::report_routed_nets(by_name.len(), true, &mut log);
+        let secs = started.elapsed().as_secs();
+        (&mut log as &mut dyn crate::log::Sink).info("GRT", 303, format!("Global routing runtime = {:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60));
     }
     // X — saveGuides over the block's nets, in its order.
     let total_overflow = ov.overflow;
@@ -2425,17 +2476,31 @@ pub type IncrObserver<'a> = &'a mut dyn FnMut(&str, &AfterRoute);
 /// default (true); the antenna repair's own call passes false.
 #[allow(clippy::too_many_arguments)]
 pub fn update_dirty_routes_fast_route(db: &mut Db, opts: &RouteOptions, a: &mut AfterRoute, dirty: &[String], stt: SteinerBuilder<'_>, flutes: crate::brk_rsmt::Flutes<'_>, obs: IncrObserver<'_>, save_guides: bool, net_slack: Option<NetSlack<'_>>) -> Res<Vec<String>> {
+    update_dirty_routes_fast_route_logged(db, opts, a, dirty, stt, flutes, obs, save_guides, net_slack, &mut Vec::new())
+}
+
+/// [`update_dirty_routes_fast_route`] with its verbose lines: GRT-9 (the dirty nets, after
+/// updateDirtyNets — printed even for none) and initNetlist's GRT-1 / GRT-2 over them.
+#[allow(clippy::too_many_arguments)]
+pub fn update_dirty_routes_fast_route_logged(db: &mut Db, opts: &RouteOptions, a: &mut AfterRoute, dirty: &[String], stt: SteinerBuilder<'_>, flutes: crate::brk_rsmt::Flutes<'_>, obs: IncrObserver<'_>, save_guides: bool, net_slack: Option<NetSlack<'_>>, log: &mut dyn crate::log::Sink) -> Res<Vec<String>> {
     if dirty.is_empty() {
         return Ok(Vec::new());
     }
     // clearNetsToRoute, then updateDirtyNets.
     let fresh = update_net_pins(db, opts, a)?;
     let dirty_nets = update_dirty_nets(a, &fresh, dirty)?;
+    if opts.verbose {
+        log.info("GRT", 9, format!("rerouting {} nets.", dirty_nets.len()));
+    }
     if dirty_nets.is_empty() {
         return Ok(Vec::new());
     }
     // setCriticalNetsPercentage(0); initFastRouteIncr; findRouting; mergeResults.
     init_fast_route_incr(a, &fresh, &dirty_nets);
+    // initNetlist(dirty_nets, true)'s reportNetDegree: a net is counted with more than one pin
+    // (and no wires, which a globally routed net never has).
+    let degrees: Vec<(usize, bool)> = dirty_nets.iter().map(|&id| { let p = a.router_nets[id].net_pins.len(); (p, p > 1) }).collect();
+    crate::netlist::report_net_degree(&degrees, opts.verbose, log);
     let routes = find_routing(db, opts, a, &dirty_nets, stt, flutes, obs, net_slack)?;
     merge_results(a, routes);
     if a.total_overflow > 0 && !opts.allow_congestion {

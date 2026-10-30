@@ -727,6 +727,8 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, diode: Option
     let tech = tech_layers(db)?;
     let number_to_index: BTreeMap<i64, usize> = tech.0.iter().enumerate().map(|(i, l)| (i64::from(db.layer_get_number(&l.name)), i)).collect();
     let by_net = net_violations(db, &first, &number_to_index)?;
+    // The loop's opening line (verbose), before its first check is reported.
+    if opts.verbose { log.info("GRT", 6, format!("Repairing antennas, iteration {}.", 1)); }
     log.info("GRT", 12, format!("Found {} antenna violations.", by_net.len()));
     let mut saved = Vec::new();
     // hasNewViolations: every net is new on the first iteration.
@@ -774,7 +776,7 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, diode: Option
             db.net_set_jumpers(&net, false).map_err(err)?;
         }
         let gates: Vec<String> = second.iter().flat_map(|v| v.2.iter().map(|g| g.rsplit_once('/').map_or(g.clone(), |p| p.0.to_string()))).collect();
-        let legalized = legalize_placed_cells(db, padding, &diodes, &gates, &mut text);
+        let legalized = legalize_placed_cells(db, padding, &diodes, &gates, &mut text, log);
         if let Some(path) = step["diode_trace"].as_str() {
             std::fs::write(path, &text).map_err(at(path))?;
         }
@@ -819,6 +821,7 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, diode: Option
                 break;
             }
             itr += 1;
+            if opts.verbose { log.info("GRT", 6, format!("Repairing antennas, iteration {}.", itr)); }
             second = match &oracle {
                 Some(blocks) => blocks.get(checks).cloned().unwrap_or_default(),
                 None => {
@@ -865,7 +868,7 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, diode: Option
                 incr_text.push_str(&vyges_grt::global_route::router_state_text(tag, a).unwrap_or_default());
             }
         };
-        let rerouted = vyges_grt::global_route::update_dirty_routes_fast_route(db, &ropts, state, &nets_to_repair, &stt, &flutes, &mut obs, false, None);
+        let rerouted = vyges_grt::global_route::update_dirty_routes_fast_route_logged(db, &ropts, state, &nets_to_repair, &stt, &flutes, &mut obs, false, None, log);
         if let Some(path) = step["incr_trace"].as_str() {
             std::fs::write(path, &incr_text).map_err(at(path))?;
         }
@@ -897,6 +900,7 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, diode: Option
         // open flow's `-iterations 3` on a design the reference finishes in one pass (rv_plic_lite:
         // 35 → 7 jumpers → 29 → 31 diodes → "Found 0 antenna violations.").
         itr += 1;
+        if opts.verbose { log.info("GRT", 6, format!("Repairing antennas, iteration {}.", itr)); }
         second = match &oracle {
             Some(blocks) => blocks.get(checks).cloned().unwrap_or_default(),
             None => {
@@ -939,6 +943,7 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, diode: Option
     if jumper_only {
         while !second.is_empty() && itr < iterations {
             itr += 1;
+            if opts.verbose { log.info("GRT", 6, format!("Repairing antennas, iteration {}.", itr)); }
             for pass_check in 0..2 {
                 second = match &oracle {
                     Some(blocks) => blocks.get(checks).cloned().unwrap_or_default(),
@@ -1199,24 +1204,56 @@ fn dump_insts(db: &Db, tag: &str, text: &mut String) {
 /// default tunables, with the padding in force — written back as `updateDbInstLocations` does
 /// (orientation, then location, each only where it changed; status untouched), and then the
 /// diodes and the gates they protect back to PLACED.
-fn legalize_placed_cells(db: &mut Db, padding: (i32, i32), diodes: &[String], gates: &[String], text: &mut String) -> Result<(), Fail> {
+///
+/// The lines are `detailedPlacementQuiet`'s: DPL-37 when the design holds fillers, the
+/// legalizer's lines that are NOT quiet-gated (a stall's DPL-700/702 and the recovery count),
+/// then DPL-501 — the one-line summary standing in for the analysis — and DPL-500.
+fn legalize_placed_cells(db: &mut Db, padding: (i32, i32), diodes: &[String], gates: &[String], text: &mut String, log: &mut dyn vyges_grt::log::Sink) -> Result<(), Fail> {
+    let started = std::time::Instant::now();
     dump_insts(db, "pre", text);
+    let network = vyges_dpl::network::network_insts(db);
+    if vyges_dpl::report::has_fillers(db, &network) {
+        log.warn("DPL", 37, "Use remove_fillers before detailed placement.");
+    }
+    let hpwl_before = vyges_dpl::report::odb_hpwl(db);
     let pad = vyges_dpl::negotiate::Padding { global: padding, ..Default::default() };
     let res = vyges_dpl::negotiate::legalize_padded(db, vyges_dpl::negotiate::Options::default(), &pad).map_err(|e| Fail::Error(format!("detailed placement: {e}")))?;
+    for l in res.log.iter().filter(|l| !l.quiet) {
+        match (l.code, l.level) {
+            (0, _) => log.report(l.text.clone()),
+            (c, "WARNING") => log.warn("DPL", c, l.text.clone()),
+            (c, _) => log.info("DPL", c, l.text.clone()),
+        }
+    }
     if !res.failures.is_empty() {
         return Err(Fail::Error(format!("DPL-0036: Detailed placement failed on {} instances", res.failures.len())));
     }
+    let mut disps = Vec::with_capacity(res.placed.len());
     for p in &res.placed {
         if let Some(orient) = &p.orient {
             if db.inst_get_orient(&p.name) != *orient {
                 db.set_inst_orient(&p.name, orient).map_err(err)?;
             }
         }
+        // findDisplacementStats reads the "initial" location AFTER the legalizer set the row's
+        // orientation (setOrient keeps the origin: a flipped cell's box has moved by its height)
+        // and before the location is written — as vyges-dpl's detailed-placement measures it.
+        let (x0, y0) = db.inst_location(&p.name);
+        disps.push((i64::from(p.x) - i64::from(x0)).abs() + (i64::from(p.y) - i64::from(y0)).abs());
         if db.inst_location(&p.name) != (p.x, p.y) {
             db.set_inst_location(&p.name, p.x, p.y).map_err(err)?;
         }
     }
+    // A swept macro the write-back discards still counts: its node holds the negotiated spot.
+    for (name, x, y) in &res.discarded {
+        let (x0, y0) = db.inst_location(name);
+        disps.push((i64::from(*x) - i64::from(x0)).abs() + (i64::from(*y) - i64::from(y0)).abs());
+    }
     dump_insts(db, "post", text);
+    let disp = vyges_dpl::report::displacement(disps, network.len());
+    log.info("DPL", 501, vyges_dpl::report::legalization_summary(res.total_moves, disp, hpwl_before,
+                                                                 vyges_dpl::report::odb_hpwl(db), i64::from(db.dbu_per_micron())));
+    log.info("DPL", 500, format!("Runtime: {:.2}s", started.elapsed().as_secs_f64()));
     // setDiodesAndGatesPlacementStatus(PLACED)
     for g in gates {
         if !db.master_get_type(&db.inst_master(g)).map_err(err)?.starts_with("BLOCK") {
@@ -1653,6 +1690,8 @@ fn run(job: &Value) -> Result<Value, Fail> {
                         guides.insert(ng.net.clone(), ng.guides.iter().map(|x| (x.box_.x_min, x.box_.y_min, x.box_.x_max, x.box_.y_max, g.layer_names[&x.layer].clone())).collect());
                     }
                     (&mut log as &mut dyn vyges_grt::log::Sink).replay(r.log.clone());
+                    // finishGlobalRouting, after saveGuides: CUGR overflow is always the warning.
+                    vyges_grt::finish::congestion_verdict(r.init.cugr.grid.total_overflow() > 0, opts.allow_congestion, true, &mut log);
                     calls.push(json!({ "nets": g.guides.len(), "already_wired": g.already_wired, "use_cugr": true }));
                     after = None;
                     routed_by_cugr = true;
@@ -1682,6 +1721,11 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 calls.push(json!({ "nets": res.guides.len(), "already_wired": res.already_wired, "total_overflow": res.total_overflow, "congested": res.guide_is_congested, "clock_nets": res.clock_nets }));
                 after = Some((res.after.clone(), res.total_overflow));
                 routed_by_cugr = false;
+                // finishGlobalRouting, after saveGuides: GRT-115 with -allow_congestion. (GRT-704's
+                // suggestion needs computeSuggestedAdjustment, not modelled.)
+                if res.total_overflow > 0 && opts.allow_congestion {
+                    vyges_grt::finish::congestion_verdict(true, true, false, &mut log);
+                }
                 if res.total_overflow > 0 && !opts.allow_congestion {
                     // GRT-116: the reference ends the command in error after writing the guides.
                     return Err(Fail::Error("GRT-0116: Global routing finished with congestion. Check the congestion regions in the DRC Viewer.".into()));

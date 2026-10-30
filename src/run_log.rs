@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `run()`'s own log lines, read off its stage events: the congestion loop's (GRT-101 once, then
-//! GRT-102 per iteration) and the via filling's (GRT-197 … GRT-199). Verbose only. They are
+//! GRT-102 per iteration), the via filling's (GRT-197 … GRT-199) and `reportRunMetrics`'
+//! (GRT-111 / GRT-112). Verbose only. They are
 //! collected while the run goes and written after it, in the order they were raised.
 
 use crate::congestion_loop::LoopEvent;
@@ -47,6 +48,10 @@ impl RunLines {
                 self.info("GRT", 197, format!("Via related to pin nodes: {}", fin.vias.pin_nodes));
                 self.info("GRT", 198, format!("Via related Steiner nodes: {}", fin.vias.steiner_nodes));
                 self.info("GRT", 199, "Via filling finished.".into());
+                // reportRunMetrics: the vias `threeDVIA` counted, and the usage `getOverflow3D`
+                // returned plus three per via.
+                self.info("GRT", 111, format!("Final number of vias: {}", fin.num_via));
+                self.info("GRT", 112, format!("Final usage 3D: {}", fin.overflow.total_usage + 3 * fin.num_via));
             }
             _ => {}
         }
@@ -91,7 +96,7 @@ mod tests {
             r.stage(&Stage::Loop(e));
         }
         r.stage(&Stage::B19(&fin));
-        assert_eq!(texts(&mut r), ["101 Running extra iterations to remove congestion.", "102 Start extra iteration 1/50", "102 Start extra iteration 2/50", "102 Start extra iteration 1/50", "197 Via related to pin nodes: 7", "198 Via related Steiner nodes: 3", "199 Via filling finished."]);
+        assert_eq!(texts(&mut r), ["101 Running extra iterations to remove congestion.", "102 Start extra iteration 1/50", "102 Start extra iteration 2/50", "102 Start extra iteration 1/50", "197 Via related to pin nodes: 7", "198 Via related Steiner nodes: 3", "199 Via filling finished.", "111 Final number of vias: 0", "112 Final usage 3D: 0"]);
         let mut q = RunLines::new(false, 50);
         q.stage(&Stage::Loop(&evs[0]));
         assert!(texts(&mut q).is_empty());
