@@ -1463,7 +1463,8 @@ fn run(job: &Value) -> Result<Value, Fail> {
     let mut planar_routes: BTreeMap<String, Vec<vyges_grt::parasitics::Segment>> = BTreeMap::new();
     let mut snapshot_edges: BTreeMap<String, Vec<vyges_grt::global_route::SnapshotEdge>> = BTreeMap::new();
     let mut calls = Vec::new();
-    let mut log = Log(vyges_events::logger::Logger::new().events("vyges-grt"));
+    // Each line also on stderr as it is written: the report keeps them, a flow's log shows them.
+    let mut log = Log(vyges_events::logger::Logger::new().events("vyges-grt").stderr(true));
     // The router as a later command finds it: the last global_route's state.
     let mut after: Option<(vyges_grt::global_route::AfterRoute, i32)> = None;
     // The last global_route was CUGR's: the router state a later command reads (repair,
