@@ -1190,7 +1190,11 @@ pub fn remove_net(a: &mut AfterRoute, net: &str) -> Res<()> {
                         t1.edges.extend(t2.edges);
                     }
                     (None, _) => {}
-                    (Some(_), None) => return Err(format!("net {preserved}: no 3D tree to merge {net} into — GRT-0013").into()),
+                    // The survivor has a FastRoute id (`live_id` above) but an empty tree — its
+                    // route cleared (`clearNetRoute`) or remade (`makeFastrouteNet`): the removed
+                    // tree's nodes and edges are appended to nothing. GRT-0013 is only for a
+                    // survivor FastRoute does not hold, which `live_id` already refused.
+                    (Some(t2), None) => a.final_state[pid].tree3d = Some(t2),
                 }
             }
         }
