@@ -117,6 +117,137 @@ pub fn finish_loaded_route(route: &mut Vec<GSegment>, pins: &[crate::findrouting
     crate::findrouting::merge_segments(pins, route, block_min_routing_layer);
 }
 
+/// A grid-cell node of a route: gcell x, gcell y, layer.
+pub type PruneNode = (i32, i32, i32);
+
+/// The geometry of `pruneMergedNetRoute`: the pruned route, or `None` when nothing is pruned (no
+/// edge went, the route is empty, or a segment end or a pin — `(on-grid x, y, connection layer)` —
+/// is off a gcell centre). The grid's lower-left corner and tile size give the gcell centres.
+pub fn pruned_merged_route(route: &[crate::GSegment], pins: &[PruneNode], x_min: i32, y_min: i32, tile: i32) -> Option<Vec<crate::GSegment>> {
+    use std::collections::{BTreeMap, BTreeSet};
+    if route.is_empty() {
+        return None;
+    }
+    let x_origin = x_min + tile / 2;
+    let y_origin = y_min + tile / 2;
+    // the gcell index of a gcell centre, or -1 for any other position
+    let to_gcell = |coord: i32, origin: i32| -> i32 {
+        let offset = coord - origin;
+        if offset >= 0 && offset % tile == 0 { offset / tile } else { -1 }
+    };
+    // `std::map<Edge, bool>`: edge -> is jumper (emplace keeps the first)
+    let mut edges: BTreeMap<(PruneNode, PruneNode), bool> = BTreeMap::new();
+    let mut total_edges = 0usize;
+    let mut add_edge = |mut p: PruneNode, mut q: PruneNode, jumper: bool| {
+        if q < p {
+            std::mem::swap(&mut p, &mut q);
+        }
+        edges.entry((p, q)).or_insert(jumper);
+        total_edges += 1;
+    };
+    for seg in route {
+        let x0 = to_gcell(seg.init_x.min(seg.final_x), x_origin);
+        let y0 = to_gcell(seg.init_y.min(seg.final_y), y_origin);
+        let x1 = to_gcell(seg.init_x.max(seg.final_x), x_origin);
+        let y1 = to_gcell(seg.init_y.max(seg.final_y), y_origin);
+        if x0 < 0 || y0 < 0 || x1 < 0 || y1 < 0 {
+            return None;
+        }
+        if seg.is_via() {
+            let (bottom, top) = (seg.init_layer.min(seg.final_layer), seg.init_layer.max(seg.final_layer));
+            for layer in bottom..top {
+                add_edge((x0, y0, layer), (x0, y0, layer + 1), seg.is_jumper);
+            }
+        } else {
+            let layer = seg.init_layer;
+            for x in x0..x1 {
+                add_edge((x, y0, layer), (x + 1, y0, layer), seg.is_jumper);
+            }
+            for y in y0..y1 {
+                add_edge((x0, y, layer), (x0, y + 1, layer), seg.is_jumper);
+            }
+        }
+    }
+    let mut pin_gcells: BTreeSet<(i32, i32)> = BTreeSet::new();
+    let mut pin_nodes: BTreeSet<PruneNode> = BTreeSet::new();
+    for &(px, py, layer) in pins {
+        let x = to_gcell(px, x_origin);
+        let y = to_gcell(py, y_origin);
+        if x < 0 || y < 0 {
+            return None;
+        }
+        pin_gcells.insert((x, y));
+        pin_nodes.insert((x, y, layer));
+    }
+    let is_prunable = |node: &PruneNode, neighbors: &BTreeSet<PruneNode>| neighbors.len() == 1 && !pin_gcells.contains(&(node.0, node.1));
+    // trim the dangling branches from their open ends
+    let mut adjacency: BTreeMap<PruneNode, BTreeSet<PruneNode>> = BTreeMap::new();
+    for &(p, q) in edges.keys() {
+        adjacency.entry(p).or_default().insert(q);
+        adjacency.entry(q).or_default().insert(p);
+    }
+    let mut open_ends: Vec<PruneNode> = adjacency.iter().filter(|(node, nb)| is_prunable(node, nb)).map(|(node, _)| *node).collect();
+    while let Some(node) = open_ends.pop() {
+        let neighbors = adjacency.entry(node).or_default();
+        if !is_prunable(&node, neighbors) {
+            continue;
+        }
+        let next = *neighbors.iter().next().expect("a prunable node has one neighbour");
+        neighbors.clear();
+        edges.remove(&if node < next { (node, next) } else { (next, node) });
+        let next_neighbors = adjacency.entry(next).or_default();
+        next_neighbors.remove(&node);
+        if is_prunable(&next, next_neighbors) {
+            open_ends.push(next);
+        }
+    }
+    if edges.len() == total_edges {
+        return None;
+    }
+    // rebuild the route: straight segments ending at every branch, via and pin
+    let to_dbu = |gcell: i32, origin: i32| origin + gcell * tile;
+    let mut pruned: Vec<crate::GSegment> = Vec::new();
+    let mut add_segment = |x0: i32, y0: i32, l0: i32, x1: i32, y1: i32, l1: i32, is_jumper: bool| {
+        pruned.push(crate::GSegment { init_x: to_dbu(x0, x_origin), init_y: to_dbu(y0, y_origin), init_layer: l0, final_x: to_dbu(x1, x_origin), final_y: to_dbu(y1, y_origin), final_layer: l1, is_jumper });
+    };
+    // (layer, row or column, is jumper) -> the start of each unit edge
+    let mut horizontal: BTreeMap<(i32, i32, bool), Vec<i32>> = BTreeMap::new();
+    let mut vertical: BTreeMap<(i32, i32, bool), Vec<i32>> = BTreeMap::new();
+    for (&((x0, y0, l0), (x1, y1, l1)), &is_jumper) in &edges {
+        if l0 != l1 {
+            add_segment(x0, y0, l0, x1, y1, l1, is_jumper);
+        } else if y0 == y1 {
+            horizontal.entry((l0, y0, is_jumper)).or_default().push(x0);
+        } else {
+            vertical.entry((l0, x0, is_jumper)).or_default().push(y0);
+        }
+    }
+    for (runs, is_horizontal) in [(&horizontal, true), (&vertical, false)] {
+        for (&(layer, line, is_jumper), starts) in runs {
+            let mut first = 0usize;
+            for i in 1..=starts.len() {
+                if i < starts.len() && starts[i] == starts[i - 1] + 1 {
+                    let joint = if is_horizontal { (starts[i], line, layer) } else { (line, starts[i], layer) };
+                    // `adjacency[joint]`: an absent node has no neighbours
+                    let degree = adjacency.get(&joint).map_or(0, BTreeSet::len);
+                    if degree == 2 && !pin_nodes.contains(&joint) {
+                        continue;
+                    }
+                }
+                let begin = starts[first];
+                let end = starts[i - 1] + 1;
+                if is_horizontal {
+                    add_segment(begin, line, layer, end, line, layer, is_jumper);
+                } else {
+                    add_segment(line, begin, layer, line, end, layer, is_jumper);
+                }
+                first = i;
+            }
+        }
+    }
+    Some(pruned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,3 +317,59 @@ mod tests {
         assert_eq!(net_is_covered(&[s], &[at(50, 50, 1), at(250, 50, 1)]), vec![1]);
     }
 }
+
+#[cfg(test)]
+mod prune_merged_route_tests {
+    use super::pruned_merged_route;
+    use crate::GSegment;
+
+    fn seg(x0: i32, y0: i32, l0: i32, x1: i32, y1: i32, l1: i32) -> GSegment {
+        GSegment { init_x: x0, init_y: y0, init_layer: l0, final_x: x1, final_y: y1, final_layer: l1, is_jumper: false }
+    }
+
+    /// Rule (`GlobalRouter::pruneMergedNetRoute`, upstream 442e664144c): the branch to a removed
+    /// buffer is trimmed back from its open end to the trunk, and the trunk, whose joint now has
+    /// two neighbours and no pin, is joined into one segment. Tile 10 from 0: gcell centres 5, 15,
+    /// 25. Pins at gcells (0,0) and (2,0) on layer 1; the dead branch climbs from (1,0) to (1,2)
+    /// and up a via at its end.
+    #[test]
+    fn a_branch_to_a_removed_buffer_is_trimmed_and_the_trunk_joined() {
+        let route = vec![seg(5, 5, 1, 15, 5, 1), seg(15, 5, 1, 25, 5, 1), seg(15, 5, 1, 15, 25, 1), seg(15, 25, 1, 15, 25, 2)];
+        let pins = [(5, 5, 1), (25, 5, 1)];
+        let got = pruned_merged_route(&route, &pins, 0, 0, 10).expect("the branch is pruned");
+        assert_eq!(got, vec![seg(5, 5, 1, 25, 5, 1)]);
+    }
+
+    /// Rule: a branch ending in a pin's gcell is kept (on any layer: the pin access guide), a run is
+    /// broken at a pin node, and nothing pruned gives nothing to install.
+    #[test]
+    fn a_branch_to_a_pin_gcell_is_kept_and_runs_break_at_pins() {
+        let route = vec![seg(5, 5, 1, 25, 5, 1), seg(15, 5, 1, 15, 15, 1)];
+        // the branch ends in pin gcell (1,1); a pin sits on the trunk at (1,0)
+        let pins = [(5, 5, 1), (25, 5, 1), (15, 15, 2), (15, 5, 1)];
+        assert_eq!(pruned_merged_route(&route, &pins, 0, 0, 10), None, "nothing to prune");
+        // duplicated edges collapse, so an edge count drop alone forces a rebuild
+        let dup = vec![seg(5, 5, 1, 25, 5, 1), seg(5, 5, 1, 15, 5, 1)];
+        let got = pruned_merged_route(&dup, &[(5, 5, 1), (25, 5, 1), (15, 5, 1)], 0, 0, 10).expect("the duplicate goes");
+        assert_eq!(got, vec![seg(5, 5, 1, 15, 5, 1), seg(15, 5, 1, 25, 5, 1)], "broken at the pin node (1,0,1)");
+    }
+
+    /// Rule (`std::map::emplace`): a unit edge met twice keeps the FIRST copy's jumper flag.
+    #[test]
+    fn a_duplicated_edge_keeps_the_first_jumper_flag() {
+        let mut jumper = seg(5, 5, 1, 15, 5, 1);
+        jumper.is_jumper = true;
+        let route = vec![seg(5, 5, 1, 25, 5, 1), jumper];
+        let got = pruned_merged_route(&route, &[(5, 5, 1), (25, 5, 1)], 0, 0, 10).expect("the duplicate goes");
+        assert_eq!(got, vec![seg(5, 5, 1, 25, 5, 1)]);
+        assert!(!got[0].is_jumper, "the first copy was not a jumper");
+    }
+
+    /// Rule: a segment end off a gcell centre leaves the route as it is.
+    #[test]
+    fn an_off_centre_end_leaves_the_route() {
+        let route = vec![seg(5, 5, 1, 25, 5, 1), seg(15, 5, 1, 15, 22, 1)];
+        assert_eq!(pruned_merged_route(&route, &[(5, 5, 1), (25, 5, 1)], 0, 0, 10), None);
+    }
+}
+

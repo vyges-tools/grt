@@ -2561,6 +2561,16 @@ fn update_dirty_nets(a: &mut AfterRoute, fresh: &std::collections::BTreeMap<Stri
         // takes its route from them, and is not re-routed.
         if !res_aware && a.restore_from_guides.contains(name) && a.db_guides.get(name).is_some_and(|g| !g.is_empty()) {
             load_routing_from_db_guides(a, fresh, name)?;
+            // the route restored, a merged net is checked and pruned all the same
+            if a.merged.remove(name).is_some() {
+                let route = a.net_routes.iter().find(|r| &r.name == name).map(|r| r.segments.clone()).unwrap_or_default();
+                if !is_connected(&route, name)? {
+                    return Err(format!("[ERROR GRT-0267] Net {name} has disconnected segments.").into());
+                }
+                if let Some(id) = live_id(a, name) {
+                    prune_merged_net_route(a, fresh, name, id)?;
+                }
+            }
             continue;
         }
         let Some(id) = live_id(a, name) else {
@@ -2590,17 +2600,19 @@ fn update_dirty_nets(a: &mut AfterRoute, fresh: &std::collections::BTreeMap<Stri
         let changed = if changed && merged && !res_aware {
             let pins: Vec<crate::Pin> = fresh.get(name).map(|n| n.net_pins.iter().map(|p| crate::Pin { connection_layer: p.connection_layer, on_grid_x: p.on_grid.0, on_grid_y: p.on_grid.1 }).collect()).unwrap_or_default();
             let route = a.net_routes.iter().find(|r| &r.name == name).map(|r| r.segments.clone()).unwrap_or_default();
-            if crate::restore::net_is_covered(&route, &pins).is_empty() {
-                if !is_connected(&route, name)? {
-                    return Err(format!("[ERROR GRT-0267] Net {name} has disconnected segments.").into());
-                }
-                false
-            } else {
-                true
-            }
+            !crate::restore::net_is_covered(&route, &pins).is_empty()
         } else {
             changed
         };
+        // `else if (net->isMergedNet())`: a merged net that keeps its route — its pins did not
+        // move, or its joined route covers them — must be connected (GRT-0267), and its route is
+        // pruned (`pruneMergedNetRoute`, upstream 442e664144c).
+        if !changed && merged {
+            let route = a.net_routes.iter().find(|r| &r.name == name).map(|r| r.segments.clone()).unwrap_or_default();
+            if !is_connected(&route, name)? {
+                return Err(format!("[ERROR GRT-0267] Net {name} has disconnected segments.").into());
+            }
+        }
         // A diagnostic: each dirty net's pins as compared (`VYGES_GRT_INCR_TRACE`, appended).
         if let Ok(path) = std::env::var("VYGES_GRT_INCR_TRACE") {
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
@@ -2614,6 +2626,9 @@ fn update_dirty_nets(a: &mut AfterRoute, fresh: &std::collections::BTreeMap<Stri
             if let Some(n) = fresh.get(name) {
                 a.router_nets[id].net_pins = n.net_pins.clone();
                 a.router_nets[id].pin_is_driver = n.pin_is_driver.clone();
+            }
+            if merged {
+                prune_merged_net_route(a, fresh, name, id)?;
             }
             continue;
         }
@@ -2638,6 +2653,42 @@ fn update_dirty_nets(a: &mut AfterRoute, fresh: &std::collections::BTreeMap<Stri
         out.push(id);
     }
     Ok(out)
+}
+
+/// `GlobalRouter::pruneMergedNetRoute` (upstream 442e664144c): a merged net's route cut into unit
+/// edges between adjacent gcells or layers (duplicates collapse; the first copy's jumper flag
+/// stays), then the dangling branches trimmed from their open ends — a node with one neighbour
+/// outside every pin's gcell, taken from the back of the list — and, when an edge went, the route
+/// rebuilt: the vias in edge order, then per (layer, row, jumper) and per (layer, column, jumper)
+/// the straight runs, broken at every branch, via and pin node. Nothing is done when a segment end
+/// or a pin is off a gcell centre. The new route is installed as a route restored from guides is
+/// (the old restored usage released, `makeFastrouteNet`, the new usage charged, `saveGuides`).
+fn prune_merged_net_route(a: &mut AfterRoute, fresh: &std::collections::BTreeMap<String, RouterNet>, name: &str, id: usize) -> Res<()> {
+    let Some(route) = a.net_routes.iter().find(|r| r.name == name).map(|r| r.segments.clone()) else { return Ok(()) };
+    let Some(n) = fresh.get(name) else { return Ok(()) };
+    let pins: Vec<crate::restore::PruneNode> = n.net_pins.iter().map(|p| (p.on_grid.0, p.on_grid.1, p.connection_layer)).collect();
+    let g = &a.jumper_grid.grid;
+    let Some(pruned) = crate::restore::pruned_merged_route(&route, &pins, g.area.x_min, g.area.y_min, g.tile_size) else { return Ok(()) };
+    // install it as a route restored from guides
+    let lec = a.layer_edge_cost.get(name).cloned().unwrap_or_default();
+    if a.final_state[id].segments_restored {
+        if let (Some(g2), Some(g3)) = (a.final_2d.as_mut(), a.final_3d.as_mut()) {
+            update_net_resources(g2, g3, &a.jumper_grid, &a.router_nets[id], id, &lec, &route, -1);
+        }
+    }
+    if let Some(r) = a.net_routes.iter_mut().find(|r| r.name == name) {
+        r.segments = pruned.clone();
+    }
+    // `makeFastrouteNet`: FastRoute's `addNet` on a net it has clears its route (`clearNetRoute`)
+    // and resets it; restored, it is not routed again.
+    clear_net_route(a, id);
+    a.router_nets[id] = n.clone();
+    a.final_state[id] = reset_net_state(&a.final_state[id]);
+    a.final_state[id].segments_restored = true;
+    if let (Some(g2), Some(g3)) = (a.final_2d.as_mut(), a.final_3d.as_mut()) {
+        update_net_resources(g2, g3, &a.jumper_grid, &a.router_nets[id], id, &lec, &pruned, 1);
+    }
+    save_net_guides(a, name)
 }
 
 /// `GlobalRouter::loadRoutingFromDBGuides(db_net)` on a net with guides and the restore flag: its
