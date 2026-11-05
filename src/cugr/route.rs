@@ -227,6 +227,8 @@ fn init_net_costs(ci: &mut CugrInit, db: &Db, opts: &RouteOptions) -> Res<(Vec<f
     ci.cugr.resistance_aware = opts.resistance_aware;
     // initCUGR: without a liberty library the router's member is 0 after GRT-0309's check.
     ci.cugr.critical_nets_percentage = if opts.liberty.is_none() { 0.0 } else { opts.critical_nets_percentage };
+    // initCUGR: `setVerbose(verbose_)` before `init`.
+    ci.cugr.verbose = opts.verbose;
     ci.cugr.res_aware_percentage = opts.res_aware_nets_percentage.unwrap_or(15.0);
     let constant = if opts.liberty.is_none() || opts.critical_nets_percentage == 0.0 { 0.0 } else { 1.0e30f32 };
     let mut alphas = Vec::with_capacity(ci.cugr.nets.len());
@@ -793,6 +795,8 @@ pub fn update_dirty_routes_cugr(
     mut trace: Option<&mut Vec<String>>,
 ) -> Res<Vec<crate::NetGuides>> {
     use crate::findrouting::{add_remaining_guides, RemainingNet};
+    // updateDirtyRoutesCugr starts with `cugr_->setVerbose(false)`: no stage report on this path.
+    cugr.verbose = false;
     if opts.liberty.is_some() && !opts.clock_sources.is_empty() {
         return Err("cugr: an incremental route of a clocked liberty design reads the timer's slacks — not modelled".into());
     }

@@ -129,6 +129,9 @@ pub struct Cugr {
     /// `resistance_aware_`, `critical_nets_percentage_`, `res_aware_percentage_` (15 unless set).
     pub resistance_aware: bool,
     pub critical_nets_percentage: f32,
+    /// `verbose_`: `initCUGR` sets it from the command's `-verbose` before `init`;
+    /// `updateDirtyRoutesCugr` clears it.
+    pub verbose: bool,
     pub res_aware_percentage: f32,
     /// The timer's slack of every net at each `updateNetSlacks` (captured), and the calls made.
     /// With them the engine refreshes, marks and demotes itself; without, sorts after the first
@@ -587,6 +590,7 @@ impl Cugr {
                 multiplier += 1.0;
             }
             self.cost_multiplier = multiplier;
+            report_extra_iteration(self.verbose, i, iterations, log);
             if let Some(t) = trace.as_deref_mut() {
                 trace::commits(t, &commits, 5);
                 t.push(format!("VYGC|rrr|{i}|{multiplier}|{}|{}|demoted={}", nets.len(), trace::list(nets.iter()), demoted.iter().map(|d| format!("{d},")).collect::<String>()));
@@ -603,6 +607,15 @@ impl Cugr {
             log.warn("GRT", 118, format!("Iterative RRR finished with congestion remaining ({residual})."));
         }
         Ok(())
+    }
+}
+
+/// `iterativeRRR`, each round after the cost multiplier is raised and before its maze pass: with
+/// `verbose_`, GRT-0117 names the round and the round limit (`congestion_iterations_`). Both
+/// values are loop counters — nothing a stage computed.
+pub fn report_extra_iteration(verbose: bool, i: i32, iterations: i32, log: &mut dyn crate::log::Sink) {
+    if verbose {
+        log.info("GRT", 117, format!("Start extra iteration {i}/{iterations}"));
     }
 }
 
@@ -756,11 +769,30 @@ pub fn init(facts: &DesignFacts, driver_terms: &[String], min_routing_layer: i32
         .map(|n| GrNet::new(n, &driver_terms[n.facts_index], &grid))
         .collect::<Result<Vec<_>, _>>()
         .map_err(InitError::Grid)?;
-    Ok(Cugr { constants, design, grid, nets, cost_multiplier: 1.0, sort_slacks: None, sorts_done: 0, incremental_candidates: None, resistance_aware: false, critical_nets_percentage: 0.0, res_aware_percentage: 15.0, raw_slacks: None, raw_done: 0, constant_slack: None, worst: (1.0, 1.0, 1, 1), slack_source: SlackSource::default() })
+    Ok(Cugr { constants, design, grid, nets, cost_multiplier: 1.0, sort_slacks: None, sorts_done: 0, incremental_candidates: None, resistance_aware: false, critical_nets_percentage: 0.0, verbose: false, res_aware_percentage: 15.0, raw_slacks: None, raw_done: 0, constant_slack: None, worst: (1.0, 1.0, 1, 1), slack_source: SlackSource::default() })
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// Upstream rule (CUGR::iterativeRRR at the pin): with verbose_, each RRR round reports
+    /// GRT-0117 `Start extra iteration <i>/<congestion_iterations_>`; without it, nothing.
+    #[test]
+    fn extra_iteration_reports_round_and_limit_only_when_verbose() {
+        let mut log: Vec<crate::log::Msg> = Vec::new();
+        super::report_extra_iteration(false, 1, 5, &mut log);
+        assert!(log.is_empty(), "not verbose: no line");
+        super::report_extra_iteration(true, 2, 5, &mut log);
+        assert_eq!(log.len(), 1);
+        match &log[0] {
+            crate::log::Msg::Coded { level, tool, id, text } => {
+                assert!(matches!(level, crate::log::Level::Info));
+                assert_eq!((*tool, *id, text.as_str()), ("GRT", 117, "Start extra iteration 2/5"));
+            }
+            m => panic!("expected a coded line, got {m:?}"),
+        }
+    }
+
     use super::design::{DesignFacts, TechLayerFacts};
     use super::geo::{Interval, Point};
     use super::grid_graph::GrTree;
