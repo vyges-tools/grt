@@ -9,11 +9,12 @@ pub fn compute_net_wirelength(segment_lengths: &[i32], tile_size: i32) -> i32 {
     segment_lengths.iter().filter(|&&l| l > 0).map(|&l| l + tile_size).sum()
 }
 
-/// X4 — `computeWirelength`: the routes' total, in DEF units, divided (INTEGER division, `int64_t`)
-/// by the DEF units per micron — GRT-18 when verbose. Returns the reported microns.
-pub fn compute_wirelength(routes: &[Vec<i32>], tile_size: i32, def_units: i32, verbose: bool, log: &mut dyn crate::log::Sink) -> i64 {
+/// X4 — `computeWirelength`, ONE function for both routers (`finishGlobalRouting` is shared): the
+/// routes' total in `int64_t`, in microns by [`wirelength_microns`] (the block's DEF units) —
+/// GRT-18 when verbose. Returns the reported microns.
+pub fn compute_wirelength(routes: &[Vec<i32>], tile_size: i32, units: DbUnits, verbose: bool, log: &mut dyn crate::log::Sink) -> i64 {
     let total: i64 = routes.iter().map(|r| compute_net_wirelength(r, tile_size) as i64).sum();
-    let um = total / def_units as i64;
+    let um = wirelength_microns(total, units);
     if verbose {
         log.info("GRT", 18, format!("Total wirelength: {um} um"));
     }
@@ -47,11 +48,8 @@ pub fn wirelength_microns(total_dbu: i64, units: DbUnits) -> i64 {
 /// counts in GRT-14, an empty route included, and each route's wirelength is its moving segments'
 /// (vias count nothing), in microns by [`wirelength_microns`]. Returns the reported microns.
 pub fn report_route_map(routes: &std::collections::BTreeMap<String, Vec<crate::GSegment>>, tile_size: i32, units: DbUnits, verbose: bool, log: &mut dyn crate::log::Sink) -> i64 {
-    let total: i64 = routes.values().map(|r| i64::from(compute_net_wirelength(&r.iter().map(|g| (g.final_x - g.init_x).abs() + (g.final_y - g.init_y).abs()).collect::<Vec<i32>>(), tile_size))).sum();
-    let um = wirelength_microns(total, units);
-    if verbose {
-        log.info("GRT", 18, format!("Total wirelength: {um} um"));
-    }
+    let lengths: Vec<Vec<i32>> = routes.values().map(|r| r.iter().map(|g| (g.final_x - g.init_x).abs() + (g.final_y - g.init_y).abs()).collect()).collect();
+    let um = compute_wirelength(&lengths, tile_size, units, verbose, log);
     report_routed_nets(routes.len(), verbose, log);
     um
 }

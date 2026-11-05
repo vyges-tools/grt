@@ -62,7 +62,8 @@ fn replay(g: &Value) -> Seen {
                 seen.tables += 1;
             }
             let lengths: Vec<Vec<i32>> = arr(&c["lengths"]).iter().map(|r| arr(r).iter().map(int).collect()).collect();
-            compute_wirelength(&lengths, int(&c["tile"]), int(&c["def_units"]), verbose, &mut log);
+            let def_units = int(&c["def_units"]);
+            compute_wirelength(&lengths, int(&c["tile"]), vyges_grt::finish::DbUnits { tech_dbu_per_micron: def_units, block_def_units: def_units }, verbose, &mut log);
             report_routed_nets(lengths.len(), verbose, &mut log);
             let congested = int(&c["congested"]) == 1;
             if !cugr {
@@ -203,4 +204,15 @@ fn wirelength_microns_divides_by_the_block_def_units() {
     let finer_def = DbUnits { tech_dbu_per_micron: 1000, block_def_units: 2000 };
     assert_eq!(wirelength_microns(638_999, finer_def), 319, "truncates toward zero");
     assert_eq!(wirelength_microns(i64::from(i32::MAX) * 4, asap7), i64::from(i32::MAX) * 4 / 1000, "the total is int64");
+}
+
+// Upstream rule (`finishGlobalRouting` → `computeWirelength`, shared by FastRoute and CUGR): the
+// FastRoute total is divided by the BLOCK's DEF units too — one design, tech 4000 / DEF 1000.
+#[test]
+fn compute_wirelength_divides_by_the_block_def_units_for_either_router() {
+    let units = vyges_grt::finish::DbUnits { tech_dbu_per_micron: 4000, block_def_units: 1000 };
+    let mut log: Vec<vyges_grt::log::Msg> = Vec::new();
+    // (3000 + 500) + (1000 + 500) = 5000 dbu -> 5 um by DEF units (1 by the tech's).
+    assert_eq!(compute_wirelength(&[vec![3000, 0], vec![1000]], 500, units, true, &mut log), 5);
+    assert_eq!(log.iter().map(|m| m.line()).collect::<Vec<_>>(), ["[INFO GRT-0018] Total wirelength: 5 um"]);
 }

@@ -157,6 +157,11 @@ pub struct TechSetup {
 }
 
 /// What the setup reports read: the run's options and the routing layer names at `min` and `max`.
+/// The design's unit scales (`computeWirelength` divides by the block's DEF units).
+pub fn db_units(db: &Db) -> crate::finish::DbUnits {
+    crate::finish::DbUnits { tech_dbu_per_micron: db.tech_get_db_units_per_micron(), block_def_units: db.block_get_def_units() }
+}
+
 pub(crate) fn setup_options(tech: &TechFacts, min: i32, max: i32, opts: &RouteOptions) -> SetupOptions {
     let name_of = |level: i32| tech.routing_layers.iter().find(|l| l.routing_level == level).map(|l| l.name.clone()).unwrap_or_default();
     SetupOptions {
@@ -2168,7 +2173,7 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         let lengths: Vec<Vec<i32>> = by_name.values()
             .map(|r| r.iter().map(|g| (g.final_x - g.init_x).abs() + (g.final_y - g.init_y).abs()).collect())
             .collect();
-        crate::finish::compute_wirelength(&lengths, t.core.tile_size, db.tech_get_db_units_per_micron(), true, &mut log);
+        crate::finish::compute_wirelength(&lengths, t.core.tile_size, db_units(db), true, &mut log);
         crate::finish::report_routed_nets(by_name.len(), true, &mut log);
         let secs = started.elapsed().as_secs();
         (&mut log as &mut dyn crate::log::Sink).info("GRT", 303, format!("Global routing runtime = {:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60));
