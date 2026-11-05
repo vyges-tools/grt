@@ -206,6 +206,22 @@ pub fn report_layer_settings(opts: &SetupOptions, log: &mut dyn crate::log::Sink
     }
 }
 
+/// `reportMacrosAndBlockages`' counts, read from the database alone (the CUGR path's source; the
+/// FastRoute path counts the same while it applies the obstructions): every block obstruction
+/// whose layer's routing level is in `[min, max]`; per INSTANCE, one macro if its master is a block
+/// and each of the master's obstruction boxes in range. `block_obs` and each master's are routing
+/// levels (0 for a layer that is not a routing layer); `insts` is one entry per instance.
+pub fn count_macros_and_blockages<'a>(min: i32, max: i32, block_obs: &[i32], insts: impl IntoIterator<Item = (bool, &'a [i32])>) -> (usize, usize) {
+    let in_range = |l: &&i32| min <= **l && **l <= max;
+    let mut blockages = block_obs.iter().filter(in_range).count();
+    let mut macros = 0;
+    for (is_block, obs) in insts {
+        macros += usize::from(is_block);
+        blockages += obs.iter().filter(in_range).count();
+    }
+    (macros, blockages)
+}
+
 /// `reportMacrosAndBlockages`: GRT-3 / GRT-4, verbose only, after the obstruction adjustments.
 pub fn report_macros_and_blockages(verbose: bool, macros: usize, blockages: usize, log: &mut dyn crate::log::Sink) {
     if verbose {

@@ -1683,13 +1683,14 @@ fn run(job: &Value) -> Result<Value, Fail> {
                         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(at(&path))?;
                         std::io::Write::write_all(&mut f, (lines.join("\n") + "\n").as_bytes()).map_err(err)?;
                     }
+                    // initCUGR's and the stages' lines precede saveGuides'.
+                    (&mut log as &mut dyn vyges_grt::log::Sink).replay(r.log.clone());
                     let g = vyges_grt::cugr::route::cugr_guides(&mut db, &opts, &r.init.cugr, &r.init.clock_nets, &r.alphas, r.slack, &mut log).map_err(|e| classify(e.to_string()))?;
                     // saveGuides replaces the guides of every net it routes; the others keep theirs.
                     for ng in &g.guides {
                         db_guides.insert(ng.net.clone(), ng.guides.clone());
                         guides.insert(ng.net.clone(), ng.guides.iter().map(|x| (x.box_.x_min, x.box_.y_min, x.box_.x_max, x.box_.y_max, g.layer_names[&x.layer].clone())).collect());
                     }
-                    (&mut log as &mut dyn vyges_grt::log::Sink).replay(r.log.clone());
                     // finishGlobalRouting, after saveGuides: CUGR overflow is always the warning.
                     vyges_grt::finish::congestion_verdict(r.init.cugr.grid.total_overflow() > 0, opts.allow_congestion, true, &mut log);
                     calls.push(json!({ "nets": g.guides.len(), "already_wired": g.already_wired, "use_cugr": true }));

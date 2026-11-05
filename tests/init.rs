@@ -374,3 +374,17 @@ fn the_EXTRA_corpora_close_the_layer_blindness_gap() {
         "exactly one net across the extra designs pins two layers at one point; it is what makes \
          `is_local` decidable");
 }
+
+/// Upstream rule (`GlobalRouter::reportMacrosAndBlockages`, 4155ac3, "read straight from the db;
+/// engine agnostic"): a blockage is a block obstruction, or a master obstruction box counted once
+/// per INSTANCE, whose routing level is in [min, max]; a non-routing layer (level 0) never is; a
+/// macro is an instance of a block master.
+#[test]
+fn macros_and_blockages_are_counted_per_instance_in_the_routing_range() {
+    let macro_obs = [2, 3, 7, 0];
+    let cell_obs = [1, 2];
+    let insts: Vec<(bool, &[i32])> = vec![(true, &macro_obs), (true, &macro_obs), (false, &cell_obs), (false, &[])];
+    // block: levels 1 (below), 2, 5 (above max 4) -> 1; each macro: 2, 3 -> 2 each; the cell: 2 -> 1.
+    assert_eq!(count_macros_and_blockages(2, 4, &[1, 2, 5], insts), (2, 1 + 2 + 2 + 1));
+    assert_eq!(count_macros_and_blockages(1, 1, &[], vec![(false, &[0, 1][..])]), (0, 1), "level 0 is never in range");
+}

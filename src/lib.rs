@@ -141,7 +141,7 @@ pub mod init;
 pub mod callbacks;
 pub use init::{
     init_fast_route, init_grid, is_clk_term, is_local, is_non_leaf_clock, is_routable, order_nets,
-    AbsentStage, CoreGrid, DiscoveredNet, ITermClockFacts, SetupReport, config_fast_route, report_layer_settings, FastRouteConfig, SetupOptions,
+    AbsentStage, CoreGrid, DiscoveredNet, ITermClockFacts, SetupReport, config_fast_route, count_macros_and_blockages, report_layer_settings, FastRouteConfig, SetupOptions,
 };
 
 #[cfg(feature = "odb")]

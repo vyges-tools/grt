@@ -22,6 +22,7 @@ pub mod grid_graph;
 pub mod grnet;
 pub mod jumpers;
 pub mod layers;
+pub mod init_cugr;
 pub mod maze_route;
 pub mod pattern_route;
 pub mod restore;

@@ -156,6 +156,47 @@ pub struct TechSetup {
     pub log: Vec<crate::log::Msg>,
 }
 
+/// What the setup reports read: the run's options and the routing layer names at `min` and `max`.
+pub(crate) fn setup_options(tech: &TechFacts, min: i32, max: i32, opts: &RouteOptions) -> SetupOptions {
+    let name_of = |level: i32| tech.routing_layers.iter().find(|l| l.routing_level == level).map(|l| l.name.clone()).unwrap_or_default();
+    SetupOptions {
+        verbose: opts.verbose,
+        has_liberty: opts.liberty.is_some(),
+        critical_nets_percentage: opts.critical_nets_percentage,
+        adjustment: opts.adjustment,
+        grid_origin: opts.grid_origin,
+        min_layer_name: name_of(min),
+        max_layer_name: name_of(max),
+    }
+}
+
+/// What `initRoutingGrid` leaves: I4's index → layer, the routing tracks and the core grid.
+pub(crate) struct RoutingGrid {
+    pub routing_layers: Vec<(i32, RoutingLayer)>,
+    pub tracks: Vec<RoutingTracks>,
+    pub core: CoreGrid,
+}
+
+/// `initRoutingGrid` (I4–I7), the half of the setup both routers share — `initFastRoute` and
+/// `initCUGR` each call it: `initRoutingLayers` (checked for alternating directions),
+/// `reportLayerSettings` (GRT-0020..0023, verbose), `initRoutingTracks` (GRT-0088 per layer,
+/// verbose) and `initCoreGrid` on the tile size as G3 left it. `block_max` is the block's max
+/// routing layer AFTER G3's write-back.
+pub(crate) fn init_routing_grid(db: &Db, tech: &TechFacts, min: i32, max: i32, block_max: i32, setup: &SetupOptions, log: &mut dyn crate::log::Sink) -> Res<RoutingGrid> {
+    // I4
+    let routing_layers = init_routing_layers(&tech.routing_layers, min, max)?;
+    let by_level = |level: i32| tech.routing_layers.iter().find(|l| l.routing_level == level).cloned();
+    check_adjacent_layers_direction(&by_level, min, max)?;
+    // I5
+    report_layer_settings(setup, log);
+    // I6
+    let pitches = calc_layer_pitches(&tech.pitch_layers, max, tech.block_min_routing_layer, block_max, tech.routing_layer_count, &tech.vias, &DbSpacing(db));
+    let tracks = init_routing_tracks(&tech.tracks, max, &pitches, tech.dbu_per_micron, setup.verbose, log).map_err(|e| e.to_string())?;
+    // I7 — the tile size AFTER G3's write-back.
+    let core = init_grid(tech.die, read_tile_size(db), routing_layers.len() as i32, max);
+    Ok(RoutingGrid { routing_layers, tracks, core })
+}
+
 /// G3 `getMinMaxLayer`, then `initFastRoute` up to `setCapacities` (I3–I9).
 pub fn setup_tech(db: &mut Db, opts: &RouteOptions) -> Res<TechSetup> {
     let mut log = Vec::new();
@@ -173,30 +214,12 @@ pub fn setup_tech(db: &mut Db, opts: &RouteOptions) -> Res<TechSetup> {
     if block_max != tech.block_max_routing_layer {
         db.block_set_max_routing_layer(block_max)?;
     }
-    let block_min = tech.block_min_routing_layer;
-    let name_of = |level: i32| tech.routing_layers.iter().find(|l| l.routing_level == level).map(|l| l.name.clone()).unwrap_or_default();
-    let setup = SetupOptions {
-        verbose: opts.verbose,
-        has_liberty: opts.liberty.is_some(),
-        critical_nets_percentage: opts.critical_nets_percentage,
-        adjustment: opts.adjustment,
-        grid_origin: opts.grid_origin,
-        min_layer_name: name_of(min),
-        max_layer_name: name_of(max),
-    };
+    let setup = setup_options(&tech, min, max, opts);
     // I3
     let config = config_fast_route(&setup, &mut log);
-    // I4
-    let routing_layers = init_routing_layers(&tech.routing_layers, min, max)?;
+    // I4–I7
+    let RoutingGrid { routing_layers, tracks, core } = init_routing_grid(db, &tech, min, max, block_max, &setup, &mut log)?;
     let by_level = |level: i32| tech.routing_layers.iter().find(|l| l.routing_level == level).cloned();
-    check_adjacent_layers_direction(&by_level, min, max)?;
-    // I5
-    report_layer_settings(&setup, &mut log);
-    // I6
-    let pitches = calc_layer_pitches(&tech.pitch_layers, max, block_min, block_max, tech.routing_layer_count, &tech.vias, &DbSpacing(db));
-    let tracks = init_routing_tracks(&tech.tracks, max, &pitches, tech.dbu_per_micron, opts.verbose, &mut log).map_err(|e| e.to_string())?;
-    // I7 — the tile size AFTER G3's write-back.
-    let core = init_grid(tech.die, read_tile_size(db), routing_layers.len() as i32, max);
     // I8
     let directions: Vec<_> = (1..=core.num_layers).map(|level| by_level(level).and_then(|l| l.direction)).collect();
     let fast_route = mirror_grid_to_fast_route(&core, &directions);

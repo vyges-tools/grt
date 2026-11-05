@@ -8,6 +8,7 @@ use vyges_opendb::Db;
 
 use super::pattern_route::SteinerBuilder;
 use super::read::read_design_facts;
+use super::init_cugr::{init_cugr_sequence, InitCugrStages};
 use super::{init, Cugr, StageError};
 use crate::driver::get_min_max_layer;
 use crate::global_route::RouteOptions;
@@ -23,18 +24,122 @@ pub struct CugrInit {
     pub min_routing_layer: i32,
     pub max_routing_layer: i32,
     pub clock_nets: BTreeSet<String>,
+    /// `initCUGR`'s lines, in its order: the grid, track, macro/blockage, clock-net and degree
+    /// reports (verbose), the net-discovery messages and GRT-0309.
+    pub log: Vec<crate::log::Msg>,
 }
 
-/// `initCUGR`'s sequence, as far as it decides CUGR's model.
-///
-/// 1. `getMinMaxLayer` — an unset max routing layer is computed and WRITTEN BACK to the block.
-/// 2. `computeUserGlobalAdjustments` — the global adjustment is written INTO each tech layer in
-///    range that has none of its own; `MetalLayer` reads it back from there, and it persists.
-/// 3. `initNets(true)` — with a liberty library the timer's clock nets are re-typed CLOCK in the
-///    database; `findClockNets` then takes the admitted nets that are non-leaf clocks.
-/// 4. `CUGR::init`.
-///
-/// The grid, track and net-degree reports `initCUGR` also makes are not modelled here.
+/// [`InitCugrStages`] on the database.
+struct InitCugrDb<'a> {
+    db: &'a mut Db,
+    opts: &'a RouteOptions,
+    tech: crate::read::TechFacts,
+    min: i32,
+    max: i32,
+    block_max: i32,
+    log: Vec<crate::log::Msg>,
+    db_nets: Vec<crate::read::NetFacts>,
+    admitted: Vec<usize>,
+    clock_nets: BTreeSet<String>,
+    cugr: Option<Cugr>,
+}
+
+impl InitCugrStages for InitCugrDb<'_> {
+    fn init_routing_grid(&mut self) -> Res<()> {
+        // Shared with initFastRoute.
+        let setup = crate::global_route::setup_options(&self.tech, self.min, self.max, self.opts);
+        crate::global_route::init_routing_grid(self.db, &self.tech, self.min, self.max, self.block_max, &setup, &mut self.log)?;
+        Ok(())
+    }
+
+    fn compute_user_global_adjustments(&mut self) -> Res<()> {
+        if self.opts.adjustment != 0.0 {
+            for l in self.min..=self.max {
+                let name = self.tech.routing_layers.iter().find(|r| r.routing_level == l).map(|r| r.name.clone()).ok_or("a routing level with no layer")?;
+                if self.db.layer_get_layer_adjustment(&name) == 0.0 {
+                    self.db.layer_set_layer_adjustment(&name, self.opts.adjustment)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn report_macros_and_blockages(&mut self) -> Res<()> {
+        report_macros_and_blockages(self.db, self.min, self.max, self.opts.verbose, &mut self.log)
+    }
+
+    fn init_nets(&mut self) -> Res<()> {
+        let mut found = 0;
+        if let Some(lib) = &self.opts.liberty {
+            for net in crate::clk_network::find_clk_nets(self.db, lib, &self.opts.clock_sources)? {
+                self.db.net_set_sig_type(&net, "CLOCK")?;
+                found += 1;
+            }
+        }
+        crate::init::report_clock_nets(self.opts.verbose, found, &mut self.log);
+        self.db_nets = read_nets(self.db);
+        let candidates: Vec<NetCandidate> = self
+            .db_nets
+            .iter()
+            .map(|n| NetCandidate {
+                name: n.name.clone(),
+                is_supply: n.is_supply(),
+                is_special: n.is_special,
+                term_count: n.term_count,
+                has_special_wires: n.has_special_wires,
+                connected_by_abutment: n.connected_by_abutment,
+            })
+            .collect();
+        self.admitted = find_nets(&candidates, self.opts.skip_large_fanout, &mut self.log);
+        Ok(())
+    }
+
+    fn find_clock_nets(&mut self) {
+        let no_liberty = ITermClockFacts { has_liberty_port: false, is_reg_clk: false, cell_is_pad: false };
+        for &i in &self.admitted {
+            let n = &self.db_nets[i];
+            let facts: Vec<ITermClockFacts> = match &self.opts.liberty {
+                Some(lib) if n.sig_type == "CLOCK" => n.iterms.iter().map(|(inst, mterm)| lib.iterm_facts(&self.db.inst_master(inst), mterm)).collect(),
+                _ => vec![no_liberty; n.iterms.len()],
+            };
+            if is_non_leaf_clock(n.sig_type == "CLOCK", &facts) {
+                self.clock_nets.insert(n.name.clone());
+            }
+        }
+    }
+
+    fn report_net_degree(&mut self) {
+        // computeNetDegree's gate — the initNetlist one (stacked vias read as false, as on the
+        // FastRoute path).
+        let degrees: Vec<(usize, bool)> = self
+            .admitted
+            .iter()
+            .map(|&i| {
+                let n = &self.db_nets[i];
+                let p = n.term_count.max(0) as usize;
+                (p, crate::netlist::makes_fastroute_net(p, n.has_wire, || false))
+            })
+            .collect();
+        crate::netlist::report_net_degree(&degrees, self.opts.verbose, &mut self.log);
+    }
+
+    fn check_timing_available(&mut self) {
+        if self.opts.liberty.is_none() && self.opts.critical_nets_percentage != 0.0 {
+            let sink: &mut dyn crate::log::Sink = &mut self.log;
+            sink.warn("GRT", 309, "Timing is not available, setting critical nets percentage to 0.");
+        }
+    }
+
+    fn cugr_init(&mut self) -> Res<()> {
+        let (facts, drivers) = read_design_facts(self.db, &self.clock_nets)?;
+        self.cugr = Some(init(&facts, &drivers, self.min, self.max).map_err(|e| format!("{e:?}"))?);
+        Ok(())
+    }
+}
+
+/// `initCUGR`, after `globalRoute`'s `getMinMaxLayer` (an unset max routing layer is computed and
+/// WRITTEN BACK to the block): [`init_cugr_sequence`] on the database. Its lines are returned in
+/// [`CugrInit::log`], in the reference's order.
 pub fn init_cugr(db: &mut Db, opts: &RouteOptions) -> Res<CugrInit> {
     let tech = read_tech(db)?;
     let has_track_grid: Vec<bool> = tech.routing_layers.iter().map(|l| l.has_track_grid).collect();
@@ -43,47 +148,34 @@ pub fn init_cugr(db: &mut Db, opts: &RouteOptions) -> Res<CugrInit> {
     if block_max != tech.block_max_routing_layer {
         db.block_set_max_routing_layer(block_max)?;
     }
-    if opts.adjustment != 0.0 {
-        for l in min..=max {
-            let name = tech.routing_layers.iter().find(|r| r.routing_level == l).map(|r| r.name.clone()).ok_or("a routing level with no layer")?;
-            if db.layer_get_layer_adjustment(&name) == 0.0 {
-                db.layer_set_layer_adjustment(&name, opts.adjustment)?;
-            }
-        }
+    let mut s = InitCugrDb { db, opts, tech, min, max, block_max, log: Vec::new(), db_nets: Vec::new(), admitted: Vec::new(), clock_nets: BTreeSet::new(), cugr: None };
+    init_cugr_sequence(&mut s)?;
+    let cugr = s.cugr.expect("invariant: init_cugr_sequence ends with cugr_init");
+    Ok(CugrInit { cugr, min_routing_layer: min, max_routing_layer: max, clock_nets: s.clock_nets, log: s.log })
+}
+
+/// `reportMacrosAndBlockages` on the database (verbose only): GRT-0003/0004 from
+/// [`crate::init::count_macros_and_blockages`] over the block's obstructions and every instance's
+/// master obstructions.
+fn report_macros_and_blockages(db: &Db, min: i32, max: i32, verbose: bool, log: &mut dyn crate::log::Sink) -> Res<()> {
+    if !verbose {
+        return Ok(());
     }
-    if let Some(lib) = &opts.liberty {
-        for net in crate::clk_network::find_clk_nets(db, lib, &opts.clock_sources)? {
-            db.net_set_sig_type(&net, "CLOCK")?;
+    let level = |n: i64| db.layer_get_routing_level(&db.layer_name_by_number(n));
+    let block_obs: Vec<i32> = db.obstruction_boxes()?.into_iter().map(|(n, ..)| level(n)).collect();
+    let mut masters: std::collections::HashMap<String, (bool, Vec<i32>)> = std::collections::HashMap::new();
+    let mut insts = Vec::new();
+    for inst in db.inst_names() {
+        let master = db.inst_master(&inst);
+        if !masters.contains_key(&master) {
+            let m = crate::read::read_master_shapes(db, &master)?;
+            masters.insert(master.clone(), (m.is_block, m.obstructions.iter().map(|(l, _)| *l).collect()));
         }
+        insts.push(master);
     }
-    let db_nets = read_nets(db);
-    let candidates: Vec<NetCandidate> = db_nets
-        .iter()
-        .map(|n| NetCandidate {
-            name: n.name.clone(),
-            is_supply: n.is_supply(),
-            is_special: n.is_special,
-            term_count: n.term_count,
-            has_special_wires: n.has_special_wires,
-            connected_by_abutment: n.connected_by_abutment,
-        })
-        .collect();
-    let mut log = Vec::new();
-    let no_liberty = ITermClockFacts { has_liberty_port: false, is_reg_clk: false, cell_is_pad: false };
-    let mut clock_nets = BTreeSet::new();
-    for i in find_nets(&candidates, opts.skip_large_fanout, &mut log) {
-        let n = &db_nets[i];
-        let facts: Vec<ITermClockFacts> = match &opts.liberty {
-            Some(lib) if n.sig_type == "CLOCK" => n.iterms.iter().map(|(inst, mterm)| lib.iterm_facts(&db.inst_master(inst), mterm)).collect(),
-            _ => vec![no_liberty; n.iterms.len()],
-        };
-        if is_non_leaf_clock(n.sig_type == "CLOCK", &facts) {
-            clock_nets.insert(n.name.clone());
-        }
-    }
-    let (facts, drivers) = read_design_facts(db, &clock_nets)?;
-    let cugr = init(&facts, &drivers, min, max).map_err(|e| format!("{e:?}"))?;
-    Ok(CugrInit { cugr, min_routing_layer: min, max_routing_layer: max, clock_nets })
+    let (macros, blockages) = crate::init::count_macros_and_blockages(min, max, &block_obs, insts.iter().map(|m| (masters[m].0, masters[m].1.as_slice())));
+    crate::init::report_macros_and_blockages(true, macros, blockages, log);
+    Ok(())
 }
 
 /// `computeNdrCosts(net)`: 1 on every layer without a rule, from the net's non-default rule.
@@ -231,7 +323,8 @@ pub fn route_cugr(db: &mut Db, opts: &RouteOptions, call: usize, stt: SteinerBui
     if opts.resistance_aware && opts.critical_nets_percentage != 0.0 && ci.cugr.raw_slacks.is_none() && ci.cugr.slack_source.0.is_none() {
         return Err("cugr: -resistance_aware with critical nets needs the timer's slacks at each refresh — not modelled without them".into());
     }
-    let mut log = Vec::new();
+    // initCUGR's lines first, then the stages'.
+    let mut log = std::mem::take(&mut ci.log);
     let mut trace = trace;
     // The model's records are those of `CUGR::init` — before any stage changes a net (RRR's
     // soft-NDR demotion resets its factors).
