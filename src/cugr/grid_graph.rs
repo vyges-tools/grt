@@ -808,6 +808,44 @@ impl GridGraph {
         }
     }
 
+    /// `computeCongestionInformation`'s `cap_per_layer_` (`getTotalCapacityPerLayer`): per layer the
+    /// edge capacities summed in the layer's row order and ROUNDED; 0 for a layer below the min
+    /// routing layer (skipped there: it holds only pin-access via demand).
+    pub fn total_capacity_per_layer(&self) -> Vec<i32> {
+        (0..self.num_layers)
+            .map(|l| {
+                if l < self.min_routing_layer {
+                    return 0;
+                }
+                let mut sum = 0.0f64;
+                if self.layer_directions[l] == H {
+                    for y in 0..self.y_size {
+                        for x in 0..self.x_size.saturating_sub(1) {
+                            sum += self.graph_edges[l][x][y].capacity;
+                        }
+                    }
+                } else {
+                    for x in 0..self.x_size {
+                        for y in 0..self.y_size.saturating_sub(1) {
+                            sum += self.graph_edges[l][x][y].capacity;
+                        }
+                    }
+                }
+                sum.round() as i32
+            })
+            .collect()
+    }
+
+    /// `reportResources`' rows on the CUGR path: one per grid layer, in layer order —
+    /// `getOriginalResources()[l]` (before the user's adjustment) and
+    /// [`Self::total_capacity_per_layer`], the direction the tech layer's.
+    pub fn resource_rows(&self) -> Vec<crate::driver::ResourceRow<'_>> {
+        let derated = self.total_capacity_per_layer();
+        (0..self.num_layers)
+            .map(|l| crate::driver::ResourceRow { name: &self.layer_names[l], horizontal: self.layer_directions[l] == H, original: self.original_resources_per_layer[l], derated: derated[l] })
+            .collect()
+    }
+
     /// `computeCongestionInformation` → `totalOverflow`: per routable layer the overflow
     /// (`demand - capacity` where positive) summed in the layer's row order and ROUNDED, then the
     /// layers added.
@@ -967,6 +1005,23 @@ mod tests {
         assert_eq!(g.original_resources_per_layer[1], 30, "totals are taken before the adjustment");
         f.layers[1].metal.as_mut().unwrap().adjustment = 1.0;
         assert_eq!(graph(&f).edge(1, 0, 0).capacity, 0.0, "exactly 1 removes everything");
+    }
+
+    // Upstream rule (`reportResources` on CUGR: `getOriginalResources` / `getTotalCapacityPerLayer`):
+    // original = the capacities BEFORE the user's adjustment; derated = `computeCongestionInformation`'s
+    // `cap_per_layer_`, the capacities as init leaves them, summed and ROUNDED per layer, and 0 below
+    // the min routing layer whatever its edges hold. m2 (vertical, 6 edges of 5): adjustment 0.9
+    // leaves each at least one track: 30 -> 6.
+    #[test]
+    fn resource_rows_are_original_before_adjustment_and_rounded_capacity_after() {
+        let mut f = facts();
+        f.layers[1].metal.as_mut().unwrap().adjustment = 0.9;
+        let mut g = graph(&f);
+        g.graph_edges[0][0][0].capacity = 7.0;
+        g.graph_edges[2][0][0].capacity += 0.5;
+        let rows = g.resource_rows();
+        let got: Vec<(&str, bool, i32, i32)> = rows.iter().map(|r| (r.name, r.horizontal, r.original, r.derated)).collect();
+        assert_eq!(got, [("m1", true, 0, 0), ("m2", false, 30, 6), ("m3", true, 30, 31)], "30.5 rounds half away from zero");
     }
 
     // Upstream rule (CUGR `totalOverflow` ← `computeCongestionInformation`): each layer's overflow

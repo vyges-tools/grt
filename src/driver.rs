@@ -54,15 +54,44 @@ pub struct ResourceLayer<'a> {
 /// `(1.0 - (float) derated / (float) original) * 100` — the `1.0` is a `double`, the result stored
 /// in a `float` — and 0 when there is no original resource.
 pub fn report_resources(layers: &[ResourceLayer<'_>], log: &mut dyn crate::log::Sink) {
+    let rows: Vec<ResourceRow<'_>> = layers
+        .iter()
+        .map(|l| {
+            let preferred = if l.horizontal { l.h_edges } else { l.v_edges };
+            ResourceRow {
+                name: l.name,
+                horizontal: l.horizontal,
+                original: preferred.iter().map(|e| e.1 as i32).sum(),
+                derated: l.h_edges.iter().chain(l.v_edges).map(|e| e.0 as i32).sum(),
+            }
+        })
+        .collect();
+    report_resources_table(&rows, log);
+}
+
+/// One row of `reportResources`' table, whichever router computed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceRow<'a> {
+    pub name: &'a str,
+    /// The TECH layer's direction (`dbTechLayer::getDirection`).
+    pub horizontal: bool,
+    /// `getOriginalResources()[l]`.
+    pub original: i32,
+    /// `getTotalCapacityPerLayer()[l]`.
+    pub derated: i32,
+}
+
+/// `reportResources`' table (GRT-0053), one row per entry of the original-resource vector:
+/// reduction `(1.0 - (float) derated / (float) original) * 100` — the `1.0` is a `double`, the
+/// result stored in a `float` — and 0 when there is no original resource.
+pub fn report_resources_table(rows: &[ResourceRow<'_>], log: &mut dyn crate::log::Sink) {
     log.report("");
     log.info("GRT", 53, "Routing resources analysis:");
     log.report("          Routing      Original      Derated      Resource");
     log.report("Layer     Direction    Resources     Resources    Reduction (%)");
     log.report("---------------------------------------------------------------");
-    for l in layers {
-        let preferred = if l.horizontal { l.h_edges } else { l.v_edges };
-        let original: i32 = preferred.iter().map(|e| e.1 as i32).sum();
-        let derated: i32 = l.h_edges.iter().chain(l.v_edges).map(|e| e.0 as i32).sum();
+    for l in rows {
+        let (original, derated) = (l.original, l.derated);
         let reduction = if original > 0 { ((1.0 - (derated as f32 / original as f32) as f64) * 100.0) as f32 } else { 0.0 };
         log.report(format!(
             "{:<7}    {:<10}   {:>8}      {:>8}          {:>3.2}%",

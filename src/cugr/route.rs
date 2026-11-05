@@ -154,6 +154,14 @@ pub fn init_cugr(db: &mut Db, opts: &RouteOptions) -> Res<CugrInit> {
     Ok(CugrInit { cugr, min_routing_layer: min, max_routing_layer: max, clock_nets: s.clock_nets, log: s.log })
 }
 
+/// `globalRoute`'s `reportResources` on the CUGR path (after `initCUGR`, before
+/// `findRoutingCugr`): one row per grid layer, the original resources taken before the user's
+/// adjustment (`getOriginalResources`), the derated ones the capacities as `CUGR::init` leaves them
+/// (`getTotalCapacityPerLayer`), the direction the tech layer's.
+pub fn report_resources_cugr(grid: &super::grid_graph::GridGraph, log: &mut dyn crate::log::Sink) {
+    crate::driver::report_resources_table(&grid.resource_rows(), log);
+}
+
 /// `reportMacrosAndBlockages` on the database (verbose only): GRT-0003/0004 from
 /// [`crate::init::count_macros_and_blockages`] over the block's obstructions and every instance's
 /// master obstructions.
@@ -323,8 +331,11 @@ pub fn route_cugr(db: &mut Db, opts: &RouteOptions, call: usize, stt: SteinerBui
     if opts.resistance_aware && opts.critical_nets_percentage != 0.0 && ci.cugr.raw_slacks.is_none() && ci.cugr.slack_source.0.is_none() {
         return Err("cugr: -resistance_aware with critical nets needs the timer's slacks at each refresh — not modelled without them".into());
     }
-    // initCUGR's lines first, then the stages'.
+    // initCUGR's lines first, then (verbose) reportResources, then the stages'.
     let mut log = std::mem::take(&mut ci.log);
+    if opts.verbose {
+        report_resources_cugr(&ci.cugr.grid, &mut log);
+    }
     let mut trace = trace;
     // The model's records are those of `CUGR::init` — before any stage changes a net (RRR's
     // soft-NDR demotion resets its factors).
