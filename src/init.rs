@@ -180,6 +180,47 @@ pub struct FastRouteConfig {
     pub critical_nets_percentage: f32,
 }
 
+/// The critical-nets percentage is a MEMBER of each router, not an option of the call: FastRoute's
+/// and CUGR's are separate, both 10 at construction, and they persist across `global_route` calls.
+///
+/// - `setCriticalNetsPercentage` (the `-critical_nets_percentage` flag, set by the Tcl AFTER
+///   `set_use_cugr`) writes the CURRENT router's member — 0 without a liberty library (GRT-301).
+/// - `configFastRoute` (every FastRoute call) zeroes FastRoute's without a liberty library.
+/// - `initCUGR` zeroes CUGR's without a liberty library, after GRT-0309 when it was not yet 0 —
+///   so a second CUGR call in the session does not warn again.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CriticalNetsPercentages {
+    pub fast_route: f32,
+    pub cugr: f32,
+}
+
+impl Default for CriticalNetsPercentages {
+    fn default() -> Self {
+        CriticalNetsPercentages { fast_route: 10.0, cugr: 10.0 }
+    }
+}
+
+impl CriticalNetsPercentages {
+    /// The current router's member.
+    pub fn get(&self, use_cugr: bool) -> f32 {
+        if use_cugr { self.cugr } else { self.fast_route }
+    }
+
+    /// `setCriticalNetsPercentage`: the current router's member, 0 without a liberty library.
+    pub fn set_critical_nets_percentage(&mut self, use_cugr: bool, percentage: f32, has_liberty: bool) {
+        let p = if has_liberty { percentage } else { 0.0 };
+        if use_cugr { self.cugr = p } else { self.fast_route = p }
+    }
+
+    /// What a call leaves in the member without a liberty library: `configFastRoute` zeroes
+    /// FastRoute's, `initCUGR` CUGR's.
+    pub fn after_call(&mut self, use_cugr: bool, has_liberty: bool) {
+        if !has_liberty {
+            if use_cugr { self.cugr = 0.0 } else { self.fast_route = 0.0 }
+        }
+    }
+}
+
 /// I3 — `configFastRoute`: push the run's options into the router.
 ///
 /// ⛔ With no Liberty loaded the critical-nets percentage is FORCED to 0, with GRT-300 — every run,
@@ -326,5 +367,34 @@ pub fn init_fast_route(
             CheckPinPlacement,
             InitNetlist,
         ],
+    }
+}
+
+#[cfg(test)]
+mod critical_nets_tests {
+    use super::CriticalNetsPercentages;
+
+    /// Upstream rule (grt at the pin): each router owns its critical-nets percentage, 10 at
+    /// construction; the flag writes only the current router's (0 without liberty, GRT-301);
+    /// initCUGR / configFastRoute zero their own router's without liberty, and nothing resets it
+    /// between calls — so a second CUGR call without liberty sees 0 and does not warn GRT-0309.
+    #[test]
+    fn each_router_keeps_its_own_percentage_across_calls() {
+        let mut c = CriticalNetsPercentages::default();
+        assert_eq!((c.get(false), c.get(true)), (10.0, 10.0));
+        // With liberty: the flag sets only the current router's member.
+        c.set_critical_nets_percentage(true, 30.0, true);
+        assert_eq!((c.get(false), c.get(true)), (10.0, 30.0));
+        c.after_call(true, true);
+        assert_eq!(c.get(true), 30.0, "a call with liberty keeps the member");
+        // Without liberty: the flag writes 0, for that router only.
+        let mut c = CriticalNetsPercentages::default();
+        c.set_critical_nets_percentage(false, 30.0, false);
+        assert_eq!((c.get(false), c.get(true)), (0.0, 10.0));
+        // A CUGR call without liberty zeroes CUGR's member; the next CUGR call sees 0.
+        let mut c = CriticalNetsPercentages::default();
+        assert_eq!(c.get(true), 10.0, "first CUGR call sees 10 and warns GRT-0309");
+        c.after_call(true, false);
+        assert_eq!((c.get(false), c.get(true)), (10.0, 0.0), "second sees 0; FastRoute's untouched");
     }
 }

@@ -1507,6 +1507,8 @@ fn run(job: &Value) -> Result<Value, Fail> {
     // The last global_route was CUGR's: the router state a later command reads (repair,
     // incremental) is FastRoute's here, so those commands are refused after it.
     let mut routed_by_cugr = false;
+    // Each router's critical-nets percentage, a member that persists across calls.
+    let mut critical_nets = vyges_grt::CriticalNetsPercentages::default();
     // The router a later command reads after a CUGR route: CUGR itself and the global router's
     // routes, pins and grid (`repairAntennas` does not re-initialize after one).
     let mut cugr_state: Option<(vyges_grt::cugr::Cugr, vyges_grt::cugr::route::CugrGuides)> = None;
@@ -1618,9 +1620,13 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 if let Some(p) = step["res_aware_nets_percentage"].as_f64() {
                     opts.res_aware_nets_percentage = Some(if opts.resistance_aware { p as f32 } else { 0.0 });
                 }
+                // The router this call configures: the Tcl calls set_use_cugr only outside the
+                // incremental bracket. The percentage is that router's member.
+                let cugr_call = if step["incremental"].is_string() { routed_by_cugr } else { step["use_cugr"].as_bool() == Some(true) };
                 if let Some(p) = step["critical_nets_percentage"].as_f64() {
-                    opts.critical_nets_percentage = if opts.liberty.is_some() { p as f32 } else { 0.0 };
+                    critical_nets.set_critical_nets_percentage(cugr_call, p as f32, opts.liberty.is_some());
                 }
+                opts.critical_nets_percentage = critical_nets.get(cugr_call);
                 // `-start_incremental` / `-end_incremental`: the engine is the one the session last
                 // routed with (the Tcl keeps `use_cugr` across the bracket). CUGR's rip-up budget
                 // is the one `initCUGR` gave it: this call's reset never reaches it.
@@ -1678,6 +1684,8 @@ fn run(job: &Value) -> Result<Value, Fail> {
                     let mut stage = Vec::new();
                     let r = vyges_grt::cugr::route::route_cugr(&mut db, &opts, cugr_calls, &branches, Some(&mut stage)).map_err(|e| classify(e.to_string()))?;
                     cugr_calls += 1;
+                    // initCUGR leaves CUGR's member at 0 without a liberty library.
+                    critical_nets.after_call(true, opts.liberty.is_some());
                     if let Ok(path) = std::env::var("VYGC_OUT") {
                         let lines = stage;
                         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(at(&path))?;
@@ -1708,6 +1716,8 @@ fn run(job: &Value) -> Result<Value, Fail> {
                     continue;
                 }
                 let res = route_design(&mut db, &opts, &stt, &flutes).map_err(|e| classify(e.to_string()))?;
+                // configFastRoute leaves FastRoute's member at 0 without a liberty library.
+                critical_nets.after_call(false, opts.liberty.is_some());
                 // The setup's lines (layers, tracks, blockages, pins, net degrees), where the command prints them.
                 (&mut log as &mut dyn vyges_grt::log::Sink).replay(res.log.clone());
                 gcell_grid = Some(res.gcell_grid);

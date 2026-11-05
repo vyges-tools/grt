@@ -225,7 +225,8 @@ fn init_net_costs(ci: &mut CugrInit, db: &Db, opts: &RouteOptions) -> Res<(Vec<f
     // The router's settings as the command left them: resistance-aware routing, the critical-net
     // percentage (zeroed without a liberty library) and the res-aware one (15 unless given).
     ci.cugr.resistance_aware = opts.resistance_aware;
-    ci.cugr.critical_nets_percentage = opts.critical_nets_percentage;
+    // initCUGR: without a liberty library the router's member is 0 after GRT-0309's check.
+    ci.cugr.critical_nets_percentage = if opts.liberty.is_none() { 0.0 } else { opts.critical_nets_percentage };
     ci.cugr.res_aware_percentage = opts.res_aware_nets_percentage.unwrap_or(15.0);
     let constant = if opts.liberty.is_none() || opts.critical_nets_percentage == 0.0 { 0.0 } else { 1.0e30f32 };
     let mut alphas = Vec::with_capacity(ci.cugr.nets.len());
