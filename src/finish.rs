@@ -27,6 +27,35 @@ pub fn report_routed_nets(routes: usize, verbose: bool, log: &mut dyn crate::log
     }
 }
 
+/// A design's two unit scales. They differ where the DEF was written at another resolution than
+/// the technology's database (asap7: tech 4000, DEF 1000).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DbUnits {
+    /// `dbTech::getDbUnitsPerMicron`.
+    pub tech_dbu_per_micron: i32,
+    /// `dbBlock::getDefUnits`.
+    pub block_def_units: i32,
+}
+
+/// `computeWirelength`'s conversion: the `int64_t` total divided (integer division) by
+/// `block_->getDefUnits()` — the BLOCK's DEF units, never the tech's database units.
+pub fn wirelength_microns(total_dbu: i64, units: DbUnits) -> i64 {
+    total_dbu / i64::from(units.block_def_units)
+}
+
+/// X4 + X5 over the route map: `computeWirelength` then GRT-14, both over `routes_` — every entry
+/// counts in GRT-14, an empty route included, and each route's wirelength is its moving segments'
+/// (vias count nothing), in microns by [`wirelength_microns`]. Returns the reported microns.
+pub fn report_route_map(routes: &std::collections::BTreeMap<String, Vec<crate::GSegment>>, tile_size: i32, units: DbUnits, verbose: bool, log: &mut dyn crate::log::Sink) -> i64 {
+    let total: i64 = routes.values().map(|r| i64::from(compute_net_wirelength(&r.iter().map(|g| (g.final_x - g.init_x).abs() + (g.final_y - g.init_y).abs()).collect::<Vec<i32>>(), tile_size))).sum();
+    let um = wirelength_microns(total, units);
+    if verbose {
+        log.info("GRT", 18, format!("Total wirelength: {um} um"));
+    }
+    report_routed_nets(routes.len(), verbose, log);
+    um
+}
+
 /// One router layer's edges as the congestion report reads them: `(cap, usage)` per edge.
 pub struct CongestionLayer<'a> {
     pub name: &'a str,

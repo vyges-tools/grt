@@ -169,3 +169,38 @@ fn cugr_congestion_is_only_a_warning() {
     log.clear();
     assert!(congestion_verdict(false, false, false, &mut log) && log.is_empty());
 }
+
+// Upstream rule (finishGlobalRouting: computeWirelength, then GRT-14 `routes_.size()`): over the
+// route map, every entry counts as a routed net — an empty route too — and a route's wirelength is
+// its MOVING segments plus a tile each (a via counts nothing); microns by integer division.
+#[test]
+fn route_map_reports_every_entry_and_moving_segments_only() {
+    use vyges_grt::GSegment;
+    let seg = |x0, y0, l0, x1, y1, l1| GSegment { init_x: x0, init_y: y0, init_layer: l0, final_x: x1, final_y: y1, final_layer: l1, is_jumper: false };
+    let mut routes = std::collections::BTreeMap::new();
+    routes.insert("a".to_string(), vec![seg(0, 0, 2, 3000, 0, 2), seg(3000, 0, 2, 3000, 0, 3)]);
+    routes.insert("b".to_string(), vec![seg(0, 0, 3, 0, 1500, 3)]);
+    routes.insert("c".to_string(), Vec::new());
+    let mut log: Vec<vyges_grt::log::Msg> = Vec::new();
+    // (3000 + 600) + (1500 + 600) = 5700 dbu at 1000 per micron -> 5 um.
+    let units = vyges_grt::finish::DbUnits { tech_dbu_per_micron: 1000, block_def_units: 1000 };
+    assert_eq!(vyges_grt::finish::report_route_map(&routes, 600, units, true, &mut log), 5);
+    let lines: Vec<String> = log.iter().map(|m| m.line()).collect();
+    assert_eq!(lines, ["[INFO GRT-0018] Total wirelength: 5 um", "[INFO GRT-0014] Routed nets: 3"]);
+    let mut quiet: Vec<vyges_grt::log::Msg> = Vec::new();
+    vyges_grt::finish::report_route_map(&routes, 600, units, false, &mut quiet);
+    assert!(quiet.is_empty(), "both are verbose only");
+}
+
+// Upstream rule (`computeWirelength`): `total_wirelength / block_->getDefUnits()` — the BLOCK's DEF
+// units, not the tech's database units; they differ on asap7 (tech 4000, DEF 1000), where dividing
+// by the tech's reads a quarter of the wirelength. Integer division of the int64 total.
+#[test]
+fn wirelength_microns_divides_by_the_block_def_units() {
+    use vyges_grt::finish::{wirelength_microns, DbUnits};
+    let asap7 = DbUnits { tech_dbu_per_micron: 4000, block_def_units: 1000 };
+    assert_eq!(wirelength_microns(7_364_500, asap7), 7364);
+    let finer_def = DbUnits { tech_dbu_per_micron: 1000, block_def_units: 2000 };
+    assert_eq!(wirelength_microns(638_999, finer_def), 319, "truncates toward zero");
+    assert_eq!(wirelength_microns(i64::from(i32::MAX) * 4, asap7), i64::from(i32::MAX) * 4 / 1000, "the total is int64");
+}

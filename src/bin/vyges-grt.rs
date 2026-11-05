@@ -229,6 +229,12 @@ thread_local! {
     static LUT: vyges_stt::flute::lut::Lut = vyges_stt::flute::lut::load_tables(vyges_stt::flute::lut::MAX_LUT_DEGREE).expect("flute tables");
 }
 
+/// The design's unit scales, for `computeWirelength` ([`vyges_grt::finish::wirelength_microns`]
+/// divides by the block's DEF units).
+fn db_units(db: &vyges_opendb::Db) -> vyges_grt::finish::DbUnits {
+    vyges_grt::finish::DbUnits { tech_dbu_per_micron: db.tech_get_db_units_per_micron(), block_def_units: db.block_get_def_units() }
+}
+
 fn to_rsmt(t: &vyges_stt::Tree) -> vyges_grt::RsmtTree {
     vyges_grt::RsmtTree { deg: t.deg, length: t.length, branch: t.branch.iter().map(|b| vyges_grt::Branch { x: b.x, y: b.y, n: b.n }).collect() }
 }
@@ -1686,6 +1692,9 @@ fn run(job: &Value) -> Result<Value, Fail> {
                     // initCUGR's and the stages' lines precede saveGuides'.
                     (&mut log as &mut dyn vyges_grt::log::Sink).replay(r.log.clone());
                     let g = vyges_grt::cugr::route::cugr_guides(&mut db, &opts, &r.init.cugr, &r.init.clock_nets, &r.alphas, r.slack, &mut log).map_err(|e| classify(e.to_string()))?;
+                    // finishGlobalRouting, before saveGuides: computeWirelength (GRT-0018) and GRT-0014
+                    // over routes_ (CUGR's routes and addRemainingGuides'), when verbose.
+                    vyges_grt::finish::report_route_map(&g.routes, g.jumper_grid.grid.tile_size, db_units(&db), opts.verbose, &mut log);
                     // saveGuides replaces the guides of every net it routes; the others keep theirs.
                     for ng in &g.guides {
                         db_guides.insert(ng.net.clone(), ng.guides.clone());
