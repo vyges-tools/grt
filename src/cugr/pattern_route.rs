@@ -344,7 +344,7 @@ struct Scaffold {
 /// - scaffolds are grown bottom-up in the DAG's path order; a child's pending scaffold is handed to
 ///   a new top scaffold inside the loop over each child's PATHS (so once per path list);
 /// - the shift range grows while the stems' total length stays within `trunk × max_detour_ratio`
-///   (truncated to an int) — upward the test reads the stems at `high - 1`, not `high + 1`;
+///   (truncated to an int), each side testing its candidate position ([`shift_range`]);
 /// - the step widens until fewer than `target_detour_count` shifts remain on either side;
 /// - a pinned node is copied (its pins stay) and joined to its shifted twin.
 pub fn construct_detours(dag: &mut Dag, view: &super::grid_graph::View<bool>, sizes: [usize; 2], c: &Constants, log: &mut dyn crate::log::Sink) {
@@ -446,8 +446,6 @@ pub fn construct_detours(dag: &mut Dag, view: &super::grid_graph::View<bool>, si
             }
         }
     }
-    let stem_length = |stems: &[i32], pos: i32| stems.iter().map(|s| (s - pos).abs()).sum::<i32>();
-
     fn build_detour(dag: &mut Dag, sc: &[Scaffold], s: usize, d: usize, shift: i32) -> usize {
         let tree_node = sc[s].node.expect("a scaffold below the top has a node");
         let (p, fixed) = (dag.nodes[tree_node].p, dag.nodes[tree_node].fixed);
@@ -482,16 +480,9 @@ pub fn construct_detours(dag: &mut Dag, view: &super::grid_graph::View<bool>, si
             stems.sort();
             let first = sc[top].children[0];
             let trunk_pos = dag.nodes[sc[first].node.expect("scaffold child has a node")].p.get(1 - d);
-            let original = stem_length(&stems, trunk_pos);
-            let mut shift = Interval::point(trunk_pos);
             let max_increase = (f64::from(trunk.range()) * c.max_detour_ratio) as i32;
             let size = sizes[1 - d] as i32;
-            while shift.low >= 1 && stem_length(&stems, shift.low - 1) - original <= max_increase {
-                shift.low -= 1;
-            }
-            while shift.high + 1 < size && stem_length(&stems, shift.high - 1) - original <= max_increase {
-                shift.high += 1;
-            }
+            let mut shift = shift_range(&stems, trunk_pos, max_increase, size);
             let step = detour_step(trunk_pos, shift.low, shift.high, c.target_detour_count);
             shift = Interval::new(trunk_pos - (trunk_pos - shift.low) / step * step, trunk_pos + (shift.high - trunk_pos) / step * step);
             let mut pos = shift.low;
@@ -544,6 +535,25 @@ pub fn construct_detours(dag: &mut Dag, view: &super::grid_graph::View<bool>, si
 
 /// `constructDetours`' step: widened while the shifts left on the two sides at the NEXT step
 /// still number the target or more (`>=`).
+/// The positions a scaffold's trunk may shift over: from the trunk outward one gcell at a time,
+/// inside the grid, while the stems' total length grows by no more than `max_increase`.
+///
+/// Upstream rule (`constructDetours`, in at the pin since 38d7b18242): each side tests its
+/// CANDIDATE position, `low - 1` downward and `high + 1` upward (before it, upward read `high - 1`
+/// and admitted one gcell too many).
+fn shift_range(stems: &[i32], trunk_pos: i32, max_increase: i32, size: i32) -> Interval {
+    let length = |pos: i32| stems.iter().map(|s| (s - pos).abs()).sum::<i32>();
+    let original = length(trunk_pos);
+    let mut shift = Interval::point(trunk_pos);
+    while shift.low >= 1 && length(shift.low - 1) - original <= max_increase {
+        shift.low -= 1;
+    }
+    while shift.high + 1 < size && length(shift.high + 1) - original <= max_increase {
+        shift.high += 1;
+    }
+    shift
+}
+
 fn detour_step(trunk_pos: i32, low: i32, high: i32, target: i32) -> i32 {
     let mut step = 1;
     while (trunk_pos - low) / (step + 1) + (high - trunk_pos) / (step + 1) >= target {
@@ -1034,6 +1044,19 @@ pub(crate) mod tests {
         // Layer 1's pads: a stack ending on 1 pads max(upper[0], 0) = 200; starting on 1 pads
         // max(0, lower[1]) = 300 — so the bottom pad costs more on an empty grid.
         assert!(v[1].bottom_pad > v[1].top_pad);
+    }
+
+    // Upstream rule (PatternRoute `constructDetours`, in at the pin since 38d7b18242, witnessed
+    // upstream by `cugr_detour_limit`): the shift range grows on each side while the stems' total
+    // length at the CANDIDATE position (`low - 1`, `high + 1`) stays within the allowed growth.
+    // One stem at 5, two gcells allowed: 3..=7. Reading `high - 1` upward (before the fix)
+    // admitted up to 9. pin_access2_cugr and resistance_aware_cugr first differed here (the
+    // stage-3 detour DAG's path lists).
+    #[test]
+    fn the_shift_range_tests_each_candidate_position() {
+        assert_eq!(shift_range(&[5], 5, 2, 20), Interval::new(3, 7));
+        assert_eq!(shift_range(&[5], 5, 2, 7), Interval::new(3, 6), "clipped to the grid");
+        assert_eq!(shift_range(&[2, 8], 5, 0, 20), Interval::new(2, 8), "between the stems the length does not grow");
     }
 
     // Upstream rule (PatternRoute `constructDetours`): the step widens while the next step still
