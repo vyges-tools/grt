@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use crate::brk_rsmt::{gen_brk_rsmt, BrkFlags, BrkGrid, BrkSummary, Caps3D, Flutes, NetState, RsmtNet, RsmtTree, StTree};
 use crate::checks3d::Overflow3D;
 use crate::congestion_loop::{congestion_loop, LoopEnd, LoopEvent, LoopStart};
-use crate::estimate::EstimateGrid;
+use crate::estimate::{CongestionPolicy, EdgeUsageGuard, EstimateGrid};
 use crate::finalize::{
     finish_3d, get_overflow_3d_all, get_routes_all, layer_assignment, maze_route_msmd_order_3d_all, remove_loops_all, Finish3d, Graph3d,
     LayerParams, Maze3dParams, NetLayerAttrs,
@@ -76,6 +76,9 @@ pub struct RunInputs<'a> {
     /// `rebuildUsedGrids`: the used sets are cleared and refilled from COMMITTED usage (`> 0`), not
     /// left as the last run's.
     pub resume: Option<(&'a Graph2d, &'a Graph3d)>,
+    /// `setAllowCongestion(allow_congestion_)` before each run (`findRouting`): the edge-usage
+    /// guard warns instead of stopping.
+    pub allow_congestion: bool,
 }
 
 /// One boundary of the run, as the observer sees it.
@@ -101,6 +104,10 @@ pub enum Stage<'a> {
     B18 { tag: &'static str, expand: i32, ripup_ub: i32 },
     /// After R19.
     B19(&'a Finish3d),
+    /// The edge-usage guard's warnings under `-allow_congestion` since the last stage (every
+    /// overflow scan checks): the offending edges, in call order, each a warning (GRT-0251 /
+    /// GRT-0299). Sent just before the stage it precedes; cannot stop the run.
+    EdgeUsage(&'a [crate::estimate::UsageViolation]),
 }
 
 /// Watches the run. `false` from a stoppable stage ends the run there.
@@ -156,8 +163,21 @@ pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn 
             BrkGrid { g: &mut g2d, red_h: &red_h, red_v: &red_v, caps: inp.caps, h_capacity: inp.h_capacity, v_capacity: inp.v_capacity, via_cost: 0.0 }
         };
     }
+    let policy = if inp.allow_congestion { CongestionPolicy::Allow } else { CongestionPolicy::Stop };
+    let guard = EdgeUsageGuard::new(inp.h_capacity, inp.v_capacity, policy);
+    // The guard's warnings since the last stage go out first: the reference writes them inside the
+    // scan, before whatever the stage after it logs.
+    macro_rules! flush_edge_usage {
+        ($g:expr, $st:expr) => {{
+            let w = guard.take();
+            if !w.is_empty() {
+                let _ = obs.stage(Stage::EdgeUsage(&w), $g, None, $st);
+            }
+        }};
+    }
     macro_rules! stop_unless {
         ($s:expr, $g3:expr) => {
+            flush_edge_usage!(&g2d, &*state);
             if !obs.stage($s, &g2d, $g3, &*state) {
                 return Ok(RunEnd::Stopped);
             }
@@ -175,10 +195,12 @@ pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn 
     let sum = gen_brk_rsmt(BrkFlags { congestion_driven: true, re_route: true, gen_tree: true, no_adj }, ids, &nets_own, state, &mut grid!(), inp.stt, inp.flutes)
         .map_err(|e| format!("R7: {e:?}"))?;
     stop_unless!(Stage::R7(&sum), None);
+    guard.check(&g2d.est)?; // `getOverflow2D` → `check2DEdgesUsage`
     let scan = g2d.get_overflow_2d();
     stop_unless!(Stage::Scan { tag: "B7", scan: &scan }, None);
     // R8
     newroute_l_all(false, true, ids, &nets_own, state, &mut grid!());
+    guard.check(&g2d.est)?; // `getOverflow2D` → `check2DEdgesUsage`
     let scan = g2d.get_overflow_2d();
     stop_unless!(Stage::Scan { tag: "B8", scan: &scan }, None);
     // R9 — no overflow scan follows it.
@@ -187,24 +209,22 @@ pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn 
     stop_unless!(Stage::Scan { tag: "B9", scan: &scan }, None);
     // R10
     newroute_z_all(10, ids, &nets_own, state, &mut grid!());
+    guard.check(&g2d.est)?; // `getOverflow2D` → `check2DEdgesUsage`
     let scan = g2d.get_overflow_2d();
     stop_unless!(Stage::Scan { tag: "B10", scan: &scan }, None);
     // R11
+    // `convertToMazeroute` ends in `check2DEdgesUsage`; the conversion hands back its findings.
     let viol = convert_to_mazeroute_all(ids, state, &mut g2d, inp.h_capacity, inp.v_capacity);
-    if !viol.is_empty() {
-        // The reference reports the first offending edge and stops (the list is in its order).
-        let v = viol[0];
-        let (code, dir) = if v.horizontal { ("GRT-0228", "Horizontal") } else { ("GRT-0229", "Vertical") };
-        return Err(format!("{code}: {dir} edge usage exceeds the maximum allowed. ({}, {}) usage={} limit={}", v.x, v.y, v.usage as i64, v.limit));
-    }
+    guard.record(&viol)?;
     stop_unless!(Stage::Scan { tag: "B11", scan: &scan }, None);
     // R12
     let pattern_scan = scan;
     let (mut last, mut last_lc) = (scan, 0.0f32);
-    lv_rounds(scan.max_overflow, ids, &nets_own, state, &mut grid!(), &mut |k, round, g, st| {
+    lv_rounds(scan.max_overflow, ids, &nets_own, state, &mut grid!(), &guard, &mut |k, round, g, st| {
+        flush_edge_usage!(g, st);
         let _ = obs.stage(Stage::Lv { k, round }, g, None, st);
         (last, last_lc) = (round.scan, round.logistic_coef);
-    });
+    })?;
     // R13
     init_for_congestion_loop(ids, state, &mut g2d);
     stop_unless!(Stage::Scan { tag: "B13", scan: &last }, None);
@@ -217,7 +237,8 @@ pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn 
         critical_nets_percentage: inp.critical_nets_percentage,
         has_ndr: inp.attrs.iter().map(|a| a.has_ndr).collect(),
     };
-    let end = congestion_loop(&start, ids, &mut nets_own, state, &mut grid!(), inp.timer_slack, &mut |ev, g, st| {
+    let end = congestion_loop(&start, ids, &mut nets_own, state, &mut grid!(), inp.timer_slack, &guard, &mut |ev, g, st| {
+        flush_edge_usage!(g, st);
         let _ = obs.stage(Stage::Loop(ev), g, None, st);
     })?;
     let nets = &nets_own[..];
@@ -238,6 +259,7 @@ pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn 
     stop_unless!(Stage::LoopEnd(&end), None);
     // R15 — freeRR drops the loop's own backup; nothing is left here to free.
     remove_loops_all(ids, nets, state, &mut g2d);
+    guard.check(&g2d.est)?; // `getOverflow2Dmaze` → `check2DEdgesUsage`
     let scan = g2d.get_overflow_2d_maze();
     stop_unless!(Stage::Scan { tag: "B15", scan: &scan }, None);
     // R16
@@ -292,6 +314,7 @@ pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn 
             crate::softndr::update_net_3d_usage(&soft, 1, &mut Usage3d(&mut g3));
             r17_demoted.push(id);
         }
+        guard.check(&g2d.est)?; // `getOverflow2Dmaze` → `check2DEdgesUsage`
         past_cong = g2d.get_overflow_2d_maze().total_overflow;
     }
     // A net R17 demoted reads 1 on every layer from here on, as the loop's demotions do.

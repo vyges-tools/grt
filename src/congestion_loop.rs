@@ -153,6 +153,7 @@ pub struct RareBranches {
 }
 
 /// run()'s congestion loop, from `i = 1` to its break, then `copyBR` when any round beat nothing.
+#[allow(clippy::too_many_arguments)]
 pub fn congestion_loop(
     start: &LoopStart,
     net_ids: &[usize],
@@ -160,6 +161,7 @@ pub fn congestion_loop(
     state: &mut [NetState],
     grid: &mut BrkGrid<'_>,
     timer_slack: TimerSlack<'_>,
+    guard: &crate::estimate::EdgeUsageGuard,
     on: &mut dyn FnMut(&LoopEvent, &crate::graph2d::Graph2d, &[NetState]),
 ) -> Result<LoopEnd, String> {
     const ENLARGE: i32 = 15;
@@ -301,6 +303,7 @@ pub fn congestion_loop(
         on(&LoopEvent::Before { params: p, schedule: LoopSchedule { up_type, stop_dec, thresh_m, cost_step, max_adj, history_args } }, grid.g, state);
         pass(grid, nets, state, &p)?;
         let mut last_cong = past_cong;
+        guard.check(&grid.g.est)?; // `getOverflow2Dmaze` → `check2DEdgesUsage`
         scan = grid.g.get_overflow_2d_maze();
         (past_cong, max_overflow, total_overflow) = (scan.total_overflow, scan.max_overflow, scan.total_overflow);
         on(&LoopEvent::After { kind: PassKind::Main, iter: i, scan }, grid.g, state);
@@ -329,6 +332,7 @@ pub fn congestion_loop(
                 let p = params(i, enlarge, ripup_threshold, via, l, logistic_coef, costheight, slope);
                 pass(grid, nets, state, &p)?;
                 last_cong = past_cong;
+                guard.check(&grid.g.est)?; // `getOverflow2Dmaze` → `check2DEdgesUsage`
                 scan = grid.g.get_overflow_2d_maze();
                 (past_cong, max_overflow, total_overflow) = (scan.total_overflow, scan.max_overflow, scan.total_overflow);
                 on(&LoopEvent::After { kind: PassKind::Extra20, iter: i, scan }, grid.g, state);
@@ -372,6 +376,7 @@ pub fn congestion_loop(
                 let p = params(i, enlarge, ripup_threshold, via, l, logistic_coef, costheight, slope);
                 pass(grid, nets, state, &p)?;
                 last_cong = past_cong;
+                guard.check(&grid.g.est)?; // `getOverflow2Dmaze` → `check2DEdgesUsage`
                 scan = grid.g.get_overflow_2d_maze();
                 (past_cong, max_overflow, total_overflow) = (scan.total_overflow, scan.max_overflow, scan.total_overflow);
                 on(&LoopEvent::After { kind: PassKind::ExtraCopyRs, iter: i, scan }, grid.g, state);
@@ -394,6 +399,7 @@ pub fn congestion_loop(
         }
         if i >= MAZE_ROUND {
             rare.maze_round += 1;
+            guard.check(&grid.g.est)?; // `getOverflow2Dmaze` → `check2DEdgesUsage`
             scan = grid.g.get_overflow_2d_maze();
             total_overflow = scan.total_overflow;
             break;

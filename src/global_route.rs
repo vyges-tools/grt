@@ -2028,6 +2028,7 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         origin: crate::routes::GridOrigin { tile_size: t.core.tile_size, x_corner: t.core.area.x_min, y_corner: t.core.area.y_min },
         db_id: &db_id,
         resume: None,
+        allow_congestion: opts.allow_congestion,
     };
     // The run's final overflow (after R19), for the congestion verdict — and the 2D trees at the
     // router's first timer read, which is the state `estimateAllGlobalRouteParasitics` reads
@@ -3080,24 +3081,34 @@ fn find_routing(db: &Db, opts: &RouteOptions, a: &mut AfterRoute, dirty_nets: &[
         origin: crate::routes::GridOrigin { tile_size: a.jumper_grid.grid.tile_size, x_corner: a.jumper_grid.grid.area.x_min, y_corner: a.jumper_grid.grid.area.y_min },
         db_id: &db_id,
         resume: Some((&g2, &g3)),
+        allow_congestion: opts.allow_congestion,
     };
     struct Observer {
         overflow: i32,
         g2d: Option<crate::graph2d::Graph2d>,
         g3: Option<Graph3d>,
+        /// Any edge-usage warning (`-allow_congestion`) — this path has no log to write them to.
+        edge_usage_warnings: bool,
     }
     impl RunObserver for Observer {
         fn stage(&mut self, s: Stage<'_>, g2d: &crate::graph2d::Graph2d, g3: Option<&Graph3d>, _: &[crate::brk_rsmt::NetState]) -> bool {
-            if let Stage::B19(fin) = s {
-                self.overflow = fin.overflow.total;
-                (self.g2d, self.g3) = (Some(g2d.clone()), g3.cloned());
+            match s {
+                Stage::B19(fin) => {
+                    self.overflow = fin.overflow.total;
+                    (self.g2d, self.g3) = (Some(g2d.clone()), g3.cloned());
+                }
+                Stage::EdgeUsage(_) => self.edge_usage_warnings = true,
+                _ => {}
             }
             true
         }
     }
-    let mut ov = Observer { overflow: 0, g2d: None, g3: None };
+    let mut ov = Observer { overflow: 0, g2d: None, g3: None, edge_usage_warnings: false };
     let mut state = std::mem::take(&mut a.final_state);
     let end = fastroute_run(&inp, &mut state, &mut ov);
+    if ov.edge_usage_warnings {
+        return Err("an incremental route's edge-usage warnings (GRT-0251/0299 under -allow_congestion) are not modelled".into());
+    }
     a.final_state = state;
     let routes = match end? {
         RunEnd::Routed(r) => r,

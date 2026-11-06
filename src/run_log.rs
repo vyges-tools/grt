@@ -33,6 +33,14 @@ impl RunLines {
     /// - GRT-102 opens each iteration with its number, which a soft-NDR restart sets back to 1;
     /// - fillVIA's counters, then its closing line.
     pub fn stage(&mut self, s: &Stage<'_>) {
+        // ⛔ The edge-usage guard's warnings are written whatever the verbosity (`logger_->warn`).
+        if let Stage::EdgeUsage(viol) = s {
+            for v in viol.iter() {
+                let (tool, id, text) = crate::estimate::edge_usage_message(v, crate::estimate::CongestionPolicy::Allow);
+                self.lines.push(Msg::Coded { level: crate::log::Level::Warning, tool, id, text });
+            }
+            return;
+        }
         if !self.verbose {
             return;
         }

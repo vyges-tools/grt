@@ -224,3 +224,62 @@ fn usage_violations_come_in_the_references_order() {
     let at: Vec<(bool, usize, usize)> = check_2d_edges_usage(&g, 2, 2).iter().map(|u| (u.horizontal, u.x, u.y)).collect();
     assert_eq!(at, vec![(true, 2, 4), (false, 0, 3), (false, 3, 0)]);
 }
+
+use vyges_grt::{edge_usage_message, edge_usage_verdict, CongestionPolicy, EdgeUsageGuard, EdgeUsageVerdict};
+
+/// ⛔ Upstream 3ab8fb9dc7 / b39453a7ac: four ids, one text. Without `-allow_congestion` an
+/// offending edge is an ERROR, GRT-0228 horizontal / GRT-0229 vertical; with it a WARNING,
+/// GRT-0251 / GRT-0299 (one call site per id). The usage prints as the integer it reads.
+#[test]
+fn the_guard_message_ids_split_by_policy_and_direction() {
+    let h = UsageViolation { x: 1, y: 3, horizontal: true, usage: 201.0, limit: 200 };
+    let v = UsageViolation { horizontal: false, ..h };
+    assert_eq!(edge_usage_message(&h, CongestionPolicy::Stop).0, "GRT");
+    assert_eq!(edge_usage_message(&h, CongestionPolicy::Stop).1, 228);
+    assert_eq!(edge_usage_message(&v, CongestionPolicy::Stop).1, 229);
+    assert_eq!(edge_usage_message(&h, CongestionPolicy::Allow).1, 251);
+    assert_eq!(edge_usage_message(&v, CongestionPolicy::Allow).1, 299);
+    assert_eq!(
+        edge_usage_message(&v, CongestionPolicy::Allow).2,
+        "Vertical edge usage exceeds the maximum allowed. (1, 3) usage=201 limit=200"
+    );
+}
+
+/// ⛔ `check2DEdgesUsage`: the error throws at the FIRST offending edge in the guard's order; the
+/// warning is written for EVERY offending edge and the route goes on.
+#[test]
+fn the_guard_stops_at_the_first_edge_or_warns_at_every_one() {
+    let a = UsageViolation { x: 0, y: 3, horizontal: false, usage: 201.0, limit: 200 };
+    let b = UsageViolation { x: 3, y: 0, ..a };
+    let viol = [a, b];
+    assert_eq!(edge_usage_verdict(&[], CongestionPolicy::Stop), EdgeUsageVerdict::Clean);
+    assert_eq!(edge_usage_verdict(&[], CongestionPolicy::Allow), EdgeUsageVerdict::Clean);
+    assert_eq!(
+        edge_usage_verdict(&viol, CongestionPolicy::Stop),
+        EdgeUsageVerdict::Stop("GRT-0229: Vertical edge usage exceeds the maximum allowed. (0, 3) usage=201 limit=200".into())
+    );
+    assert_eq!(edge_usage_verdict(&viol, CongestionPolicy::Allow), EdgeUsageVerdict::Warn(&viol[..]));
+}
+
+/// ⛔ The guard runs at EVERY overflow scan (`convertToMazeroute`, `getOverflow2D`,
+/// `getOverflow2Dmaze`), so an edge still over its limit is reported once per scan — the
+/// reference's congestion4 probe repeats 83 edges before the 1000-message limit. The warnings are
+/// held in call order until the sequencer writes them.
+#[test]
+fn the_guard_reports_an_edge_at_every_scan_in_call_order() {
+    let mut g = EstimateGrid::new(5, 5);
+    g.update_v(3, 0, 1, 201.0);
+    g.add_est_usage_to_usage();
+    let allow = EdgeUsageGuard::new(2, 2, CongestionPolicy::Allow);
+    allow.check(&g).expect("allowed congestion never stops");
+    g.update_h(2, 3, 4, 201.0);
+    g.add_est_usage_to_usage();
+    allow.check(&g).expect("allowed congestion never stops");
+    let at: Vec<(bool, usize, usize)> = allow.take().iter().map(|u| (u.horizontal, u.x, u.y)).collect();
+    assert_eq!(at, vec![(false, 3, 0), (true, 2, 4), (false, 3, 0)], "scan 1, then scan 2 in its own order");
+    assert!(allow.take().is_empty(), "a take drains");
+
+    let stop = EdgeUsageGuard::new(2, 2, CongestionPolicy::Stop);
+    assert!(stop.check(&g).expect_err("over the limit stops").starts_with("GRT-0228: "));
+    assert!(stop.take().is_empty(), "an error holds no warnings");
+}

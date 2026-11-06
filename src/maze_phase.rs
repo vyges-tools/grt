@@ -145,8 +145,9 @@ pub fn lv_rounds(
     nets: &[RsmtNet<'_>],
     state: &mut [NetState],
     grid: &mut BrkGrid<'_>,
+    guard: &crate::estimate::EdgeUsageGuard,
     on_round: &mut RoundHook<'_>,
-) -> (i32, Vec<LvRound>) {
+) -> Result<(i32, Vec<LvRound>), String> {
     const COSHEIGHT: i32 = 4;
     const LV_ITER: usize = 3;
     let costheight = if max_overflow > 700 { 8 } else { COSHEIGHT };
@@ -155,6 +156,8 @@ pub fn lv_rounds(
     for k in 0..LV_ITER {
         let logistic_coef = (2.0 / (1.0 + f64::from(max_ov).ln())) as f32;
         route_monotonic_all(new_th, enlarge, logistic_coef, costheight, net_ids, nets, state, grid);
+        // `getOverflow2Dmaze` runs `check2DEdgesUsage` first.
+        guard.check(&grid.g.est)?;
         let scan = grid.g.get_overflow_2d_maze();
         max_ov = scan.max_overflow;
         let round = LvRound { threshold: new_th, enlarge, logistic_coef, scan };
@@ -163,7 +166,7 @@ pub fn lv_rounds(
         enlarge += 5;
         new_th = (new_th - 5).max(1);
     }
-    (costheight, rounds)
+    Ok((costheight, rounds))
 }
 
 /// R13 — `InitEstUsage`, `InitLastUsage(1)`, `SaveLastRouteLen`, in the run's order.

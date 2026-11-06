@@ -73,7 +73,7 @@ pub use mazecost::{cost_table, get_cost, CostParams};
 pub mod monotonic;
 pub use monotonic::{monotonic_box, monotonic_cost_table, route_monotonic, walk_monotonic_route, MonotonicRoute};
 pub mod zroute;
-pub use estimate::{check_2d_edges_usage, save_last_route_len, UsageViolation};
+pub use estimate::{check_2d_edges_usage, edge_usage_message, edge_usage_verdict, save_last_route_len, CongestionPolicy, EdgeUsageGuard, EdgeUsageVerdict, UsageViolation};
 pub use mazeconv::{convert_to_mazeroute, MazeRoute, SymbolicRoute};
 pub use zroute::{newroute_z, newroute_z_edge, route_z_edge_after_ripup, ZChoice, HCOST};
 pub use spiral::{

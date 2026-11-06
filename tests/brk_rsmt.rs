@@ -658,6 +658,7 @@ fn replay_chain(who: &str, pass: usize, c5: &Value, c7: &Value, group: &[&Value]
         origin,
         db_id: &db_id,
         resume: None,
+        allow_congestion: false,
     };
     let maze_stripped = bounds.and_then(|b| b["maze_stripped"].as_bool()).unwrap_or(false);
     let mut obs = ChainCheck { at: &at, c5, c7, cn: &cn, nets: &nets, red: (&red_h, &red_v), ndr, at_b: &at_b, b15, maze_stripped, pass_pres: &pass_pres, prev_scan: None, befores: 0, resistance_aware: flag("resaware"), seen };
@@ -719,6 +720,8 @@ impl RunObserver for ChainCheck<'_, '_> {
         let at = self.at;
         let at_b = self.at_b;
         match s {
+            // The guard's warnings carry no captured state; they never stop a run.
+            Stage::EdgeUsage(_) => true,
             Stage::R5(sum) => {
                 check_call(&format!("{at} (R5)"), self.c5, self.cn, R5_FLAGS, sum, state, g2d, self.red, self.ndr, self.seen);
                 true
@@ -1290,7 +1293,8 @@ fn the_lv_rounds_follow_the_reference_schedule() {
     let mut g2d = Graph2d::new(4, 4, 1);
     let caps = grid_caps(4, 4, 10);
     let mut grid = BrkGrid { g: &mut g2d, red_h: &no_red, red_v: &no_red, caps: &caps, h_capacity: 10, v_capacity: 10, via_cost: 0.0 };
-    let (height, rounds) = lv_rounds(701, &[], &[], &mut [], &mut grid, &mut |_, _, _, _| {});
+    let guard = vyges_grt::EdgeUsageGuard::new(10, 10, vyges_grt::CongestionPolicy::Stop);
+    let (height, rounds) = lv_rounds(701, &[], &[], &mut [], &mut grid, &guard, &mut |_, _, _, _| {}).expect("invariant: an empty grid is under every limit");
     assert_eq!(height, 8, "maxOverflow > 700 raises the cost height");
     let schedule: Vec<(i32, i32)> = rounds.iter().map(|r| (r.threshold, r.enlarge)).collect();
     assert_eq!(schedule, vec![(10, 10), (5, 15), (1, 20)]);
@@ -1359,12 +1363,62 @@ fn the_congestion_loop_steps_enlarge_until_the_clamp() {
     let start = LoopStart { pattern_max_overflow: 0, logistic_coef: 0.0, scan, overflow_iterations: 4, critical_nets_percentage: 0.0, has_ndr: vec![false] };
     let mut expands = Vec::new();
     let mut nets = nets;
-    let _ = congestion_loop(&start, &[0], &mut nets, &mut state, &mut grid, vyges_grt::congestion_loop::TimerSlack::None, &mut |ev, _, _| {
+    let guard = vyges_grt::EdgeUsageGuard::new(10, 10, vyges_grt::CongestionPolicy::Stop);
+    let _ = congestion_loop(&start, &[0], &mut nets, &mut state, &mut grid, vyges_grt::congestion_loop::TimerSlack::None, &guard, &mut |ev, _, _| {
         if let LoopEvent::Before { params, .. } = ev {
             expands.push(params.expand);
         }
     });
     assert_eq!(expands, vec![20, 25, 30, 35], "ESTEP3 per round, under the clamp of 40");
+}
+
+/// ⛔ Upstream 3ab8fb9dc7 / b39453a7ac: `getOverflow2Dmaze` runs `check2DEdgesUsage` first, so under
+/// `-allow_congestion` an edge over its limit is warned about at EVERY loop scan, not once. One far
+/// edge carries 1001 against a limit of 100 × 10 and no route ever reaches it: each pass's scan
+/// reports it exactly once, before that pass's `After`. (The congestion4 probe cannot show this —
+/// the 1000-message limit is spent before the loop.)
+#[test]
+fn the_congestion_loop_checks_edge_usage_at_every_scan() {
+    let pins = [(0, 0), (4, 0)];
+    let mut state = vec![st_tree(2, &[(0, 0, 1), (4, 0, 1)], &pins)];
+    {
+        let r = &mut state[0].tree.as_mut().expect("tree").routes[0];
+        (r.kind, r.grids, r.routelen) = (RouteKind::MazeRoute, (0..=4).map(|x| (x, 0)).collect(), 4);
+    }
+    let (px, py): (Vec<i32>, Vec<i32>) = pins.iter().copied().unzip();
+    let mut nets = [RsmtNet { layer_edge_cost: &[1], ..net(&px, &py) }];
+    let mut g2d = Graph2d::new(80, 3, 1);
+    for x in 0..4 {
+        g2d.est.update_usage_h(x, 0, 1.0);
+        g2d.used_h.insert((x, 0));
+    }
+    g2d.est.update_usage_h(70, 2, 1001.0); // far outside every search box
+    for y in 0..3usize {
+        for x in 0..80usize {
+            g2d.cap_h[y * 80 + x] = if y == 0 { 0 } else { 10 };
+            g2d.cap_v[y * 80 + x] = 10;
+        }
+    }
+    let caps = grid_caps(80, 3, 10);
+    let mut grid = BrkGrid { g: &mut g2d, red_h: &no_red, red_v: &no_red, caps: &caps, h_capacity: 10, v_capacity: 10, via_cost: 0.0 };
+    let scan = grid.g.get_overflow_2d_maze();
+    let start = LoopStart { pattern_max_overflow: 0, logistic_coef: 0.0, scan, overflow_iterations: 4, critical_nets_percentage: 0.0, has_ndr: vec![false] };
+    let guard = vyges_grt::EdgeUsageGuard::new(10, 10, vyges_grt::CongestionPolicy::Allow);
+    let mut per_after = Vec::new();
+    congestion_loop(&start, &[0], &mut nets, &mut state, &mut grid, vyges_grt::congestion_loop::TimerSlack::None, &guard, &mut |ev, _, _| {
+        if let LoopEvent::After { .. } = ev {
+            per_after.push(guard.take().iter().map(|v| (v.x, v.y, v.horizontal)).collect::<Vec<_>>());
+        }
+    })
+    .expect("allowed congestion never stops the loop");
+    assert!(!per_after.is_empty(), "the loop scanned");
+    assert!(per_after.iter().all(|w| w == &[(70, 2, true)]), "each scan reports the edge once: {per_after:?}");
+
+    // Without -allow_congestion the first scan stops the loop with the error.
+    let stop = vyges_grt::EdgeUsageGuard::new(10, 10, vyges_grt::CongestionPolicy::Stop);
+    let e = congestion_loop(&start, &[0], &mut nets, &mut state, &mut grid, vyges_grt::congestion_loop::TimerSlack::None, &stop, &mut |_, _, _| {})
+        .expect_err("over the limit stops");
+    assert!(e.starts_with("GRT-0228: Horizontal edge usage exceeds the maximum allowed. (70, 2) usage=1001"), "{e}");
 }
 
 /// ⛔ `copyBR` restores the trees `copyRS` saved AND moves the committed usage with them: the current

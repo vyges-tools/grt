@@ -441,6 +441,101 @@ pub fn check_2d_edges_usage(
     out
 }
 
+/// What `-allow_congestion` makes of the edge-usage guard's findings (`setAllowCongestion`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CongestionPolicy {
+    /// No `-allow_congestion`: the first offending edge is an error and the route stops.
+    Stop,
+    /// `-allow_congestion`: every offending edge is a warning and the route goes on.
+    Allow,
+}
+
+/// One call's outcome — the branch inside the reference's `check2DEdgesUsage`.
+#[derive(Debug, PartialEq)]
+pub enum EdgeUsageVerdict<'a> {
+    Clean,
+    /// Every offending edge, in the guard's order, each one warning line.
+    Warn(&'a [UsageViolation]),
+    /// The first offending edge's error line; the route stops there.
+    Stop(String),
+}
+
+/// The message code (tool, id) and text of one offending edge under `policy`.
+///
+/// ⛔ Upstream 3ab8fb9dc7 / b39453a7ac: the WARNING ids are 251 (horizontal) and 299 (vertical),
+/// the ERROR ids 228 and 229 — separate ids because each id has one call site. The text is the
+/// same for all four, and `usage` prints as the integer the reference reads (`getUsageH/V`).
+pub fn edge_usage_message(v: &UsageViolation, policy: CongestionPolicy) -> (&'static str, u16, String) {
+    let (tool, id) = match (policy, v.horizontal) {
+        (CongestionPolicy::Allow, true) => ("GRT", 251),
+        (CongestionPolicy::Allow, false) => ("GRT", 299),
+        (CongestionPolicy::Stop, true) => ("GRT", 228),
+        (CongestionPolicy::Stop, false) => ("GRT", 229),
+    };
+    let dir = if v.horizontal { "Horizontal" } else { "Vertical" };
+    (tool, id, format!("{dir} edge usage exceeds the maximum allowed. ({}, {}) usage={} limit={}", v.x, v.y, v.usage as i64, v.limit))
+}
+
+/// Decide one guard call from its violations (in [`check_2d_edges_usage`]'s order).
+///
+/// ⛔ Without `-allow_congestion` the reference's `logger_->error` throws at the FIRST offending
+/// edge; with it, it warns at every one and returns.
+pub fn edge_usage_verdict(viol: &[UsageViolation], policy: CongestionPolicy) -> EdgeUsageVerdict<'_> {
+    match (viol.first(), policy) {
+        (None, _) => EdgeUsageVerdict::Clean,
+        (Some(_), CongestionPolicy::Allow) => EdgeUsageVerdict::Warn(viol),
+        (Some(v), CongestionPolicy::Stop) => {
+            let (tool, id, text) = edge_usage_message(v, policy);
+            EdgeUsageVerdict::Stop(format!("{tool}-{id:04}: {text}"))
+        }
+    }
+}
+
+/// The edge-usage guard across one run: it decides each call and holds the warnings until the
+/// sequencer writes them, so they land between the log lines in the reference's place.
+///
+/// ⛔ `check2DEdgesUsage` runs at EVERY overflow scan — `convertToMazeroute`, `getOverflow2D`,
+/// `getOverflow2Dmaze` — not only after R11: the reference's congestion4 probe with
+/// `-allow_congestion` repeats 83 of its 918 vertical edges before the 1000-message limit.
+/// ⚠️ `getOverflow2D` checks a second time when `needsEstimatedUsageScan` sends it to
+/// `scanOverflow2D`; not modelled — committed usage is zero before R11 on a full route, and an
+/// incremental route refuses on any warning.
+#[derive(Debug)]
+pub struct EdgeUsageGuard {
+    pub h_capacity: i32,
+    pub v_capacity: i32,
+    pub policy: CongestionPolicy,
+    pending: std::cell::RefCell<Vec<UsageViolation>>,
+}
+
+impl EdgeUsageGuard {
+    pub fn new(h_capacity: i32, v_capacity: i32, policy: CongestionPolicy) -> Self {
+        EdgeUsageGuard { h_capacity, v_capacity, policy, pending: std::cell::RefCell::new(Vec::new()) }
+    }
+
+    /// One `check2DEdgesUsage` call on the grid's committed usage.
+    pub fn check(&self, grid: &EstimateGrid) -> Result<(), String> {
+        self.record(&check_2d_edges_usage(grid, self.h_capacity, self.v_capacity))
+    }
+
+    /// Decide one call whose violations are already in hand (R11 has them from the conversion).
+    pub fn record(&self, viol: &[UsageViolation]) -> Result<(), String> {
+        match edge_usage_verdict(viol, self.policy) {
+            EdgeUsageVerdict::Clean => Ok(()),
+            EdgeUsageVerdict::Warn(w) => {
+                self.pending.borrow_mut().extend_from_slice(w);
+                Ok(())
+            }
+            EdgeUsageVerdict::Stop(e) => Err(e),
+        }
+    }
+
+    /// The warnings since the last take, in call order.
+    pub fn take(&self) -> Vec<UsageViolation> {
+        std::mem::take(&mut *self.pending.borrow_mut())
+    }
+}
+
 /// Remember each edge's routed length for the next round — the reference's `SaveLastRouteLen`.
 ///
 /// ⚠️ This is the value the critical-net rip-up arm divides by. An edge whose length was never
