@@ -1349,4 +1349,39 @@ mod tests {
         assert_ne!(view[dir][p.edge.x as usize][p.edge.y as usize], before[dir][p.edge.x as usize][p.edge.y as usize], "a pad edge is re-priced");
     }
 
+
+    // Upstream rule (`updateWireCostView` walks `forEachTreeDemandImpl`, which for an ADOPTED
+    // tree spreads a wrong-way span over its cells' flank edges): those flank edges are re-priced
+    // too, so the updated view still equals a full extraction.
+    #[test]
+    fn the_updated_view_reprices_an_adopted_trees_wrong_way_flanks() {
+        let mut c = router();
+        for l in 0..c.grid.num_layers {
+            for col in c.grid.graph_edges[l].iter_mut() {
+                for e in col.iter_mut() {
+                    e.capacity = 2.0;
+                }
+            }
+        }
+        let layers = c.design.wrong_way_demand_length.len();
+        c.design.wrong_way_demand_length = vec![0.75; layers];
+        // Layer 2 runs horizontally: a vertical span on it is wrong-way, legal only when adopted.
+        let mut t = GrTree::default();
+        let a = t.add(2, Point::new(3, 1));
+        let b = t.add(2, Point::new(3, 4));
+        t.nodes[a].children.push(b);
+        let mut n = net_with(t, &[]);
+        n.adopted = true;
+        let tree = n.routing_tree.clone().unwrap();
+        let flanks: Vec<_> = c.grid.tree_demands(&c.design, &tree, true, &n.ndr_costs).unwrap().into_iter().filter(|d| d.kind == grid_graph::DemandKind::WrongWay && d.demand > 0.0).collect();
+        assert!(!flanks.is_empty(), "the adopted span charges wrong-way flank edges");
+        let mut view: grid_graph::View<f64> = Vec::new();
+        c.grid.extract_wire_cost_view(&mut view, &[], &c.constants, 1.0);
+        c.grid.commit_tree(&c.design, &tree, false, &n.ndr_costs, true, &mut Vec::new()).unwrap();
+        c.grid.update_wire_cost_view(&mut view, &c.design, &n, &c.constants, 1.0).unwrap();
+        let mut full: grid_graph::View<f64> = Vec::new();
+        c.grid.extract_wire_cost_view(&mut full, &[], &c.constants, 1.0);
+        assert_eq!(view, full);
+    }
+
 }
