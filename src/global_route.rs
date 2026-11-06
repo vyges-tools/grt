@@ -2286,6 +2286,110 @@ fn update_net_resources(g2: &mut crate::graph2d::Graph2d, g3: &mut Graph3d, grid
     }
 }
 
+/// One routing layer of the database's congestion map (`dbGCellGrid`) as
+/// `restoreCapacitiesFromDb` reads it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DbMapLayer {
+    /// The routing level (`k + 1`).
+    pub level: i32,
+    /// `layer_directions_[k] == HORIZONTAL` — any other direction counts as vertical.
+    pub horizontal: bool,
+    /// `(getCapacity, getUsage)` per gcell, `[y * x_grid + x]`; a cell the map never wrote is `(0, 0)`.
+    pub cells: Vec<(f32, f32)>,
+}
+
+/// The database's congestion map over the router's layers `min..=max`, or `None` when the map is
+/// not on the router's grid: exactly ONE grid pattern each way, whose `(origin, count, step)` is the
+/// router's `(corner, grid, tile size)`. A layer the technology has no routing layer for is left out.
+fn db_congestion_map(db: &Db, t: &TechSetup) -> Res<Option<Vec<DbMapLayer>>> {
+    if db.gcell_get_num_grid_patterns_x() != 1 || db.gcell_get_num_grid_patterns_y() != 1 {
+        return Ok(None);
+    }
+    let fr = &t.fast_route;
+    let tile = t.core.tile_size;
+    if db.gcell_grid_pattern_x(0)? != (fr.x_corner, fr.x_grid, tile) || db.gcell_grid_pattern_y(0)? != (fr.y_corner, fr.y_grid, tile) {
+        // debugPrint GRT incr 1: "The odb congestion map is on another grid; capacities kept."
+        return Ok(None);
+    }
+    let (xg, yg) = (fr.x_grid as usize, fr.y_grid as usize);
+    let mut layers = Vec::new();
+    for level in t.min_routing_layer..=t.max_routing_layer {
+        let Some(layer) = t.tech.routing_layers.iter().find(|l| l.routing_level == level) else { continue };
+        let mut cells = vec![(0.0f32, 0.0f32); xg * yg];
+        for c in db.gcell_layer_congestion(&layer.name)? {
+            let (x, y) = (c.x_idx as usize, c.y_idx as usize);
+            if x < xg && y < yg {
+                cells[y * xg + x] = (c.capacity, c.usage);
+            }
+        }
+        let horizontal = layer.direction == Some(crate::capacity::Direction::Horizontal);
+        layers.push(DbMapLayer { level, horizontal, cells });
+    }
+    Ok(Some(layers))
+}
+
+/// What [`restore_capacities_from_db`] did, as its debug line counts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[must_use]
+pub struct RestoredCapacities {
+    /// Edges whose capacity changed.
+    pub changed: i32,
+    /// Edges left alone because the map disagrees with the routes (other tracks or other usage).
+    pub kept: i32,
+}
+
+/// `FastRouteCore::restoreCapacitiesFromDb` (upstream 44d32e3f4b): routes adopted from the
+/// database take back the capacities they were routed with — the congestion map's — rather than
+/// those recomputed now for cells that moved since.
+///
+/// ⛔ The inverse of `updateDbCongestion`: per edge along the layer's direction (the last column of
+/// a horizontal layer and the last row of a vertical one are skipped — they only mirror their
+/// neighbour), `tracks = lround(capacity)` and `blockage = lround(usage) − edge.usage − other.usage
+/// − other.red`, where `other` is the same cell's edge in the OTHER direction on that layer.
+/// The edge is KEPT (counted, unchanged) when `tracks != edge.cap + edge.red` or the blockage is
+/// outside `0..=tracks`; otherwise its capacity becomes `tracks − blockage`, through
+/// `addAdjustment(…, cap, delta < 0)` and `addCap3D(delta)` on the NDR ledger (cap and cap_ndr).
+/// Only edges along the layer's direction are written, so the visiting order cannot change a value.
+pub fn restore_capacities_from_db(e: &mut crate::adjust::RouterEdges, g3: &Graph3d, map: &[DbMapLayer], ndr: &mut crate::ndr_cost::NdrLedger) -> RestoredCapacities {
+    let mut out = RestoredCapacities::default();
+    if e.h3.is_empty() {
+        return out;
+    }
+    let (xg, yg) = (e.x_grid, e.y_grid);
+    for l in map {
+        let k = (l.level - 1) as usize;
+        for y in 0..yg {
+            for x in 0..xg {
+                if (l.horizontal && x == xg - 1) || (!l.horizontal && y == yg - 1) {
+                    continue;
+                }
+                let i3 = ((k as i32 * yg + y) * xg + x) as usize;
+                let ig = g3.at(x, y);
+                let (edge, other) = if l.horizontal { (e.h3[i3], e.v3[i3]) } else { (e.v3[i3], e.h3[i3]) };
+                let (edge_usage, other_usage) =
+                    if l.horizontal { (g3.h_usage[k][ig], g3.v_usage[k][ig]) } else { (g3.v_usage[k][ig], g3.h_usage[k][ig]) };
+                let (cap_f, usage_f) = l.cells[(y * xg + x) as usize];
+                let tracks = cap_f.round() as i32;
+                let blockage = usage_f.round() as i32 - i32::from(edge_usage) - i32::from(other_usage) - i32::from(other.red);
+                if tracks != i32::from(edge.cap) + i32::from(edge.red) || blockage < 0 || blockage > tracks {
+                    out.kept += 1;
+                    continue;
+                }
+                let cap = tracks - blockage;
+                if cap == i32::from(edge.cap) {
+                    continue;
+                }
+                let delta = cap - i32::from(edge.cap);
+                let (x2, y2) = if l.horizontal { (x + 1, y) } else { (x, y + 1) };
+                e.add_adjustment(x, y, x2, y2, l.level, cap as u16, delta < 0);
+                ndr.add_cap_3d(x as usize, y as usize, k, l.horizontal, delta);
+                out.changed += 1;
+            }
+        }
+    }
+    out
+}
+
 /// `repairAntennas` with no route in the session (`!initialized_`): the routes come from the
 /// database's guides and the router is set up around them — the state antenna repair then starts
 /// from. In the reference's order:
@@ -2298,7 +2402,9 @@ fn update_net_resources(g2: &mut crate::graph2d::Graph2d, g3: &mut Graph3d, grid
 ///    `updateEdgesUsage` charged in step 1, so that charge is not modelled;
 /// 3. per net of `routes_` (odb-id order) that is not detail-routed, `updateNetResources`: every
 ///    wire segment's tiles charged once — 2D through the NDR-aware cost at the net's edge cost, 3D
-///    at the layer's edge cost — and the net marked `areSegmentsRestored`.
+///    at the layer's edge cost — and the net marked `areSegmentsRestored`;
+/// 4. with no detail-routed net in the block, [`restore_capacities_from_db`]: the capacities the
+///    routes were made with, from the database's congestion map (upstream 44d32e3f4b).
 ///
 /// ⛔ Refused rather than guessed: a pin no restored segment covers (`ensurePinsPositions`' repair
 /// of pin positions is not modelled), a detail-routed net, an NDR net
@@ -2335,7 +2441,7 @@ pub fn restore_for_repair(db: &mut Db, opts: &RouteOptions) -> Res<AfterRoute> {
         }
     }
     let layer_of = |v: &[crate::adjust::EdgeState], l: usize| -> Vec<i32> { (0..xg * yg).map(|i| i32::from(v[l * xg * yg + i].cap)).collect() };
-    let caps = Caps3D { x_grid: xg, layers: (0..e.num_layers as usize).map(|l| CapLayer { h: layer_of(&e.h3, l), v: layer_of(&e.v3, l) }).collect() };
+    let mut caps = Caps3D { x_grid: xg, layers: (0..e.num_layers as usize).map(|l| CapLayer { h: layer_of(&e.h3, l), v: layer_of(&e.v3, l) }).collect() };
     let num_layers = e.num_layers as usize;
     let max_layer = nets.iter().filter(|n| !n.is_local).map(|n| (n.max_layer - 1) as usize).max().unwrap_or(0);
     let mut g2 = crate::run::initial_graph_2d(xg, yg, &caps, &cap_h, &cap_v, num_layers.max(max_layer + 1));
@@ -2383,6 +2489,36 @@ pub fn restore_for_repair(db: &mut Db, opts: &RouteOptions) -> Res<AfterRoute> {
         }
         update_net_resources(&mut g2, &mut g3, &jumper_grid, n, id, &all_layer_edge_costs(n, num_layers), &routes[name], 1);
         state[id].segments_restored = true;
+    }
+
+    // 4. `restoreCapacitiesFromDb` — only when NO net of the block is detail-routed
+    // (`haveDetailedRoutes`), after the usage is charged and before the NDR pass.
+    let have_detailed_routes = order.iter().any(|n| !db.net_is_special(n) && db.net_get_wire_type(n) == "ROUTED" && db.net_has_wire(n));
+    if !have_detailed_routes {
+        if let Some(map) = db_congestion_map(db, &t)? {
+            let _counts = restore_capacities_from_db(&mut e, &g3, &map, &mut g2.ndr);
+            // The capacities the graphs were built from follow the edges.
+            for y in 0..yg {
+                for x in 0..xg {
+                    if x + 1 < xg {
+                        let s = e.h2[y * (xg - 1) + x];
+                        (red_h[y * xg + x], cap_h[y * xg + x]) = (s.red, s.cap);
+                    }
+                    if y + 1 < yg {
+                        let s = e.v2[y * xg + x];
+                        (red_v[y * xg + x], cap_v[y * xg + x]) = (s.red, s.cap);
+                    }
+                }
+            }
+            g2.cap_h.clone_from(&cap_h);
+            g2.cap_v.clone_from(&cap_v);
+            for (l, cl) in caps.layers.iter_mut().enumerate() {
+                cl.h = layer_of(&e.h3, l);
+                cl.v = layer_of(&e.v3, l);
+                g3.h_cap[l] = cl.h.iter().map(|&c| c as u16).collect();
+                g3.v_cap[l] = cl.v.iter().map(|&c| c as u16).collect();
+            }
+        }
     }
 
     let layer_dir: Vec<crate::layertable::LayerDir> = (1..=num_layers as i32)
@@ -3037,5 +3173,103 @@ mod merged_restored_tests {
         assert_eq!(connection_charge(true, false), ConnectionCharge::Resources);
         assert_eq!(connection_charge(true, true), ConnectionCharge::Resources);
         assert_eq!(connection_charge(false, true), ConnectionCharge::Nothing);
+    }
+}
+
+#[cfg(test)]
+mod restore_capacities_tests {
+    use super::{restore_capacities_from_db, DbMapLayer, RestoredCapacities};
+    use crate::adjust::{EdgeState, RouterEdges};
+    use crate::finalize::Graph3d;
+    use crate::ndr_cost::NdrLedger;
+
+    /// A 3 × 2 grid, one horizontal layer: every 3D edge `cap 5, red 3` (8 tracks), the 2D edges the
+    /// same, no usage but `usage 2` on h(0,0) and `usage 1` on v(0,0).
+    fn grid() -> (RouterEdges, Graph3d, NdrLedger) {
+        let s = EdgeState { cap: 5, red: 3, real_cap: 8 };
+        let e = RouterEdges {
+            die: crate::Rect { x_min: 0, y_min: 0, x_max: 30, y_max: 20 },
+            tile_size: 10,
+            x_grid: 3,
+            y_grid: 2,
+            num_layers: 1,
+            track_pitches: vec![1],
+            h3: vec![s; 6],
+            v3: vec![EdgeState { cap: 0, red: 0, real_cap: 0 }; 6],
+            h2: vec![s; 4],
+            v2: vec![EdgeState::default(); 3],
+            horizontal_blocked: Default::default(),
+            vertical_blocked: Default::default(),
+            verbose: false,
+            log: Vec::new(),
+        };
+        let mut h_usage = vec![vec![0u16; 6]];
+        h_usage[0][0] = 2;
+        let mut v_usage = vec![vec![0u16; 6]];
+        v_usage[0][0] = 1;
+        let g3 = Graph3d { x_grid: 3, num_layers: 1, h_cap: vec![vec![5; 6]], v_cap: vec![vec![0; 6]], h_usage, v_usage };
+        let mut ndr = NdrLedger::new(3, 2, 1);
+        for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            ndr.update_cap_3d(x, y, 0, true, 5.0);
+        }
+        (e, g3, ndr)
+    }
+
+    /// Rule (`restoreCapacitiesFromDb`, 44d32e3f4b): per edge along the layer, `tracks =
+    /// lround(map capacity)`, `blockage = lround(map usage) − edge.usage − other.usage − other.red`;
+    /// kept when `tracks != cap + red` or the blockage is outside `0..=tracks`, else `cap = tracks −
+    /// blockage` through addAdjustment (raise: 2D cap up, 2D and 3D red down; lower: the reverse)
+    /// and addCap3D (ledger cap and cap_ndr by the delta). The last column only mirrors its
+    /// neighbour and is not visited.
+    #[test]
+    fn adopted_routes_take_back_the_capacities_of_the_odb_congestion_map() {
+        let (mut e, g3, mut ndr) = grid();
+        let mut cells = vec![(8.0f32, 0.0f32); 6];
+        cells[0] = (8.0, 5.4); // h(0,0): blockage 5 − 2 − 1 − 0 = 2 → cap 6 (raised by 1)
+        cells[1] = (9.0, 0.0); // h(1,0): 9 tracks ≠ 5 + 3 → kept
+        cells[3] = (8.0, 3.0); // h(0,1): blockage 3 → cap 5, unchanged, not counted
+        cells[4] = (7.6, 4.0); // h(1,1): lround → 8 tracks, blockage 4 → cap 4 (lowered by 1)
+        cells[2] = (1.0, 1.0); // h(2,0): the mirroring column, never read
+        cells[5] = (8.0, 9.0); // h(2,1): same
+        let map = [DbMapLayer { level: 1, horizontal: true, cells }];
+        let got = restore_capacities_from_db(&mut e, &g3, &map, &mut ndr);
+        // h(0,1): blockage 3 → cap 5 = unchanged; so the counts are 2 changed, 1 kept.
+        assert_eq!(got, RestoredCapacities { changed: 2, kept: 1 });
+        assert_eq!((e.h3[0].cap, e.h3[0].red, e.h2[0].cap, e.h2[0].red), (6, 2, 6, 2));
+        assert_eq!((e.h3[4].cap, e.h3[4].red, e.h2[3].cap, e.h2[3].red), (4, 4, 4, 4));
+        assert_eq!((e.h3[1].cap, e.h3[3].cap, e.h3[2].cap), (5, 5, 5));
+        let (a, b) = (ndr.cap(true, 0, 0, 0), ndr.cap(true, 0, 1, 1));
+        assert_eq!((a.cap, a.cap_ndr, b.cap, b.cap_ndr), (6, 6.0, 4, 4.0));
+        assert_eq!(ndr.cap(true, 0, 1, 0).cap, 5);
+    }
+
+    /// Rule: the map's usage holds BOTH directions' usage and reduction (`updateDbCongestion`), so
+    /// the other direction's REDUCTION is taken out of the blockage too, not only its usage.
+    #[test]
+    fn the_other_directions_reduction_is_not_blockage() {
+        let (mut e, g3, mut ndr) = grid();
+        e.v3[0].red = 2;
+        let mut cells = vec![(8.0f32, 3.0f32); 6];
+        cells[0] = (8.0, 7.0); // h(0,0): 7 − 2 − 1 − 2 = 2 → cap 6 (without other.red: 4 → cap 4)
+        let map = [DbMapLayer { level: 1, horizontal: true, cells }];
+        let got = restore_capacities_from_db(&mut e, &g3, &map, &mut ndr);
+        assert_eq!(got, RestoredCapacities { changed: 1, kept: 0 });
+        assert_eq!(e.h3[0].cap, 6);
+    }
+
+    /// Rule: a negative blockage, or one above the tracks, means other routes than the map was
+    /// written with — the edge is kept.
+    #[test]
+    fn a_blockage_outside_the_tracks_keeps_the_edge() {
+        let (mut e, g3, mut ndr) = grid();
+        let mut cells = vec![(8.0f32, 0.0f32); 6];
+        cells[0] = (8.0, 1.0); // 1 − 2 − 1 = −2
+        cells[1] = (8.0, 9.0); // 9 > 8
+        cells[3] = (8.0, 3.0);
+        cells[4] = (8.0, 3.0);
+        let map = [DbMapLayer { level: 1, horizontal: true, cells }];
+        let got = restore_capacities_from_db(&mut e, &g3, &map, &mut ndr);
+        assert_eq!(got, RestoredCapacities { changed: 0, kept: 2 });
+        assert!(e.h3.iter().all(|s| s.cap == 5));
     }
 }

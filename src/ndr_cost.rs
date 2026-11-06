@@ -167,6 +167,15 @@ impl NdrLedger {
         c.cap_ndr = cap;
     }
 
+    /// `addCap3D` — add to a layer's capacity, keeping the NDR capacity reserved on it: both move
+    /// by `delta`. ⛔ `cap` is `uint16_t`: `cap += delta` wraps as the reference's does.
+    pub fn add_cap_3d(&mut self, x: usize, y: usize, layer: usize, horizontal: bool, delta: i32) {
+        let i = self.cap_at(layer, x, y);
+        let c = if horizontal { &mut self.h_cap[i] } else { &mut self.v_cap[i] };
+        c.cap = (i32::from(c.cap) + delta) as u16;
+        c.cap_ndr += f64::from(delta);
+    }
+
     /// `hasNDRCapacity` — whether ANY single layer in the net's range still has room for its layer
     /// edge cost. A net with edge cost 1 always has room.
     pub fn has_ndr_capacity(&self, net: &NdrCostNet, x: usize, y: usize, horizontal: bool) -> bool {
