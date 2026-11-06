@@ -53,7 +53,28 @@ pub struct GrNet {
     pub odb_ap_choices: Vec<Vec<(Point, Interval)>>,
 }
 
+/// `GRNet::SavedRoute`: what a maze rollback restores — the tree, its adopted flag and the
+/// access points the maze re-selects.
+#[derive(Debug, Clone)]
+pub struct SavedRoute {
+    tree: Option<GrTree>,
+    adopted: bool,
+    access_points: BTreeMap<usize, (Point, Interval)>,
+}
+
 impl GrNet {
+    /// `saveRoute()`.
+    pub fn save_route(&self) -> SavedRoute {
+        SavedRoute { tree: self.routing_tree.clone(), adopted: self.adopted, access_points: self.preferred_aps.clone() }
+    }
+
+    /// `restoreRoute(route)`.
+    pub fn restore_route(&mut self, saved: SavedRoute) {
+        self.routing_tree = saved.tree;
+        self.adopted = saved.adopted;
+        self.preferred_aps = saved.access_points;
+    }
+
     /// The `GRNet` constructor.
     ///
     /// Upstream rule: each pin's shapes are mapped to the gcells they overlap (`rangeSearchCells`)

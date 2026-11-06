@@ -365,7 +365,7 @@ pub fn route_cugr(db: &mut Db, opts: &RouteOptions, call: usize, stt: SteinerBui
     let mut nets = ci.cugr.congested_nets(2, trace.as_deref_mut());
     ci.cugr.pattern_route_with_detours(&mut nets, &alphas, stt, &mut log, trace.as_deref_mut()).map_err(fail)?;
     let mut nets = ci.cugr.congested_nets(3, trace.as_deref_mut());
-    ci.cugr.maze_route(&mut nets, 4, &mut log, trace.as_deref_mut()).map_err(fail)?;
+    ci.cugr.maze_route(&mut nets, 4, 0, &mut log, trace.as_deref_mut()).map_err(fail)?;
     let mut nets = ci.cugr.congested_nets(4, trace.as_deref_mut());
     ci.cugr.iterative_rrr(&mut nets, opts.congestion_iterations, &mut log, trace.as_deref_mut()).map_err(fail)?;
     if let Some(t) = trace {

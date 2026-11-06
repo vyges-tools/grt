@@ -272,6 +272,18 @@ pub fn slack_refresh(out: &mut Vec<String>, call: usize, r: &super::SlackRefresh
     out.push(format!("VYGC|slkupd|{call}|{mode}|{}|{}", nets.len(), list(nets)));
 }
 
+/// `mzacc|stage|iter|idx|delta|keep|relief|edges`: one maze transaction's verdict — the
+/// touched-edge overflow change (f64 bits), kept or rolled back, relief neighbour (never: the
+/// incremental relief is not modelled) and the new tree's touched-edge count.
+pub fn maze_accept(out: &mut Vec<String>, stage: i32, iteration: i32, k: usize, delta: f64, keep: bool, edges: usize) {
+    out.push(format!("VYGC|mzacc|{stage}|{iteration}|{k}|{:016x}|{}|0|{edges}", delta.to_bits(), u8::from(keep)));
+}
+
+/// `mzret|stage|iter|accepted|rejected|change`: `mazeRoute`'s return (f64 bits).
+pub fn maze_return(out: &mut Vec<String>, stage: i32, iteration: i32, accepted: usize, rejected: usize, change: f64) {
+    out.push(format!("VYGC|mzret|{stage}|{iteration}|{accepted}|{rejected}|{:016x}", change.to_bits()));
+}
+
 /// `collect|stage|add or incr|n|nets,`: one `collectReroutedNets`, in the order given.
 pub fn collect(out: &mut Vec<String>, stage: i32, incremental: bool, nets: &[usize]) {
     out.push(format!("VYGC|collect|{stage}|{}|{}|{}", if incremental { "incr" } else { "add" }, nets.len(), list(nets)));

@@ -190,6 +190,16 @@ impl PartialEq for SlackSource {
 /// `kDemotedSlack`: a non-critical net's slack after demotion.
 pub const DEMOTED_SLACK: f32 = f32::MAX;
 
+/// `mazeRoute`'s `kAcceptTolerance`: a reroute that adds more overflow than float noise is rolled
+/// back (#11829).
+pub const MAZE_ACCEPT_TOLERANCE: f64 = 1e-9;
+
+/// `mazeRoute`'s accept test for a net that is not a relief neighbour: `delta <=
+/// kAcceptTolerance` — a reroute that leaves the touched edges' overflow unchanged is kept.
+pub fn maze_keeps(delta: f64) -> bool {
+    delta <= MAZE_ACCEPT_TOLERANCE
+}
+
 /// A stage that stopped where the reference would have gone on to something not modelled, or
 /// would have raised an error.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -539,37 +549,46 @@ impl Cugr {
         Ok(())
     }
 
-    /// `mazeRoute(nets, stage)` (stage 4, and each RRR iteration as stage 5): EVERY listed net
-    /// ripped up first, then the wire-cost view taken, the nets in the neutral order, each routed
-    /// on a sparsified grid whose offset steps after every net, its tree laid onto layers by
-    /// pattern routing, committed, and the view re-priced along it.
-    pub fn maze_route(&mut self, nets: &mut [usize], stage: i32, log: &mut dyn crate::log::Sink, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
+    /// `mazeRoute(nets, stage, iteration)` (stage 4 at iteration 0, each RRR iteration as stage 5):
+    /// the critical-net refresh, the wire-cost view taken with every net in place, the nets
+    /// sorted, then ONE NET AT A TIME a transaction (#11829): the net's route and access points
+    /// saved, its tree's usage removed and the view re-priced along it, routed on a sparsified
+    /// grid whose offset steps after every net, its tree laid onto layers by pattern routing and
+    /// committed. The overflow change on the edges the old and new trees touch decides it: above
+    /// `MAZE_ACCEPT_TOLERANCE` the new route is ripped up and the saved one restored. Only the
+    /// accepted nets are collected for the next slack refresh. Returns the accepted nets' summed
+    /// overflow change.
+    pub fn maze_route(&mut self, nets: &mut [usize], stage: i32, iteration: i32, log: &mut dyn crate::log::Sink, mut trace: Option<&mut Vec<String>>) -> Result<f64, StageError> {
         if nets.is_empty() {
-            return Ok(());
+            return Ok(0.0);
         }
         if self.critical_nets_percentage != 0.0 {
             self.update_critical_nets(stage, trace.as_deref_mut())?;
         }
-        let mut ripped = Vec::new();
-        for &k in nets.iter() {
-            self.commit_net(k, true, &mut ripped)?;
-        }
         let mut view: grid_graph::View<f64> = Vec::new();
         self.grid.extract_wire_cost_view(&mut view, &[], &self.constants, self.cost_multiplier);
         let res_aware = self.res_aware_order();
-        let mut sorted_trace = Vec::new();
-        self.sort_net_indices(nets, res_aware, stage, Some(&mut sorted_trace))?;
+        self.sort_maze_net_indices(nets, res_aware, stage, trace.as_deref_mut())?;
         if let Some(t) = trace.as_deref_mut() {
-            trace::commits(t, &ripped, stage);
-            t.extend(sorted_trace);
-            trace::order(t, self, nets, stage);
             trace::wire_cost_view(t, &view, stage);
         }
         let mut grid = maze_route::SparseGrid::new(10, 10, 0, 0);
         let mut ndr_view: grid_graph::View<f64> = Vec::new();
+        let (mut rejected, mut overflow_change) = (0usize, 0.0f64);
+        let mut accepted: Vec<usize> = Vec::with_capacity(nets.len());
         for &k in nets.iter() {
             if self.nets[k].num_pins() < 2 {
                 continue;
+            }
+            let saved = self.nets[k].save_route();
+            let mut touched = self.tree_edges(k)?;
+            let mut delta = -self.grid.sum_overflow(&touched);
+            let mut ripped = Vec::new();
+            self.commit_net(k, true, &mut ripped)?;
+            delta += self.grid.sum_overflow(&touched);
+            self.update_view_along(k, &mut view);
+            if let Some(t) = trace.as_deref_mut() {
+                trace::commits(t, &ripped, stage);
             }
             let selected = pattern_route::select_access_points(&mut self.nets[k], &self.grid, log).map_err(StageError::Pattern)?;
             let has_ndr = self.nets[k].has_ndr();
@@ -580,10 +599,12 @@ impl Cugr {
             let cx = pattern_route::CostContext { grid: &self.grid, design: &self.design, constants: &self.constants, cost_multiplier: self.cost_multiplier };
             let mut route = pattern_route::pattern_route_tree(&mut self.nets[k], steiner, &cx).map_err(StageError::Pattern)?;
             route.maze = Some((sparse, arena, found));
+            touched = self.tree_edges(k)?;
+            delta -= self.grid.sum_overflow(&touched);
             let mut commits = Vec::new();
             self.commit_net(k, false, &mut commits)?;
-            let tree = self.nets[k].routing_tree.clone().expect("set by the route");
-            self.grid.update_wire_cost_view(&mut view, &tree, &self.constants, self.cost_multiplier);
+            delta += self.grid.sum_overflow(&touched);
+            let keep = maze_keeps(delta);
             if let Some(t) = trace.as_deref_mut() {
                 // The reference's order: the access points (chosen by the sparse graph), the maze
                 // (graph, paths, tree), then the DAG, the tree and the commits.
@@ -594,16 +615,56 @@ impl Cugr {
                 trace::maze(&mut maze, &self.nets[k], &route, &grid);
                 lines.splice(split..split, maze);
                 t.extend(lines);
+                trace::maze_accept(t, stage, iteration, k, delta, keep, touched.len());
             }
+            if keep {
+                overflow_change += delta;
+                accepted.push(k);
+            } else {
+                let mut rollback = Vec::new();
+                self.commit_net(k, true, &mut rollback)?;
+                self.update_view_along(k, &mut view);
+                self.nets[k].restore_route(saved);
+                self.commit_net(k, false, &mut rollback)?;
+                rejected += 1;
+                if let Some(t) = trace.as_deref_mut() {
+                    trace::commits(t, &rollback, stage);
+                }
+            }
+            self.update_view_along(k, &mut view);
             grid.step();
         }
-        // ⚠️ The reference collects only the ACCEPTED nets (its per-net accept test, E1); with
-        // every net kept, that is all of them.
-        self.collect_rerouted_nets(nets, stage, trace.as_deref_mut());
-        if let Some(t) = trace {
+        if let Some(t) = trace.as_deref_mut() {
             trace::demand(t, &self.grid, stage);
+            trace::maze_return(t, stage, iteration, accepted.len(), rejected, overflow_change);
+        }
+        self.collect_rerouted_nets(&accepted, stage, trace);
+        Ok(overflow_change)
+    }
+
+    /// `mazeRoute`'s `sortNetIndices` call and its trace (the sorted order, then the `order`
+    /// records). Behind its own function: post-pin #12090 changes this sort upstream.
+    fn sort_maze_net_indices(&mut self, nets: &mut [usize], res_aware: bool, stage: i32, trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
+        let mut sorted_trace = Vec::new();
+        self.sort_net_indices(nets, res_aware, stage, Some(&mut sorted_trace))?;
+        if let Some(t) = trace {
+            t.extend(sorted_trace);
+            trace::order(t, self, nets, stage);
         }
         Ok(())
+    }
+
+    /// `collectTreeEdges(*net)` for net `k`: the edges its current tree charges.
+    fn tree_edges(&self, k: usize) -> Result<Vec<(usize, i32, i32)>, StageError> {
+        let n = &self.nets[k];
+        self.grid.collect_tree_edges(&self.design, n.routing_tree.as_ref(), n.adopted, &n.ndr_costs).map_err(StageError::Commit)
+    }
+
+    /// `updateWireCostView(view, *net)` for net `k`'s current tree (none: nothing to re-price).
+    fn update_view_along(&self, k: usize, view: &mut grid_graph::View<f64>) {
+        if let Some(tree) = self.nets[k].routing_tree.as_ref() {
+            self.grid.update_wire_cost_view(view, tree, &self.constants, self.cost_multiplier);
+        }
     }
 
     /// `iterativeRRR` (stage 5): only with integer overflow left; up to `iterations` rounds, each
@@ -655,10 +716,11 @@ impl Cugr {
                 t.push(format!("VYGC|rrr|{i}|{multiplier}|{}|{}|demoted={}", nets.len(), trace::list(nets.iter()), demoted.iter().map(|d| format!("{d},")).collect::<String>()));
             }
             // Incremental re-mazes every candidate each round, in the candidates' own order.
-            match self.incremental_candidates.clone() {
-                Some(mut all) => self.maze_route(&mut all, 5, log, trace.as_deref_mut())?,
-                None => self.maze_route(nets, 5, log, trace.as_deref_mut())?,
-            }
+            // ⚠️ The pass's overflow change feeds the GRT-0124 stagnation stop (E2), not ported yet.
+            let _overflow_change = match self.incremental_candidates.clone() {
+                Some(mut all) => self.maze_route(&mut all, 5, i, log, trace.as_deref_mut())?,
+                None => self.maze_route(nets, 5, i, log, trace.as_deref_mut())?,
+            };
         }
         self.cost_multiplier = 1.0;
         let residual = self.grid.total_overflow();
@@ -801,7 +863,7 @@ impl Cugr {
         let mut nets = queued;
         self.pattern_route(&mut nets, alphas, stt, log, trace.as_deref_mut())?;
         self.pattern_route_with_detours(&mut nets, alphas, stt, log, trace.as_deref_mut())?;
-        self.maze_route(&mut nets, 4, log, trace.as_deref_mut())?;
+        self.maze_route(&mut nets, 4, 0, log, trace.as_deref_mut())?;
         self.iterative_rrr(&mut nets, iterations, log, trace.as_deref_mut())?;
         self.incremental_candidates = None;
         if let Some(t) = trace {
@@ -1159,4 +1221,54 @@ mod tests {
         c.update_critical_nets(3, None).unwrap();
         assert_eq!(*asked.borrow(), vec![SlackRefresh::Full, SlackRefresh::Rerouted(vec![1])]);
     }
+
+    // Upstream rule (`mazeRoute`, #11829): the accept test is `delta <= kAcceptTolerance` (1e-9)
+    // for a net that is not a relief neighbour — no change and float noise are kept, anything
+    // above is rolled back.
+    #[test]
+    fn the_maze_keeps_a_reroute_unless_it_adds_overflow_beyond_noise() {
+        assert!(maze_keeps(0.0));
+        assert!(maze_keeps(-1.0));
+        assert!(maze_keeps(MAZE_ACCEPT_TOLERANCE));
+        assert!(!maze_keeps(2e-9));
+        assert!(!maze_keeps(0.5));
+    }
+
+    // Upstream rule (`GRNet::saveRoute` / `restoreRoute`): a rollback restores the tree, its
+    // adopted flag and the access points the maze re-selected.
+    #[test]
+    fn a_rollback_restores_the_tree_the_flag_and_the_access_points() {
+        let mut n = critical_candidate(0.0);
+        n.adopted = true;
+        n.preferred_aps.insert(0, (Point::new(1, 1), Interval::point(0)));
+        let before = (n.routing_tree.clone(), n.preferred_aps.clone());
+        let saved = n.save_route();
+        n.routing_tree = None;
+        n.adopted = false;
+        n.preferred_aps.insert(0, (Point::new(3, 3), Interval::point(1)));
+        n.restore_route(saved);
+        assert!(n.adopted);
+        assert_eq!((n.routing_tree.clone(), n.preferred_aps.clone()), before);
+    }
+
+    // Upstream rules (`collectTreeEdges`, `edgeOverflow`, `sumOverflow`): the edges a tree
+    // charges on routable layers, sorted and unique; an edge's overflow is `max(0, demand -
+    // capacity)`, so an edge with room adds nothing.
+    #[test]
+    fn the_touched_edges_are_unique_and_only_overfull_ones_count() {
+        let mut c = router();
+        let n = critical_candidate(0.0);
+        let edges = c.grid.collect_tree_edges(&c.design, n.routing_tree.as_ref(), false, &n.ndr_costs).unwrap();
+        assert_eq!(edges, vec![(2, 0, 0), (2, 1, 0), (2, 2, 0), (2, 3, 0)]);
+        assert!(edges.windows(2).all(|w| w[0] < w[1]));
+        for &(l, x, y) in &edges {
+            let e = &mut c.grid.graph_edges[l][x as usize][y as usize];
+            e.demand = e.capacity - 0.5;
+        }
+        assert_eq!(c.grid.sum_overflow(&edges), 0.0);
+        let e = &mut c.grid.graph_edges[2][1][0];
+        e.demand = e.capacity + 1.25;
+        assert_eq!(c.grid.sum_overflow(&edges), 1.25);
+    }
+
 }

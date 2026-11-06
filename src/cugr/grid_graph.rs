@@ -691,6 +691,38 @@ impl GridGraph {
         Ok(())
     }
 
+    /// `collectTreeEdges(net)`: every edge the tree charges (`forEachTreeDemandImpl`) on a
+    /// routable layer, as `(layer, x, y)`, sorted and unique (`std::array<int, 3>` order). No tree:
+    /// none.
+    pub fn collect_tree_edges(&self, design: &Design, tree: Option<&GrTree>, adopted: bool, net_costs: &[f64]) -> Result<Vec<(usize, i32, i32)>, CommitError> {
+        let Some(tree) = tree else { return Ok(Vec::new()) };
+        let mut edges: Vec<(usize, i32, i32)> = self
+            .tree_demands(design, tree, adopted, net_costs)?
+            .into_iter()
+            .filter(|c| c.layer >= self.min_routing_layer)
+            .map(|c| (c.layer, c.edge.x, c.edge.y))
+            .collect();
+        edges.sort_unstable();
+        edges.dedup();
+        Ok(edges)
+    }
+
+    /// `edgeOverflow(edge)`: `std::max(0.0, demand - capacity)` — 0 unless strictly positive.
+    pub fn edge_overflow(&self, (layer, x, y): (usize, i32, i32)) -> f64 {
+        let e = &self.graph_edges[layer][x as usize][y as usize];
+        let over = e.demand - e.capacity;
+        if 0.0 < over { over } else { 0.0 }
+    }
+
+    /// `sumOverflow(edges)`: the edges' overflows added in the list's order.
+    pub fn sum_overflow(&self, edges: &[(usize, i32, i32)]) -> f64 {
+        let mut sum = 0.0;
+        for &e in edges {
+            sum += self.edge_overflow(e);
+        }
+        sum
+    }
+
     /// `pinAccessTops(net)`: per gcell of the net's preferred access points, the HIGHEST top layer
     /// of the points there, each at least the net's min layer (itself at least the min routing
     /// layer), keyed and ordered by gcell.
