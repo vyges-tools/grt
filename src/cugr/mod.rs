@@ -190,6 +190,14 @@ impl PartialEq for SlackSource {
 /// `kDemotedSlack`: a non-critical net's slack after demotion.
 pub const DEMOTED_SLACK: f32 = f32::MAX;
 
+/// `updateCriticalNets`' `extend_res_aware`: whether the refresh may mark more nets
+/// resistance-aware (the pattern stages) or only refreshes its score's inputs (the maze passes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResAwareSet {
+    Extend,
+    Keep,
+}
+
 /// `mazeRoute`'s `kAcceptTolerance`: a reroute that adds more overflow than float noise is rolled
 /// back (#11829).
 pub const MAZE_ACCEPT_TOLERANCE: f64 = 1e-9;
@@ -266,7 +274,7 @@ impl Cugr {
     /// `updateCriticalNets`: every net's slack refreshed from the timer (`updateNetSlacks`, the
     /// next captured call), the res-aware set marked on those real slacks, then — outside an
     /// incremental route — every non-critical net demoted.
-    pub fn update_critical_nets(&mut self, stage: i32, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
+    pub fn update_critical_nets(&mut self, stage: i32, set: ResAwareSet, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
         let refresh = self.take_slack_refresh();
         if let Some(t) = trace.as_deref_mut() {
             trace::slack_refresh(t, self.raw_done, &refresh);
@@ -288,7 +296,7 @@ impl Cugr {
             }
         }
         self.raw_done += 1;
-        self.mark_res_aware_nets(stage, trace.as_deref_mut());
+        self.mark_res_aware_nets(stage, set, trace.as_deref_mut());
         if self.incremental_candidates.is_none() {
             let th = self.critical_slack_threshold();
             if let Some(t) = trace {
@@ -351,11 +359,12 @@ impl Cugr {
     /// resistance (the tree's, f64 → f32) and length (the tree's planar length, else the bounding
     /// box's half perimeter); a net of under two pins, of length ≤ `resistance_min_net_length`,
     /// or of positive slack (a CLOCK-typed net excepted) is skipped; the rest update the
-    /// normalisers (from 1, 1, 1 and `f32::MAX`), and a CLOCK or NDR net is marked outright while
-    /// an unmarked one becomes a candidate. Pass 2 ranks the candidates by `(score, index)` and
-    /// marks the first `ceil(count * res_aware_percentage / 100)` (f32) — every one in an
-    /// incremental route.
-    fn mark_res_aware_nets(&mut self, stage: i32, mut trace: Option<&mut Vec<String>>) {
+    /// normalisers (from 1, 1, 1 and `f32::MAX`) and become candidates. With
+    /// [`ResAwareSet::Keep`] (`extend_res_aware` false: the maze passes) that is all — nothing is
+    /// marked, clock and NDR nets included. Otherwise pass 2 marks a CLOCK or NDR candidate
+    /// outright, ranks the unmarked rest by `(score, index)` and marks the first
+    /// `ceil(count * res_aware_percentage / 100)` (f32) — every one in an incremental route.
+    fn mark_res_aware_nets(&mut self, stage: i32, set: ResAwareSet, mut trace: Option<&mut Vec<String>>) {
         if !self.resistance_aware {
             return;
         }
@@ -385,14 +394,22 @@ impl Cugr {
             worst_fanout = worst_fanout.max(n.num_pins() as i32);
             worst_length = worst_length.max(n.net_length);
             worst_slack = worst_slack.min(n.slack);
-            if n.is_clock_sig || n.has_ndr() {
-                n.res_aware = true;
-            } else if !n.res_aware {
-                candidates.push(k);
-            }
+            candidates.push(k);
         }
         self.worst = (worst_slack, worst_resistance, worst_fanout, worst_length);
-        let mut scored: Vec<(usize, f32)> = candidates.iter().map(|&k| (k, self.res_aware_score(k))).collect();
+        if set == ResAwareSet::Keep {
+            return;
+        }
+        // Pass 2: an eligible clock or NDR net is marked outright; the others not marked yet are
+        // ranked.
+        let mut scored: Vec<(usize, f32)> = Vec::new();
+        for k in candidates {
+            if self.nets[k].is_clock_sig || self.nets[k].has_ndr() {
+                self.nets[k].res_aware = true;
+            } else if !self.nets[k].res_aware {
+                scored.push((k, self.res_aware_score(k)));
+            }
+        }
         scored.sort_by(|a, b| (a.1, a.0).partial_cmp(&(b.1, b.0)).unwrap_or(std::cmp::Ordering::Equal));
         if let Some(t) = trace.as_deref_mut() {
             t.push(format!("VYGC|raworst|{stage}|{:08x}|{:08x}|{worst_fanout}|{worst_length}", worst_slack.to_bits(), worst_resistance.to_bits()));
@@ -416,7 +433,7 @@ impl Cugr {
         if !self.res_aware_order() {
             return Ok(());
         }
-        self.update_critical_nets(2, trace.as_deref_mut())?;
+        self.update_critical_nets(2, ResAwareSet::Extend, trace.as_deref_mut())?;
         let mut nets: Vec<usize> = (0..self.nets.len()).filter(|&k| self.nets[k].res_aware).collect();
         if nets.is_empty() {
             return Ok(());
@@ -513,7 +530,7 @@ impl Cugr {
             return Ok(());
         }
         if self.critical_nets_percentage != 0.0 {
-            self.update_critical_nets(3, trace.as_deref_mut())?;
+            self.update_critical_nets(3, ResAwareSet::Extend, trace.as_deref_mut())?;
         }
         let view = self.grid.extract_congestion_view();
         if let Some(t) = trace.as_deref_mut() {
@@ -563,7 +580,8 @@ impl Cugr {
             return Ok(0.0);
         }
         if self.critical_nets_percentage != 0.0 {
-            self.update_critical_nets(stage, trace.as_deref_mut())?;
+            // Maze passes keep the resistance-aware set the pattern stages chose.
+            self.update_critical_nets(stage, ResAwareSet::Keep, trace.as_deref_mut())?;
         }
         let mut view: grid_graph::View<f64> = Vec::new();
         self.grid.extract_wire_cost_view(&mut view, &[], &self.constants, self.cost_multiplier);
@@ -1172,7 +1190,7 @@ mod tests {
         let mut clock = critical_candidate(1.0);
         clock.is_clock_sig = true;
         c.nets = vec![critical_candidate(-1.0), critical_candidate(-1.0), clock];
-        c.mark_res_aware_nets(2, None);
+        c.mark_res_aware_nets(2, ResAwareSet::Extend, None);
         assert!(c.nets[2].res_aware, "a positive-slack CLOCK net is still marked");
         assert!(c.nets[0].res_aware && !c.nets[1].res_aware, "a tie goes to the lower index: ceil(2 * 50%) = 1");
     }
@@ -1216,9 +1234,9 @@ mod tests {
             Ok(cu.nets.iter().map(|n| (n.name.clone(), -1.0)).collect())
         };
         c.slack_source = SlackSource(Some(std::rc::Rc::new(std::cell::RefCell::new(read))));
-        c.update_critical_nets(2, None).unwrap();
+        c.update_critical_nets(2, ResAwareSet::Extend, None).unwrap();
         c.collect_rerouted_nets(&[1], 2, None);
-        c.update_critical_nets(3, None).unwrap();
+        c.update_critical_nets(3, ResAwareSet::Extend, None).unwrap();
         assert_eq!(*asked.borrow(), vec![SlackRefresh::Full, SlackRefresh::Rerouted(vec![1])]);
     }
 
@@ -1269,6 +1287,25 @@ mod tests {
         let e = &mut c.grid.graph_edges[2][1][0];
         e.demand = e.capacity + 1.25;
         assert_eq!(c.grid.sum_overflow(&edges), 1.25);
+    }
+
+
+    // Upstream rule (`markResAwareNets(nets, extend_res_aware = false)`, the maze passes' refresh):
+    // pass 1 refreshes resistance, length and the normalisers, then the call returns — no net is
+    // marked, not even an eligible CLOCK net, which the pattern stages' call would mark outright.
+    #[test]
+    fn a_maze_refresh_keeps_the_res_aware_set() {
+        let mut c = router();
+        c.resistance_aware = true;
+        c.res_aware_percentage = 100.0;
+        c.nets = vec![critical_candidate(-1.0), critical_candidate(-2.0)];
+        c.nets[0].is_clock_sig = true;
+        c.mark_res_aware_nets(4, ResAwareSet::Keep, None);
+        assert!(c.nets.iter().all(|n| !n.res_aware));
+        assert_eq!(c.nets[0].net_length, 4);
+        assert_eq!(c.worst.0, -2.0);
+        c.mark_res_aware_nets(3, ResAwareSet::Extend, None);
+        assert!(c.nets.iter().all(|n| n.res_aware));
     }
 
 }
