@@ -604,7 +604,7 @@ impl Cugr {
             let mut ripped = Vec::new();
             self.commit_net(k, true, &mut ripped)?;
             delta += self.grid.sum_overflow(&touched);
-            self.update_view_along(k, &mut view);
+            self.update_view_along(k, &mut view)?;
             if let Some(t) = trace.as_deref_mut() {
                 trace::commits(t, &ripped, stage);
             }
@@ -641,7 +641,7 @@ impl Cugr {
             } else {
                 let mut rollback = Vec::new();
                 self.commit_net(k, true, &mut rollback)?;
-                self.update_view_along(k, &mut view);
+                self.update_view_along(k, &mut view)?;
                 self.nets[k].restore_route(saved);
                 self.commit_net(k, false, &mut rollback)?;
                 rejected += 1;
@@ -649,7 +649,7 @@ impl Cugr {
                     trace::commits(t, &rollback, stage);
                 }
             }
-            self.update_view_along(k, &mut view);
+            self.update_view_along(k, &mut view)?;
             grid.step();
         }
         if let Some(t) = trace.as_deref_mut() {
@@ -679,10 +679,8 @@ impl Cugr {
     }
 
     /// `updateWireCostView(view, *net)` for net `k`'s current tree (none: nothing to re-price).
-    fn update_view_along(&self, k: usize, view: &mut grid_graph::View<f64>) {
-        if let Some(tree) = self.nets[k].routing_tree.as_ref() {
-            self.grid.update_wire_cost_view(view, tree, &self.constants, self.cost_multiplier);
-        }
+    fn update_view_along(&self, k: usize, view: &mut grid_graph::View<f64>) -> Result<(), StageError> {
+        self.grid.update_wire_cost_view(view, &self.design, &self.nets[k], &self.constants, self.cost_multiplier).map_err(StageError::Commit)
     }
 
     /// `iterativeRRR` (stage 5): only with integer overflow left; up to `iterations` rounds, each
@@ -1306,6 +1304,49 @@ mod tests {
         assert_eq!(c.worst.0, -2.0);
         c.mark_res_aware_nets(3, ResAwareSet::Extend, None);
         assert!(c.nets.iter().all(|n| n.res_aware));
+    }
+
+
+    // Upstream rule (`updateWireCostView`, checked by its `verify_view` debug mode): the view is
+    // re-priced on every edge the tree CHARGES — wires, wrong-way flanks and via-stack pads — so
+    // after a commit the updated view equals a full extraction, including at the via's pad edges.
+    #[test]
+    fn the_updated_view_equals_a_full_extraction_after_a_commit() {
+        let mut c = router();
+        for l in 0..c.grid.num_layers {
+            for col in c.grid.graph_edges[l].iter_mut() {
+                for e in col.iter_mut() {
+                    e.capacity = 2.0;
+                }
+            }
+        }
+        let mut t = GrTree::default();
+        let a = t.add(2, Point::new(0, 1));
+        let b = t.add(2, Point::new(3, 1));
+        let v = t.add(1, Point::new(3, 1));
+        let d = t.add(1, Point::new(3, 4));
+        t.nodes[a].children.push(b);
+        t.nodes[b].children.push(v);
+        t.nodes[v].children.push(d);
+        let n = net_with(t, &[]);
+        // A via with pad demand on both of its layers.
+        let layers = c.design.via_demand_length_upper.len();
+        c.design.via_demand_length_upper = vec![0.5; layers];
+        c.design.via_demand_length_lower = vec![0.5; layers];
+        let mut view: grid_graph::View<f64> = Vec::new();
+        c.grid.extract_wire_cost_view(&mut view, &[], &c.constants, 1.0);
+        let before = view.clone();
+        let tree = n.routing_tree.clone().unwrap();
+        c.grid.commit_tree(&c.design, &tree, false, &n.ndr_costs, false, &mut Vec::new()).unwrap();
+        c.grid.update_wire_cost_view(&mut view, &c.design, &n, &c.constants, 1.0).unwrap();
+        let mut full: grid_graph::View<f64> = Vec::new();
+        c.grid.extract_wire_cost_view(&mut full, &[], &c.constants, 1.0);
+        assert_eq!(view, full);
+        let pads: Vec<_> = c.grid.tree_demands(&c.design, &tree, false, &n.ndr_costs).unwrap().into_iter().filter(|d| d.kind == grid_graph::DemandKind::ViaPad && d.layer >= 1 && d.demand > 0.0).collect();
+        assert!(!pads.is_empty(), "the via charges pad edges");
+        let p = &pads[0];
+        let dir = c.grid.layer_directions[p.layer];
+        assert_ne!(view[dir][p.edge.x as usize][p.edge.y as usize], before[dir][p.edge.x as usize][p.edge.y as usize], "a pad edge is re-priced");
     }
 
 }

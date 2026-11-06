@@ -875,54 +875,35 @@ impl GridGraph {
         }
     }
 
-    /// `updateWireCostView(view, tree)`: re-price (the summed, NDR-blind way) every edge the tree's
-    /// wires cross, and at each via, per layer crossed, the edge at the cell and the one before it
-    /// along that layer's direction.
-    pub fn update_wire_cost_view(&self, view: &mut View<f64>, tree: &GrTree, c: &super::Constants, cost_multiplier: f64) {
+    /// `updateWireCostView(view, net)`: re-price every edge the net's tree (if any) CHARGES
+    /// (`forEachTreeDemandImpl`: wire edges, wrong-way flank edges, via-stack pad edges) on a
+    /// routable layer, each cell computed as the default (NDR-blind) extraction computes it
+    /// (`wireCostViewCell(default_view_context_)`): length × (unit wire cost + the direction's
+    /// smallest short cost × the logistic of the direction's summed free capacity, or 1 under one
+    /// track).
+    pub fn update_wire_cost_view(&self, view: &mut View<f64>, design: &Design, net: &GrNet, c: &super::Constants, cost_multiplier: f64) -> Result<(), CommitError> {
+        let Some(tree) = net.routing_tree.as_ref() else { return Ok(()) };
         let dirs = [self.direction_layers(0), self.direction_layers(1)];
-        let update = |view: &mut View<f64>, direction: usize, x: i32, y: i32| {
-            let edge_index = if direction == H { x } else { y } as usize;
-            if edge_index >= self.size(direction) - 1 {
-                return;
+        for charge in self.tree_demands(design, tree, net.adopted, &net.ndr_costs)? {
+            if charge.layer < self.min_routing_layer {
+                continue;
             }
+            let direction = self.layer_directions[charge.layer];
+            let (x, y) = (charge.edge.x as usize, charge.edge.y as usize);
+            let edge_index = if direction == H { x } else { y };
             let (layers, short) = &dirs[direction];
             let (mut capacity, mut demand) = (0.0, 0.0);
             for &l in layers {
-                let e = &self.graph_edges[l][x as usize][y as usize];
+                let e = &self.graph_edges[l][x][y];
                 capacity += e.capacity;
                 demand += e.demand;
             }
             let length = f64::from(self.edge_length(direction, edge_index));
-            view[direction][x as usize][y as usize] = length
+            view[direction][x][y] = length
                 * (self.unit_length_wire_cost
                     + short * if capacity < 1.0 { 1.0 } else { GridGraph::logistic(capacity - demand, c.maze_logistic_slope * cost_multiplier) });
-        };
-        for n in tree.preorder() {
-            let node = &tree.nodes[n];
-            for &ch in &node.children {
-                let child = &tree.nodes[ch];
-                if node.layer == child.layer {
-                    let direction = self.layer_directions[node.layer as usize];
-                    if direction == H {
-                        for x in node.p.x.min(child.p.x)..node.p.x.max(child.p.x) {
-                            update(view, direction, x, node.p.y);
-                        }
-                    } else {
-                        for y in node.p.y.min(child.p.y)..node.p.y.max(child.p.y) {
-                            update(view, direction, node.p.x, y);
-                        }
-                    }
-                } else {
-                    for l in node.layer.min(child.layer)..node.layer.max(child.layer) {
-                        let direction = self.layer_directions[l as usize];
-                        update(view, direction, node.p.x, node.p.y);
-                        if node.p.get(direction) > 0 {
-                            update(view, direction, node.p.x - 1 + direction as i32, node.p.y - direction as i32);
-                        }
-                    }
-                }
-            }
         }
+        Ok(())
     }
 
     /// `computeCongestionInformation`'s `cap_per_layer_` (`getTotalCapacityPerLayer`): per layer the
