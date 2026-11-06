@@ -615,15 +615,7 @@ fn calculate_routing_costs(dag: &mut Dag, node: usize, net: &GrNet, cx: &CostCon
         }
     }
     let p = n.p;
-    let mut via_costs = vec![0.0; num_layers];
-    for layer in 1..num_layers {
-        via_costs[layer] = via_costs[layer - 1] + cx.grid.via_cost(cx.design, layer - 1, p, &net.ndr_costs, cx.constants, cx.cost_multiplier);
-        // A res-aware net pays each via's resistance too, so climbing pays off only when the
-        // upper layer's lower wire resistance beats it.
-        if net.res_aware {
-            via_costs[layer] += cx.grid.via_resistance_cost(cx.design, cx.constants, layer - 1);
-        }
-    }
+    let via_costs = layer_via_costs(net, p, cx);
     let range = net.layer_range;
     let fixed = if n.fixed.is_valid() {
         Interval::new(n.fixed.low.min(num_layers as i32 - 1), n.fixed.high.max(range.min_layer))
@@ -642,7 +634,7 @@ fn calculate_routing_costs(dag: &mut Dag, node: usize, net: &GrNet, cx: &CostCon
                 }
             }
             if layer as i32 >= fixed.high {
-                let mut cost = via_costs[layer] - via_costs[low];
+                let mut cost = stack_cost(&via_costs, low, layer);
                 for &child_cost in &min_child_costs {
                     cost += child_cost;
                 }
@@ -659,6 +651,63 @@ fn calculate_routing_costs(dag: &mut Dag, node: usize, net: &GrNet, cx: &CostCon
             }
         }
     }
+}
+
+/// `calculateRoutingCosts`' per-layer via costs at a node (`LayerViaCosts`): `unit` and
+/// `mid_pad` are prefix sums over the vias below layer k and the intermediate pads up to k;
+/// `bottom_pad` / `top_pad` are the pad of a stack that starts / ends on k.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LayerViaCosts {
+    pub unit: f64,
+    pub mid_pad: f64,
+    pub bottom_pad: f64,
+    pub top_pad: f64,
+}
+
+/// Upstream rule (`calculateRoutingCosts` at the pin, with the one-pad-per-layer stack model):
+/// per layer k, `unit` adds the via below's unit cost (`getUnitViaCost`: the unit via cost times
+/// the larger NDR factor of its two layers, plus its resistance cost on a res-aware net); the top
+/// pad is the pad cost of a via ending on k, the bottom pad of one starting on k; an intermediate
+/// layer's pad costs the LARGER of the two (pad cost never falls with pad length) and accumulates
+/// into `mid_pad`. Each pad cost is `getStackPadCost`: the wire cost of the pad on its flank edges.
+pub fn layer_via_costs(net: &GrNet, p: Point, cx: &CostContext<'_>) -> Vec<LayerViaCosts> {
+    let num_layers = cx.grid.num_layers;
+    let factor = |l: usize| net.ndr_costs.get(l).copied().unwrap_or(1.0);
+    let pad_cost = |layer: usize, low: usize, high: usize| -> f64 {
+        let mut cost = 0.0;
+        for (edge, demand, f) in cx.grid.pad_flank_edges(cx.design, layer, low, high, p, &net.ndr_costs) {
+            cost += cx.grid.wire_cost_at(layer, edge, demand, f, cx.constants, cx.cost_multiplier);
+        }
+        cost
+    };
+    let mut costs = vec![LayerViaCosts::default(); num_layers];
+    for l in 0..num_layers {
+        if l > 0 {
+            let mut unit = cx.grid.unit_via_cost * factor(l - 1).max(factor(l));
+            if net.res_aware {
+                unit += cx.grid.via_resistance_cost(cx.design, cx.constants, l - 1);
+            }
+            costs[l].unit = costs[l - 1].unit + unit;
+            costs[l].mid_pad = costs[l - 1].mid_pad;
+            costs[l].top_pad = pad_cost(l, l - 1, l);
+        }
+        if l + 1 < num_layers {
+            costs[l].bottom_pad = pad_cost(l, l, l + 1);
+            if l > 0 {
+                costs[l].mid_pad += costs[l].top_pad.max(costs[l].bottom_pad);
+            }
+        }
+    }
+    costs
+}
+
+/// `stack_cost(low, high)`: a stack from `low` to `high` — the vias' unit costs, the
+/// intermediate layers' pads, and the two end pads; nothing when it spans no layer.
+pub fn stack_cost(c: &[LayerViaCosts], low: usize, high: usize) -> f64 {
+    if high == low {
+        return 0.0;
+    }
+    c[high].unit - c[low].unit + (c[high - 1].mid_pad - c[low].mid_pad) + c[low].bottom_pad + c[high].top_pad
 }
 
 /// `getRoutingTree(node, parent_layer)`: the DP's choice as a routing tree.
@@ -942,6 +991,49 @@ pub(crate) mod tests {
         calculate_routing_costs(&mut dag, node, &n, &cx);
         assert_eq!(dag.nodes[node].costs[1], 13.0);
         assert_eq!(dag.nodes[node].best_paths[1], vec![(0, 1)], "the tie keeps m2's own path");
+    }
+
+    // Upstream rule (calculateRoutingCosts' LayerViaCosts at the pin): a stack low..high costs
+    // the vias' unit costs, the INTERMEDIATE layers' pads (each the larger of its top and bottom
+    // pad), and one end pad at each end — not a via's two flank costs summed per via.
+    #[test]
+    fn stack_cost_takes_unit_costs_mid_pads_and_the_two_end_pads() {
+        let c = |unit: f64, mid_pad: f64, bottom_pad: f64, top_pad: f64| LayerViaCosts { unit, mid_pad, bottom_pad, top_pad };
+        let v = vec![c(0.0, 0.0, 1.0, 0.0), c(4.0, 7.0, 2.0, 7.0), c(8.0, 7.0 + 9.0, 9.0, 5.0), c(12.0, 16.0, 0.0, 3.0)];
+        assert_eq!(stack_cost(&v, 1, 1), 0.0, "no layer spanned");
+        // 0..3: units 12, mids layers 1-2 = 16 - 0, bottom pad of 0 = 1, top pad of 3 = 3.
+        assert_eq!(stack_cost(&v, 0, 3), 12.0 + 16.0 + 1.0 + 3.0);
+        // 1..2: unit 4, no intermediate layer (mid[1] - mid[1]), bottom of 1 = 2, top of 2 = 5.
+        assert_eq!(stack_cost(&v, 1, 2), 4.0 + 0.0 + 2.0 + 5.0);
+        // On the grid: an empty 4-layer grid, no NDR. Each mid pad is max(top, bottom) of its
+        // layer, and the prefix sums add up.
+        let f = DesignFacts {
+            dbu_per_micron: 1000,
+            die: (0, 0, 6001, 6001),
+            gcell_tile_size: 1000,
+            layers: vec![layer("m1", 1, true), layer("m2", 2, false), layer("m3", 3, true), layer("m4", 4, false)],
+            vias: Vec::new(),
+            nets: Vec::new(),
+            instance_shapes: Vec::new(),
+            design_obstructions: Vec::new(),
+            min_layer_for_clock: 0,
+            max_layer_for_clock: 0,
+        };
+        let mut r = init(&f, &[], 2, 4).unwrap();
+        r.design.via_demand_length_lower = vec![100.0, 300.0, 50.0, 0.0];
+        r.design.via_demand_length_upper = vec![200.0, 120.0, 400.0, 0.0];
+        let n = net(&r.grid, &[&[(1, 2, 2)]]);
+        let cx = CostContext { grid: &r.grid, design: &r.design, constants: &r.constants, cost_multiplier: 1.0 };
+        let v = layer_via_costs(&n, Point::new(2, 2), &cx);
+        for l in 1..3 {
+            assert_eq!(v[l].mid_pad, v[l - 1].mid_pad + v[l].top_pad.max(v[l].bottom_pad), "layer {l}");
+            assert_eq!(v[l].unit, v[l - 1].unit + r.grid.unit_via_cost);
+        }
+        assert_eq!(v[3].bottom_pad, 0.0, "no layer above the top");
+        assert_eq!(v[0].top_pad, 0.0, "no via below the bottom");
+        // Layer 1's pads: a stack ending on 1 pads max(upper[0], 0) = 200; starting on 1 pads
+        // max(0, lower[1]) = 300 — so the bottom pad costs more on an empty grid.
+        assert!(v[1].bottom_pad > v[1].top_pad);
     }
 
     // Upstream rule (PatternRoute `constructDetours`): the step widens while the next step still

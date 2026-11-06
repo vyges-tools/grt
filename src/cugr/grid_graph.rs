@@ -549,6 +549,9 @@ impl GridGraph {
     /// `forEachViaFlankEdgeImpl(layer_index, loc, net_costs)`: a via between `layer_index` and the
     /// layer above deposits, on each of the two layers' flank edges, that layer's via demand length
     /// spread over the flank span: `(layer, edge, demand, the layer's NDR factor)`.
+    ///
+    /// ⚠️ The per-via model from before the pin: only the jumper check still uses it (the
+    /// reference's jumper checks use `forEachStackFlankEdge`; ported in their own commit).
     pub fn via_flank_edges(&self, layer_index: usize, loc: Point, via_demand_lower: f64, via_demand_upper: f64, net_costs: &[f64]) -> Vec<(usize, Point, f64, f64)> {
         let mut out = Vec::new();
         for l in layer_index..=(layer_index + 1).min(self.num_layers - 1) {
@@ -559,18 +562,6 @@ impl GridGraph {
             }
         }
         out
-    }
-
-    /// `getViaCost(layer_index, loc, net_costs)`: the unit via cost times the larger NDR factor of
-    /// the two layers, plus the wire cost of every flank deposit at its demand.
-    pub fn via_cost(&self, design: &Design, layer_index: usize, loc: Point, net_costs: &[f64], c: &super::Constants, cost_multiplier: f64) -> f64 {
-        let lower = net_costs.get(layer_index).copied().unwrap_or(1.0);
-        let upper = net_costs.get(layer_index + 1).copied().unwrap_or(1.0);
-        let mut cost = self.unit_via_cost * lower.max(upper);
-        for (l, edge, demand, factor) in self.via_flank_edges(layer_index, loc, design.via_demand_length_lower[layer_index], design.via_demand_length_upper[layer_index], net_costs) {
-            cost += self.wire_cost_at(l, edge, demand, factor, c, cost_multiplier);
-        }
-        cost
     }
 
     /// `commit`: demand += demand × factor.
