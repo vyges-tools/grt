@@ -546,24 +546,6 @@ impl GridGraph {
         out
     }
 
-    /// `forEachViaFlankEdgeImpl(layer_index, loc, net_costs)`: a via between `layer_index` and the
-    /// layer above deposits, on each of the two layers' flank edges, that layer's via demand length
-    /// spread over the flank span: `(layer, edge, demand, the layer's NDR factor)`.
-    ///
-    /// ⚠️ The per-via model from before the pin: only the jumper check still uses it (the
-    /// reference's jumper checks use `forEachStackFlankEdge`; ported in their own commit).
-    pub fn via_flank_edges(&self, layer_index: usize, loc: Point, via_demand_lower: f64, via_demand_upper: f64, net_costs: &[f64]) -> Vec<(usize, Point, f64, f64)> {
-        let mut out = Vec::new();
-        for l in layer_index..=(layer_index + 1).min(self.num_layers - 1) {
-            let factor = net_costs.get(l).copied().unwrap_or(1.0);
-            let length = if l == layer_index { via_demand_lower } else { via_demand_upper };
-            for (edge, sum) in self.flank_edges(l, loc) {
-                out.push((l, edge, if sum > 0 { length / f64::from(sum) } else { 0.0 }, factor));
-            }
-        }
-        out
-    }
-
     /// `commit`: demand += demand × factor.
     fn commit(&mut self, layer: usize, lower: Point, demand: f64, net_factor: f64, log: &mut Vec<Commit>) {
         self.graph_edges[layer][lower.x as usize][lower.y as usize].demand += demand * net_factor;

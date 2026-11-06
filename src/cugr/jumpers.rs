@@ -112,11 +112,13 @@ impl JumperRouter for CugrJumpers<'_> {
         if k.is_some_and(|k| self.cugr.nets[k].routing_tree.is_some()) {
             wire(&mut demands, layer - 2, -1.0);
         }
+        // The adopted route commits each endpoint's two vias as ONE stack (`forEachStackFlankEdge`,
+        // the via-stack pad model of `commit_tree`): one pad per layer low..=high, the top included.
+        let (low, high) = ((layer - 2) as usize, layer as usize);
         for e in &ends {
-            for l in (layer - 2)..layer {
-                let l = l as usize;
-                for (fl, edge, demand, f) in g.via_flank_edges(l, *e, self.cugr.design.via_demand_length_lower[l], self.cugr.design.via_demand_length_upper[l], &costs) {
-                    *demands.entry((fl, edge.x, edge.y)).or_insert(0.0) += demand * f;
+            for l in low..=high.min(g.num_layers - 1) {
+                for (edge, demand, f) in g.pad_flank_edges(&self.cugr.design, l, low, high, *e, &costs) {
+                    *demands.entry((l, edge.x, edge.y)).or_insert(0.0) += demand * f;
                 }
             }
         }
@@ -243,5 +245,20 @@ mod tests {
         assert!(j.has_jumper_resources((1500, 1500), (3500, 1500), 3, "n"), "+0.1 via, −1 wire on m1 (1,1)");
         j.cugr.nets[0].routing_tree = None;
         assert!(!j.has_jumper_resources((1500, 1500), (3500, 1500), 3, "n"), "no tree, no credit: 0.1 > 0.05");
+    }
+
+    // Upstream rule (CUGR `hasJumperResources` → `forEachStackFlankEdge(layer-2, layer)`): each
+    // endpoint's two vias are ONE stack with a pad on EVERY layer low..=high, so the jumper layer
+    // itself carries the top pad (upper via length of the layer below). m3 (0,1) is a flank edge
+    // of the endpoint (1,1) that the m3 wire (x 1..3) does not cross: only the pad loads it.
+    #[test]
+    fn jumper_resources_charge_the_stack_top_pad_on_the_jumper_layer() {
+        let mut c = router();
+        let cap = c.grid.graph_edges[2][0][1].capacity;
+        c.grid.graph_edges[2][0][1].demand = cap - 0.05;
+        let mut j = jumpers(&mut c);
+        assert!(!j.has_jumper_resources((1500, 1500), (3500, 1500), 3, "n"), "top pad 0.1 > 0.05 on m3 (0,1)");
+        j.cugr.grid.graph_edges[2][0][1].demand = cap - 0.15;
+        assert!(j.has_jumper_resources((1500, 1500), (3500, 1500), 3, "n"), "0.1 fits in 0.15");
     }
 }
