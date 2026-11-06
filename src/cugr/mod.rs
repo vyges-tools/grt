@@ -686,12 +686,18 @@ impl Cugr {
     /// `iterativeRRR` (stage 5): only with integer overflow left; up to `iterations` rounds, each
     /// taking the congested nets again (stopping when none), demoting an NDR net congested two
     /// rounds running to the default rule, raising the logistic slope by 1 up to 6, and maze-
-    /// routing the congested set. The multiplier is reset after.
+    /// routing the congested set. A round's overflow change is its demotions' plus its maze
+    /// pass's; after `RRR_MAX_STAGNANT_PASSES` rounds in a row that each remove less than
+    /// `RRR_MIN_PASS_IMPROVEMENT` track, the loop stops (GRT-0124) — unless a congested NDR net
+    /// is still waiting to be demoted. The multiplier is reset after, and with `verbose_` the
+    /// demotions are totalled (GRT-0306).
     pub fn iterative_rrr(&mut self, nets: &mut Vec<usize>, iterations: i32, log: &mut dyn crate::log::Sink, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
         if self.grid.total_overflow() == 0 {
             return Ok(());
         }
         let mut streak: std::collections::HashMap<usize, i32> = std::collections::HashMap::new();
+        let mut stagnant_passes = 0;
+        let mut soft_ndr_demotions = 0usize;
         let mut multiplier = 1.0f64;
         for i in 1..=iterations {
             *nets = self.congested_nets(5, trace.as_deref_mut());
@@ -701,6 +707,10 @@ impl Cugr {
             let current: std::collections::HashSet<usize> = nets.iter().copied().collect();
             let mut demoted = Vec::new();
             let mut commits = Vec::new();
+            // A demotion relieves overflow too, so it counts toward the pass's change.
+            let mut overflow_change = 0.0f64;
+            // A congested NDR net not demoted yet is demoted if it stays congested.
+            let mut demotion_pending = false;
             for &k in nets.iter() {
                 if !self.nets[k].has_ndr() {
                     continue;
@@ -708,10 +718,15 @@ impl Cugr {
                 let s = streak.entry(k).or_insert(0);
                 *s += 1;
                 if *s >= 2 {
+                    let touched = self.tree_edges(k)?;
+                    overflow_change -= self.grid.sum_overflow(&touched);
                     self.commit_net(k, true, &mut commits)?;
                     self.nets[k].set_soft_ndr();
                     self.commit_net(k, false, &mut commits)?;
+                    overflow_change += self.grid.sum_overflow(&touched);
                     demoted.push(self.nets[k].name.clone());
+                } else {
+                    demotion_pending = true;
                 }
             }
             for (k, s) in streak.iter_mut() {
@@ -720,6 +735,7 @@ impl Cugr {
                 }
             }
             if !demoted.is_empty() {
+                soft_ndr_demotions += demoted.len();
                 log.warn("GRT", 305, format!("Demoted {} NDR net(s) to default rule to reduce congestion (use debug 'softNDR' for net list).", demoted.len()));
             }
             if multiplier < 6.0 {
@@ -732,19 +748,60 @@ impl Cugr {
                 t.push(format!("VYGC|rrr|{i}|{multiplier}|{}|{}|demoted={}", nets.len(), trace::list(nets.iter()), demoted.iter().map(|d| format!("{d},")).collect::<String>()));
             }
             // Incremental re-mazes every candidate each round, in the candidates' own order.
-            // ⚠️ The pass's overflow change feeds the GRT-0124 stagnation stop (E2), not ported yet.
-            let _overflow_change = match self.incremental_candidates.clone() {
+            overflow_change += match self.incremental_candidates.clone() {
                 Some(mut all) => self.maze_route(&mut all, 5, i, log, trace.as_deref_mut())?,
                 None => self.maze_route(nets, 5, i, log, trace.as_deref_mut())?,
             };
+            stagnant_passes = rrr_stagnant_passes(stagnant_passes, overflow_change);
+            if let Some(t) = trace.as_deref_mut() {
+                trace::rrr_stop(t, i, overflow_change, stagnant_passes, demotion_pending, self.grid.total_overflow());
+            }
+            if rrr_stops(stagnant_passes, demotion_pending) {
+                // Reported only with overflow left; an incremental route defers to GRT-0128.
+                if rrr_reports_stop(self.verbose, self.incremental_candidates.is_some(), i, iterations, self.grid.total_overflow()) {
+                    report_rrr_stopped(i, log);
+                }
+                break;
+            }
         }
         self.cost_multiplier = 1.0;
+        if self.verbose && soft_ndr_demotions > 0 {
+            log.info("GRT", 306, format!("Iterative RRR soft-demoted {soft_ndr_demotions} NDR net(s) total."));
+        }
         let residual = self.grid.total_overflow();
         if residual > 0 && self.incremental_candidates.is_none() {
             log.warn("GRT", 118, format!("Iterative RRR finished with congestion remaining ({residual})."));
         }
         Ok(())
     }
+}
+
+/// `iterativeRRR`'s `kMinPassImprovement` and `kMaxStagnantPasses`: stop after this many rounds
+/// in a row that each remove less than one track of overflow.
+pub const RRR_MIN_PASS_IMPROVEMENT: f64 = 1.0;
+pub const RRR_MAX_STAGNANT_PASSES: i32 = 2;
+
+/// `stagnant_passes = -overflow_change < kMinPassImprovement ? stagnant_passes + 1 : 0`.
+pub fn rrr_stagnant_passes(stagnant_passes: i32, overflow_change: f64) -> i32 {
+    if -overflow_change < RRR_MIN_PASS_IMPROVEMENT { stagnant_passes + 1 } else { 0 }
+}
+
+/// `stagnant_passes >= kMaxStagnantPasses && !demotion_pending`.
+pub fn rrr_stops(stagnant_passes: i32, demotion_pending: bool) -> bool {
+    stagnant_passes >= RRR_MAX_STAGNANT_PASSES && !demotion_pending
+}
+
+/// `verbose_ && !incremental_routing_ && i < congestion_iterations_ && totalOverflow() > 0`:
+/// GRT-0124 is reported only for a stop before the last round with overflow left; an incremental
+/// route defers to GRT-0128.
+pub fn rrr_reports_stop(verbose: bool, incremental: bool, i: i32, iterations: i32, total_overflow: i32) -> bool {
+    verbose && !incremental && i < iterations && total_overflow > 0
+}
+
+/// GRT-0124, `iterativeRRR`'s stagnation stop before its last round: the round, the passes and
+/// the improvement (`{:.0f}` of 1.0 prints `1`).
+pub fn report_rrr_stopped(i: i32, log: &mut dyn crate::log::Sink) {
+    log.info("GRT", 124, format!("Iterative RRR stopped after iteration {i}: the last {RRR_MAX_STAGNANT_PASSES} iterations each removed less than {RRR_MIN_PASS_IMPROVEMENT:.0} track of overflow."));
 }
 
 /// `iterativeRRR`, each round after the cost multiplier is raised and before its maze pass: with
@@ -1382,6 +1439,29 @@ mod tests {
         let mut full: grid_graph::View<f64> = Vec::new();
         c.grid.extract_wire_cost_view(&mut full, &[], &c.constants, 1.0);
         assert_eq!(view, full);
+    }
+
+
+    // Upstream rule (`iterativeRRR`, GRT-0124): a round that removes less than one track of
+    // overflow is stagnant, one that removes a track or more resets the count; two stagnant
+    // rounds in a row stop the loop unless a congested NDR net is still waiting to be demoted.
+    #[test]
+    fn rrr_stops_after_two_rounds_that_each_remove_under_a_track() {
+        assert_eq!(rrr_stagnant_passes(0, -0.5), 1);
+        assert_eq!(rrr_stagnant_passes(1, 0.0), 2);
+        assert_eq!(rrr_stagnant_passes(1, -1.0), 0);
+        assert_eq!(rrr_stagnant_passes(1, 3.0), 2);
+        assert!(!rrr_stops(1, false));
+        assert!(rrr_stops(2, false));
+        assert!(!rrr_stops(2, true));
+        assert!(rrr_reports_stop(true, false, 3, 5, 2));
+        assert!(!rrr_reports_stop(true, false, 5, 5, 2), "a stop at the last round is not reported");
+        assert!(!rrr_reports_stop(true, false, 3, 5, 0), "nor one with no overflow left");
+        assert!(!rrr_reports_stop(true, true, 3, 5, 2), "nor an incremental route's");
+        assert!(!rrr_reports_stop(false, false, 3, 5, 2));
+        let mut log: Vec<crate::log::Msg> = Vec::new();
+        report_rrr_stopped(3, &mut log);
+        assert_eq!(crate::log::lines(&log), vec!["[INFO GRT-0124] Iterative RRR stopped after iteration 3: the last 2 iterations each removed less than 1 track of overflow.".to_string()]);
     }
 
 }

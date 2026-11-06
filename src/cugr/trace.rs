@@ -284,6 +284,13 @@ pub fn maze_return(out: &mut Vec<String>, stage: i32, iteration: i32, accepted: 
     out.push(format!("VYGC|mzret|{stage}|{iteration}|{accepted}|{rejected}|{:016x}", change.to_bits()));
 }
 
+/// `rrrstop|i|change|stagnant|pending|overflow`: `iterativeRRR`'s stagnation test after a round —
+/// the round's overflow change (f64 bits), stagnant rounds so far, a pending NDR demotion and
+/// `totalOverflow()`.
+pub fn rrr_stop(out: &mut Vec<String>, i: i32, change: f64, stagnant: i32, pending: bool, overflow: i32) {
+    out.push(format!("VYGC|rrrstop|{i}|{:016x}|{stagnant}|{}|{overflow}", change.to_bits(), u8::from(pending)));
+}
+
 /// `collect|stage|add or incr|n|nets,`: one `collectReroutedNets`, in the order given.
 pub fn collect(out: &mut Vec<String>, stage: i32, incremental: bool, nets: &[usize]) {
     out.push(format!("VYGC|collect|{stage}|{}|{}|{}", if incremental { "incr" } else { "add" }, nets.len(), list(nets)));
