@@ -486,6 +486,13 @@ impl GridGraph {
         1.0 / (1.0 + (input * slope).exp())
     }
 
+    /// `congestionCost(base, capacity, resource, slope)`: `base × multiplier × (1 under one track,
+    /// else logistic(resource, slope × multiplier))` — the RRR multiplier scales the cost's
+    /// HEIGHT as well as its slope (e996548879, before the pin).
+    pub fn congestion_cost(base: f64, capacity: f64, resource: f64, slope: f64, cost_multiplier: f64) -> f64 {
+        base * cost_multiplier * if capacity < 1.0 { 1.0 } else { GridGraph::logistic(resource, slope * cost_multiplier) }
+    }
+
     /// `getWireCost(layer, lower, demand, net_factor)`: one edge at `demand` tracks.
     ///
     /// Upstream rule: the demand's length (`demand × factor × edge length`) at the unit wire
@@ -499,9 +506,7 @@ impl GridGraph {
         let demand_length = demand * net_factor * f64::from(edge_length);
         let edge = &self.graph_edges[layer][lower.x as usize][lower.y as usize];
         let mut cost = demand_length * self.unit_length_wire_cost;
-        cost += demand_length
-            * self.unit_length_short_costs[layer]
-            * if edge.capacity < 1.0 { 1.0 } else { GridGraph::logistic(edge.capacity - edge.demand, c.cost_logistic_slope * cost_multiplier) };
+        cost += GridGraph::congestion_cost(demand_length * self.unit_length_short_costs[layer], edge.capacity, edge.capacity - edge.demand, c.cost_logistic_slope, cost_multiplier);
         if c.congestion_gate_penalty > 0.0 && demand >= 1.0 && edge.capacity >= 1.0 && edge.capacity - edge.demand < demand * net_factor {
             cost += demand_length * self.unit_length_wire_cost * c.congestion_gate_penalty;
         }
@@ -869,7 +874,7 @@ impl GridGraph {
                     let length = f64::from(self.edge_length(direction, edge_index));
                     view[direction][x][y] = length
                         * (self.unit_length_wire_cost
-                            + short * if capacity < 1.0 { 1.0 } else { GridGraph::logistic(effective, c.maze_logistic_slope * cost_multiplier) });
+                            + GridGraph::congestion_cost(short, capacity, effective, c.maze_logistic_slope, cost_multiplier));
                 }
             }
         }
@@ -901,7 +906,7 @@ impl GridGraph {
             let length = f64::from(self.edge_length(direction, edge_index));
             view[direction][x][y] = length
                 * (self.unit_length_wire_cost
-                    + short * if capacity < 1.0 { 1.0 } else { GridGraph::logistic(capacity - demand, c.maze_logistic_slope * cost_multiplier) });
+                    + GridGraph::congestion_cost(*short, capacity, capacity - demand, c.maze_logistic_slope, cost_multiplier));
         }
         Ok(())
     }
@@ -992,6 +997,17 @@ mod tests {
     use crate::cugr::layers::MetalLayerFacts;
     use crate::cugr::Constants;
 
+
+    // Upstream rule (`congestionCost`, e996548879): the RRR multiplier scales the congestion
+    // cost's height as well as its slope — `base × m × logistic(resource, slope × m)` — and a
+    // cell under one track costs `base × m`. At m = 1 it is the plain `base × logistic`.
+    #[test]
+    fn the_rrr_multiplier_scales_the_congestion_cost_height_and_slope() {
+        let (base, slope) = (3.0, 0.5);
+        assert_eq!(GridGraph::congestion_cost(base, 4.0, 1.0, slope, 1.0), base * GridGraph::logistic(1.0, slope));
+        assert_eq!(GridGraph::congestion_cost(base, 4.0, 1.0, slope, 2.0), base * 2.0 * GridGraph::logistic(1.0, slope * 2.0));
+        assert_eq!(GridGraph::congestion_cost(base, 0.5, 1.0, slope, 3.0), base * 3.0);
+    }
     fn layer(name: &str, level: i32, horizontal: bool, pitch: i32, first: i32, num: i32, adjustment: f32) -> TechLayerFacts {
         TechLayerFacts {
             name: name.into(),
