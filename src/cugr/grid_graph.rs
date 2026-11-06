@@ -444,6 +444,29 @@ impl GrTree {
     }
 }
 
+/// `GridGraph::DemandKind`: what a tree charges an edge for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DemandKind {
+    /// A wire along the layer's preferred direction.
+    Wire,
+    /// The pad of an adopted wrong-way wire on its flanking edges.
+    WrongWay,
+    /// The pad of a via stack on its flanking edges.
+    ViaPad,
+}
+
+/// `GridGraph::TreeDemand`: one edge charge of a tree — `source` is the wire's lower cell, the
+/// wrong-way cell crossed, or the via column's cell.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TreeDemand {
+    pub layer: usize,
+    pub edge: Point,
+    pub demand: f64,
+    pub factor: f64,
+    pub kind: DemandKind,
+    pub source: Point,
+}
+
 /// A native tree the reference would reject (`logger_->error`), refused rather than committed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommitError {
@@ -556,66 +579,139 @@ impl GridGraph {
         log.push(Commit { layer, p: lower, delta: demand * net_factor });
     }
 
-    /// `commitTree(tree, rip_up, net_costs, adopted)`, in preorder — each same-layer child a wire
-    /// (one track per edge crossed), each layer change a via per layer crossed at the parent's
-    /// cell.
-    ///
-    /// Upstream rule for an ADOPTED tree (restored from a route): a span below the min routing
-    /// layer commits nothing, and a WRONG-WAY span deposits, per cell it crosses, the layer's
-    /// wrong-way demand length over that cell's flank edges (`commitWrongWayWire`). A native tree
-    /// with either is an error, as is a diagonal span on any tree.
-    pub fn commit_tree(&mut self, design: &Design, tree: &GrTree, rip_up: bool, net_costs: &[f64], adopted: bool, log: &mut Vec<Commit>) -> Result<(), CommitError> {
-        let sign = if rip_up { -1.0 } else { 1.0 };
+    /// `stackPadLength(layer, low, high)`: a via stack's pad on `layer` is the longer of the
+    /// via below's upper demand length and the via above's lower one (0 at the stack's ends).
+    pub fn stack_pad_length(design: &Design, layer: usize, low: usize, high: usize) -> f64 {
+        let upper = if layer > low { design.via_demand_length_upper[layer - 1] } else { 0.0 };
+        let lower = if layer < high { design.via_demand_length_lower[layer] } else { 0.0 };
+        upper.max(lower)
+    }
+
+    /// `forEachPadFlankEdge(layer, low, high, loc, net_costs)`: the stack's pad on `layer`
+    /// spread over the layer's flanking edges, `(edge, pad / flank span, the layer's NDR factor)`.
+    /// (The reference's developer switch `via_demand_enabled`, on by default, is not modelled.)
+    pub fn pad_flank_edges(&self, design: &Design, layer: usize, low: usize, high: usize, loc: Point, net_costs: &[f64]) -> Vec<(Point, f64, f64)> {
+        let pad = GridGraph::stack_pad_length(design, layer, low, high);
+        let factor = net_costs.get(layer).copied().unwrap_or(1.0);
+        self.flank_edges(layer, loc).into_iter().map(|(edge, sum)| (edge, pad / f64::from(sum), factor)).collect()
+    }
+
+    /// `forEachViaColumnImpl(tree)`: every layer change as an `(x, y, low, high)` span, sorted,
+    /// and spans at one cell merged into one stack wherever they overlap or touch — pattern
+    /// routing splits a stack where a child attaches, and an adopted route keeps one edge per via.
+    pub fn via_columns(tree: &GrTree) -> Vec<(Point, usize, usize)> {
+        let mut spans: Vec<(i32, i32, i32, i32)> = Vec::new();
         for n in tree.preorder() {
             let node = &tree.nodes[n];
             for &ch in &node.children {
                 let child = &tree.nodes[ch];
-                if node.layer == child.layer {
-                    // Wrong way first; GRT-0307 per edge committed (`commitWire`), so a
-                    // zero-length wire never trips it.
-                    let layer = node.layer as usize;
-                    if adopted && layer < self.min_routing_layer {
-                        continue;
+                if node.layer != child.layer {
+                    spans.push((node.p.x, node.p.y, node.layer.min(child.layer), node.layer.max(child.layer)));
+                }
+            }
+        }
+        spans.sort();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < spans.len() {
+            let (x, y, low, mut high) = spans[i];
+            i += 1;
+            while i < spans.len() && spans[i].0 == x && spans[i].1 == y && spans[i].2 <= high {
+                high = high.max(spans[i].3);
+                i += 1;
+            }
+            out.push((Point { x, y }, low as usize, high as usize));
+        }
+        out
+    }
+
+    /// `forEachTreeWireEdgeImpl(tree, adopted)`: the wire edges and the wrong-way cells a tree
+    /// occupies, each ONCE (sorted by layer, x, y and deduplicated: the union of two merged nets
+    /// can cross an edge twice) — wires first, then wrong-way cells. An adopted span below the min
+    /// routing layer occupies nothing; a wrong-way span on a native tree, or a diagonal one on any,
+    /// is the reference's GRT-1252/1253 error.
+    fn tree_wire_edges(&self, tree: &GrTree, adopted: bool) -> Result<(Vec<(i32, i32, i32)>, Vec<(i32, i32, i32)>), CommitError> {
+        let (mut wires, mut wrong_way) = (Vec::new(), Vec::new());
+        for n in tree.preorder() {
+            let node = &tree.nodes[n];
+            for &ch in &node.children {
+                let child = &tree.nodes[ch];
+                if node.layer != child.layer {
+                    continue;
+                }
+                let layer = node.layer as usize;
+                if adopted && layer < self.min_routing_layer {
+                    continue;
+                }
+                let direction = self.layer_directions[layer];
+                let perp = 1 - direction;
+                if node.p.get(perp) != child.p.get(perp) {
+                    let diagonal = node.p.get(direction) != child.p.get(direction);
+                    if !adopted || diagonal {
+                        return Err(CommitError::WrongWayWire { layer: node.layer });
                     }
-                    let direction = self.layer_directions[layer];
-                    let perp = 1 - direction;
-                    let factor = net_costs.get(layer).copied().unwrap_or(1.0);
-                    if node.p.get(perp) != child.p.get(perp) {
-                        let diagonal = node.p.get(direction) != child.p.get(direction);
-                        if !adopted || diagonal {
-                            return Err(CommitError::WrongWayWire { layer: node.layer });
-                        }
-                        for c in node.p.get(perp).min(child.p.get(perp))..node.p.get(perp).max(child.p.get(perp)) {
-                            let mut cell = node.p;
-                            cell.set(perp, c);
-                            let length = design.wrong_way_demand_length[layer];
-                            for (edge, sum) in self.flank_edges(layer, cell) {
-                                self.commit(layer, edge, sign * (length / f64::from(sum)), factor, log);
-                            }
-                        }
-                        continue;
-                    }
-                    let (lo, hi) = (node.p.get(direction).min(child.p.get(direction)), node.p.get(direction).max(child.p.get(direction)));
-                    for i in lo..hi {
-                        if layer < self.min_routing_layer {
-                            return Err(CommitError::WireBelowMinLayer { layer: node.layer });
-                        }
-                        let mut lower = node.p;
-                        lower.set(direction, i);
-                        self.commit(layer, lower, sign, factor, log);
+                    for c in node.p.get(perp).min(child.p.get(perp))..node.p.get(perp).max(child.p.get(perp)) {
+                        let mut cell = node.p;
+                        cell.set(perp, c);
+                        wrong_way.push((node.layer, cell.x, cell.y));
                     }
                 } else {
-                    for l in node.layer.min(child.layer)..node.layer.max(child.layer) {
-                        let l = l as usize;
-                        if l + 1 >= self.num_layers {
-                            return Err(CommitError::ViaAboveTop { layer: l as i32 });
-                        }
-                        for (fl, edge, demand, factor) in self.via_flank_edges(l, node.p, design.via_demand_length_lower[l], design.via_demand_length_upper[l], net_costs) {
-                            self.commit(fl, edge, sign * demand, factor, log);
-                        }
+                    for c in node.p.get(direction).min(child.p.get(direction))..node.p.get(direction).max(child.p.get(direction)) {
+                        let mut lower = node.p;
+                        lower.set(direction, c);
+                        wires.push((node.layer, lower.x, lower.y));
                     }
                 }
             }
+        }
+        for cells in [&mut wires, &mut wrong_way] {
+            cells.sort();
+            cells.dedup();
+        }
+        Ok((wires, wrong_way))
+    }
+
+    /// `forEachTreeDemandImpl(tree, adopted, net_costs)`: everything a tree charges, in the
+    /// reference's order — each wire edge (one track), then each wrong-way cell's flank edges
+    /// (the layer's wrong-way demand length over the flank span), then each via COLUMN's stack:
+    /// on every layer from its low to its high, ONE pad on that layer's flank edges. One walk
+    /// serves commit, rip-up and every measure of a tree's demand, as upstream's does.
+    pub fn tree_demands(&self, design: &Design, tree: &GrTree, adopted: bool, net_costs: &[f64]) -> Result<Vec<TreeDemand>, CommitError> {
+        let (wires, wrong_way) = self.tree_wire_edges(tree, adopted)?;
+        let factor_of = |layer: usize| net_costs.get(layer).copied().unwrap_or(1.0);
+        let mut out = Vec::new();
+        for (layer, x, y) in wires {
+            let p = Point { x, y };
+            out.push(TreeDemand { layer: layer as usize, edge: p, demand: 1.0, factor: factor_of(layer as usize), kind: DemandKind::Wire, source: p });
+        }
+        for (layer, x, y) in wrong_way {
+            let (layer, cell) = (layer as usize, Point { x, y });
+            for (edge, sum) in self.flank_edges(layer, cell) {
+                out.push(TreeDemand { layer, edge, demand: design.wrong_way_demand_length[layer] / f64::from(sum), factor: factor_of(layer), kind: DemandKind::WrongWay, source: cell });
+            }
+        }
+        for (loc, low, high) in GridGraph::via_columns(tree) {
+            if high >= self.num_layers {
+                return Err(CommitError::ViaAboveTop { layer: high as i32 - 1 });
+            }
+            for l in low..=high {
+                for (edge, demand, factor) in self.pad_flank_edges(design, l, low, high, loc, net_costs) {
+                    out.push(TreeDemand { layer: l, edge, demand, factor, kind: DemandKind::ViaPad, source: loc });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// `commitTree(tree, rip_up, net_costs, adopted)`: every charge of `tree_demands`, added (or
+    /// removed on a rip-up) at `demand × factor`. A WIRE below the min routing layer is the
+    /// reference's GRT-0307 error.
+    pub fn commit_tree(&mut self, design: &Design, tree: &GrTree, rip_up: bool, net_costs: &[f64], adopted: bool, log: &mut Vec<Commit>) -> Result<(), CommitError> {
+        for charge in self.tree_demands(design, tree, adopted, net_costs)? {
+            if charge.kind == DemandKind::Wire && charge.layer < self.min_routing_layer {
+                return Err(CommitError::WireBelowMinLayer { layer: charge.layer as i32 });
+            }
+            self.commit(charge.layer, charge.edge, if rip_up { -charge.demand } else { charge.demand }, charge.factor, log);
         }
         Ok(())
     }
@@ -1052,6 +1148,58 @@ mod tests {
     // replaces the layer's (0 = the layer's), and the references are the FIRST NON-ZERO sheet and
     // via resistance over the layers in order — here m2's, as m1 has none. A via stack adds each
     // crossed layer's via resistance. No net of the stage-2 corpus has an NDR.
+    #[test]
+    fn via_stack_pads_once_per_layer_and_wires_once_per_net() {
+        // Upstream rule (forEachTreeDemandImpl / forEachViaColumnImpl / stackPadLength, at the
+        // pin): a tree's charges are its wire edges (sorted, each once), then its wrong-way cells,
+        // then each via COLUMN — layer changes at one cell merged where they overlap or touch —
+        // charging ONE pad per layer from low to high: max(the via below's upper length, the via
+        // above's lower length), spread over the layer's flanking edges.
+        let f = facts();
+        let mut d = Design::new(&f, &Constants::default(), 2, 3).unwrap();
+        d.via_demand_length_lower = vec![10.0, 20.0, 0.0];
+        d.via_demand_length_upper = vec![30.0, 40.0, 0.0];
+        let g = GridGraph::new(&d, 1).unwrap();
+        let c = Point::new(1, 1);
+        // A stack 0 -> 1 -> 2 split at layer 1 (two tree edges), then two branches on layer 2
+        // that both cross the edge (1,1)-(2,1).
+        let mut t = GrTree::default();
+        let l0 = t.add(0, c);
+        let l1 = t.add(1, c);
+        let l2 = t.add(2, c);
+        let a = t.add(2, Point::new(2, 1));
+        let b = t.add(2, Point::new(2, 1));
+        t.nodes[l0].children.push(l1);
+        t.nodes[l1].children.push(l2);
+        t.nodes[l2].children.extend([a, b]);
+        let charges = g.tree_demands(&d, &t, false, &[]).unwrap();
+        let wires: Vec<_> = charges.iter().filter(|x| x.kind == DemandKind::Wire).collect();
+        assert_eq!(wires.len(), 1, "an edge crossed twice is charged once");
+        assert_eq!((wires[0].layer, wires[0].edge), (2, c));
+        assert!(charges.iter().position(|x| x.kind == DemandKind::ViaPad) > charges.iter().position(|x| x.kind == DemandKind::Wire), "wires first");
+        let pad = |layer: usize| -> Vec<f64> { charges.iter().filter(|x| x.kind == DemandKind::ViaPad && x.layer == layer).map(|x| x.demand).collect() };
+        let span = |layer: usize| -> f64 {
+            let dir = g.layer_directions[layer];
+            f64::from(g.edge_length(dir, 0) + g.edge_length(dir, 1))
+        };
+        // One column 0..2: layer 0 = its lower 10, layer 1 = max(30, 20) = 30 (not 30 + 20),
+        // layer 2 = the via below's upper 40.
+        assert_eq!(pad(0), vec![10.0 / span(0); 2]);
+        assert_eq!(pad(1), vec![30.0 / span(1); 2]);
+        assert_eq!(pad(2), vec![40.0 / span(2); 2]);
+        assert_eq!(GridGraph::via_columns(&t), vec![(c, 0, 2)], "the split stack is one column");
+        // A rip-up removes exactly what the commit added.
+        let span2 = span(2);
+        let mut g = g;
+        let mut log = Vec::new();
+        g.commit_tree(&d, &t, false, &[], false, &mut log).unwrap();
+        // The wire's edge is also a flank edge of the column's layer-2 pad.
+        assert_eq!(g.edge(2, 1, 1).demand, 1.0 + 40.0 / span2);
+        g.commit_tree(&d, &t, true, &[], false, &mut log).unwrap();
+        // (Up to float residue: the same adds in the same order, negated, as upstream.)
+        assert!(g.graph_edges.iter().flatten().flatten().all(|e| e.demand.abs() < 1e-12));
+    }
+
     #[test]
     fn resistance_takes_the_ndr_width_and_the_first_nonzero_reference() {
         let mut f = facts();
