@@ -8,9 +8,11 @@
 //! FRACTION of the track, so the sums below must run in the reference's order.
 #![allow(clippy::needless_range_loop)] // index loops walk the grids by the coordinates the traces report
 
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use super::design::Design;
+use super::grnet::GrNet;
 use super::geo::{BoxT, Interval, Point};
 use super::layers::{H, V};
 
@@ -689,30 +691,44 @@ impl GridGraph {
         Ok(())
     }
 
-    /// `checkCongestion(tree, threshold)`: the tree's wire edges with demand > capacity × threshold.
-    pub fn check_congestion(&self, tree: &GrTree, threshold: f64) -> usize {
-        let mut num = 0;
-        for n in tree.preorder() {
-            let node = &tree.nodes[n];
-            for &ch in &node.children {
-                let child = &tree.nodes[ch];
-                if node.layer != child.layer {
-                    continue;
-                }
-                let layer = node.layer as usize;
-                let d = self.layer_directions[layer];
-                let (lo, hi) = (node.p.get(d).min(child.p.get(d)), node.p.get(d).max(child.p.get(d)));
-                let r = node.p.get(1 - d);
-                for c in lo..hi {
-                    let (x, y) = if d == H { (c, r) } else { (r, c) };
-                    let e = &self.graph_edges[layer][x as usize][y as usize];
-                    if e.demand > e.capacity * threshold {
-                        num += 1;
-                    }
-                }
+    /// `pinAccessTops(net)`: per gcell of the net's preferred access points, the HIGHEST top layer
+    /// of the points there, each at least the net's min layer (itself at least the min routing
+    /// layer), keyed and ordered by gcell.
+    pub fn pin_access_tops(&self, net: &GrNet) -> BTreeMap<(i32, i32), i32> {
+        let net_min_layer = (self.min_routing_layer as i32).max(net.layer_range.min_layer);
+        let mut tops = BTreeMap::new();
+        for (p, layers) in net.preferred_aps.values() {
+            let top = layers.high.max(net_min_layer);
+            let at = tops.entry((p.x, p.y)).or_insert(top);
+            *at = (*at).max(top);
+        }
+        tops
+    }
+
+    /// `reliefScore(net, threshold)`: the overflow the net's removal alone would relieve. Over every
+    /// charge of `tree_demands` (wires, wrong-way cells, via-stack pads), the edge's demand above
+    /// capacity × threshold, capped at the charge itself. Skipped: charges below the min routing
+    /// layer (no capacity) and via pads at a pin gcell at or below that pin's access top (no
+    /// reroute moves them). A net with no tree scores 0.
+    pub fn relief_score(&self, design: &Design, net: &GrNet, threshold: f64) -> f64 {
+        let Some(tree) = &net.routing_tree else { return 0.0 };
+        let pin_tops = self.pin_access_tops(net);
+        let charges = self.tree_demands(design, tree, net.adopted, &net.ndr_costs).expect("invariant: a routed net's tree was committed, so its demand walk succeeds");
+        let mut score = 0.0;
+        for charge in charges {
+            if charge.layer < self.min_routing_layer {
+                continue;
+            }
+            if charge.kind == DemandKind::ViaPad && pin_tops.get(&(charge.source.x, charge.source.y)).is_some_and(|&top| charge.layer as i32 <= top) {
+                continue;
+            }
+            let edge = &self.graph_edges[charge.layer][charge.edge.x as usize][charge.edge.y as usize];
+            let overflow = edge.demand - edge.capacity * threshold;
+            if overflow > 0.0 {
+                score += (charge.demand * charge.factor).min(overflow);
             }
         }
-        num
+        score
     }
 }
 

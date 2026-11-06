@@ -417,9 +417,10 @@ impl Cugr {
         Ok(())
     }
 
-    /// `updateCongestedNets(threshold 1)` over every routed net, in index order: those whose tree
-    /// crosses an edge with more demand than capacity. Empty means stages 3 to 5 have nothing to
-    /// do. `tag` is the stage the trace records it under.
+    /// `updateCongestedNets(threshold 1)` over every routed net, in index order: those whose removal
+    /// would relieve some overflow (`reliefScore` > 0: wires, wrong-way cells and via-stack pads,
+    /// pin-access pads excluded). Empty means stages 3 to 5 have nothing to do. `tag` is the stage
+    /// the trace records it under.
     pub fn congested_nets(&self, tag: i32, trace: Option<&mut Vec<String>>) -> Vec<usize> {
         let scope: Vec<usize> = match &self.incremental_candidates {
             Some(c) => c.clone(),
@@ -427,7 +428,7 @@ impl Cugr {
         };
         let out: Vec<usize> = scope
             .into_iter()
-            .filter(|&k| self.nets[k].routing_tree.as_ref().is_some_and(|t| self.grid.check_congestion(t, 1.0) > 0))
+            .filter(|&k| self.nets[k].routing_tree.is_some() && self.grid.relief_score(&self.design, &self.nets[k], 1.0) > 0.0)
             .collect();
         if let Some(t) = trace {
             t.push(format!("VYGC|cong|{tag}|{}|{}", out.len(), trace::list(&out)));
@@ -935,6 +936,58 @@ mod tests {
         assert_eq!(c.congested_nets(0, None), vec![0, 1]);
         c.incremental_candidates = Some(vec![1]);
         assert_eq!(c.congested_nets(0, None), vec![1]);
+    }
+
+    /// The congested-net tree: m1 (1,1) up to m3, then m3 to (3,1). Via lengths 100 on each side.
+    fn stacked(c: &mut Cugr, ap: Point) -> GrNet {
+        c.design.via_demand_length_lower = vec![100.0, 100.0, 0.0];
+        c.design.via_demand_length_upper = vec![100.0, 100.0, 0.0];
+        let mut t = GrTree::default();
+        let a = t.add(0, Point::new(1, 1));
+        let b = t.add(2, Point::new(1, 1));
+        let e = t.add(2, Point::new(3, 1));
+        t.nodes[a].children.push(b);
+        t.nodes[b].children.push(e);
+        net_with(t, &[(0, ap), (1, Point::new(3, 1))])
+    }
+
+    // Upstream rule (CUGR `updateCongestedNets` → `GridGraph::reliefScore`, pre-pin 6a9bb0572d): a
+    // net is congested when its removal would relieve overflow ANYWHERE it puts demand — its via
+    // pads too, not only its wire edges — each charge capped at the edge's overflow. m3 (0,1) is a
+    // flank edge of the stack's top pad that no wire of the net crosses.
+    #[test]
+    fn a_net_is_congested_by_the_overflow_its_via_pads_relieve() {
+        let mut c = router();
+        let n = stacked(&mut c, Point::new(1, 1));
+        c.nets = vec![n];
+        assert!(c.congested_nets(0, None).is_empty(), "nothing overflows");
+        let cap = c.grid.graph_edges[2][0][1].capacity;
+        c.grid.graph_edges[2][0][1].demand = cap + 5.0;
+        let pad = c.grid.pad_flank_edges(&c.design, 2, 0, 2, Point::new(1, 1), &[1.0; 3])[0].1;
+        assert!(pad > 0.0);
+        assert_eq!(c.congested_nets(0, None), vec![0], "the top pad loads an overfull edge");
+        assert!((c.grid.relief_score(&c.design, &c.nets[0], 1.0) - pad).abs() < 1e-12, "capped at the charge");
+        c.grid.graph_edges[2][0][1].demand = cap + pad / 4.0;
+        assert!((c.grid.relief_score(&c.design, &c.nets[0], 1.0) - pad / 4.0).abs() < 1e-12, "capped at the overflow");
+    }
+
+    // Upstream rule (`reliefScore`, `pinAccessTops`): a via pad at a pin's gcell at or below that
+    // pin's access top (at least the net's min layer, here m2) relieves nothing — no reroute moves
+    // it. The same pad away from every pin gcell counts; layers below the min routing layer never.
+    #[test]
+    fn pin_access_pads_and_layers_below_min_relieve_nothing() {
+        let mut c = router();
+        let n = stacked(&mut c, Point::new(1, 1));
+        c.nets = vec![n];
+        let cap = c.grid.graph_edges[1][1][0].capacity;
+        c.grid.graph_edges[1][1][0].demand = cap + 5.0;
+        assert!(c.congested_nets(0, None).is_empty(), "the m2 pad sits at the pin's top");
+        c.nets[0].preferred_aps.insert(0, (Point::new(5, 5), Interval::point(0)));
+        assert_eq!(c.congested_nets(0, None), vec![0], "off the pin gcells the m2 pad counts");
+        c.grid.graph_edges[1][1][0].demand = 0.0;
+        let cap0 = c.grid.graph_edges[0][0][1].capacity;
+        c.grid.graph_edges[0][0][1].demand = cap0 + 5.0;
+        assert!(c.congested_nets(0, None).is_empty(), "m1 is below the min routing layer");
     }
 
     // Upstream rule (CUGR `updateNet`): the net is rebuilt from its new pins with its rule's
