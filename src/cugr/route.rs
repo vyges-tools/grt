@@ -655,14 +655,17 @@ pub fn restore_cugr_for_repair(db: &mut Db, opts: &RouteOptions, mut trace: Opti
 ///   layers; a net with no route gets no network (it is timed lumped);
 /// - the pins are the global router's own (`initNets(true)`), moved to CUGR's access points by
 ///   `updatePinAccessPoints` at the FIRST estimate (`getPartialRoutes`), and kept moved;
-/// - every net is re-estimated at every read. The reference re-estimates only the nets re-routed
-///   since the last read; a net not re-routed has the same route and pins, so the same network.
-///
-/// ⚠️ Known divergence after the first read: the reference then times INCREMENTALLY — only the
-/// re-estimated nets' pins are invalidated, and a load slew that changed by less than the fuzzy
-/// tolerance does not re-time its fanout — so a few downstream delays stay stale where a full
-/// timing (this one) moves them by an ulp or two. Measured over the four reads after a refresh
-/// witnessed: three exact; one off in the last bits on 14 of 411 nets, its guides still exact.
+/// - one timer and one set of networks, kept across the reads (`updateNetSlacks`, by
+///   [`super::SlackRefresh`]):
+///   - `Full` (`estimateAllGlobalRouteParasitics`): every network deleted (`clearParasitics`)
+///     and every net estimated again; the timer starts over, a full timing;
+///   - `Rerouted` (`updateReroutedParasitics`): only the listed nets estimated again, each then
+///     invalidated at every pin it connects (`delaysInvalidFromFanin(net)`); a net skipped
+///     (fewer than 2 pins, local) or left with no route keeps its network and invalidates
+///     nothing (`updateGlobalRouteParasitics` returns first). The timer then updates
+///     INCREMENTALLY: a change no larger than fuzzy equality does not re-time the fanout, so a
+///     value it does not reach stays as the last read left it — where a full timing would move
+///     it by a few ulps, and decide a later ranking differently.
 fn timer_slack_source(db: &mut Db, opts: &RouteOptions) -> Res<super::SlackSource> {
     use crate::parasitics::{estimate_net, NetParasitics, PinAttach, PinGridLocation, Segment};
     let timing = opts.timing.clone().ok_or("cugr: no timer")?;
@@ -703,9 +706,14 @@ fn timer_slack_source(db: &mut Db, opts: &RouteOptions) -> Res<super::SlackSourc
     };
     let (max_routing_layer, min_routing_layer) = (t.max_routing_layer, t.min_routing_layer);
     let mut moved = false;
+    // Each timing-netlist net's pins: the vertices `delaysInvalidFromFanin(net)` invalidates.
+    let net_pins: std::collections::HashMap<String, Vec<String>> = netlist.nets.iter().map(|n| (n.name.clone(), n.pins.iter().map(|c| netlist.pin_name(c)).collect())).collect();
+    // The reference's one timer and one parasitics store, kept across the reads.
+    let mut timer = vyges_sta::incr::IncTimer::default();
+    let mut par: std::collections::BTreeMap<String, crate::parasitics::Network> = std::collections::BTreeMap::new();
     // `timer_trace`: each read appended as `C <read> 0 <net> <bits>` (stage 1 is read 0).
     let (trace, mut reads) = (opts.timer_trace.clone(), 1usize);
-    let read = move |cugr: &Cugr| -> Result<std::collections::BTreeMap<String, f32>, String> {
+    let read = move |cugr: &Cugr, refresh: &super::SlackRefresh| -> Result<std::collections::BTreeMap<String, f32>, String> {
         if !moved {
             for net in &cugr.nets {
                 if let Some((pins, _)) = nets.get_mut(&net.name) {
@@ -716,15 +724,16 @@ fn timer_slack_source(db: &mut Db, opts: &RouteOptions) -> Res<super::SlackSourc
             }
             moved = true;
         }
-        let mut par = std::collections::BTreeMap::new();
-        for net in &cugr.nets {
+        // `getNetRoute` then `estimateGlobalRouteParasitics`: None where the reference makes no
+        // network (fewer than 2 pins, local, not a global-router net, an empty route).
+        let estimate = |net: &super::grnet::GrNet| -> Option<crate::parasitics::Network> {
             if net.num_pins() < 2 || Cugr::is_local(net) {
-                continue;
+                return None;
             }
             let route = cugr.net_route(net);
-            let Some((pins, widths)) = nets.get(&net.name) else { continue };
+            let (pins, widths) = nets.get(&net.name)?;
             if route.is_empty() {
-                continue;
+                return None;
             }
             let segs: Vec<Segment> = route.iter().map(|g| Segment::new(g.init_x, g.init_y, g.init_layer, g.final_x, g.final_y, g.final_layer)).collect();
             let pins: Vec<PinGridLocation> = pins
@@ -732,9 +741,30 @@ fn timer_slack_source(db: &mut Db, opts: &RouteOptions) -> Res<super::SlackSourc
                 .map(|(p, d)| PinGridLocation { name: p.name.clone(), is_port: p.is_port, is_driver: *d, pt: p.position, grid_pt: p.on_grid, conn_layer: p.connection_layer })
                 .collect();
             let np = NetParasitics { name: &net.name, route: &segs, pins: &pins, net_min_layer: min_routing_layer, min_routing_layer, ndr_width: widths.as_ref(), attach: PinAttach::Routed };
-            par.insert(net.name.clone(), estimate_net(&np, &rc));
+            Some(estimate_net(&np, &rc))
+        };
+        match refresh {
+            super::SlackRefresh::Full | super::SlackRefresh::Incremental => {
+                par.clear();
+                timer = vyges_sta::incr::IncTimer::default();
+                for net in &cugr.nets {
+                    if let Some(n) = estimate(net) {
+                        par.insert(net.name.clone(), n);
+                    }
+                }
+            }
+            super::SlackRefresh::Rerouted(dirty) => {
+                for &k in dirty {
+                    let net = cugr.nets.get(k).expect("invariant: a dirty net index was collected from this router's own nets");
+                    let Some(n) = estimate(net) else { continue };
+                    par.insert(net.name.clone(), n);
+                    for pin in net_pins.get(&net.name).into_iter().flatten() {
+                        timer.delays_invalid_from(pin);
+                    }
+                }
+            }
         }
-        let m: std::collections::BTreeMap<String, f32> = crate::timer::net_slacks(&timing, &netlist, &par)?.into_iter().collect();
+        let m: std::collections::BTreeMap<String, f32> = crate::timer::net_slacks_incremental(&timing, &netlist, &par, &mut timer)?.into_iter().collect();
         if let Some(path) = &trace {
             use std::io::Write;
             let mut f = std::fs::OpenOptions::new().append(true).create(true).open(path).map_err(|e| e.to_string())?;

@@ -261,6 +261,22 @@ pub fn demand(out: &mut Vec<String>, g: &GridGraph, stage: i32) {
     }
 }
 
+/// `slkupd|call|mode|n|nets,`: one `updateNetSlacks` and the nets it estimates again (the
+/// reference's call-sequence instrument, `cugr-slkseq-patch.py`).
+pub fn slack_refresh(out: &mut Vec<String>, call: usize, r: &super::SlackRefresh) {
+    let (mode, nets): (&str, &[usize]) = match r {
+        super::SlackRefresh::Full => ("full", &[]),
+        super::SlackRefresh::Rerouted(n) => ("rerouted", n),
+        super::SlackRefresh::Incremental => ("incremental", &[]),
+    };
+    out.push(format!("VYGC|slkupd|{call}|{mode}|{}|{}", nets.len(), list(nets)));
+}
+
+/// `collect|stage|add or incr|n|nets,`: one `collectReroutedNets`, in the order given.
+pub fn collect(out: &mut Vec<String>, stage: i32, incremental: bool, nets: &[usize]) {
+    out.push(format!("VYGC|collect|{stage}|{}|{}|{}", if incremental { "incr" } else { "add" }, nets.len(), list(nets)));
+}
+
 /// `restoreNetRoute`'s answer for `net`.
 pub fn restore(net: &str, r: &super::restore::Restore) -> String {
     match r {

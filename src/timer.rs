@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use vyges_opendb::Db;
 use vyges_sta::graph::{Graph, NetParasitics};
+use vyges_sta::incr::IncTimer;
 use vyges_sta::liberty::Library;
 use vyges_sta::netlist::{Conn, Net, Netlist, PortDir};
 use vyges_sta::parasitics::Network;
@@ -186,6 +187,21 @@ pub fn net_slacks(timing: &Timing, nl: &Netlist, parasitics: &BTreeMap<String, c
 
 /// The same, on networks already in the timer's form.
 pub fn net_slacks_on(timing: &Timing, nl: &Netlist, par: &HashMap<String, NetParasitics>) -> Result<HashMap<String, f32>, String> {
+    net_slacks_timed(timing, nl, par, None)
+}
+
+/// [`net_slacks`] through a timer kept across reads (`inc`), as the reference's one `dbSta` is.
+/// A fresh timer's first read is a full timing, the same as [`net_slacks`]. Each later read
+/// updates only from what the caller invalidated since (`inc.delays_invalid_from` on a pin whose
+/// net was estimated again): a delay, slew or arrival that changed by no more than fuzzy equality
+/// does not re-time its fanout, so a value it does not reach stays as it was.
+pub fn net_slacks_incremental(timing: &Timing, nl: &Netlist, parasitics: &BTreeMap<String, crate::parasitics::Network>, inc: &mut IncTimer) -> Result<HashMap<String, f32>, String> {
+    let par: HashMap<String, NetParasitics> = parasitics.iter().map(|(net, n)| (net.clone(), timer_network(net, n))).collect();
+    net_slacks_timed(timing, nl, &par, Some(inc))
+}
+
+/// Every net's worst load slack, timed in full or (with `inc`) incrementally.
+fn net_slacks_timed(timing: &Timing, nl: &Netlist, par: &HashMap<String, NetParasitics>, inc: Option<&mut IncTimer>) -> Result<HashMap<String, f32>, String> {
     let scale = timing.libs.first().ok_or("timing needs a library")?.time_scale;
     let built;
     let sdc = match &timing.sdc {
@@ -199,10 +215,27 @@ pub fn net_slacks_on(timing: &Timing, nl: &Netlist, par: &HashMap<String, NetPar
         },
     };
     let mut g = Graph::build(&timing.libs, nl)?;
-    g.find_delays(par, None)?;
-    let mut s = Search::in_graph_order(&g, sdc);
-    s.find_arrivals()?;
-    s.find_requireds()?;
+    let s = match inc {
+        None => {
+            g.find_delays(par, None)?;
+            let mut s = Search::in_graph_order(&g, sdc);
+            s.find_arrivals()?;
+            s.find_requireds()?;
+            s
+        }
+        // `Sta::slack` → `findRequireds` → `findArrivals` → `findDelays`, each from the state the
+        // last read left (`vyges_sta::incr`, the resizer's timer).
+        Some(inc) => {
+            inc.import(&mut g);
+            inc.find_delays(&mut g, par, None)?;
+            inc.export(&g);
+            let mut s = Search::in_graph_order(&g, sdc);
+            inc.import_paths(&mut s);
+            inc.find_arrivals(&mut s, None)?;
+            inc.find_requireds(&mut s, None)?;
+            s
+        }
+    };
     let index: HashMap<&str, usize> = g.vertices.iter().enumerate().map(|(i, v)| (v.name.as_str(), i)).collect();
     Ok(nl
         .nets

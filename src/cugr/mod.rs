@@ -147,10 +147,29 @@ pub struct Cugr {
     /// The timer itself, asked at each `updateNetSlacks` on the routes as they stand (instead of a
     /// capture).
     pub slack_source: SlackSource,
+    /// `full_slack_update_done_`: this route's full parasitics estimate has run.
+    pub full_slack_update_done: bool,
+    /// `parasitics_dirty_nets_`: the nets rerouted since the last refresh, as collected.
+    pub parasitics_dirty_nets: Vec<usize>,
+}
+
+/// What one `updateNetSlacks` re-estimates before the timer is read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlackRefresh {
+    /// `estimateAllGlobalRouteParasitics`: the route's first refresh. `clearParasitics` deleted
+    /// every network first, so every net is estimated again and the timer starts over.
+    Full,
+    /// `updateReroutedParasitics`: only the nets rerouted since the last refresh (sorted,
+    /// unique), each estimated again with its pins' delays invalidated
+    /// (`delaysInvalidFromFanin`). The timer then updates incrementally from its last state.
+    Rerouted(Vec<usize>),
+    /// `refreshNetSlacks` in an incremental route: no estimate. Not modelled: the source reads
+    /// it as a full refresh, as it did before the refreshes were told apart.
+    Incremental,
 }
 
 /// Every net's slack, by name, from the timer at one `updateNetSlacks`.
-pub type SlackFn = dyn FnMut(&Cugr) -> Result<std::collections::BTreeMap<String, f32>, String>;
+pub type SlackFn = dyn FnMut(&Cugr, &SlackRefresh) -> Result<std::collections::BTreeMap<String, f32>, String>;
 
 /// The timer as the router holds it: shared, and invisible to the router's own comparisons.
 #[derive(Clone, Default)]
@@ -238,6 +257,10 @@ impl Cugr {
     /// next captured call), the res-aware set marked on those real slacks, then — outside an
     /// incremental route — every non-critical net demoted.
     pub fn update_critical_nets(&mut self, stage: i32, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
+        let refresh = self.take_slack_refresh();
+        if let Some(t) = trace.as_deref_mut() {
+            trace::slack_refresh(t, self.raw_done, &refresh);
+        }
         match (&self.raw_slacks, self.constant_slack) {
             (Some(raw), _) => {
                 let m = raw.get(self.raw_done).ok_or_else(|| StageError::Slacks(format!("no captured timer slacks for update {}", self.raw_done)))?;
@@ -248,7 +271,7 @@ impl Cugr {
             (None, Some(constant)) => self.nets.iter_mut().for_each(|n| n.slack = constant),
             (None, None) => {
                 let Some(src) = self.slack_source.0.clone() else { return Ok(()) };
-                let m = (src.borrow_mut())(self).map_err(StageError::Slacks)?;
+                let m = (src.borrow_mut())(self, &refresh).map_err(StageError::Slacks)?;
                 for n in &mut self.nets {
                     n.slack = *m.get(&n.name).ok_or_else(|| StageError::Slacks(format!("net {} is not in the timing netlist", n.name)))?;
                 }
@@ -268,6 +291,36 @@ impl Cugr {
             }
         }
         Ok(())
+    }
+
+    /// `updateNetSlacks`' choice of what to estimate again: an incremental route estimates
+    /// nothing; the route's first refresh is the full estimate (and clears the dirty list); every
+    /// later one takes the dirty list, sorted and unique (`refreshDirtyParasitics`), and clears it.
+    pub fn take_slack_refresh(&mut self) -> SlackRefresh {
+        if self.incremental_candidates.is_some() {
+            return SlackRefresh::Incremental;
+        }
+        if !self.full_slack_update_done {
+            self.full_slack_update_done = true;
+            self.parasitics_dirty_nets.clear();
+            return SlackRefresh::Full;
+        }
+        let mut dirty = std::mem::take(&mut self.parasitics_dirty_nets);
+        dirty.sort_unstable();
+        dirty.dedup();
+        SlackRefresh::Rerouted(dirty)
+    }
+
+    /// `collectReroutedNets`: a stage's rerouted nets join the dirty list for the next refresh
+    /// (an incremental route collects nothing: it does not estimate). `stage` tags the trace.
+    pub fn collect_rerouted_nets(&mut self, nets: &[usize], stage: i32, trace: Option<&mut Vec<String>>) {
+        if let Some(t) = trace {
+            trace::collect(t, stage, self.incremental_candidates.is_some(), nets);
+        }
+        if self.incremental_candidates.is_some() {
+            return;
+        }
+        self.parasitics_dirty_nets.extend_from_slice(nets);
     }
 
     /// `criticalSlackThreshold`: every net's slack, stably sorted; the one at
@@ -376,6 +429,7 @@ impl Cugr {
                 trace::net_route(t, &self.nets[k], &route, &commits, 2);
             }
         }
+        self.collect_rerouted_nets(&nets, 2, trace);
         Ok(())
     }
 
@@ -478,6 +532,7 @@ impl Cugr {
                 trace::net_route(t, &self.nets[k], &route, &commits, 3);
             }
         }
+        self.collect_rerouted_nets(nets, 3, trace.as_deref_mut());
         if let Some(t) = trace {
             trace::demand(t, &self.grid, 3);
         }
@@ -542,6 +597,9 @@ impl Cugr {
             }
             grid.step();
         }
+        // ⚠️ The reference collects only the ACCEPTED nets (its per-net accept test, E1); with
+        // every net kept, that is all of them.
+        self.collect_rerouted_nets(nets, stage, trace.as_deref_mut());
         if let Some(t) = trace {
             trace::demand(t, &self.grid, stage);
         }
@@ -736,6 +794,9 @@ impl Cugr {
         if queued.is_empty() {
             return Ok(());
         }
+        // `route()`: one full estimate per route, the dirty list started empty.
+        self.full_slack_update_done = false;
+        self.parasitics_dirty_nets.clear();
         self.incremental_candidates = Some(queued.clone());
         let mut nets = queued;
         self.pattern_route(&mut nets, alphas, stt, log, trace.as_deref_mut())?;
@@ -770,7 +831,7 @@ pub fn init(facts: &DesignFacts, driver_terms: &[String], min_routing_layer: i32
         .map(|n| GrNet::new(n, &driver_terms[n.facts_index], &grid))
         .collect::<Result<Vec<_>, _>>()
         .map_err(InitError::Grid)?;
-    Ok(Cugr { constants, design, grid, nets, cost_multiplier: 1.0, sort_slacks: None, sorts_done: 0, incremental_candidates: None, resistance_aware: false, critical_nets_percentage: 0.0, verbose: false, res_aware_percentage: 15.0, raw_slacks: None, raw_done: 0, constant_slack: None, worst: (1.0, 1.0, 1, 1), slack_source: SlackSource::default() })
+    Ok(Cugr { constants, design, grid, nets, cost_multiplier: 1.0, sort_slacks: None, sorts_done: 0, incremental_candidates: None, resistance_aware: false, critical_nets_percentage: 0.0, verbose: false, res_aware_percentage: 15.0, raw_slacks: None, raw_done: 0, constant_slack: None, worst: (1.0, 1.0, 1, 1), slack_source: SlackSource::default(), full_slack_update_done: false, parasitics_dirty_nets: Vec::new() })
 }
 
 #[cfg(test)]
@@ -1052,5 +1113,50 @@ mod tests {
         c.mark_res_aware_nets(2, None);
         assert!(c.nets[2].res_aware, "a positive-slack CLOCK net is still marked");
         assert!(c.nets[0].res_aware && !c.nets[1].res_aware, "a tie goes to the lower index: ceil(2 * 50%) = 1");
+    }
+
+    // Upstream rules (CUGR `updateNetSlacks`, `collectReroutedNets`, `refreshDirtyParasitics`): a
+    // route's FIRST refresh is the full estimate and empties the dirty list; every later one
+    // estimates only the nets the stages collected since, sorted and unique, and empties it; an
+    // incremental route collects nothing and estimates nothing. In resistance_aware_cugr the
+    // stage-3 refresh estimates only the stage-2 res-aware nets, and its slacks are the
+    // incremental timer's on them (a full re-time of the reference gives ours to the bit).
+    #[test]
+    fn a_refresh_estimates_only_the_nets_rerouted_since_the_last() {
+        let mut c = router();
+        c.collect_rerouted_nets(&[4], 1, None);
+        assert_eq!(c.take_slack_refresh(), SlackRefresh::Full);
+        assert_eq!(c.take_slack_refresh(), SlackRefresh::Rerouted(vec![]), "the full estimate dropped what came before it");
+        c.collect_rerouted_nets(&[3, 1], 2, None);
+        c.collect_rerouted_nets(&[3, 0], 3, None);
+        assert_eq!(c.take_slack_refresh(), SlackRefresh::Rerouted(vec![0, 1, 3]));
+        assert_eq!(c.take_slack_refresh(), SlackRefresh::Rerouted(vec![]), "the list was emptied");
+        c.incremental_candidates = Some(vec![1]);
+        c.collect_rerouted_nets(&[2], 3, None);
+        assert_eq!(c.take_slack_refresh(), SlackRefresh::Incremental);
+        c.incremental_candidates = None;
+        assert_eq!(c.take_slack_refresh(), SlackRefresh::Rerouted(vec![]), "nothing was collected while incremental");
+    }
+
+    // Upstream call sequence (stages 2 to 4: `updateCriticalNets` first, `collectReroutedNets`
+    // last): the timer is asked for the full estimate, then for what the stage before rerouted.
+    #[test]
+    fn the_timer_is_asked_full_then_for_the_rerouted_nets() {
+        let mut c = router();
+        c.nets = vec![critical_candidate(-1.0), critical_candidate(-2.0)];
+        for (k, n) in c.nets.iter_mut().enumerate() {
+            n.name = format!("n{k}");
+        }
+        let asked: std::rc::Rc<std::cell::RefCell<Vec<SlackRefresh>>> = std::rc::Rc::default();
+        let seen = asked.clone();
+        let read = move |cu: &Cugr, r: &SlackRefresh| -> Result<std::collections::BTreeMap<String, f32>, String> {
+            seen.borrow_mut().push(r.clone());
+            Ok(cu.nets.iter().map(|n| (n.name.clone(), -1.0)).collect())
+        };
+        c.slack_source = SlackSource(Some(std::rc::Rc::new(std::cell::RefCell::new(read))));
+        c.update_critical_nets(2, None).unwrap();
+        c.collect_rerouted_nets(&[1], 2, None);
+        c.update_critical_nets(3, None).unwrap();
+        assert_eq!(*asked.borrow(), vec![SlackRefresh::Full, SlackRefresh::Rerouted(vec![1])]);
     }
 }
