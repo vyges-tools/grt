@@ -251,6 +251,31 @@ fn an_unflagged_net_scores_zero_whatever_it_carries() {
     );
 }
 
+/// ⛔ Upstream a9ef8f7ac8 (in the pin): the score key counts only when the ROUTER is
+/// resistance-aware as well as the net (`enable_resistance_aware_ && isResAware()`). A net an
+/// earlier resistance-aware call selected keeps its flag, but once the mode is off the legacy
+/// order holds — the reference's TestResistanceMode `DisabledStaleSelectionKeepsLegacyOrder`:
+/// a short unselected net first, the long selected one after it, both scoring zero. With the mode
+/// on, the selected net's score puts it first.
+#[test]
+fn a_stale_selection_scores_zero_once_the_router_is_not_resistance_aware() {
+    let nets = vec![
+        NetForOrder {
+            net_id: 0, edge_len: &[2], edge_n1_x: &[0], num_terminals: 2,
+            has_ndr: false, is_res_aware: false, res_aware_score: 0.0, is_clock: false,
+        },
+        NetForOrder {
+            net_id: 1, edge_len: &[10], edge_n1_x: &[0], num_terminals: 2,
+            has_ndr: false, is_res_aware: true, res_aware_score: 3.0, is_clock: false,
+        },
+    ];
+    let off = netpin_order_inc(&nets, false);
+    assert_eq!(off.iter().map(|o| o.tree_index).collect::<Vec<_>>(), vec![0, 1], "mode off: the legacy order");
+    assert!(off.iter().all(|o| o.res_aware_score == 0.0), "mode off: every score is zero");
+    let on = netpin_order_inc(&nets, true);
+    assert_eq!(on.iter().map(|o| o.tree_index).collect::<Vec<_>>(), vec![1, 0], "mode on: the selected net first");
+}
+
 // ─── The two surviving mutations ────────────────────────────────────────────────────────────
 
 /// ⛔ **Survivor 1 — computing the length per pin in double precision is a GAP with a threshold.**

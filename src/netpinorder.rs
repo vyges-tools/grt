@@ -109,7 +109,10 @@ pub fn netpin_order_inc(nets: &[NetForOrder<'_>], resistance_aware: bool) -> Vec
                 length_per_pin: total_length as f32 / n.num_terminals as f32,
                 // ⚠️ Zero is the HIGHER priority here.
                 ndr_priority: i32::from(!n.has_ndr),
-                res_aware_score: if n.is_res_aware { -n.res_aware_score } else { 0.0 },
+                // ⛔ Upstream a9ef8f7ac8: the score counts only when the ROUTER is resistance-aware
+                // too (`enable_resistance_aware_ && isResAware()`). A net left selected by an earlier
+                // resistance-aware call keeps the legacy order once the mode is off.
+                res_aware_score: if resistance_aware && n.is_res_aware { -n.res_aware_score } else { 0.0 },
                 clock: if resistance_aware { i32::from(!n.is_clock) } else { 0 },
             }
         })

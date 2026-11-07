@@ -102,7 +102,8 @@ pub struct ResAware<'a> {
     pub percentage: f32,
     /// `worst_*` — what the LAST `updateSlacks` accumulated; `getResAwareScore` divides by it.
     pub worst: crate::slacks::WorstMetrics,
-    /// `resistance_aware_` — the member each net sets in `assignEdge` and the 3D pass; never reset.
+    /// `resistance_aware_` — the member `assignEdge` and the 3D pass set per net to
+    /// `enable_resistance_aware_ && isResAware()` (a9ef8f7ac8); the last net walked leaves it.
     pub member: bool,
     /// The timer's slacks at each `updateSlacks` call, and how many calls have read them.
     pub slacks: crate::congestion_loop::TimerSlack<'a>,
@@ -447,16 +448,14 @@ fn assign_edge(net: &RsmtNet<'_>, attrs: &NetLayerAttrs, res_aware: bool, range:
     if (widened.min_layer, widened.max_layer) != (lo, hi) {
         *range = Some((widened.min_layer, widened.max_layer));
     }
-    // A resistance-aware router prices this edge for resistance only if the NET is resistance-aware
-    // (`resistance_aware_ = net->isResAware()`, a member left as the last net set it). The wire
-    // price reads the net's range as widened above.
+    // ⛔ a9ef8f7ac8: `resistance_aware_ = enable_resistance_aware_ && net->isResAware()` on EVERY
+    // edge — the router's mode and the net's selection both. The wire price reads the net's range
+    // as widened above.
     let edge_cost: Vec<i64> = lec.iter().map(|&c| i64::from(c)).collect();
     let (mut wire, mut via) = (vec![0i64; nl], vec![vec![0i64; nl]; nl]);
     if let Some(ra) = p.ra {
         let mut ra = ra.borrow_mut();
-        if p.resistance_aware {
-            ra.member = res_aware;
-        }
+        ra.member = p.resistance_aware && res_aware;
         if ra.member {
             let wn = WireNet { ndr_width: None, min_layer: widened.min_layer as i32, max_layer: widened.max_layer as i32 };
             for (l, w) in wire.iter_mut().enumerate() {
@@ -672,12 +671,11 @@ pub fn maze_route_msmd_order_3d_all(order: &[usize], nets: &[RsmtNet<'_>], attrs
         Some(ra) => (&ra.tech, ra.tile_size),
         None => (&no_tech, 0),
     };
-    let member = ra.as_ref().is_some_and(|ra| ra.member);
     let mut pass_nets = Vec::with_capacity(order.len());
     for &id in &order {
-        // resistance_aware_ = net->isResAware() in a resistance-aware call; otherwise it keeps the
-        // value it last held. ⚠️ Only the nets the pass walks set it, in its order.
-        let effective = if call.resistance_aware { state[id].res_aware } else { member };
+        // ⛔ a9ef8f7ac8: `resistance_aware_ = enable_resistance_aware_ && net->isResAware()` for each
+        // net the pass walks, before its slack skip — no value carries over from an earlier net.
+        let effective = call.resistance_aware && state[id].res_aware;
         let (lo, hi) = state[id].layer_range.unwrap_or((nets[id].min_layer, nets[id].max_layer));
         let wn = WireNet { ndr_width: None, min_layer: lo as i32, max_layer: hi as i32 };
         let price = |from: usize, to: usize, via: bool| get_maze_route_cost_3d(tech, effective, p.via_cost, tile_size, MoveCost { from_layer: from as i32, to_layer: to as i32, dx: i32::from(!via), dy: 0, is_via: via }, wn);
@@ -698,10 +696,8 @@ pub fn maze_route_msmd_order_3d_all(order: &[usize], nets: &[RsmtNet<'_>], attrs
     drop(ra);
     let recovered = maze_route_3d_pass(PassParams { call, expand: p.expand, detour_penalty }, &mut grid, &mut pass_nets);
     // The member as the pass leaves it: the last net it walked set it (before its slack skip).
-    if call.resistance_aware {
-        if let (Some(ra), Some(&last)) = (p.layer.ra, order[..crate::maze3d::end_index(order.len(), true)].last()) {
-            ra.borrow_mut().member = state[last].res_aware;
-        }
+    if let (Some(ra), Some(&last)) = (p.layer.ra, order[..crate::maze3d::end_index(order.len(), call.resistance_aware)].last()) {
+        ra.borrow_mut().member = call.resistance_aware && state[last].res_aware;
     }
     // The 2D charges, in order, through each net's NDR-aware update.
     for &(i, horizontal, x, y, d) in grid.log_2d.as_ref().expect("logging") {
