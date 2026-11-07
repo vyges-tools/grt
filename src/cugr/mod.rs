@@ -751,11 +751,9 @@ impl Cugr {
                 trace::commits(t, &commits, 5);
                 t.push(format!("VYGC|rrr|{i}|{multiplier}|{}|{}|demoted={}", nets.len(), trace::list(nets.iter()), demoted.iter().map(|d| format!("{d},")).collect::<String>()));
             }
-            // Incremental re-mazes every candidate each round, in the candidates' own order.
-            overflow_change += match self.incremental_candidates.clone() {
-                Some(mut all) => self.maze_route(&mut all, 5, i, log, trace.as_deref_mut())?,
-                None => self.maze_route(nets, 5, i, log, trace.as_deref_mut())?,
-            };
+            // Only the congested nets are re-mazed, incremental or not (aeb3de12040): the
+            // incremental scope is in the congested-set scan, which looks only at the candidates.
+            overflow_change += self.maze_route(nets, 5, i, log, trace.as_deref_mut())?;
             stagnant_passes = rrr_stagnant_passes(stagnant_passes, overflow_change);
             if let Some(t) = trace.as_deref_mut() {
                 trace::rrr_stop(t, i, overflow_change, stagnant_passes, demotion_pending, self.grid.total_overflow());
