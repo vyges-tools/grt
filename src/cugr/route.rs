@@ -368,6 +368,8 @@ pub fn route_cugr(db: &mut Db, opts: &RouteOptions, call: usize, stt: SteinerBui
     ci.cugr.maze_route(&mut nets, 4, 0, &mut log, trace.as_deref_mut()).map_err(fail)?;
     let mut nets = ci.cugr.congested_nets(4, trace.as_deref_mut());
     ci.cugr.iterative_rrr(&mut nets, opts.congestion_iterations, &mut log, trace.as_deref_mut()).map_err(fail)?;
+    // `route(false)` ends with `printStatistics` (reports only), then `captureOverflowBaseline`.
+    ci.cugr.capture_overflow_baseline(trace.as_deref_mut());
     if let Some(t) = trace {
         t.push("VYGC|routed".into());
     }
@@ -609,6 +611,8 @@ pub fn restore_cugr_for_repair(db: &mut Db, opts: &RouteOptions, mut trace: Opti
             tr.push(super::trace::restore(name, &r));
         }
     }
+    // `initEngineWithExistingRouting`: the relief clears only the overflow above the adopted routing.
+    ci.cugr.capture_overflow_baseline(trace);
     let net_routes: Vec<crate::NetRoute> = order
         .iter()
         .filter_map(|name| {

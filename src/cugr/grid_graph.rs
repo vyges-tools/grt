@@ -719,6 +719,23 @@ impl GridGraph {
         if 0.0 < over { over } else { 0.0 }
     }
 
+    /// `overflowedEdges()`: every edge with positive overflow and its overflow, from the min routing
+    /// layer up, then by x, then by y — the `(layer, x, y)` order, so the list is sorted by edge.
+    pub fn overflowed_edges(&self) -> Vec<((usize, i32, i32), f64)> {
+        let mut edges = Vec::new();
+        for layer in self.min_routing_layer..self.num_layers {
+            for x in 0..self.x_size as i32 {
+                for y in 0..self.y_size as i32 {
+                    let overflow = self.edge_overflow((layer, x, y));
+                    if overflow > 0.0 {
+                        edges.push(((layer, x, y), overflow));
+                    }
+                }
+            }
+        }
+        edges
+    }
+
     /// `sumOverflow(edges)`: the edges' overflows added in the list's order.
     pub fn sum_overflow(&self, edges: &[(usize, i32, i32)]) -> f64 {
         let mut sum = 0.0;
@@ -1149,6 +1166,26 @@ mod tests {
         assert_eq!(g.total_overflow(), 0);
         g.graph_edges[1][0][1].demand = 5.2;
         assert_eq!(g.total_overflow(), 1, "0.4 + 0.2 on m2 rounds to 1");
+    }
+
+    // Upstream rule (GridGraph `overflowedEdges`, f72dc020d2): every edge with overflow > 0 from the
+    // MIN ROUTING layer up, layer-major then x then y — so the list is sorted by edge, which the
+    // relief's `addedOverflow` binary-searches. An edge at exactly its capacity, and any edge below
+    // the min routing layer, is left out.
+    #[test]
+    fn overflowed_edges_are_the_positive_ones_from_the_min_layer_in_edge_order() {
+        let mut g = graph(&facts());
+        let min = g.min_routing_layer;
+        assert!(min > 0, "the fixture has a layer below the min routing layer");
+        let mut over = |l: usize, x: usize, y: usize, by: f64| {
+            let e = &mut g.graph_edges[l][x][y];
+            e.demand = e.capacity + by;
+        };
+        over(min - 1, 0, 0, 3.0);
+        over(min + 1, 0, 1, 0.25);
+        over(min, 1, 0, 2.0);
+        over(min, 0, 1, 0.0);
+        assert_eq!(g.overflowed_edges(), [((min, 1, 0), 2.0), ((min + 1, 0, 1), 0.25)]);
     }
 
     // Upstream rule (GridGraph `rangeSearchRows`): starting ON a gridline starts in that gcell,

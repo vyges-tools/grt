@@ -151,6 +151,10 @@ pub struct Cugr {
     pub full_slack_update_done: bool,
     /// `parasitics_dirty_nets_`: the nets rerouted since the last refresh, as collected.
     pub parasitics_dirty_nets: Vec<usize>,
+    /// `overflow_baseline_`: each overflowed edge and its overflow at the last
+    /// [`Cugr::capture_overflow_baseline`], sorted by edge. The incremental relief clears only the
+    /// overflow above it. Empty at `init` (`clear`).
+    pub overflow_baseline: Vec<((usize, i32, i32), f64)>,
 }
 
 /// What one `updateNetSlacks` re-estimates before the timer is read.
@@ -880,6 +884,16 @@ impl Cugr {
 }
 
 impl Cugr {
+    /// `captureOverflowBaseline`: the overflow as it stands becomes the baseline the incremental
+    /// relief keeps (`overflowedEdges`). Called at the end of a full route and after
+    /// `initEngineWithExistingRouting` adopts the existing routing; never by an incremental route.
+    pub fn capture_overflow_baseline(&mut self, trace: Option<&mut Vec<String>>) {
+        self.overflow_baseline = self.grid.overflowed_edges();
+        if let Some(t) = trace {
+            trace::baseline(t, &self.overflow_baseline);
+        }
+    }
+
     /// `CUGR::updateNet(net)` for a net the router holds: its tree's demand released (with its
     /// adopted flag), the net rebuilt from `net_facts` as new — no preferred access points, slack
     /// 0 — with its rule's factors, kept at 1 if it was soft-demoted; queued for the next route.
@@ -966,7 +980,7 @@ pub fn init(facts: &DesignFacts, driver_terms: &[String], min_routing_layer: i32
         .map(|n| GrNet::new(n, &driver_terms[n.facts_index], &grid))
         .collect::<Result<Vec<_>, _>>()
         .map_err(InitError::Grid)?;
-    Ok(Cugr { constants, design, grid, nets, cost_multiplier: 1.0, sort_slacks: None, sorts_done: 0, incremental_candidates: None, resistance_aware: false, critical_nets_percentage: 0.0, verbose: false, res_aware_percentage: 15.0, raw_slacks: None, raw_done: 0, constant_slack: None, worst: (1.0, 1.0, 1, 1), slack_source: SlackSource::default(), full_slack_update_done: false, parasitics_dirty_nets: Vec::new() })
+    Ok(Cugr { constants, design, grid, nets, cost_multiplier: 1.0, sort_slacks: None, sorts_done: 0, incremental_candidates: None, resistance_aware: false, critical_nets_percentage: 0.0, verbose: false, res_aware_percentage: 15.0, raw_slacks: None, raw_done: 0, constant_slack: None, worst: (1.0, 1.0, 1, 1), slack_source: SlackSource::default(), full_slack_update_done: false, parasitics_dirty_nets: Vec::new(), overflow_baseline: Vec::new() })
 }
 
 #[cfg(test)]
@@ -1022,6 +1036,26 @@ mod tests {
     }
 
     /// Gridlines 0, 1000, …, 4000, 5900: the last gcell is 1900 wide.
+    // Upstream rule (CUGR `captureOverflowBaseline`, f72dc020d2 / 7f4e38c449): the baseline is
+    // REPLACED by the overflow as it stands — an edge whose overflow cleared leaves it — and the
+    // trace gives the count, then each edge in the baseline's order.
+    #[test]
+    fn capturing_the_overflow_baseline_replaces_it_with_the_current_overflow() {
+        let mut c = router();
+        let min = c.grid.min_routing_layer;
+        let cap = c.grid.graph_edges[min][0][0].capacity;
+        c.grid.graph_edges[min][0][0].demand = cap + 1.5;
+        c.capture_overflow_baseline(None);
+        assert_eq!(c.overflow_baseline, [((min, 0, 0), 1.5)]);
+        c.grid.graph_edges[min][0][0].demand = cap;
+        let cap2 = c.grid.graph_edges[min][1][0].capacity;
+        c.grid.graph_edges[min][1][0].demand = cap2 + 0.5;
+        let mut t = Vec::new();
+        c.capture_overflow_baseline(Some(&mut t));
+        assert_eq!(c.overflow_baseline, [((min, 1, 0), 0.5)]);
+        assert_eq!(t, [String::from("VYGR|baseline|1"), format!("VYGR|base|{min},1,0|0.5")]);
+    }
+
     fn router() -> Cugr {
         let f = DesignFacts {
             dbu_per_micron: 1000,

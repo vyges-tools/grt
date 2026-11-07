@@ -291,6 +291,15 @@ pub fn rrr_stop(out: &mut Vec<String>, i: i32, change: f64, stagnant: i32, pendi
     out.push(format!("VYGC|rrrstop|{i}|{:016x}|{stagnant}|{}|{overflow}", change.to_bits(), u8::from(pending)));
 }
 
+/// `VYGR|baseline|n`, then `VYGR|base|layer,x,y|overflow` per edge in the baseline's order: one
+/// `captureOverflowBaseline`. `VYGR` records are the relief family's, scored on their own.
+pub fn baseline(out: &mut Vec<String>, edges: &[((usize, i32, i32), f64)]) {
+    out.push(format!("VYGR|baseline|{}", edges.len()));
+    for ((l, x, y), overflow) in edges {
+        out.push(format!("VYGR|base|{l},{x},{y}|{overflow}"));
+    }
+}
+
 /// `collect|stage|add or incr|n|nets,`: one `collectReroutedNets`, in the order given.
 pub fn collect(out: &mut Vec<String>, stage: i32, incremental: bool, nets: &[usize]) {
     out.push(format!("VYGC|collect|{stage}|{}|{}|{}", if incremental { "incr" } else { "add" }, nets.len(), list(nets)));
