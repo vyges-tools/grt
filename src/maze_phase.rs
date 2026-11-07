@@ -59,11 +59,11 @@ pub fn route_monotonic_edge(
     cost_table: &[f64],
     threshold: i32,
     enlarge: i32,
-) {
+) -> Result<(), String> {
     let t = st.tree.as_mut().expect("tree");
     let e = t.edges[eid];
     if e.len <= threshold || e.len == 0 {
-        return;
+        return Ok(());
     }
     let (red_h, red_v) = (grid.red_h, grid.red_v);
     let g = &*grid.g;
@@ -73,7 +73,7 @@ pub fn route_monotonic_edge(
     let r = &t.routes[eid];
     assert_eq!(r.kind, RouteKind::MazeRoute, "GRT-500: route type is not maze");
     if needs_ripup_check(&r.grids, r.routelen as usize, threshold, caps, None, &used_h, &used_v).is_none() {
-        return;
+        return Ok(());
     }
     let nn = net.ndr_net(id);
     give_back_committed(&mut grid.g.for_net(&nn), &r.grids, r.routelen as usize, nn.edge_cost);
@@ -82,6 +82,14 @@ pub fn route_monotonic_edge(
     let others: Vec<(i32, i32)> = t.nodes.iter().map(|n| (n.x as i32, n.y as i32)).collect();
     let dims = (grid.g.est.x_grids as i32, grid.g.est.y_grids as i32);
     let bx = monotonic_box(p1, p2, enlarge, dims, &others, t.num_terminals);
+    // ⛔ The reference's lookup is `h_cost_table_[min(usage, size() - 1)]` on a table of
+    // `10 × h_capacity_`: with no horizontal capacity the table is empty, `size() - 1` wraps, and
+    // the read is out of bounds — the reference crashes (congestion3 under -allow_congestion,
+    // a vertical-only routing layer). Every edge that reaches the search spans two cells, so it
+    // reads. We refuse instead of modelling the crash.
+    if cost_table.is_empty() {
+        return Err(format!("monotonic routing with an empty cost table (10 x h_capacity = 0): the reference reads past it (net {id}, edge {eid})"));
+    }
     let g = &*grid.g;
     let used_h = |x: i32, y: i32| f64::from(g.usage_red_h(x, y, red_h(x as usize, y as usize)));
     let used_v = |x: i32, y: i32| f64::from(g.usage_red_v(x, y, red_v(x as usize, y as usize)));
@@ -90,6 +98,7 @@ pub fn route_monotonic_edge(
     let r = &mut t.routes[eid];
     r.grids = points;
     r.routelen = routelen;
+    Ok(())
 }
 
 /// `routeMonotonicAll(threshold, expand, logis_cof)` — build the cost table, then
@@ -107,14 +116,15 @@ pub fn route_monotonic_all(
     nets: &[RsmtNet<'_>],
     state: &mut [NetState],
     grid: &mut BrkGrid<'_>,
-) {
+) -> Result<(), String> {
     let table = monotonic_cost_table(f64::from(costheight), grid.h_capacity, f64::from(logis_cof));
     for &id in net_ids {
         let n = state[id].tree.as_ref().map_or(0, |t| t.edges.len());
         for eid in 0..n {
-            route_monotonic_edge(id, eid, &nets[id], &mut state[id], grid, &table, threshold, expand);
+            route_monotonic_edge(id, eid, &nets[id], &mut state[id], grid, &table, threshold, expand)?;
         }
     }
+    Ok(())
 }
 
 /// One monotonic round as the run records it.
@@ -155,7 +165,7 @@ pub fn lv_rounds(
     let mut rounds = Vec::with_capacity(LV_ITER);
     for k in 0..LV_ITER {
         let logistic_coef = (2.0 / (1.0 + f64::from(max_ov).ln())) as f32;
-        route_monotonic_all(new_th, enlarge, logistic_coef, costheight, net_ids, nets, state, grid);
+        route_monotonic_all(new_th, enlarge, logistic_coef, costheight, net_ids, nets, state, grid)?;
         // `getOverflow2Dmaze` runs `check2DEdgesUsage` first.
         guard.check(&grid.g.est)?;
         let scan = grid.g.get_overflow_2d_maze();

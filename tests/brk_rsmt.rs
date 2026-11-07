@@ -1279,11 +1279,35 @@ fn the_monotonic_cost_height_trades_congestion_for_length() {
         }
         let caps = grid_caps(7, 3, 10);
         let mut grid = BrkGrid { g: &mut g2d, red_h: &no_red, red_v: &no_red, caps: &caps, h_capacity: 10, v_capacity: 10, via_cost: 0.0 };
-        route_monotonic_all(1, 2, 0.2, height, &[0], &nets, &mut state, &mut grid);
+        route_monotonic_all(1, 2, 0.2, height, &[0], &nets, &mut state, &mut grid).expect("invariant: capacity 10 builds a table");
         state[0].tree.as_ref().expect("tree").routes[0].grids.clone()
     };
     assert_eq!(route_with(4), (0..=4).map(|x| (x, 0)).collect::<Vec<_>>(), "height 4: straight along row 0");
     assert_eq!(route_with(8), vec![(0, 0), (0, 1), (1, 1), (2, 1), (3, 1), (4, 1), (4, 0)], "height 8: through row 1");
+}
+
+/// ⛔ The reference's monotonic table is `10 × h_capacity_` long and its lookup is
+/// `h_cost_table_[min(usage, size() - 1)]`: with no horizontal capacity (a vertical-only routing
+/// layer, congestion3 under -allow_congestion) the table is empty, `size() - 1` wraps, and the
+/// reference reads out of bounds and crashes. We refuse with an error instead of panicking.
+#[test]
+fn monotonic_routing_refuses_an_empty_cost_table() {
+    let pins = [(0, 0), (4, 0)];
+    let mut state = vec![st_tree(2, &[(0, 0, 1), (4, 0, 1)], &pins)];
+    {
+        let r = &mut state[0].tree.as_mut().expect("tree").routes[0];
+        (r.kind, r.grids, r.routelen) = (RouteKind::MazeRoute, (0..=4).map(|x| (x, 0)).collect(), 4);
+    }
+    let (px, py): (Vec<i32>, Vec<i32>) = pins.iter().copied().unzip();
+    let nets = [RsmtNet { layer_edge_cost: &[1], ..net(&px, &py) }];
+    let mut g2d = Graph2d::new(7, 3, 1);
+    for x in 0..4 {
+        g2d.est.update_usage_h(x, 0, 2.0); // over a capacity of 0: the edge is ripped up and searched
+    }
+    let caps = grid_caps(7, 3, 10);
+    let mut grid = BrkGrid { g: &mut g2d, red_h: &no_red, red_v: &no_red, caps: &caps, h_capacity: 0, v_capacity: 10, via_cost: 0.0 };
+    let e = route_monotonic_all(1, 2, 0.2, 4, &[0], &nets, &mut state, &mut grid).expect_err("an empty table is refused");
+    assert!(e.starts_with("monotonic routing with an empty cost table"), "{e}");
 }
 
 /// ⛔ The LV rounds' schedule: `newTH` 10, 5, then floored at 1; `enlarge_` 10, 15, 20; and the
