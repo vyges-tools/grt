@@ -884,6 +884,16 @@ impl Cugr {
 }
 
 impl Cugr {
+    /// `markNetStale(db_net)`: a net CUGR holds keeps its old pins, so the relief must not move it.
+    /// A net CUGR does not hold is left alone (no record).
+    pub fn mark_net_stale(&mut self, k: Option<usize>, trace: Option<&mut Vec<String>>) {
+        let Some(net) = k.and_then(|k| self.nets.get_mut(k)) else { return };
+        net.stale = true;
+        if let Some(t) = trace {
+            t.push(format!("VYGR|stale|{}", net.name));
+        }
+    }
+
     /// `captureOverflowBaseline`: the overflow as it stands becomes the baseline the incremental
     /// relief keeps (`overflowedEdges`). Called at the end of a full route and after
     /// `initEngineWithExistingRouting` adopts the existing routing; never by an incremental route.
@@ -1079,6 +1089,23 @@ mod tests {
         assert_eq!(out, ["VYGR|incr|2|b;a;"], "in the order queued");
     }
 
+    // Upstream rule (CUGR `markNetStale`, f72dc020d2): only a net CUGR holds is marked (the trace
+    // names it); one it does not hold is left alone.
+    #[test]
+    fn only_a_held_net_is_marked_stale() {
+        let mut c = router();
+        let n = congested(&mut c);
+        c.nets = vec![n];
+        let mut t = Vec::new();
+        c.mark_net_stale(None, Some(&mut t));
+        assert!(t.is_empty() && !c.nets[0].stale);
+        c.mark_net_stale(Some(0), Some(&mut t));
+        assert!(c.nets[0].stale);
+        assert_eq!(t, [format!("VYGR|stale|{}", c.nets[0].name)]);
+        c.mark_net_stale(Some(7), Some(&mut t));
+        assert_eq!(t.len(), 1, "an index past the held nets marks nothing");
+    }
+
     fn router() -> Cugr {
         let f = DesignFacts {
             dbu_per_micron: 1000,
@@ -1117,6 +1144,7 @@ mod tests {
             is_clock_sig: false,
             odb_aps: Vec::new(),
             odb_ap_choices: Vec::new(),
+            stale: false,
         }
     }
 

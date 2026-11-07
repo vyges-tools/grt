@@ -892,6 +892,9 @@ pub fn update_dirty_routes_cugr(
                 }
             }
             rerouted.push(name.clone());
+        } else {
+            // `else if (!restored)`: CUGR keeps the net's previous pins, so it must not reroute it.
+            cugr.mark_net_stale(index.get(name).copied(), trace.as_deref_mut());
         }
     }
     cugr.route_incremental(queued, cg.iterations, &cg.alphas, stt, log, trace).map_err(|e| format!("cugr: {e:?}"))?;

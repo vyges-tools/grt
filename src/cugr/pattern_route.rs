@@ -923,6 +923,7 @@ pub(crate) mod tests {
             is_clock_sig: false,
             odb_aps: Vec::new(),
             odb_ap_choices: Vec::new(),
+            stale: false,
         };
         for p in &n.pin_access_points.clone() {
             for g in p {

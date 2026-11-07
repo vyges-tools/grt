@@ -51,6 +51,9 @@ pub struct GrNet {
     pub odb_aps: Vec<Vec<(i32, i32, i32)>>,
     /// Per pin, the cells they mapped to as `findODBAccessPoints` saw them (for the trace).
     pub odb_ap_choices: Vec<Vec<(Point, Interval)>>,
+    /// `stale_` (`markNetStale`): the net's pins here are out of date, so the incremental relief
+    /// never moves it. Only a rebuild (`updateNet`, a new GRNet) clears it.
+    pub stale: bool,
 }
 
 /// `GRNet::SavedRoute`: what a maze rollback restores — the tree, its adopted flag and the
@@ -131,6 +134,7 @@ impl GrNet {
             is_clock_sig: false,
             odb_aps: net.pins.iter().map(|p| p.access_points.clone()).collect(),
             odb_ap_choices: Vec::new(),
+            stale: false,
         })
     }
 
