@@ -883,7 +883,50 @@ impl Cugr {
     }
 }
 
+/// `kReliefTolerance`: the added overflow, and a round's gain, below which the relief sees nothing.
+pub const RELIEF_TOLERANCE: f64 = 1e-9;
+
 impl Cugr {
+    /// `addedOverflow(edge)`: the edge's overflow above the baseline (0 where the baseline has none).
+    pub fn added_overflow(&self, edge: (usize, i32, i32)) -> f64 {
+        let baseline = match self.overflow_baseline.binary_search_by(|(e, _)| e.cmp(&edge)) {
+            Ok(i) => self.overflow_baseline[i].1,
+            Err(_) => 0.0,
+        };
+        self.grid.edge_overflow(edge) - baseline
+    }
+
+    /// `findCongestedEdges(nets)`: over the routed nets given, every edge of their trees whose added
+    /// overflow exceeds the tolerance, sorted and unique.
+    pub fn find_congested_edges(&self, nets: &[usize]) -> Result<Vec<(usize, i32, i32)>, StageError> {
+        let mut congested = Vec::new();
+        for &k in nets {
+            if self.nets[k].routing_tree.is_none() {
+                continue;
+            }
+            congested.extend(self.tree_edges(k)?.into_iter().filter(|&e| self.added_overflow(e) > RELIEF_TOLERANCE));
+        }
+        congested.sort_unstable();
+        congested.dedup();
+        Ok(congested)
+    }
+
+    /// `relieveIncrementalOverflow`, at the end of an incremental route: the candidates' congested
+    /// edges (added overflow only); none, or no overflow left in all (`totalOverflow() == 0`), and
+    /// nothing moves. ⛔ The relief rounds themselves are refused, not guessed.
+    pub fn relieve_incremental_overflow(&mut self, trace: Option<&mut Vec<String>>) -> Result<Vec<usize>, StageError> {
+        let rerouted = self.incremental_candidates.clone().unwrap_or_default();
+        let congested = self.find_congested_edges(&rerouted)?;
+        let total = self.grid.total_overflow();
+        if let Some(t) = trace {
+            trace::relief_entry(t, rerouted.len(), &congested, total);
+        }
+        if congested.is_empty() || total == 0 {
+            return Ok(Vec::new());
+        }
+        Err(StageError::Maze(format!("cugr: the incremental overflow relief's reroute rounds are not modelled ({} congested edges)", congested.len())))
+    }
+
     /// `markNetStale(db_net)`: a net CUGR holds keeps its old pins, so the relief must not move it.
     /// A net CUGR does not hold is left alone (no record).
     pub fn mark_net_stale(&mut self, k: Option<usize>, trace: Option<&mut Vec<String>>) {
@@ -965,6 +1008,8 @@ impl Cugr {
         self.pattern_route_with_detours(&mut nets, alphas, stt, log, trace.as_deref_mut())?;
         self.maze_route(&mut nets, 4, 0, log, trace.as_deref_mut())?;
         self.iterative_rrr(&mut nets, iterations, log, trace.as_deref_mut())?;
+        // The relief's moves would need new routes and guides too: refused above while unported.
+        self.relieve_incremental_overflow(trace.as_deref_mut())?;
         self.incremental_candidates = None;
         if let Some(t) = trace {
             t.push("VYGC|routed".into());
@@ -1104,6 +1149,42 @@ mod tests {
         assert_eq!(t, [format!("VYGR|stale|{}", c.nets[0].name)]);
         c.mark_net_stale(Some(7), Some(&mut t));
         assert_eq!(t.len(), 1, "an index past the held nets marks nothing");
+    }
+
+    // Upstream rule (CUGR `addedOverflow` / `findCongestedEdges`, f72dc020d2): an edge is congested
+    // for the relief only by overflow ABOVE its baseline, beyond 1e-9 — an edge already over at
+    // the baseline, by as much, is not; the same edge grown past it is.
+    #[test]
+    fn the_relief_sees_only_overflow_above_the_baseline() {
+        let mut c = router();
+        let n = congested(&mut c);
+        c.nets = vec![n];
+        c.capture_overflow_baseline(None);
+        assert!(!c.overflow_baseline.is_empty());
+        assert_eq!(c.find_congested_edges(&[0]).unwrap(), []);
+        let e = &mut c.grid.graph_edges[2][1][1];
+        e.demand += 1e-10;
+        assert_eq!(c.find_congested_edges(&[0]).unwrap(), [], "within the tolerance");
+        let e = &mut c.grid.graph_edges[2][1][1];
+        e.demand += 0.5;
+        assert_eq!(c.find_congested_edges(&[0]).unwrap(), [(2, 1, 1)]);
+        assert!((c.added_overflow((2, 1, 1)) - (0.5 + 1e-10)).abs() < 1e-12);
+    }
+
+    // Upstream rule (CUGR `relieveIncrementalOverflow`, f72dc020d2): with no congested edge among
+    // the candidates, or no overflow left in all, nothing moves — and the entry is traced first.
+    #[test]
+    fn the_relief_moves_nothing_without_added_overflow() {
+        let mut c = router();
+        let n = congested(&mut c);
+        c.nets = vec![n];
+        c.capture_overflow_baseline(None);
+        c.incremental_candidates = Some(vec![0]);
+        let mut t = Vec::new();
+        assert_eq!(c.relieve_incremental_overflow(Some(&mut t)).unwrap(), Vec::<usize>::new());
+        assert_eq!(t, [format!("VYGR|relief|rerouted=1|congested=0|total={}", c.grid.total_overflow()), "VYGR|cong|".to_string()]);
+        c.grid.graph_edges[2][1][1].demand += 2.0;
+        assert!(c.relieve_incremental_overflow(None).is_err(), "the rounds are refused until ported");
     }
 
     fn router() -> Cugr {

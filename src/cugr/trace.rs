@@ -307,6 +307,14 @@ pub fn incremental_candidates(out: &mut Vec<String>, nets: &[GrNet], candidates:
     out.push(format!("VYGR|incr|{}|{names}", candidates.len()));
 }
 
+/// `VYGR|relief|rerouted=n|congested=k|total=t` then `VYGR|cong|layer,x,y;…`: the relief's entry —
+/// the candidates, their congested edges (sorted) and `totalOverflow()`.
+pub fn relief_entry(out: &mut Vec<String>, rerouted: usize, congested: &[(usize, i32, i32)], total: i32) {
+    out.push(format!("VYGR|relief|rerouted={rerouted}|congested={}|total={total}", congested.len()));
+    let edges: String = congested.iter().map(|(l, x, y)| format!("{l},{x},{y};")).collect();
+    out.push(format!("VYGR|cong|{edges}"));
+}
+
 /// `collect|stage|add or incr|n|nets,`: one `collectReroutedNets`, in the order given.
 pub fn collect(out: &mut Vec<String>, stage: i32, incremental: bool, nets: &[usize]) {
     out.push(format!("VYGC|collect|{stage}|{}|{}|{}", if incremental { "incr" } else { "add" }, nets.len(), list(nets)));
