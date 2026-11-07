@@ -815,9 +815,12 @@ fn pins_moved(before: &[crate::pins::NetPin], after: &[crate::pins::NetPin]) -> 
 /// connection layer), differ from those saved when it was dirtied — the ones CUGR's access points
 /// had set, so a net can count as moved with nothing moved. A rerouted net is released and
 /// rebuilt in CUGR (`CUGR::updateNet`: its pins re-read, its rule's factors, soft-NDR kept), then
-/// all are routed incrementally (`route(true)`). Each rerouted net's route replaces its old one
-/// (empty: removed), its pins take CUGR's access points, and `addRemainingGuides` covers the
-/// rerouted nets.
+/// all are routed incrementally (`route(true)`). The nets the overflow relief moved join the
+/// rerouted ones after them (`findRoutingCugr`; their detailed wires would be destroyed first).
+/// Each rerouted net's route replaces its old one (empty: removed), its pins take CUGR's access
+/// points, and `addRemainingGuides` covers the rerouted nets; `saveGuides(rerouted)` writes the
+/// moved nets' guides with the dirty ones'. Also returns the moved nets, in that order, for
+/// `repairAntennas`' `add_moved_nets`.
 #[allow(clippy::too_many_arguments)]
 pub fn update_dirty_routes_cugr(
     db: &mut Db,
@@ -828,7 +831,7 @@ pub fn update_dirty_routes_cugr(
     stt: SteinerBuilder<'_>,
     log: &mut dyn crate::log::Sink,
     mut trace: Option<&mut Vec<String>>,
-) -> Res<Vec<crate::NetGuides>> {
+) -> Res<(Vec<crate::NetGuides>, Vec<String>)> {
     use crate::findrouting::{add_remaining_guides, RemainingNet};
     // updateDirtyRoutesCugr starts with `cugr_->setVerbose(false)`: no stage report on this path.
     cugr.verbose = false;
@@ -899,8 +902,17 @@ pub fn update_dirty_routes_cugr(
         }
     }
     let moved = cugr.route_incremental(queued, cg.iterations, &cg.alphas, stt, log, trace).map_err(|e| format!("cugr: {e:?}"))?;
-    if !moved.is_empty() {
-        return Err(format!("cugr: {} nets moved by the overflow relief need new routes and guides — not modelled", moved.len()).into());
+    // findRoutingCugr: each net the relief moved that the router holds (`db_net_map_`) is
+    // appended to the rerouted nets, its detailed wire destroyed first (`destroyNetWire`).
+    let mut moved_names: Vec<String> = Vec::with_capacity(moved.len());
+    for k in moved {
+        let name = cugr.nets[k].name.clone();
+        let f = all.iter().find(|f| f.name == name).ok_or("a moved net missing from the database")?;
+        if f.has_wire {
+            return Err(format!("cugr: net {name}, moved by the overflow relief, has detailed wires — destroyNetWire is not modelled").into());
+        }
+        rerouted.push(name.clone());
+        moved_names.push(name);
     }
     // findRoutingCugr over the rerouted nets.
     let grid_pins = |pins: &[crate::pins::NetPin]| -> Vec<crate::findrouting::GridPin> { pins.iter().map(|p| (p.on_grid.0, p.on_grid.1, p.connection_layer)).collect() };
@@ -922,7 +934,7 @@ pub fn update_dirty_routes_cugr(
         } else {
             cg.routes.insert(name.clone(), route);
         }
-        let pins = cg.pins.get_mut(name).expect("inserted above");
+        let pins = cg.pins.get_mut(name).ok_or("a rerouted net without pins")?;
         if let Some(&k) = index.get(name) {
             for pin in pins.iter_mut() {
                 update_pin_access_point(cugr, &cugr.nets[k], pin, &pin_grid, t.max_routing_layer);
@@ -932,10 +944,12 @@ pub fn update_dirty_routes_cugr(
         remaining.push(RemainingNet { name: name.clone(), made: crate::makes_fastroute_net(pins.len(), f.has_wire, || false), pins: grid_pins(pins) });
     }
     add_remaining_guides(&mut cg.routes, &remaining, t.min_routing_layer, t.max_routing_layer, db.block_get_max_routing_layer()).map_err(|e| format!("{e:?}"))?;
-    // saveGuides(nets_to_repair): every dirty net with a route; a rerouted one without is cleared.
+    // saveGuides(rerouted) then saveGuides(nets_to_repair): every dirty or moved net with a
+    // route; a rerouted one without is cleared. A moved net is never dirty (the relief skips
+    // candidates and stale nets), so none is written twice.
     let mut saved = Vec::new();
     let mut to_save = Vec::new();
-    for name in dirty {
+    for name in dirty.iter().chain(moved_names.iter()) {
         let pins = &cg.pins[name];
         let on_grid: Vec<(i32, i32)> = pins.iter().map(|p| p.on_grid).collect();
         let nr = crate::NetRoute {
@@ -952,7 +966,7 @@ pub fn update_dirty_routes_cugr(
     }
     saved.extend(crate::save_guides(&to_save, &cg.jumper_grid.grid, &cg.save).map_err(|e| format!("{e:?}"))?);
     refresh_net_routes(db, cg);
-    Ok(saved)
+    Ok((saved, moved_names))
 }
 
 /// The global router's nets as `saveGuides` reads them, in block order: each held net's route and

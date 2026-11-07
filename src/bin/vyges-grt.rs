@@ -803,7 +803,7 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, diode: Option
             (None, Some((_, cg))) => cg.pins.keys().cloned().collect(),
             (None, None) => BTreeSet::new(),
         };
-        let nets_to_repair: Vec<String> = order.iter().filter(|n| dirty.contains(*n) && known.contains(*n)).cloned().collect();
+        let mut nets_to_repair: Vec<String> = order.iter().filter(|n| dirty.contains(*n) && known.contains(*n)).cloned().collect();
         if let Some((c, cg)) = cugr.as_mut() {
             // IncrementalGRoute::updateRoutes → updateDirtyRoutesCugr.
             let branches = |x: &[i32], y: &[i32], d: usize, a: f32| stt(x, y, d, a).branch.iter().map(|b| (b.x, b.y, b.n)).collect::<Vec<_>>();
@@ -813,7 +813,10 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, diode: Option
                 let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(at(&path))?;
                 std::io::Write::write_all(&mut f, (t.join("\n") + "\n").as_bytes()).map_err(err)?;
             }
-            saved.extend(res.map_err(|e| classify(e.to_string()))?);
+            let (rerouted_guides, moved) = res.map_err(|e| classify(e.to_string()))?;
+            saved.extend(rerouted_guides);
+            // The relief also moved clean nets: check them again too.
+            vyges_grt::repair_antennas::add_moved_nets(&mut nets_to_repair, moved);
             if let Some(path) = step["diode_trace"].as_str() {
                 std::fs::write(path, &text).map_err(at(path))?;
             }
@@ -1650,7 +1653,8 @@ fn run(job: &Value) -> Result<Value, Fail> {
                             let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(at(&path))?;
                             std::io::Write::write_all(&mut f, (t.join("\n") + "\n").as_bytes()).map_err(err)?;
                         }
-                        let mut saved = res.map_err(|e| classify(e.to_string()))?;
+                        // updateRoutes' returned nets are not read on this path.
+                        let (mut saved, _moved) = res.map_err(|e| classify(e.to_string()))?;
                         // finishGlobalRouting → saveGuides(every net): a net with a route is
                         // rewritten, the others keep what they have. It also writes the router
                         // (`grt_use_cugr`) and, through updateDbCongestion, the gcell grid.

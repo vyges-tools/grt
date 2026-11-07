@@ -299,6 +299,16 @@ pub fn recheck_scope<V>(mut found: Vec<V>, net: impl Fn(&V) -> &String, nets_to_
     found
 }
 
+/// `repairAntennas`' `add_moved_nets(moved)`: the nets CUGR's overflow relief moved are checked
+/// again — each not already among `nets_to_repair` is appended once, in the moved order.
+pub fn add_moved_nets(nets_to_repair: &mut Vec<String>, moved: Vec<String>) {
+    for net in moved {
+        if !nets_to_repair.contains(&net) {
+            nets_to_repair.push(net);
+        }
+    }
+}
+
 /// `RepairAntennas::jumperInsertion`.
 ///
 /// `trace`, when given, collects the pass's call sequence in the reference instrument's `VYGJ|`

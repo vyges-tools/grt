@@ -510,3 +510,14 @@ fn a_later_iteration_rechecks_only_the_dirty_nets() {
     let got = vyges_grt::repair_antennas::recheck_scope(found, |v| &v.0, &dirty, &order);
     assert_eq!(got, vec![("a".to_string(), 3), ("c".to_string(), 1)]);
 }
+
+// Upstream rule (`GlobalRouter::repairAntennas`, `add_moved_nets`): the nets CUGR's overflow
+// relief moved join `nets_to_repair` AFTER the dirty nets, in the moved order, each once; a moved
+// net already there is not repeated (the reference erases the ones it finds before appending).
+#[test]
+fn the_relief_moved_nets_are_checked_again_after_the_dirty_ones() {
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    let mut nets = s(&["d", "b"]);
+    vyges_grt::repair_antennas::add_moved_nets(&mut nets, s(&["c", "b", "a", "c"]));
+    assert_eq!(nets, s(&["d", "b", "c", "a"]));
+}
