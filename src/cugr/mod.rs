@@ -947,6 +947,9 @@ impl Cugr {
         self.full_slack_update_done = false;
         self.parasitics_dirty_nets.clear();
         self.incremental_candidates = Some(queued.clone());
+        if let Some(t) = trace.as_deref_mut() {
+            trace::incremental_candidates(t, &self.nets, &queued);
+        }
         let mut nets = queued;
         self.pattern_route(&mut nets, alphas, stt, log, trace.as_deref_mut())?;
         self.pattern_route_with_detours(&mut nets, alphas, stt, log, trace.as_deref_mut())?;
@@ -1054,6 +1057,26 @@ mod tests {
         c.capture_overflow_baseline(Some(&mut t));
         assert_eq!(c.overflow_baseline, [((min, 1, 0), 0.5)]);
         assert_eq!(t, [String::from("VYGR|baseline|1"), format!("VYGR|base|{min},1,0|0.5")]);
+    }
+
+    // Upstream rule (CUGR `route(true)`, f72dc020d2): an incremental route with nothing queued
+    // returns BEFORE it takes its candidates — no candidates record, none held after — and one with
+    // nets takes them in the order queued (`incremental_candidates_ = net_indices`, unsorted).
+    #[test]
+    fn an_incremental_route_takes_its_candidates_only_when_nets_are_queued() {
+        let mut c = router();
+        let stt = |_: &[i32], _: &[i32], _: usize, _: f32| Vec::new();
+        let mut t = Vec::new();
+        c.route_incremental(Vec::new(), 1, &[], &stt, &mut Vec::<crate::log::Msg>::new(), Some(&mut t)).unwrap();
+        assert!(!t.iter().any(|r| r.starts_with("VYGR|")), "{t:?}");
+        assert!(c.incremental_candidates.is_none());
+        let n = congested(&mut c);
+        let (mut a, mut b) = (n.clone(), n);
+        a.name = "a".into();
+        b.name = "b".into();
+        let mut out = Vec::new();
+        trace::incremental_candidates(&mut out, &[a, b], &[1, 0]);
+        assert_eq!(out, ["VYGR|incr|2|b;a;"], "in the order queued");
     }
 
     fn router() -> Cugr {

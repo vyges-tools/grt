@@ -300,6 +300,13 @@ pub fn baseline(out: &mut Vec<String>, edges: &[((usize, i32, i32), f64)]) {
     }
 }
 
+/// `VYGR|incr|n|name;…`: an incremental `route`'s candidates (`incremental_candidates_`), in the
+/// order given.
+pub fn incremental_candidates(out: &mut Vec<String>, nets: &[GrNet], candidates: &[usize]) {
+    let names: String = candidates.iter().map(|&k| format!("{};", nets[k].name)).collect();
+    out.push(format!("VYGR|incr|{}|{names}", candidates.len()));
+}
+
 /// `collect|stage|add or incr|n|nets,`: one `collectReroutedNets`, in the order given.
 pub fn collect(out: &mut Vec<String>, stage: i32, incremental: bool, nets: &[usize]) {
     out.push(format!("VYGC|collect|{stage}|{}|{}|{}", if incremental { "incr" } else { "add" }, nets.len(), list(nets)));
