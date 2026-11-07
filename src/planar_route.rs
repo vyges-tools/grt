@@ -48,11 +48,23 @@ fn record_layer_and_bridge(x: i32, y: i32, new_layer: i32, seen: &mut BTreeMap<(
     seen.insert((x, y), new_layer);
 }
 
-/// `net_segs` is a SET: a segment already made is not made again, and the route keeps the order
-/// the segments were first made in.
+/// `addSegment`: `net_segs` is a SET: a segment already made is not made again, and the route
+/// keeps the order the segments were first made in.
+///
+/// ⛔ Upstream 77a6cb6628 (in the pin): the set's KEY puts a via's layers in ascending order, so a
+/// via made top-down matches one made bottom-up; the route keeps the segment as it was made.
 fn push_unique(out: &mut Vec<Segment>, seg: Segment) {
-    if !out.contains(&seg) {
+    if !out.iter().any(|s| dedup_key(*s) == dedup_key(seg)) {
         out.push(seg);
+    }
+}
+
+/// The `net_segs` key of one segment: a via's layers in ascending order, anything else as is.
+fn dedup_key(s: Segment) -> Segment {
+    if s.is_via() && s.init_layer > s.final_layer {
+        Segment { init_layer: s.final_layer, final_layer: s.init_layer, ..s }
+    } else {
+        s
     }
 }
 
@@ -258,6 +270,20 @@ mod tests {
         assert_eq!(b.iter().map(|s| (s.init_x, s.final_x)).collect::<Vec<_>>(), [(150, 250), (50, 150)]);
     }
 
+    // ⛔ Upstream 77a6cb6628: a via is one segment whichever way round its layers were made — the
+    // `net_segs` key sorts them — and the route keeps the FIRST one as it was made. A wire is only
+    // a duplicate of an identical wire.
+    #[test]
+    fn a_via_is_kept_once_in_either_layer_order() {
+        let mut out = Vec::new();
+        push_unique(&mut out, Segment::new(50, 50, 3, 50, 50, 2));
+        push_unique(&mut out, Segment::new(50, 50, 2, 50, 50, 3));
+        assert_eq!(out, [Segment::new(50, 50, 3, 50, 50, 2)], "the top-down via stays as made; the bottom-up one is its duplicate");
+        push_unique(&mut out, Segment::new(50, 50, 2, 150, 50, 2));
+        push_unique(&mut out, Segment::new(50, 50, 3, 150, 50, 3));
+        assert_eq!(out.len(), 3, "wires on two layers are two segments");
+    }
+
     // A straight horizontal edge: one segment on the horizontal pseudo-layer, no via.
     #[test]
     fn a_horizontal_edge_is_one_segment() {
@@ -325,8 +351,10 @@ mod tests {
     }
 
     /// Rule (`get3DRoute`): at a TERMINAL end the stack first descends from the edge's layer to one
-    /// above the stack's bottom, then climbs the whole stack — so the same cut appears walked down
-    /// and then up, and both directions are kept (the set compares layers in order).
+    /// above the stack's bottom, then climbs the whole stack — so the same cut is walked down and
+    /// then up. ⛔ Upstream 77a6cb6628 (in the pin): the `net_segs` key sorts a via's layers, so the
+    /// climb's vias are duplicates of the descent's and only the descent is kept (before it, the set
+    /// compared layers in order and both directions were kept).
     #[test]
     fn a_terminal_end_descends_then_climbs_its_stack() {
         use crate::full3d::{Point3D, RouteType};
@@ -353,8 +381,6 @@ mod tests {
                 s(150, 50, 3, 250, 50, 3),
                 s(250, 50, 3, 250, 50, 2),
                 s(250, 50, 2, 250, 50, 1),
-                s(250, 50, 1, 250, 50, 2),
-                s(250, 50, 2, 250, 50, 3),
             ]
         );
     }
