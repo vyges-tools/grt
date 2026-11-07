@@ -56,9 +56,31 @@ impl DirtyNets {
     }
 }
 
+/// `dbInst::setOrigin` (under `setLocation`): whether a move reaches the callbacks
+/// (`inDbPostMoveInst` → `instItermsDirty`). An instance PLACED, FIRM, LOCKED or COVER
+/// (`isPlaced`) already at the new origin returns before them; any other move reaches them (a
+/// fixed one errors first, ODB-0359, as the database call does).
+pub fn move_reaches_callbacks(status_before: &str, origin_before: (i32, i32), origin_after: (i32, i32)) -> bool {
+    let placed = matches!(status_before, "PLACED" | "FIRM" | "LOCKED" | "COVER");
+    !(placed && origin_before == origin_after)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Upstream rule (`dbInst::setOrigin`): a placed instance (any `isPlaced` status) left at its
+    // origin fires no callback, so marks no net; an unplaced one fires even where it stands.
+    #[test]
+    fn a_move_reaches_the_callbacks_unless_a_placed_instance_stays_put() {
+        assert!(move_reaches_callbacks("PLACED", (0, 0), (10, 0)));
+        for s in ["PLACED", "FIRM", "LOCKED", "COVER"] {
+            assert!(!move_reaches_callbacks(s, (5, 5), (5, 5)), "{s}");
+        }
+        for s in ["NONE", "UNPLACED", "SUGGESTED"] {
+            assert!(move_reaches_callbacks(s, (5, 5), (5, 5)), "{s}");
+        }
+    }
 
     // Upstream rule (`addDirtyNet`): a net the global router does not hold is not marked, though
     // the callback fired. Every net the corpus marks is held.

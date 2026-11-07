@@ -2205,14 +2205,26 @@ fn run(job: &Value) -> Result<Value, Fail> {
                         }
                     }
                     "inst_create" => db.create_inst(s("master")?, s("inst")?).map_err(err)?,
-                    // `dbInst::setLocation` / `setPlacementStatus`. Inside a bracket the move would
-                    // reach `inDbPostMoveInst`, which is not modelled here.
-                    "inst_set_location" | "inst_set_placement_status" if incremental.is_some() => {
+                    // `dbInst::setPlacementStatus` inside a bracket is not modelled.
+                    "inst_set_placement_status" if incremental.is_some() => {
                         return Err(Fail::Refused(format!("odb {op} inside an incremental bracket is not modelled")));
                     }
                     "inst_set_location" => {
                         let (x, y) = (step["x"].as_i64().ok_or_else(|| err("x"))? as i32, step["y"].as_i64().ok_or_else(|| err("y"))? as i32);
-                        db.inst_set_location(s("inst")?, x, y).map_err(err)?;
+                        let inst = s("inst")?;
+                        let before = (db.inst_get_placement_status(inst), db.inst_get_origin_x(inst), db.inst_get_origin_y(inst));
+                        db.inst_set_location(inst, x, y).map_err(err)?;
+                        // A move that reaches the callbacks fires `inDbPostMoveInst` →
+                        // `instItermsDirty`: each terminal's net, in terminal order, through
+                        // `addDirtyNet` (set and not special).
+                        let fired = vyges_grt::callbacks::move_reaches_callbacks(&before.0, (before.1, before.2), (db.inst_get_origin_x(inst), db.inst_get_origin_y(inst)));
+                        if incremental.is_some() && fired {
+                            let terms: Vec<String> = db.master_mterms(&db.inst_get_master(inst)).map_err(err)?.into_iter().map(|(t, _)| t).collect();
+                            for term in &terms {
+                                let net = db.iterm_get_net(inst, term);
+                                mark(&db, &net, &mut incremental, &held);
+                            }
+                        }
                     }
                     "inst_set_placement_status" => db.inst_set_placement_status(s("inst")?, s("status")?).map_err(err)?,
                     "iterm_disconnect" => {
