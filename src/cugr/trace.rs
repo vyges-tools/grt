@@ -316,6 +316,19 @@ pub fn relief_entry(out: &mut Vec<String>, rerouted: usize, congested: &[(usize,
     out.push(format!("VYGR|cong|{edges}"));
 }
 
+/// `VYGR|round|r|added=name;…|edges=k|before=x|after=y`: one relief round — the nets added, the
+/// congested edges and their added overflow before and after the round's RRR.
+pub fn relief_round(out: &mut Vec<String>, round: i32, nets: &[GrNet], added: &[usize], edges: usize, before: f64, after: f64) {
+    let names: String = added.iter().map(|&k| format!("{};", nets[k].name)).collect();
+    out.push(format!("VYGR|round|{round}|added={names}|edges={edges}|before={before}|after={after}"));
+}
+
+/// `VYGR|moved|name;…`: the relief's moved nets, by index.
+pub fn relief_moved(out: &mut Vec<String>, nets: &[GrNet], moved: &[usize]) {
+    let names: String = moved.iter().map(|&k| format!("{};", nets[k].name)).collect();
+    out.push(format!("VYGR|moved|{names}"));
+}
+
 /// `collect|stage|add or incr|n|nets,`: one `collectReroutedNets`, in the order given.
 pub fn collect(out: &mut Vec<String>, stage: i32, incremental: bool, nets: &[usize]) {
     out.push(format!("VYGC|collect|{stage}|{}|{}|{}", if incremental { "incr" } else { "add" }, nets.len(), list(nets)));

@@ -151,6 +151,10 @@ pub struct Cugr {
     pub full_slack_update_done: bool,
     /// `parasitics_dirty_nets_`: the nets rerouted since the last refresh, as collected.
     pub parasitics_dirty_nets: Vec<usize>,
+    /// During the relief, the nets whose maze reroute was KEPT at least once. The reference tells a
+    /// moved net by its tree no longer being the shared tree it had before the relief: only a kept
+    /// maze reroute replaces it (a rolled-back one restores the tree of that pass).
+    pub relief_kept: Option<std::collections::BTreeSet<usize>>,
     /// `overflow_baseline_`: each overflowed edge and its overflow at the last
     /// [`Cugr::capture_overflow_baseline`], sorted by edge. The incremental relief clears only the
     /// overflow above it. Empty at `init` (`clear`).
@@ -678,6 +682,9 @@ impl Cugr {
             if keep {
                 overflow_change += delta;
                 accepted.push(k);
+                if let Some(kept) = self.relief_kept.as_mut() {
+                    kept.insert(k);
+                }
             } else {
                 let mut rollback = Vec::new();
                 self.commit_net(k, true, &mut rollback)?;
@@ -919,6 +926,12 @@ impl Cugr {
 
 /// `kReliefTolerance`: the added overflow, and a round's gain, below which the relief sees nothing.
 pub const RELIEF_TOLERANCE: f64 = 1e-9;
+/// `kReliefRounds`: at most this many rounds of neighbours added.
+pub const RELIEF_ROUNDS: i32 = 5;
+/// `kReliefMargin`: gcells a net's pin box is grown by to reach a congested gcell.
+pub const RELIEF_MARGIN: i32 = 5;
+/// `kMaxReliefStretch`: a neighbour's reroute may lengthen its route by at most a quarter.
+pub const MAX_RELIEF_STRETCH: f64 = 1.25;
 
 impl Cugr {
     /// `addedOverflow(edge)`: the edge's overflow above the baseline (0 where the baseline has none).
@@ -945,20 +958,101 @@ impl Cugr {
         Ok(congested)
     }
 
+    /// `sumAddedOverflow(edges)`: each edge's added overflow, never below 0, in the list's order.
+    pub fn sum_added_overflow(&self, edges: &[(usize, i32, i32)]) -> f64 {
+        let mut sum = 0.0;
+        for &e in edges {
+            sum += self.added_overflow(e).max(0.0);
+        }
+        sum
+    }
+
+    /// `findNetsOnCongestedEdges(edges, is_candidate)`: in net order, every routed net of two or
+    /// more pins that is not a candidate and not stale, whose pin box grown by `RELIEF_MARGIN`
+    /// reaches a congested gcell (it must meet the gcells' box, then contain one of them), and
+    /// whose tree uses one of the (sorted) congested edges.
+    pub fn find_nets_on_congested_edges(&self, edges: &[(usize, i32, i32)], is_candidate: &[bool]) -> Result<Vec<usize>, StageError> {
+        let mut gcells: Vec<(i32, i32)> = Vec::with_capacity(edges.len());
+        let mut window = geo::BoxT::default();
+        for &(_, x, y) in edges {
+            gcells.push((x, y));
+            window.update(geo::Point::new(x, y));
+        }
+        gcells.sort_unstable();
+        gcells.dedup();
+        let mut nets = Vec::new();
+        for (k, n) in self.nets.iter().enumerate() {
+            if is_candidate[k] || n.num_pins() < 2 || n.routing_tree.is_none() || n.stale {
+                continue;
+            }
+            let b = n.bounding_box;
+            let grown = geo::BoxT::new(b.lx() - RELIEF_MARGIN, b.ly() - RELIEF_MARGIN, b.hx() + RELIEF_MARGIN, b.hy() + RELIEF_MARGIN);
+            if !grown.has_intersect_with(&window) || !gcells.iter().any(|&(x, y)| grown.contains(geo::Point::new(x, y))) {
+                continue;
+            }
+            if self.tree_edges(k)?.iter().any(|e| edges.binary_search(e).is_ok()) {
+                nets.push(k);
+            }
+        }
+        Ok(nets)
+    }
+
     /// `relieveIncrementalOverflow`, at the end of an incremental route: the candidates' congested
     /// edges (added overflow only); none, or no overflow left in all (`totalOverflow() == 0`), and
-    /// nothing moves. ⛔ The relief rounds themselves are refused, not guessed.
-    pub fn relieve_incremental_overflow(&mut self, trace: Option<&mut Vec<String>>) -> Result<Vec<usize>, StageError> {
+    /// nothing moves. Otherwise up to `RELIEF_ROUNDS` rounds while congested edges remain: the
+    /// nets on them join the candidates, each limited to `MAX_RELIEF_STRETCH` of its route's
+    /// length as it stands, and `iterativeRRR` runs with those limits and no slack refresh; a
+    /// round that gains no more than the tolerance on the edges' added overflow ends it, else the
+    /// edges are found again. Returns the added nets whose route a kept reroute replaced, sorted.
+    pub fn relieve_incremental_overflow(&mut self, iterations: i32, log: &mut dyn crate::log::Sink, mut trace: Option<&mut Vec<String>>) -> Result<Vec<usize>, StageError> {
         let rerouted = self.incremental_candidates.clone().unwrap_or_default();
-        let congested = self.find_congested_edges(&rerouted)?;
+        let mut congested = self.find_congested_edges(&rerouted)?;
         let total = self.grid.total_overflow();
-        if let Some(t) = trace {
+        if let Some(t) = trace.as_deref_mut() {
             trace::relief_entry(t, rerouted.len(), &congested, total);
         }
         if congested.is_empty() || total == 0 {
             return Ok(Vec::new());
         }
-        Err(StageError::Maze(format!("cugr: the incremental overflow relief's reroute rounds are not modelled ({} congested edges)", congested.len())))
+        let mut is_candidate = vec![false; self.nets.len()];
+        for &k in &rerouted {
+            is_candidate[k] = true;
+        }
+        let mut options = RerouteOptions { relief_max_length: vec![f64::INFINITY; self.nets.len()], refresh_critical: false };
+        let mut added_nets: Vec<usize> = Vec::new();
+        let mut net_indices: Vec<usize> = Vec::new();
+        self.relief_kept = Some(std::collections::BTreeSet::new());
+        let mut round = 1;
+        while round <= RELIEF_ROUNDS && !congested.is_empty() {
+            let added = self.find_nets_on_congested_edges(&congested, &is_candidate)?;
+            if added.is_empty() {
+                break;
+            }
+            for &k in &added {
+                is_candidate[k] = true;
+                options.relief_max_length[k] = MAX_RELIEF_STRETCH * f64::from(GridGraph::tree_length(self.nets[k].routing_tree.as_ref()));
+                self.incremental_candidates.get_or_insert_with(Vec::new).push(k);
+                added_nets.push(k);
+            }
+            let before = self.sum_added_overflow(&congested);
+            self.iterative_rrr(&mut net_indices, iterations, &options, log, trace.as_deref_mut())?;
+            let after = self.sum_added_overflow(&congested);
+            if let Some(t) = trace.as_deref_mut() {
+                trace::relief_round(t, round, &self.nets, &added, congested.len(), before, after);
+            }
+            if before - after <= RELIEF_TOLERANCE {
+                break;
+            }
+            congested = self.find_congested_edges(&rerouted)?;
+            round += 1;
+        }
+        let kept = self.relief_kept.take().unwrap_or_default();
+        let mut moved: Vec<usize> = added_nets.into_iter().filter(|k| kept.contains(k)).collect();
+        moved.sort_unstable();
+        if let Some(t) = trace {
+            trace::relief_moved(t, &self.nets, &moved);
+        }
+        Ok(moved)
     }
 
     /// `markNetStale(db_net)`: a net CUGR holds keeps its old pins, so the relief must not move it.
@@ -1021,14 +1115,14 @@ impl Cugr {
 
     /// `CUGR::route(true)`: the queued nets only — stage 1 on them (sorted in place), then stages
     /// 3 and 4 on ALL of them (no congested-set narrowing), then RRR scoped to them; no GRT-0118.
-    pub fn route_incremental(&mut self, queued: Vec<usize>, iterations: i32, alphas: &[f32], stt: pattern_route::SteinerBuilder<'_>, log: &mut dyn crate::log::Sink, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
+    pub fn route_incremental(&mut self, queued: Vec<usize>, iterations: i32, alphas: &[f32], stt: pattern_route::SteinerBuilder<'_>, log: &mut dyn crate::log::Sink, mut trace: Option<&mut Vec<String>>) -> Result<Vec<usize>, StageError> {
         if let Some(t) = trace.as_deref_mut() {
             t.push("VYGC|route|1".into());
         }
         // Nothing queued (a restore- or remove-only round): no stage runs, and `route` returns
         // before its end.
         if queued.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         // `route()`: one full estimate per route, the dirty list started empty.
         self.full_slack_update_done = false;
@@ -1043,13 +1137,13 @@ impl Cugr {
         let options = RerouteOptions::default();
         self.maze_route(&mut nets, 4, 0, &options, log, trace.as_deref_mut())?;
         self.iterative_rrr(&mut nets, iterations, &options, log, trace.as_deref_mut())?;
-        // The relief's moves would need new routes and guides too: refused above while unported.
-        self.relieve_incremental_overflow(trace.as_deref_mut())?;
+        // The relief's moves need new routes and guides in the global router too.
+        let moved = self.relieve_incremental_overflow(iterations, log, trace.as_deref_mut())?;
         self.incremental_candidates = None;
         if let Some(t) = trace {
             t.push("VYGC|routed".into());
         }
-        Ok(())
+        Ok(moved)
     }
 }
 
@@ -1073,7 +1167,7 @@ pub fn init(facts: &DesignFacts, driver_terms: &[String], min_routing_layer: i32
         .map(|n| GrNet::new(n, &driver_terms[n.facts_index], &grid))
         .collect::<Result<Vec<_>, _>>()
         .map_err(InitError::Grid)?;
-    Ok(Cugr { constants, design, grid, nets, cost_multiplier: 1.0, sort_slacks: None, sorts_done: 0, incremental_candidates: None, resistance_aware: false, critical_nets_percentage: 0.0, verbose: false, res_aware_percentage: 15.0, raw_slacks: None, raw_done: 0, constant_slack: None, worst: (1.0, 1.0, 1, 1), slack_source: SlackSource::default(), full_slack_update_done: false, parasitics_dirty_nets: Vec::new(), overflow_baseline: Vec::new() })
+    Ok(Cugr { constants, design, grid, nets, cost_multiplier: 1.0, sort_slacks: None, sorts_done: 0, incremental_candidates: None, resistance_aware: false, critical_nets_percentage: 0.0, verbose: false, res_aware_percentage: 15.0, raw_slacks: None, raw_done: 0, constant_slack: None, worst: (1.0, 1.0, 1, 1), slack_source: SlackSource::default(), full_slack_update_done: false, parasitics_dirty_nets: Vec::new(), overflow_baseline: Vec::new(), relief_kept: None })
 }
 
 #[cfg(test)]
@@ -1216,10 +1310,42 @@ mod tests {
         c.capture_overflow_baseline(None);
         c.incremental_candidates = Some(vec![0]);
         let mut t = Vec::new();
-        assert_eq!(c.relieve_incremental_overflow(Some(&mut t)).unwrap(), Vec::<usize>::new());
+        let mut log = Vec::<crate::log::Msg>::new();
+        assert_eq!(c.relieve_incremental_overflow(1, &mut log, Some(&mut t)).unwrap(), Vec::<usize>::new());
         assert_eq!(t, [format!("VYGR|relief|rerouted=1|congested=0|total={}", c.grid.total_overflow()), "VYGR|cong|".to_string()]);
         c.grid.graph_edges[2][1][1].demand += 2.0;
-        assert!(c.relieve_incremental_overflow(None).is_err(), "the rounds are refused until ported");
+        let mut t = Vec::new();
+        assert_eq!(c.relieve_incremental_overflow(1, &mut log, Some(&mut t)).unwrap(), Vec::<usize>::new(), "no neighbour to add");
+        assert_eq!(t.len(), 3, "entry, edges, moved: {t:?}");
+        assert_eq!(t[2], "VYGR|moved|");
+    }
+
+    // Upstream rule (CUGR `findNetsOnCongestedEdges`, f72dc020d2): a neighbour is a routed net that
+    // is neither a candidate nor stale and whose tree USES a congested edge; one near the edges whose
+    // tree does not use them is not added.
+    #[test]
+    fn the_relief_adds_only_fresh_non_candidate_nets_on_the_congested_edges() {
+        let mut c = router();
+        let mut n = congested(&mut c);
+        // As `GrNet::new` builds it: the pins' gcells, here (1,1) and (3,1).
+        n.bounding_box = geo::BoxT::new(1, 1, 3, 1);
+        c.nets = vec![n.clone(), n.clone(), n];
+        c.nets[2].stale = true;
+        assert_eq!(c.find_nets_on_congested_edges(&[(2, 1, 1)], &[true, false, false]).unwrap(), [1]);
+        assert_eq!(c.find_nets_on_congested_edges(&[(2, 4, 4)], &[false; 3]).unwrap(), Vec::<usize>::new());
+    }
+
+    // Upstream rule (CUGR `sumAddedOverflow`): each edge counts its overflow above the baseline,
+    // never less than 0 — an edge relieved below its baseline does not offset another.
+    #[test]
+    fn the_relief_sums_only_positive_added_overflow() {
+        let mut c = router();
+        let n = congested(&mut c);
+        c.nets = vec![n];
+        c.capture_overflow_baseline(None);
+        c.grid.graph_edges[2][1][1].demand -= 3.0;
+        c.grid.graph_edges[2][2][1].demand += 0.5;
+        assert!((c.sum_added_overflow(&[(2, 1, 1), (2, 2, 1)]) - 0.5).abs() < 1e-12);
     }
 
     fn router() -> Cugr {

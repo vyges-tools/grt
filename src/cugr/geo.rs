@@ -162,6 +162,14 @@ impl BoxT {
         self.x.update(p.x);
         self.y.update(p.y);
     }
+    /// `hasIntersectWith`: the intersection is valid in both dimensions (touching counts).
+    pub fn has_intersect_with(&self, rhs: &BoxT) -> bool {
+        self.x.intersect_with(&rhs.x).is_valid() && self.y.intersect_with(&rhs.y).is_valid()
+    }
+    /// `contain(pt)`: both coordinates within, bounds included.
+    pub fn contains(&self, p: Point) -> bool {
+        self.x.contains(p.x) && self.y.contains(p.y)
+    }
 }
 
 #[cfg(test)]

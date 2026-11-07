@@ -898,7 +898,10 @@ pub fn update_dirty_routes_cugr(
             cugr.mark_net_stale(index.get(name).copied(), trace.as_deref_mut());
         }
     }
-    cugr.route_incremental(queued, cg.iterations, &cg.alphas, stt, log, trace).map_err(|e| format!("cugr: {e:?}"))?;
+    let moved = cugr.route_incremental(queued, cg.iterations, &cg.alphas, stt, log, trace).map_err(|e| format!("cugr: {e:?}"))?;
+    if !moved.is_empty() {
+        return Err(format!("cugr: {} nets moved by the overflow relief need new routes and guides — not modelled", moved.len()).into());
+    }
     // findRoutingCugr over the rerouted nets.
     let grid_pins = |pins: &[crate::pins::NetPin]| -> Vec<crate::findrouting::GridPin> { pins.iter().map(|p| (p.on_grid.0, p.on_grid.1, p.connection_layer)).collect() };
     let pin_grid = crate::pins::PinGrid {
