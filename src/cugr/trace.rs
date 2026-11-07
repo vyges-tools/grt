@@ -273,10 +273,11 @@ pub fn slack_refresh(out: &mut Vec<String>, call: usize, r: &super::SlackRefresh
 }
 
 /// `mzacc|stage|iter|idx|delta|keep|relief|edges`: one maze transaction's verdict — the
-/// touched-edge overflow change (f64 bits), kept or rolled back, relief neighbour (never: the
-/// incremental relief is not modelled) and the new tree's touched-edge count.
-pub fn maze_accept(out: &mut Vec<String>, stage: i32, iteration: i32, k: usize, delta: f64, keep: bool, edges: usize) {
-    out.push(format!("VYGC|mzacc|{stage}|{iteration}|{k}|{:016x}|{}|0|{edges}", delta.to_bits(), u8::from(keep)));
+/// touched-edge overflow change (f64 bits), kept or rolled back, relief neighbour or not, and the
+/// new tree's touched-edge count.
+#[allow(clippy::too_many_arguments)]
+pub fn maze_accept(out: &mut Vec<String>, stage: i32, iteration: i32, k: usize, delta: f64, keep: bool, relief: bool, edges: usize) {
+    out.push(format!("VYGC|mzacc|{stage}|{iteration}|{k}|{:016x}|{}|{}|{edges}", delta.to_bits(), u8::from(keep), u8::from(relief)));
 }
 
 /// `mzret|stage|iter|accepted|rejected|change`: `mazeRoute`'s return (f64 bits).

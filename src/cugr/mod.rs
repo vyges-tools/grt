@@ -212,6 +212,40 @@ pub fn maze_keeps(delta: f64) -> bool {
     delta <= MAZE_ACCEPT_TOLERANCE
 }
 
+/// `RerouteOptions`: how a rip-up and reroute pass treats its nets. The relief alters it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RerouteOptions {
+    /// Per net index, finite for a relief neighbour: the longest planar route, in gcells, its
+    /// reroute may leave (it must also lower overflow). Empty: no net is a neighbour.
+    pub relief_max_length: Vec<f64>,
+    /// Refresh the slacks and the critical set before a maze pass.
+    pub refresh_critical: bool,
+}
+
+impl Default for RerouteOptions {
+    fn default() -> Self {
+        RerouteOptions { relief_max_length: Vec::new(), refresh_critical: true }
+    }
+}
+
+impl RerouteOptions {
+    /// Net `k`'s length limit: infinite unless it is a relief neighbour.
+    pub fn max_length(&self, k: usize) -> f64 {
+        self.relief_max_length.get(k).copied().unwrap_or(f64::INFINITY)
+    }
+}
+
+/// `mazeRoute`'s accept test: a relief neighbour (a finite length limit) keeps its reroute only if
+/// the touched edges' overflow DROPS beyond the tolerance and the new route's planar length is
+/// within the limit; any other net keeps it unless it adds overflow beyond the tolerance.
+pub fn maze_accepts(delta: f64, max_length: f64, new_length: i32) -> bool {
+    if max_length.is_finite() {
+        delta < -MAZE_ACCEPT_TOLERANCE && f64::from(new_length) <= max_length
+    } else {
+        maze_keeps(delta)
+    }
+}
+
 /// A stage that stopped where the reference would have gone on to something not modelled, or
 /// would have raised an error.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -579,11 +613,12 @@ impl Cugr {
     /// `MAZE_ACCEPT_TOLERANCE` the new route is ripped up and the saved one restored. Only the
     /// accepted nets are collected for the next slack refresh. Returns the accepted nets' summed
     /// overflow change.
-    pub fn maze_route(&mut self, nets: &mut [usize], stage: i32, iteration: i32, log: &mut dyn crate::log::Sink, mut trace: Option<&mut Vec<String>>) -> Result<f64, StageError> {
+    pub fn maze_route(&mut self, nets: &mut [usize], stage: i32, iteration: i32, options: &RerouteOptions, log: &mut dyn crate::log::Sink, mut trace: Option<&mut Vec<String>>) -> Result<f64, StageError> {
         if nets.is_empty() {
             return Ok(0.0);
         }
-        if self.critical_nets_percentage != 0.0 {
+        // The relief's passes skip the slack refresh, which would re-time each one.
+        if self.critical_nets_percentage != 0.0 && options.refresh_critical {
             // Maze passes keep the resistance-aware set the pattern stages chose.
             self.update_critical_nets(stage, ResAwareSet::Keep, trace.as_deref_mut())?;
         }
@@ -626,7 +661,8 @@ impl Cugr {
             let mut commits = Vec::new();
             self.commit_net(k, false, &mut commits)?;
             delta += self.grid.sum_overflow(&touched);
-            let keep = maze_keeps(delta);
+            let max_length = options.max_length(k);
+            let keep = maze_accepts(delta, max_length, GridGraph::tree_length(self.nets[k].routing_tree.as_ref()));
             if let Some(t) = trace.as_deref_mut() {
                 // The reference's order: the access points (chosen by the sparse graph), the maze
                 // (graph, paths, tree), then the DAG, the tree and the commits.
@@ -637,7 +673,7 @@ impl Cugr {
                 trace::maze(&mut maze, &self.nets[k], &route, &grid);
                 lines.splice(split..split, maze);
                 t.extend(lines);
-                trace::maze_accept(t, stage, iteration, k, delta, keep, touched.len());
+                trace::maze_accept(t, stage, iteration, k, delta, keep, max_length.is_finite(), touched.len());
             }
             if keep {
                 overflow_change += delta;
@@ -695,7 +731,7 @@ impl Cugr {
     /// `RRR_MIN_PASS_IMPROVEMENT` track, the loop stops (GRT-0124) — unless a congested NDR net
     /// is still waiting to be demoted. The multiplier is reset after, and with `verbose_` the
     /// demotions are totalled (GRT-0306).
-    pub fn iterative_rrr(&mut self, nets: &mut Vec<usize>, iterations: i32, log: &mut dyn crate::log::Sink, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
+    pub fn iterative_rrr(&mut self, nets: &mut Vec<usize>, iterations: i32, options: &RerouteOptions, log: &mut dyn crate::log::Sink, mut trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
         if self.grid.total_overflow() == 0 {
             return Ok(());
         }
@@ -753,7 +789,7 @@ impl Cugr {
             }
             // Only the congested nets are re-mazed, incremental or not (aeb3de12040): the
             // incremental scope is in the congested-set scan, which looks only at the candidates.
-            overflow_change += self.maze_route(nets, 5, i, log, trace.as_deref_mut())?;
+            overflow_change += self.maze_route(nets, 5, i, options, log, trace.as_deref_mut())?;
             stagnant_passes = rrr_stagnant_passes(stagnant_passes, overflow_change);
             if let Some(t) = trace.as_deref_mut() {
                 trace::rrr_stop(t, i, overflow_change, stagnant_passes, demotion_pending, self.grid.total_overflow());
@@ -1004,8 +1040,9 @@ impl Cugr {
         let mut nets = queued;
         self.pattern_route(&mut nets, alphas, stt, log, trace.as_deref_mut())?;
         self.pattern_route_with_detours(&mut nets, alphas, stt, log, trace.as_deref_mut())?;
-        self.maze_route(&mut nets, 4, 0, log, trace.as_deref_mut())?;
-        self.iterative_rrr(&mut nets, iterations, log, trace.as_deref_mut())?;
+        let options = RerouteOptions::default();
+        self.maze_route(&mut nets, 4, 0, &options, log, trace.as_deref_mut())?;
+        self.iterative_rrr(&mut nets, iterations, &options, log, trace.as_deref_mut())?;
         // The relief's moves would need new routes and guides too: refused above while unported.
         self.relieve_incremental_overflow(trace.as_deref_mut())?;
         self.incremental_candidates = None;
@@ -1469,6 +1506,24 @@ mod tests {
         assert!(maze_keeps(MAZE_ACCEPT_TOLERANCE));
         assert!(!maze_keeps(2e-9));
         assert!(!maze_keeps(0.5));
+    }
+
+    // Upstream rule (CUGR `mazeRoute` accept, 7c9cf5f4c37 / e31aba71d7e): a relief neighbour is a net
+    // with a FINITE length limit; it keeps a reroute only on a strict overflow drop beyond 1e-9 and
+    // a new planar length within the limit. Any other net keeps a sideways move (no change).
+    #[test]
+    fn a_relief_neighbour_moves_only_to_lower_overflow_within_its_length_limit() {
+        let inf = f64::INFINITY;
+        assert!(maze_accepts(0.0, inf, 1000), "not a neighbour: sideways is kept");
+        assert!(!maze_accepts(0.0, 10.0, 5), "a neighbour must lower overflow");
+        assert!(!maze_accepts(-MAZE_ACCEPT_TOLERANCE, 10.0, 5), "by more than the tolerance");
+        assert!(maze_accepts(-1.0, 10.0, 10), "at the limit");
+        assert!(!maze_accepts(-1.0, 10.0, 11), "past the limit");
+        assert!(maze_accepts(-1.0, 12.5, 12));
+        let o = RerouteOptions { relief_max_length: vec![inf, 7.5], refresh_critical: false };
+        assert_eq!((o.max_length(0), o.max_length(1), o.max_length(2)), (inf, 7.5, inf));
+        assert_eq!(RerouteOptions::default().max_length(0), inf);
+        assert!(RerouteOptions::default().refresh_critical);
     }
 
     // Upstream rule (`GRNet::saveRoute` / `restoreRoute`): a rollback restores the tree, its

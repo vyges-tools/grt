@@ -365,9 +365,10 @@ pub fn route_cugr(db: &mut Db, opts: &RouteOptions, call: usize, stt: SteinerBui
     let mut nets = ci.cugr.congested_nets(2, trace.as_deref_mut());
     ci.cugr.pattern_route_with_detours(&mut nets, &alphas, stt, &mut log, trace.as_deref_mut()).map_err(fail)?;
     let mut nets = ci.cugr.congested_nets(3, trace.as_deref_mut());
-    ci.cugr.maze_route(&mut nets, 4, 0, &mut log, trace.as_deref_mut()).map_err(fail)?;
+    let options = super::RerouteOptions::default();
+    ci.cugr.maze_route(&mut nets, 4, 0, &options, &mut log, trace.as_deref_mut()).map_err(fail)?;
     let mut nets = ci.cugr.congested_nets(4, trace.as_deref_mut());
-    ci.cugr.iterative_rrr(&mut nets, opts.congestion_iterations, &mut log, trace.as_deref_mut()).map_err(fail)?;
+    ci.cugr.iterative_rrr(&mut nets, opts.congestion_iterations, &options, &mut log, trace.as_deref_mut()).map_err(fail)?;
     // `route(false)` ends with `printStatistics` (reports only), then `captureOverflowBaseline`.
     ci.cugr.capture_overflow_baseline(trace.as_deref_mut());
     if let Some(t) = trace {
