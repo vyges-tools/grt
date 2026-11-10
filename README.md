@@ -1,5 +1,7 @@
 # vyges-grt
 
+**[Download Loom](https://vyges.com/products/vyges-cli/#install)** · install the free [Vyges CLI](https://vyges.com/products/vyges-cli/), then `vyges install physical`
+
 Global routing over a placed design.
 
 A global router decides, per net, which cells of a coarse routing grid the detailed router may
