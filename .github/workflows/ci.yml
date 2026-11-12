@@ -59,7 +59,7 @@ jobs:
         with:
           repository: vyges-tools/layout
           path: vyges-tools-layout
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.100.0
       - name: Test
         run: cargo test --release --verbose
 
@@ -108,7 +108,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake g++ git bison libboost-dev libboost-iostreams-dev libbz2-dev zlib1g-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.100.0
 
       # No --locked: Cargo.lock is gitignored, and the [patch] resolves the sibling crates to the
       # freshly checked-out repos @ main — let Cargo resolve.
