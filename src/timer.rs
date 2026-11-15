@@ -236,7 +236,8 @@ fn net_slacks_timed(timing: &Timing, nl: &Netlist, par: &HashMap<String, NetPara
             s
         }
     };
-    let index: HashMap<&str, usize> = g.vertices.iter().enumerate().map(|(i, v)| (v.name.as_str(), i)).collect();
+    let names: Vec<String> = (0..g.vertices.len()).map(|v| g.vname(v)).collect();
+    let index: HashMap<&str, usize> = names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
     Ok(nl
         .nets
         .iter()
