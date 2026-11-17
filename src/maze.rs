@@ -85,6 +85,7 @@ pub struct Heaps {
 ///
 /// ⚠️ **Only points inside the enlarged region are seeded.** The rest of the subtree exists but
 /// is out of reach of this search.
+#[allow(clippy::needless_range_loop)] // index loops walk the grids by the coordinates the traces report
 pub fn setup_heap(
     num_terminals: usize,
     nodes: &[MazeNode],

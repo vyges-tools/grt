@@ -815,6 +815,7 @@ fn append_segments(t: &RsmtTree, edge_cost: i8, seglist: &mut Vec<RoutedSegment>
 ///
 /// ⛔ The costs are `int += double` — truncated at EVERY add, not once at the end — and a tie on
 /// cost keeps the lowest position; a tie on benefit keeps the first pair.
+#[allow(clippy::needless_range_loop)] // index loops walk the grids by the coordinates the traces report
 pub fn edge_shift(t: &mut RsmtTree, num_pins: usize, est: &EstimateGrid) -> i32 {
     let size_v = 2 * num_pins;
     let mut nbr = vec![0usize; size_v * 3];

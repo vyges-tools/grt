@@ -71,6 +71,7 @@ fn dedup_key(s: Segment) -> Segment {
 /// `getPlanarRoute(db_net, route)` over one net's edges.
 ///
 /// ⚠️ A zero-length edge is not routed and contributes nothing.
+#[allow(clippy::needless_range_loop)] // index loops walk the grids by the coordinates the traces report
 pub fn planar_route(edges: &[PlanarEdge<'_>], net_min_layer: usize, layer_dir: &[LayerDir], origin: GridOrigin) -> Vec<Segment> {
     let (layer_h, layer_v) = pseudo_layers(net_min_layer, layer_dir);
     let GridOrigin { tile_size, x_corner, y_corner } = origin;

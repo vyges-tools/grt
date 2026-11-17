@@ -132,6 +132,7 @@ pub enum RouteDefect {
 ///
 /// ⛔ **The edge gate here is `len == 0`, not `len > 0`.** An edge with a *negative* length is
 /// therefore checked, where the via count would skip it. Transcribed as written.
+#[allow(clippy::needless_range_loop)] // index loops walk the grids by the coordinates the traces report
 pub fn check_route_3d(nodes: &[RoutedNode], edges: &[RoutedEdge]) -> Vec<RouteDefect> {
     let mut out = Vec::new();
 
@@ -202,6 +203,7 @@ pub struct ViaStackEdge {
 /// runs all the way to the layer count.
 ///
 /// ⚠️ The range is keyed by **position**, so two pins sharing a position share a range.
+#[allow(clippy::needless_range_loop)] // index loops walk the grids by the coordinates the traces report
 pub fn ensure_pin_coverage(
     terminals: &[RoutedNode],
     edges: &[RoutedEdge],

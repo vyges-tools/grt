@@ -1436,6 +1436,7 @@ mod tests {
     }
 
     /// A net on m3 (horizontal) from cell (1,1) to (3,1), every edge on its way overfull.
+    #[allow(clippy::needless_range_loop)] // index loops walk the grids by the coordinates the traces report
     fn congested(c: &mut Cugr) -> GrNet {
         let mut t = GrTree::default();
         let a = t.add(2, Point::new(1, 1));

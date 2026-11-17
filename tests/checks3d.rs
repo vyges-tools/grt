@@ -300,6 +300,7 @@ fn the_pin_coverage_pass_adds_nothing_on_any_captured_net() {
 ///
 /// ⚠️ Asserted as the limitation, with the constructed cases below covering the rules.
 #[test]
+#[allow(clippy::needless_range_loop)] // index loop walks the grids as the route trace reports them
 fn no_captured_pin_is_left_uncovered() {
     let all = load("pincoverage");
     let (mut pins, mut untouched, mut would_add) = (0usize, 0usize, 0usize);
