@@ -751,6 +751,20 @@ pub fn setup_nets(db: &Db, t: &TechSetup, e: &mut RouterEdges, has_macros_or_pad
     Ok(setup_nets_counted(db, t, e, has_macros_or_pads, opts, log)?.0)
 }
 
+/// Each name to the position of its FIRST entry — what a front-to-back `find` by name returned —
+/// built once, so walking an order of names costs one lookup per name, not a scan of the list.
+///
+/// Upstream: `findNets` returns the `Net*` objects themselves, and `initNetlist` /
+/// `saveGuides` iterate them (or `db_net_map_`, a map keyed by `dbNet*`); reaching a net from its
+/// place in the order is O(1). Our order is a list of names, so this index carries that cost.
+fn first_index_by_name<'a>(names: impl IntoIterator<Item = &'a str>) -> std::collections::HashMap<&'a str, usize> {
+    let mut at = std::collections::HashMap::new();
+    for (k, name) in names.into_iter().enumerate() {
+        at.entry(name).or_insert(k);
+    }
+    at
+}
+
 /// [`setup_nets`], and how many routable nets it left out because they already have wiring.
 pub fn setup_nets_counted(db: &Db, t: &TechSetup, e: &mut RouterEdges, has_macros_or_pads: bool, opts: &RouteOptions, log: &mut dyn crate::log::Sink) -> Res<(Vec<RouterNet>, usize)> {
     let (min, max) = (t.min_routing_layer, t.max_routing_layer);
@@ -795,10 +809,13 @@ pub fn setup_nets_counted(db: &Db, t: &TechSetup, e: &mut RouterEdges, has_macro
     let order_all = order.clone();
     // I14 initNetlist — no seed: the order stands. (addResourcesForPinAccess closes it, below.)
     let grid = NetlistGrid { x_min: die.x_min, y_min: die.y_min, tile_size: t.core.tile_size, x_grids: t.core.x_grids, y_grids: t.core.y_grids, num_layers: t.core.num_layers };
+    // findNets hands initNetlist the Net objects themselves; the order here is names, so each is
+    // reached through one index built once, never a scan of `nets` per name.
+    let at = first_index_by_name(nets.iter().map(|(n, _)| n.name.as_str()));
     let mut out = Vec::new();
     let mut already_wired = 0usize;
     for name in order {
-        let (n, pins) = nets.iter().find(|(n, _)| n.name == name).expect("ordered from these");
+        let (n, pins) = &nets[at[name.as_str()]];
         let conn: Vec<i32> = pins.iter().map(|(p, _)| p.connection_layer).collect();
         let (lo, hi) = get_net_layer_range(&conn, non_leaf(n), min, max, clk_min, clk_max);
         // Net::hasStackedVias — only a net of vias and no wire segments reads the decoded via
@@ -862,7 +879,7 @@ pub fn setup_nets_counted(db: &Db, t: &TechSetup, e: &mut RouterEdges, has_macro
         let ordered: Vec<(bool, Vec<crate::netlist::AccessPinFacts>)> = order_all
             .iter()
             .map(|name| {
-                let (_, pins) = nets.iter().find(|(n, _)| &n.name == name).expect("ordered from these");
+                let (_, pins) = &nets[at[name.as_str()]];
                 let facts: Vec<crate::netlist::AccessPinFacts> = pins
                     .iter()
                     .map(|(p, _)| crate::netlist::AccessPinFacts { on_grid: p.on_grid, connection_layer: p.connection_layer, edge: p.edge, connected_to_pad_or_macro: p.connected_to_pad_or_macro })
@@ -2183,10 +2200,11 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     let total_overflow = ov.overflow;
     let guide_is_congested = total_overflow > 0 && !opts.allow_congestion;
     let order = db.net_names();
+    let at = first_index_by_name(nets.iter().map(|n| n.name.as_str()));
     let net_routes: Vec<crate::NetRoute> = order
         .iter()
         .filter_map(|name| {
-            let n = nets.iter().find(|n| &n.name == name)?;
+            let n = &nets[*at.get(name.as_str())?];
             Some(crate::NetRoute {
                 name: name.clone(),
                 segments: by_name.get(name).cloned().unwrap_or_default(),
@@ -3282,5 +3300,27 @@ mod restore_capacities_tests {
         let got = restore_capacities_from_db(&mut e, &g3, &map, &mut ndr);
         assert_eq!(got, RestoredCapacities { changed: 0, kept: 2 });
         assert!(e.h3.iter().all(|s| s.cap == 5));
+    }
+}
+
+#[cfg(test)]
+mod first_index_by_name_tests {
+    use super::first_index_by_name;
+
+    /// Rule (`findNets` → `initNetlist`): the router walks the ORDER it was given, reaching each net
+    /// by an O(1) lookup (upstream holds `Net*` objects; we hold names, resolved through this index).
+    /// The order walked is the order given, each name resolves to the entry a front-to-back `find`
+    /// returned (the first one, should a name repeat), and a name not in the list resolves to none.
+    #[test]
+    fn an_order_of_names_resolves_to_the_entries_a_find_returned() {
+        let nets = ["n3", "clk", "n1", "n2", "n1"];
+        let at = first_index_by_name(nets.iter().copied());
+        let order = ["clk", "n1", "n2", "n3"];
+        let by_index: Vec<usize> = order.iter().map(|n| at[n]).collect();
+        let by_scan: Vec<usize> = order.iter().map(|n| nets.iter().position(|m| m == n).unwrap()).collect();
+        assert_eq!(by_index, by_scan);
+        assert_eq!(by_index, vec![1, 2, 3, 0]);
+        assert_eq!(at.get("absent"), None);
+        assert_eq!(at.len(), 4);
     }
 }
