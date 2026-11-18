@@ -648,17 +648,40 @@ fn all_layer_edge_costs(n: &RouterNet, num_layers: usize) -> Vec<i8> {
 /// (`getPrefAccessPoints`), offset by the instance's location (orientation R0 — the router stores
 /// them oriented), as `(routing level, x, y)`.
 ///
-/// ⛔ A non-core pin reads EVERY access point, from a map keyed by master-pin pointer — an order
-/// not reproduced here: refused when it has any.
+/// A NON-core pin reads EVERY access point instead (`dbITerm::getAccessPoints`), even when it has
+/// preferred ones: the detailed router assigns non-core cells none, so all of them keep the guides
+/// covering at least one. That container is a map keyed by master pin and compared by object id,
+/// so the order is master pins by ascending id, each pin's points in stored order — what
+/// `Db::iterm_access_points` returns.
 fn iterm_access_points(db: &Db, inst: &str, term: &str, is_core: bool) -> Res<Vec<AccessPoint>> {
-    if !is_core {
-        if db.iterm_access_point_count(inst, term)? > 0 {
-            return Err(format!("{inst}/{term}: a non-core terminal's access points (every master pin's, pointer-ordered) are not modelled").into());
-        }
-        return Ok(Vec::new());
-    }
     let (ix, iy) = db.inst_location(inst);
-    Ok(db.iterm_pref_access_points(inst, term)?.into_iter().map(|(x, y, l)| (l, x + ix, y + iy)).collect())
+    let stored = match iterm_ap_source(is_core) {
+        ApSource::Preferred => db.iterm_pref_access_points(inst, term)?,
+        ApSource::Every => db.iterm_access_points(inst, term)?,
+    };
+    Ok(placed_access_points(stored, (ix, iy)))
+}
+
+/// Which of an instance terminal's stored access points a router reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApSource {
+    /// `getPrefAccessPoints`: the detailed router's chosen point per master pin.
+    Preferred,
+    /// `getAccessPoints`: every point of every master pin.
+    Every,
+}
+
+/// FastRoute's `findPinAccessPointPositions` (`all_access_points` false): a core pin reads its
+/// preferred points — and only those, even when there are none; any other pin reads every point,
+/// even when it has preferred ones.
+pub(crate) fn iterm_ap_source(is_core: bool) -> ApSource {
+    if is_core { ApSource::Preferred } else { ApSource::Every }
+}
+
+/// An instance terminal's stored points `(x, y, routing level)` offset by the instance's location
+/// under R0 (the stored point is already oriented), as `(routing level, x, y)`, in input order.
+fn placed_access_points(stored: Vec<(i32, i32, i32)>, (ix, iy): (i32, i32)) -> Vec<AccessPoint> {
+    stored.into_iter().map(|(x, y, l)| (l, x + ix, y + iy)).collect()
 }
 
 pub(crate) fn discover_net_pins<'a>(
@@ -3326,5 +3349,27 @@ mod first_index_by_name_tests {
         assert_eq!(by_index, vec![1, 2, 3, 0]);
         assert_eq!(at.get("absent"), None);
         assert_eq!(at.len(), 4);
+    }
+}
+
+#[cfg(test)]
+mod iterm_ap_source_tests {
+    use super::*;
+
+    /// Upstream rule (`GlobalRouter::findPinAccessPointPositions`): `isCorePin()` picks the
+    /// preferred points; a non-core pin (block macro, pad) reads `getAccessPoints()` — every master
+    /// pin's points — whether or not preferred ones exist.
+    #[test]
+    fn a_core_pin_reads_its_preferred_points_and_a_non_core_pin_reads_every_point() {
+        assert_eq!(iterm_ap_source(true), ApSource::Preferred);
+        assert_eq!(iterm_ap_source(false), ApSource::Every);
+    }
+
+    /// The stored point is relative to the instance location and already oriented: placing it is
+    /// a plain offset (R0), and the order of the input — the reference's container order — is kept.
+    #[test]
+    fn placed_points_are_offset_by_the_location_in_input_order() {
+        let stored = vec![(110, 92400, 3), (70, 92400, 3), (5, 6, 2)];
+        assert_eq!(placed_access_points(stored, (120200, 100100)), vec![(3, 120310, 192500), (3, 120270, 192500), (2, 120205, 100106)]);
     }
 }

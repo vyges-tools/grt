@@ -142,13 +142,16 @@ fn read_nets(db: &Db, clock_nets: &BTreeSet<String>, masters: &mut BTreeMap<Stri
             let (orient, origin) = (db.inst_get_orient(inst), (db.inst_get_origin_x(inst), db.inst_get_origin_y(inst)));
             let shapes = masters[&master].pins.get(term).map(|v| v.iter().map(|&b| transformed(&orient, origin, b, db)).collect()).unwrap_or_default();
             // findODBAccessPoints: the preferred access points, offset by the instance's location
-            // (orientation R0). ⛔ A non-core instance without them reads EVERY access point,
-            // pointer-ordered by master pin — refused when there are any.
+            // (orientation R0). A non-core instance WITHOUT them reads every access point
+            // (`getAccessPoints`: master pins by ascending id, each pin's in stored order).
             let (ix, iy) = db.inst_location(inst);
-            let access_points: Vec<(i32, i32, i32)> = db.iterm_pref_access_points(inst, term)?.into_iter().map(|(x, y, l)| (x + ix, y + iy, l)).collect();
-            if access_points.is_empty() && !db.master_is_core(&master) && db.iterm_access_point_count(inst, term)? > 0 {
-                return Err(format!("cugr: {iterm}: a non-core terminal's access points (every master pin's, pointer-ordered) are not modelled").into());
+            let mut stored = db.iterm_pref_access_points(inst, term)?;
+            // Upstream rule (CUGR `findODBAccessPoints`, unlike FastRoute): preferred first; only a
+            // non-core pin with NO preferred point falls back to every point.
+            if stored.is_empty() && !db.master_is_core(&master) {
+                stored = db.iterm_access_points(inst, term)?;
             }
+            let access_points: Vec<(i32, i32, i32)> = stored.into_iter().map(|(x, y, l)| (x + ix, y + iy, l)).collect();
             pins.push(PinFacts { name: iterm.clone(), is_port: false, has_location: true, shapes, access_points });
         }
         let swire_boxes = db.net_swire_expanded_boxes(&name)?.into_iter().map(|(n, via, x0, y0, x1, y1)| (Shape { layer: shape_layer(db, n), rect: (x0, y0, x1, y1) }, via)).collect();
