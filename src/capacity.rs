@@ -127,16 +127,16 @@ pub fn check_adjacent_layers_direction(
 impl CoreGrid {
     /// The centre of grid cell `(x, y)`, by index.
     ///
-    /// ⚠️ The reference computes this as `tile_size * (x + 0.5) + origin` in **floating point**,
-    /// truncating on assignment. The integer form below is equal for every positive tile size —
-    /// `floor(t*(x + 0.5)) == t*x + floor(t/2)` because `t*x` is exact — and avoids the precision
-    /// question entirely. Stated rather than assumed, because "it is the same" is the kind of
-    /// claim that turns out to be false at the edges.
+    /// ⚠️ As the reference computes it (`Grid::getPositionFromGridPoint`):
+    /// `tile_size * (x + 0.5) + origin` in **double**, truncated toward zero on assignment to
+    /// `int`. NOT the integer form `t*x + t/2 + origin` that `getPositionOnGrid` uses: the two
+    /// part when the tile is odd and the position negative, where truncation rounds the `.5` up
+    /// toward zero (tile 3, x 0, origin -10: -8, not -9). Every value here is an integer or a
+    /// half-integer well inside a double's exact range, so the double form is exact up to the
+    /// truncation.
     pub fn position_from_grid_point(&self, x: i32, y: i32) -> (i32, i32) {
-        (
-            x * self.tile_size + self.tile_size / 2 + self.area.x_min,
-            y * self.tile_size + self.tile_size / 2 + self.area.y_min,
-        )
+        let at = |i: i32, origin: i32| (f64::from(self.tile_size) * (f64::from(i) + 0.5) + f64::from(origin)) as i32;
+        (at(x, self.area.x_min), at(y, self.area.y_min))
     }
 
     /// The rectangle grid cell `(x, y)` covers.
@@ -442,4 +442,28 @@ pub fn init_edges_capacity_per_layer(c: &EdgeCapacities) -> (Vec<CapNdr>, Vec<Ca
         }
     }
     (h, v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn grid(tile_size: i32, x0: i32, y0: i32) -> CoreGrid {
+        CoreGrid { area: Rect::new(x0, y0, x0 + 64 * tile_size, y0 + 64 * tile_size), tile_size, x_grids: 64, y_grids: 64, perfect_regular_x: true, perfect_regular_y: true, num_layers: 1 }
+    }
+
+    /// Rule (`Grid::getPositionFromGridPoint`, OpenROAD 4155ac31): `int(tile * (x + 0.5) + xMin)`,
+    /// computed in double and truncated toward zero, not the integer `x*tile + tile/2 + xMin` of
+    /// `getPositionOnGrid`. They part exactly when the tile is odd and the position negative,
+    /// where the reference is the integer form + 1: tile 3, x 0, xMin -10 is -8, not -9.
+    #[test]
+    fn a_grid_point_is_centred_in_double_and_truncated_toward_zero() {
+        assert_eq!(grid(3, -10, -10).position_from_grid_point(0, 0), (-8, -8), "odd tile, negative: -8.5 truncates to -8");
+        assert_eq!(grid(5, -100, 7).position_from_grid_point(3, 1), (-82, 14), "-82.5 to -82; 14.5 to 14");
+        assert_eq!(grid(3, 0, 0).position_from_grid_point(1, 2), (4, 7), "odd tile, positive: as the integer form");
+        assert_eq!(grid(4, -10, -10).position_from_grid_point(0, 1), (-8, -4), "even tile: exact either way");
+        // the rectangle follows its centre: one tile wide, starting half a tile below it
+        let r = grid(3, -10, -10).gcell_rect(0, 0);
+        assert_eq!((r.x_min, r.y_min, r.x_max, r.y_max), (-9, -9, -7, -7));
+    }
 }
