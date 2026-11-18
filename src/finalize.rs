@@ -86,6 +86,9 @@ pub struct NetLayerAttrs {
     /// `getLayerEdgeCost(l)` for EVERY layer — the per-layer vector, indexed by absolute layer, or 1
     /// throughout for a net without one (or a soft-NDR net).
     pub layer_edge_cost: Vec<i8>,
+    /// The NDR layer rule's width per router layer (0-based), `None` where the rule lists no rule
+    /// for the layer; EMPTY for a net with no NDR. `getWireResistance` prices at it.
+    pub ndr_width: Vec<Option<i32>>,
     /// `getNetSlack` — the timer's slack for the net, which `updateSlacks` writes when it runs.
     pub sta_slack: f32,
 }
@@ -182,10 +185,10 @@ fn set_percentage(p: &LayerParams<'_>, pct: f32) {
 ///
 /// ⚠️ Before layer assignment the 2D routes carry no layers: every point reads the same one, so
 /// no via is counted.
-fn net_resistance_on_layer(id: usize, nets: &[RsmtNet<'_>], state: &[NetState], ra: &ResAware<'_>, layer: Option<i32>) -> f32 {
+fn net_resistance_on_layer(id: usize, nets: &[RsmtNet<'_>], attrs: &[NetLayerAttrs], state: &[NetState], ra: &ResAware<'_>, layer: Option<i32>) -> f32 {
     let (lo, hi) = state[id].layer_range.unwrap_or((nets[id].min_layer, nets[id].max_layer));
     let wn = WireNet { ndr_width: None, min_layer: lo as i32, max_layer: hi as i32 };
-    let wire = |l: i32, seg: i32| crate::pricing::get_wire_resistance(&ra.tech, l, seg * ra.tile_size, wn);
+    let wire = |l: i32, seg: i32| crate::pricing::get_wire_resistance(&ra.tech, l, seg * ra.tile_size, wn.on_layer(&attrs[id].ndr_width, l));
     let mut total = 0.0f32;
     match (&state[id].tree3d, layer) {
         (Some(t), None) => {
@@ -247,7 +250,7 @@ fn update_slacks(net_ids: &[usize], nets: &[RsmtNet<'_>], attrs: &[NetLayerAttrs
     }).collect();
     let resistance: Vec<f32> = net_ids.iter().map(|&id| {
         let layer = if is_3d_step { None } else { Some(state[id].layer_range.map_or(nets[id].min_layer, |r| r.0) as i32) };
-        net_resistance_on_layer(id, nets, state, &ra, layer)
+        net_resistance_on_layer(id, nets, attrs, state, &ra, layer)
     }).collect();
     let input: Vec<crate::slacks::NetSlackInput<'_>> = net_ids.iter().zip(&lens).zip(&resistance).map(|((&id, len), &res)| crate::slacks::NetSlackInput {
         net_id: id,
@@ -459,7 +462,7 @@ fn assign_edge(net: &RsmtNet<'_>, attrs: &NetLayerAttrs, res_aware: bool, range:
         if ra.member {
             let wn = WireNet { ndr_width: None, min_layer: widened.min_layer as i32, max_layer: widened.max_layer as i32 };
             for (l, w) in wire.iter_mut().enumerate() {
-                *w = i64::from(crate::pricing::get_wire_cost(&ra.tech, true, l as i32, ra.tile_size, wn));
+                *w = i64::from(crate::pricing::get_wire_cost(&ra.tech, true, l as i32, ra.tile_size, wn.on_layer(&attrs.ndr_width, l as i32)));
             }
             for (l, row) in via.iter_mut().enumerate() {
                 for (i, v) in row.iter_mut().enumerate() {
@@ -678,7 +681,7 @@ pub fn maze_route_msmd_order_3d_all(order: &[usize], nets: &[RsmtNet<'_>], attrs
         let effective = call.resistance_aware && state[id].res_aware;
         let (lo, hi) = state[id].layer_range.unwrap_or((nets[id].min_layer, nets[id].max_layer));
         let wn = WireNet { ndr_width: None, min_layer: lo as i32, max_layer: hi as i32 };
-        let price = |from: usize, to: usize, via: bool| get_maze_route_cost_3d(tech, effective, p.via_cost, tile_size, MoveCost { from_layer: from as i32, to_layer: to as i32, dx: i32::from(!via), dy: 0, is_via: via }, wn);
+        let price = |from: usize, to: usize, via: bool| get_maze_route_cost_3d(tech, effective, p.via_cost, tile_size, MoveCost { from_layer: from as i32, to_layer: to as i32, dx: i32::from(!via), dy: 0, is_via: via }, wn.on_layer(&attrs[id].ndr_width, from as i32));
         pass_nets.push(PassNet {
             tree: state[id].tree3d.take().ok_or_else(|| format!("net {id}: no 3D tree"))?,
             min_layer: lo as i32,

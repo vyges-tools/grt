@@ -612,7 +612,7 @@ fn replay_chain(who: &str, pass: usize, c5: &Value, c7: &Value, group: &[&Value]
     let (b15, b16) = (at_b("B15"), at_b("B16"));
     let attrs = match (b15, b16) {
         (Some(b15), Some(b16)) => layer_attrs(b15, b16, max_id + 1),
-        _ => vec![NetLayerAttrs { pin_layers: Vec::new(), has_ndr: false, is_clock: false, is_res_aware: false, layer_edge_cost: Vec::new(), sta_slack: 0.0 }; max_id + 1],
+        _ => vec![NetLayerAttrs { pin_layers: Vec::new(), has_ndr: false, is_clock: false, is_res_aware: false, layer_edge_cost: Vec::new(), ndr_width: Vec::new(), sta_slack: 0.0 }; max_id + 1],
     };
     let dims = b15.map(|b| b["dims"].clone()).unwrap_or(Value::Null);
     let dirs: Vec<LayerDir> = if dims.is_null() { Vec::new() } else { arr(&dims["dirs"]).iter().map(|d| match d.as_str() { Some("H") => LayerDir::Horizontal, Some("V") => LayerDir::Vertical, _ => LayerDir::Other }).collect() };
@@ -939,7 +939,7 @@ fn graph3d_from(b: &Value, xg: usize, yg: usize) -> Graph3d {
 /// `isResAware` on entry, `getLayerEdgeCost` over every layer — and the timer's slack, which
 /// `updateSlacks` writes when it runs: an INPUT, read from B16 after it ran.
 fn layer_attrs(b15: &Value, b16: &Value, n: usize) -> Vec<NetLayerAttrs> {
-    let mut out = vec![NetLayerAttrs { pin_layers: Vec::new(), has_ndr: false, is_clock: false, is_res_aware: false, layer_edge_cost: Vec::new(), sta_slack: 0.0 }; n];
+    let mut out = vec![NetLayerAttrs { pin_layers: Vec::new(), has_ndr: false, is_clock: false, is_res_aware: false, layer_edge_cost: Vec::new(), ndr_width: Vec::new(), sta_slack: 0.0 }; n];
     // A call with no routed nets writes no pin layers at all.
     let none = serde_json::Map::new();
     for (id, pl) in b15["pin_layers"].as_object().unwrap_or(&none) {
@@ -952,6 +952,7 @@ fn layer_attrs(b15: &Value, b16: &Value, n: usize) -> Vec<NetLayerAttrs> {
             is_clock: int(&a[1]) == 1,
             is_res_aware: int(&a[2]) == 1,
             layer_edge_cost: arr(&a[6]).iter().map(|v| int(v) as i8).collect(),
+            ndr_width: Vec::new(),
             sta_slack,
         };
     }
@@ -1581,7 +1582,7 @@ fn la_case(dirs: &[LayerDir], xg: usize, yg: usize, spec: &[LaNet], cap: impl Fn
         layer_edge_cost: &n.lec[n.range.0..=n.range.1],
         ..net(&p.0, &p.1)
     }).collect();
-    let attrs: Vec<NetLayerAttrs> = spec.iter().map(|n| NetLayerAttrs { pin_layers: vec![0; n.pins.len()], has_ndr: n.ndr, is_clock: n.clock, is_res_aware: false, layer_edge_cost: n.lec.clone(), sta_slack: 0.0 }).collect();
+    let attrs: Vec<NetLayerAttrs> = spec.iter().map(|n| NetLayerAttrs { pin_layers: vec![0; n.pins.len()], has_ndr: n.ndr, is_clock: n.clock, is_res_aware: false, layer_edge_cost: n.lec.clone(), ndr_width: Vec::new(), sta_slack: 0.0 }).collect();
     let layers = |h: bool| -> Vec<Vec<u16>> { (0..nl).map(|l| (0..xg * yg).map(|i| cap(h, l, i % xg, i / xg)).collect()).collect() };
     let mut g3 = Graph3d { x_grid: xg, num_layers: nl, h_cap: layers(true), v_cap: layers(false), h_usage: vec![vec![0; xg * yg]; nl], v_usage: vec![vec![0; xg * yg]; nl] };
     let p = LayerParams { layer_dir: dirs, resistance_aware, liberty: false, has_2d_overflow, ra: None, incremental: false };

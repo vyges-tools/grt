@@ -39,6 +39,17 @@ pub struct WireNet {
     pub max_layer: i32,
 }
 
+impl WireNet {
+    /// The net priced on `layer`: `getWireResistance` asks the net's NDR for the layer rule of
+    /// THAT layer (`ndr->getLayerRule(getTechLayer(layer))`) and prices at its width; a layer the
+    /// rule does not list, or a net with no NDR (`ndr_width` empty), keeps the layer's default
+    /// width. `ndr_width` is indexed by the router's 0-based layer.
+    pub fn on_layer(self, ndr_width: &[Option<i32>], layer: i32) -> WireNet {
+        let w = usize::try_from(layer).ok().and_then(|l| ndr_width.get(l).copied().flatten());
+        WireNet { ndr_width: w, ..self }
+    }
+}
+
 /// `dbBlock::dbuToMicrons`: `dbu / (double) dbu_per_micron`.
 fn dbu_to_microns(t: &TechLayers, dbu: i32) -> f64 {
     dbu as f64 / t.dbu_per_micron as f64
@@ -205,5 +216,45 @@ mod layer_rc_tests {
         let res: f64 = (7.176e-02 * 1e3) / (1.0 * 1e-6);
         let as_double: f64 = 170.0 / 1000.0 * 1e-6 * res;
         assert_ne!(as_double.to_bits(), set_dblayer_wire_r(7.176e-02, 1e3, 1e-6, 170, 1000).to_bits());
+    }
+}
+
+#[cfg(test)]
+mod ndr_width_tests {
+    use super::*;
+
+    /// sky130hs after `source sky130hs.rc` (the reference's own `getResistance()` per routing
+    /// layer as f64 bits, router layer `l` = routing level `l + 1`), and the NDR of probe `res_aware_ndr_*`
+    /// (2x width on every layer).
+    fn sky130hs() -> TechLayers {
+        TechLayers {
+            dbu_per_micron: 1000,
+            width: vec![170, 140, 140, 300, 300, 1600],
+            resistance: [0x402865fd8be34bec_u64, 0x3fc0003255946443, 0x3fc0003255946443, 0x3fa811b1da307fc0, 0x3fa811b1da307fc0, 0x3f9d2e0e3180d6d3].map(f64::from_bits).to_vec(),
+            via_resistance: vec![None; 6],
+        }
+    }
+
+    /// Rule (`FastRouteCore::getWireResistance`): a net with an NDR is priced on each layer at
+    /// THAT layer's rule width (`ndr->getLayerRule(getTechLayer(layer))->getWidth()`), its
+    /// resistance per micron `getResistance() / (float) width_um` in the same precision as the
+    /// default; a layer the rule does not list keeps the default width. Witness: the reference
+    /// traced on `res_aware_ndr_30` (net `clk`, one tile of 7200 dbu), bits of the final value.
+    #[test]
+    fn an_ndr_net_is_priced_at_the_rule_width_of_each_layer() {
+        let t = sky130hs();
+        let ndr: Vec<Option<i32>> = vec![Some(340), Some(280), Some(280), Some(600), Some(600), Some(3200)];
+        let net = WireNet { ndr_width: None, min_layer: 0, max_layer: 5 };
+        for (layer, bits) in [(1, 0x404db962u32), (2, 0x404db962), (3, 0x3f106a2b), (4, 0x3f106a2b), (5, 0x3d834f40)] {
+            assert_eq!(get_wire_resistance(&t, layer, 7200, net.on_layer(&ndr, layer)).to_bits(), bits, "layer {layer}");
+        }
+        // The default width prices differently: the check can fail.
+        assert_ne!(get_wire_resistance(&t, 1, 7200, net).to_bits(), 0x404db962);
+        // A layer the rule lists no width for, and a net with no NDR, keep the default.
+        let partial: Vec<Option<i32>> = vec![None, None, Some(280)];
+        assert_eq!(net.on_layer(&partial, 1), net);
+        assert_eq!(net.on_layer(&partial, 2).ndr_width, Some(280));
+        assert_eq!(net.on_layer(&partial, 9), net);
+        assert_eq!(net.on_layer(&[], 1), net);
     }
 }

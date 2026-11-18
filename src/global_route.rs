@@ -628,6 +628,12 @@ fn net_range_edge_costs(n: &RouterNet) -> Vec<i8> {
 }
 
 /// `getLayerEdgeCost(l)` for every layer `0..num_layers` (layer assignment's view).
+/// The NDR layer rule's width per router layer (0-based: routing level `l + 1`), `None` where the
+/// rule lists no rule for that layer; empty for a net with no NDR.
+fn ndr_width_by_layer(n: &RouterNet, num_layers: usize) -> Vec<Option<i32>> {
+    n.ndr_widths.as_ref().map_or_else(Vec::new, |m| (0..num_layers).map(|l| m.get(&(l as i32 + 1)).copied()).collect())
+}
+
 fn all_layer_edge_costs(n: &RouterNet, num_layers: usize) -> Vec<i8> {
     n.layer_edge_cost.as_ref().map_or_else(|| vec![1; num_layers], |v| v[..num_layers].to_vec())
 }
@@ -1045,6 +1051,7 @@ pub fn net_resistance_on_layer(a: &AfterRoute, net: &str, layer: Option<i32>) ->
     let n = &a.router_nets[id];
     let (lo, hi) = a.final_state[id].layer_range.unwrap_or(((n.min_layer - 1) as usize, (n.max_layer - 1) as usize));
     let wn = crate::pricing::WireNet { ndr_width: None, min_layer: lo as i32, max_layer: hi as i32 };
+    let ndr_width = ndr_width_by_layer(n, a.res_tech.width.len());
     let mut total = 0.0f32;
     for e in &t.edges {
         if e.len == 0 && e.routelen == 0 {
@@ -1055,7 +1062,7 @@ pub fn net_resistance_on_layer(a: &AfterRoute, net: &str, layer: Option<i32>) ->
             if p.layer == q.layer {
                 let seg = i32::from((p.x - q.x).abs() + (p.y - q.y).abs());
                 let wire_layer = layer.unwrap_or(i32::from(p.layer));
-                total += crate::pricing::get_wire_resistance(&a.res_tech, wire_layer, seg * a.tile_size, wn);
+                total += crate::pricing::get_wire_resistance(&a.res_tech, wire_layer, seg * a.tile_size, wn.on_layer(&ndr_width, wire_layer));
             } else {
                 total += crate::pricing::get_via_resistance(&a.res_tech, i32::from(p.layer), i32::from(q.layer));
             }
@@ -1882,6 +1889,7 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
             is_clock: n.is_clock,
             is_res_aware: false,
             layer_edge_cost: all_layer_edge_costs(n, num_layers),
+            ndr_width: ndr_width_by_layer(n, num_layers),
             sta_slack: 0.0,
         })
         .collect();
@@ -1984,12 +1992,8 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     // preProcessTechLayers: each routing layer (by level, up to the router's layers) and the cut
     // layer above it — their widths and resistances as the database holds them now (after any
     // set_layer_rc).
-    // ⬜ Resistance-aware pricing reads an NDR net's width PER LAYER (`getWireResistance`); the
-    // pricing's `WireNet` carries one width, so the pair is refused rather than priced at the
-    // default width. No upstream case combines them.
-    if opts.resistance_aware && nets.iter().any(|n| n.has_ndr) {
-        return Err("resistance-aware routing of a net with an NDR: the per-layer NDR width is not wired".into());
-    }
+    // Resistance-aware pricing reads an NDR net's width PER LAYER (`getWireResistance`): each
+    // price takes the layer rule of the layer it prices (`WireNet::on_layer`, `NetLayerAttrs::ndr_width`).
     let res_tech = pricing_tech(db, &t, num_layers)?;
     let res_aware = if opts.resistance_aware {
         Some(crate::run::ResAwareInputs { tech: res_tech.clone(), tile_size: t.core.tile_size, fixed_percentage: opts.res_aware_nets_percentage, update_slacks })
@@ -3032,7 +3036,7 @@ fn find_routing(db: &Db, opts: &RouteOptions, a: &mut AfterRoute, dirty_nets: &[
         .map(|(k, n)| {
             let lec = all_layer_edge_costs(n, num_layers);
             let layer_edge_cost = if soft(k) { vec![1; lec.len()] } else { lec };
-            NetLayerAttrs { pin_layers: n.pins.iter().map(|p| (p.2 - 1) as i16).collect(), has_ndr: n.has_ndr, is_clock: n.is_clock, is_res_aware: false, layer_edge_cost, sta_slack: 0.0 }
+            NetLayerAttrs { pin_layers: n.pins.iter().map(|p| (p.2 - 1) as i16).collect(), has_ndr: n.has_ndr, is_clock: n.is_clock, is_res_aware: false, layer_edge_cost, ndr_width: ndr_width_by_layer(n, num_layers), sta_slack: 0.0 }
         })
         .collect();
     let slack = vec![(0.0f32, false); nets.len()];
