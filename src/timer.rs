@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use vyges_opendb::Db;
 use vyges_sta::graph::{NetParasitics, NetlistRef, SdcEnv};
+use vyges_sta::search::Search;
 use vyges_sta::incr::IncTimer;
 use vyges_sta::liberty::Library;
 use vyges_sta::netlist::{Conn, Net, Netlist, PortDir};
@@ -397,9 +398,12 @@ fn net_slacks_timed(timing: &Timing, scenes: &Scenes, nl: &Netlist, par: &HashMa
     };
     let libs = scenes.slices(timing);
     let mut t = SceneTimers::for_design(&libs, scenes.link, NetlistRef::Borrowed(nl), None, c)?;
+    let Some(held) = held else {
+        return full_scene_slacks(&mut t, par);
+    };
     // `Sta::slack` → `findRequireds` → `findArrivals` → `findDelays`, each from the state the
     // last read left (`vyges_sta::incr`, the resizer's timer).
-    let held = match held {
+    let held = match Some(held) {
         Some(h) if !h.incs.is_empty() => {
             if h.incs.len() != t.incs.len() {
                 return Err(format!("{} held timers for {} scenes", h.incs.len(), t.incs.len()));
@@ -415,6 +419,59 @@ fn net_slacks_timed(timing: &Timing, scenes: &Scenes, nl: &Netlist, par: &HashMa
         h.incs = std::mem::take(&mut t.incs);
     }
     Ok(slacks)
+}
+
+/// A read with no timer kept across reads (FastRoute's: every net's parasitics re-estimated, so
+/// the reference's next slack query recomputes every delay, arrival and required): each scene
+/// timed in full, no incremental state kept. On a first read the per-scene incremental timer does
+/// exactly this (a full `find_delays` / `find_arrivals` / `find_requireds` per scene), so the
+/// slacks are its slacks; what it adds, a name-keyed copy of every vertex's paths per scene for
+/// the next read, is what a read like this never uses. Rule (`Sta::slack(net, max)`): over the
+/// net's LOAD pins in pin order, each load's slack the fuzzily least over every scene's max paths,
+/// scene by scene, each in its path order; the net's the fuzzily least over its loads in that
+/// order. Fuzzy least is order-sensitive, so the order is the reference's, not a per-scene minimum
+/// taken first.
+fn full_scene_slacks(t: &mut SceneTimers<'_>, par: &HashMap<String, NetParasitics>) -> Result<HashMap<String, f32>, String> {
+    for g in t.graphs.iter_mut() {
+        g.find_delays(par, None)?;
+    }
+    let mut searches: Vec<Search<'_, '_>> = t.graphs.iter().map(|g| Search::in_graph_order(g, &t.sdc)).collect();
+    for s in searches.iter_mut() {
+        s.find_arrivals()?;
+        s.find_requireds()?;
+    }
+    let g = &t.graphs[0];
+    let index = g.pin_index();
+    let mut name = String::new();
+    Ok(g.netlist
+        .nets
+        .iter()
+        .map(|n| {
+            let mut slack = vyges_sta::search::INF_SLACK;
+            for c in &n.pins {
+                name.clear();
+                let Some(&v) = index.get(g.netlist.pin_name_into(c, &mut name)) else { continue };
+                if g.vertices[v].is_driver {
+                    continue;
+                }
+                let mut load = vyges_sta::search::INF_SLACK;
+                for s in &searches {
+                    for p in &s.paths[v] {
+                        if p.tag.mm == vyges_sta::liberty::MAX {
+                            let x = p.required - p.arrival;
+                            if vyges_sta::fuzzy::less(x, load) {
+                                load = x;
+                            }
+                        }
+                    }
+                }
+                if vyges_sta::fuzzy::less(load, slack) {
+                    slack = load;
+                }
+            }
+            (n.name.clone(), slack)
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -517,6 +574,22 @@ mod tests {
         assert_eq!(net_slacks_timed(&t, &sc, &nl, &par, Some(&mut held)).unwrap(), full);
         let not_invalidated = net_slacks_timed(&t, &sc, &nl, &par, Some(&mut stale)).unwrap();
         assert_ne!(not_invalidated["y"], full["y"], "without the invalidation the read is stale (the test can fail)");
+    }
+
+    /// Rule (an unheld read times every scene in full, as the per-scene timer's first read does):
+    /// it equals that first read in every scene, slack for slack and bit for bit, here with a load
+    /// whose two scenes' slacks are distinct and with the wire parasitics on.
+    #[test]
+    fn an_unheld_read_equals_the_scene_timers_first_read() {
+        let (slow, fast) = (|| lib("ss", true, 1.5), || lib("ff", false, 0.5));
+        let (nl, t, sc) = (netlist(), timing(vec![slow(), fast()]), scenes(vec![vec![slow()], vec![fast()]]));
+        let par = wire(0.5e-12);
+        let unheld = net_slacks_on(&t, &sc, &nl, &par).unwrap();
+        let first = net_slacks_timed(&t, &sc, &nl, &par, Some(&mut HeldTimers::default())).unwrap();
+        assert_eq!(unheld.len(), first.len());
+        for (net, s) in &unheld {
+            assert_eq!(s.to_bits(), first[net].to_bits(), "{net}");
+        }
     }
 
     /// Rule (`Sim::evalInstance` does nothing for an instance with no liberty cell): the view the
