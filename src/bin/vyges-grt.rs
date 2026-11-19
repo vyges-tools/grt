@@ -1385,13 +1385,28 @@ fn run(job: &Value) -> Result<Value, Fail> {
     let has_access_points = from_db && db.block_access_point_count().map_err(err)? > 0;
     let mut opts = RouteOptions::new();
     // The libraries' texts, for the timer — parsed only once a clock with a period is defined.
-    let mut liberty_texts: Vec<(String, String)> = Vec::new();
+    let mut liberty_texts: Vec<(String, String, Option<usize>)> = Vec::new();
+    // read_sdc — the file and the constraint commands applied after it, as read so far.
+    let mut sdc_read: Option<(String, String)> = None;
+    // define_corners — the timer's scenes, in order; none: one scene.
+    let corners: Vec<String> = job["corners"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
     // The estimator's RC (set_layer_rc / set_wire_rc as the script sets them), for a placement
     // estimate the timer reads.
     let mut est_rc = vyges_est::rc::Rc::new();
-    // read_liberty — the libraries in read order; a cell in two resolves to the first.
+    // read_liberty — the libraries in read order; a cell in two resolves to the first. An entry
+    // `{"path": .., "corner": c}` is `read_liberty -corner c`: that scene's library only.
     for lib in job["liberty"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
-        let path = lib.as_str().ok_or_else(|| err("a liberty path"))?;
+        let (path, corner) = match (lib.as_str(), lib["path"].as_str()) {
+            (Some(p), _) => (p, None),
+            (None, Some(p)) => (p, lib["corner"].as_str()),
+            _ => return Err(err("a liberty path")),
+        };
+        let corner = match corner {
+            Some(c) => Some(corners.iter().position(|x| x == c).ok_or_else(|| Fail::Refused(format!("read_liberty -corner {c}: corner not defined")))?),
+            // the reference's own error (`parse_scene`): with corners every library names one
+            None if !corners.is_empty() => return Err(Fail::Refused(format!("{path}: STA-0103 -scene keyword required with multi-scene analysis"))),
+            None => None,
+        };
         let text = if path.ends_with(".gz") {
             let mut s = String::new();
             std::io::Read::read_to_string(&mut flate2::read::MultiGzDecoder::new(std::fs::File::open(path).map_err(at(path))?), &mut s).map_err(at(path))?;
@@ -1400,7 +1415,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
             std::fs::read_to_string(path).map_err(at(path))?
         };
         opts.liberty.get_or_insert_with(Default::default).read(&text).map_err(|e| Fail::Refused(format!("{path}: {e}")))?;
-        liberty_texts.push((path.to_string(), text));
+        liberty_texts.push((path.to_string(), text, corner));
     }
     // timer_trace — where the router writes each slack read its own timer computed.
     opts.timer_trace = job["timer_trace"].as_str().map(str::to_string);
@@ -1794,7 +1809,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 }
                 opts.clock_sources.extend(ports.iter().cloned());
                 if let Some(period) = step["period"].as_f64() {
-                    let timing = timing_of(&mut opts, &liberty_texts)?;
+                    let timing = timing_of(&mut opts, &liberty_texts, &corners)?;
                     if timing.constraints.clock.is_some() {
                         return Err(err("a second clock: one clock is timed"));
                     }
@@ -1806,6 +1821,16 @@ fn run(job: &Value) -> Result<Value, Fail> {
                     };
                     timing.constraints.clock = Some((name, period, ports, waveform));
                 }
+            }
+            // read_sdc through loom: the mode's constraints for every scene (`path`), read against
+            // the netlist as it stands, the design's constant nets with it. The slacks are then the
+            // timer's under these constraints; each clock's source port reaches the clock network.
+            "read_sdc" => {
+                let path = step["path"].as_str().ok_or_else(|| err("path"))?;
+                timing_of(&mut opts, &liberty_texts, &corners)?;
+                let text = std::fs::read_to_string(path).map_err(at(path))?;
+                read_scene_sdc(&db, &mut opts, path, &text)?;
+                sdc_read = Some((path.to_string(), text));
             }
             // The estimator's RC commands, raw (`command`: set_layer_rc | set_wire_rc).
             "est_rc" => {
@@ -1830,6 +1855,14 @@ fn run(job: &Value) -> Result<Value, Fail> {
             "propagated_clock" => {
                 if let Some(timing) = opts.timing.as_mut() {
                     timing.constraints.propagated = true;
+                }
+                // after a read_sdc: the same command applied to the constraints it read, in order.
+                // `[all_clocks]` is every clock defined so far, written out by name (the timer's
+                // reader takes a propagated clock by name).
+                if let Some((path, text)) = sdc_read.as_mut() {
+                    let names: Vec<String> = opts.scenes.constraints.as_ref().map(|c| c.sdc.clocks.iter().map(|k| k.name.clone()).collect()).unwrap_or_default();
+                    text.push_str(&propagated_clock_lines(&names));
+                    read_scene_sdc(&db, &mut opts, path, text)?;
                 }
             }
             // set_input_delay / set_output_delay relative to the clock's rise edge (user units):
@@ -2441,16 +2474,66 @@ pub fn main() -> ExitCode {
     ExitCode::from(code)
 }
 
-/// The timer's inputs, made on first use: every liberty file read so far, parsed for timing.
-fn timing_of<'a>(opts: &'a mut RouteOptions, texts: &[(String, String)]) -> Result<&'a mut vyges_grt::timer::Timing, Fail> {
+/// `read_sdc` (`path`, its `text` and any constraint command applied after it) through loom into
+/// `set_propagated_clock [all_clocks]` after a `read_sdc`, as lines appended to the constraints it
+/// read: one `[get_clocks <name>]` per clock defined so far, in definition order. Rule (`all_clocks`
+/// is the clocks defined when the command runs; `Sdc::setPropagatedClock` marks each): every clock
+/// then times propagated, its latency from the clock network rather than ideal.
+fn propagated_clock_lines(names: &[String]) -> String {
+    names.iter().map(|n| format!("\nset_propagated_clock [get_clocks {{{n}}}]\n")).collect()
+}
+
+/// the per-scene timer: the mode's constraints for every scene, read against the netlist as it
+/// stands (its queries see every instance; the simulation its linked view) with the design's
+/// constant nets. Each clock's source port reaches the clock network.
+fn read_scene_sdc(db: &Db, opts: &mut RouteOptions, path: &str, text: &str) -> Result<(), Fail> {
+    let timing = opts.timing.as_ref().ok_or_else(|| Fail::Refused("read_sdc before a liberty library".into()))?;
+    let netlist = vyges_grt::timer::netlist(db);
+    let constant_nets = vyges_grt::timer::constant_nets(db).map_err(Fail::Refused)?;
+    let read = vyges_loom::sdc::ReadOpts { base_dir: std::path::Path::new(path).parent().map(|p| p.to_path_buf()), ..Default::default() };
+    let s = vyges_loom::sdc::Sdc::parse_with_opts(text, &vyges_sta::load::sdc_design(&netlist, &timing.libs), &read).map_err(|e| Fail::Refused(format!("{path}: {}", e.0)))?;
+    let slices = opts.scenes.slices(timing);
+    let design = vyges_sta::load::Design { netlist: vyges_grt::timer::linked_view(&netlist, &slices), constant_nets };
+    let c = vyges_sta::scenes::scene_constraints(&s, vyges_sta::scenes::DesignRef::Design(&design), &slices).map_err(|e| Fail::Refused(format!("read_sdc {path}: {e}")))?;
+    for clock in &c.sdc.clocks {
+        if !clock.source.is_empty() && !opts.clock_sources.contains(&clock.source) {
+            opts.clock_sources.push(clock.source.clone());
+        }
+    }
+    opts.scenes.constraints = Some(c);
+    Ok(())
+}
+
+/// The timer's inputs, made on first use: every liberty file read so far, parsed for timing, and
+/// with `corners` (`define_corners`) each scene's libraries (`-corner`), in read order. The link
+/// scene is the first library's.
+fn timing_of<'a>(opts: &'a mut RouteOptions, texts: &[(String, String, Option<usize>)], corners: &[String]) -> Result<&'a mut vyges_grt::timer::Timing, Fail> {
     if opts.timing.is_none() {
         let mut libs = Vec::new();
-        for (path, text) in texts {
+        let mut scene_libs: Vec<Vec<vyges_sta::liberty::Library>> = vec![Vec::new(); corners.len()];
+        let mut link = None;
+        for (path, text, corner) in texts {
             let g = vyges_sta::liberty_parse::parse(text).map_err(|e| Fail::Refused(format!("{path}: {e}")))?;
-            libs.push(vyges_sta::liberty::Library::read(&g).map_err(|e| Fail::Refused(format!("{path}: {e}")))?);
+            let lib = vyges_sta::liberty::Library::read(&g).map_err(|e| Fail::Refused(format!("{path}: {e}")))?;
+            if let Some(c) = *corner {
+                scene_libs[c].push(lib.clone());
+            }
+            if link.is_none() {
+                link = Some(corner.unwrap_or(0));
+            }
+            libs.push(lib);
         }
         if libs.is_empty() {
             return Err(Fail::Refused("a clock period with no liberty library to time it".into()));
+        }
+        if let Some(k) = scene_libs.iter().position(Vec::is_empty) {
+            return Err(Fail::Refused(format!("corner {}: no liberty library", corners[k])));
+        }
+        opts.scenes = vyges_grt::timer::Scenes { libs: scene_libs, link: link.unwrap_or(0), constraints: None };
+        // a scene left as read is timed on its own graph: correct, but its edges follow its own
+        // libraries' arc order where the reference's follow the link's
+        for why in opts.scenes.align_order() {
+            eprintln!("vyges-grt: scene graph built on its own: {why}");
         }
         opts.timing = Some(vyges_grt::timer::Timing { libs, constraints: Default::default(), sdc: None });
     }
@@ -2569,5 +2652,21 @@ mod descriptor_args_tests {
                 .collect();
             assert_eq!(used, props, "{}: command line vs advertised inputs", op["name"]);
         }
+    }
+}
+
+#[cfg(test)]
+mod propagated_tests {
+    /// Rule (`set_propagated_clock [all_clocks]` marks every clock defined so far propagated): the
+    /// lines appended to a read SDC make each clock propagated in the timer's constraints. The probe
+    /// that found it: an ideal clock left every slack off by its clock-tree latency.
+    #[test]
+    fn propagated_clock_lines_mark_every_clock_propagated() {
+        let names = vec!["core_clock".to_string(), "aux".to_string()];
+        let text = format!("create_clock -name core_clock -period 10 [get_ports clk]\ncreate_clock -name aux -period 20 [get_ports clk2]\n{}", super::propagated_clock_lines(&names));
+        let s = vyges_loom::sdc::Sdc::parse(&text).expect("parse");
+        let named: Vec<String> = s.propagated.iter().flat_map(|o| o.names.iter().cloned()).collect();
+        assert_eq!(named, names);
+        assert!(s.propagated.iter().all(|o| o.accessor == "get_clocks"));
     }
 }

@@ -290,7 +290,7 @@ pub fn route_cugr(db: &mut Db, opts: &RouteOptions, call: usize, stt: SteinerBui
                 Some(nets) if opts.placement_parasitics => nets.iter().map(|(n, g)| (n.clone(), crate::timer::placement_network(n, g))).collect(),
                 _ => std::collections::HashMap::new(),
             };
-            let by_name = crate::timer::net_slacks_on(timing, &nl, &par)?;
+            let by_name = crate::timer::net_slacks_on(timing, &opts.scenes, &nl, &par)?;
             let m: std::collections::BTreeMap<String, f32> = by_name.into_iter().collect();
             if let Some(path) = &opts.timer_trace {
                 // `C <call> <sort> <net> <bits>`, as the CUGR capture writes its reads.
@@ -674,6 +674,7 @@ pub fn restore_cugr_for_repair(db: &mut Db, opts: &RouteOptions, mut trace: Opti
 fn timer_slack_source(db: &mut Db, opts: &RouteOptions) -> Res<super::SlackSource> {
     use crate::parasitics::{estimate_net, NetParasitics, PinAttach, PinGridLocation, Segment};
     let timing = opts.timing.clone().ok_or("cugr: no timer")?;
+    let scenes = opts.scenes.clone();
     let t = crate::global_route::setup_tech(db, opts)?;
     let db: &Db = db;
     let all = read_nets(db);
@@ -713,8 +714,8 @@ fn timer_slack_source(db: &mut Db, opts: &RouteOptions) -> Res<super::SlackSourc
     let mut moved = false;
     // Each timing-netlist net's pins: the vertices `delaysInvalidFromFanin(net)` invalidates.
     let net_pins: std::collections::HashMap<String, Vec<String>> = netlist.nets.iter().map(|n| (n.name.clone(), n.pins.iter().map(|c| netlist.pin_name(c)).collect())).collect();
-    // The reference's one timer and one parasitics store, kept across the reads.
-    let mut timer = vyges_sta::incr::IncTimer::default();
+    // The reference's one timer (one per scene) and one parasitics store, kept across the reads.
+    let mut timer = crate::timer::HeldTimers::default();
     let mut par: std::collections::BTreeMap<String, crate::parasitics::Network> = std::collections::BTreeMap::new();
     // `timer_trace`: each read appended as `C <read> 0 <net> <bits>` (stage 1 is read 0).
     let (trace, mut reads) = (opts.timer_trace.clone(), 1usize);
@@ -751,7 +752,7 @@ fn timer_slack_source(db: &mut Db, opts: &RouteOptions) -> Res<super::SlackSourc
         match refresh {
             super::SlackRefresh::Full | super::SlackRefresh::Incremental => {
                 par.clear();
-                timer = vyges_sta::incr::IncTimer::default();
+                timer = crate::timer::HeldTimers::default();
                 for net in &cugr.nets {
                     if let Some(n) = estimate(net) {
                         par.insert(net.name.clone(), n);
@@ -769,7 +770,7 @@ fn timer_slack_source(db: &mut Db, opts: &RouteOptions) -> Res<super::SlackSourc
                 }
             }
         }
-        let m: std::collections::BTreeMap<String, f32> = crate::timer::net_slacks_incremental(&timing, &netlist, &par, &mut timer)?.into_iter().collect();
+        let m: std::collections::BTreeMap<String, f32> = crate::timer::net_slacks_incremental(&timing, &scenes, &netlist, &par, &mut timer)?.into_iter().collect();
         if let Some(path) = &trace {
             use std::io::Write;
             let mut f = std::fs::OpenOptions::new().append(true).create(true).open(path).map_err(|e| e.to_string())?;

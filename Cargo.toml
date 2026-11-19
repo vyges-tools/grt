@@ -25,7 +25,8 @@ odb = ["dep:vyges-opendb", "vyges-opendb/gen-write", "vyges-est/odb", "dep:vyges
 # (R5/R7 take it as an injected function) and JSON for the job file and the report.
 # `repair_antennas` legalizes the diodes it inserts with the detailed placer, as the reference's
 # `legalizePlacedCells` calls `opendp_->detailedPlacement`.
-cli = ["odb", "dep:vyges-stt", "dep:serde_json", "dep:flate2", "dep:vyges-dpl", "dep:vyges-events", "dep:mimalloc", "dep:libmimalloc-sys"]
+# `read_sdc` reads the constraints through loom into the timer (`vyges-sta/loom`).
+cli = ["odb", "dep:vyges-stt", "dep:serde_json", "dep:flate2", "dep:vyges-dpl", "dep:vyges-events", "dep:vyges-loom", "vyges-sta/loom", "dep:mimalloc", "dep:libmimalloc-sys"]
 
 [dev-dependencies]
 # Test-only: the end-to-end corpus is JSON. The library itself stays dependency-free.
@@ -46,6 +47,8 @@ flate2 = { version = "1", optional = true }
 vyges-dpl = { git = "https://github.com/vyges-tools/dpl.git", branch = "main", optional = true }
 # The timer the router reads its net slacks from (a clock defined, no captured slacks).
 vyges-sta = { git = "https://github.com/vyges-tools/sta.git", branch = "main", optional = true }
+# The constraints reader `read_sdc` takes (the command line only).
+vyges-loom = { git = "https://github.com/vyges-tools/loom.git", branch = "main", optional = true }
 
 # The binary's global allocator. The reference build links tcmalloc for all of its code
 # (BUILD.bazel `malloc = @tcmalloc`), not the system allocator; mimalloc measured fastest and

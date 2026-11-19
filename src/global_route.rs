@@ -45,6 +45,9 @@ pub struct RouteOptions {
     /// The timer's libraries and constraints: with a clock and no captured slacks, the slacks are
     /// computed at each read.
     pub timing: Option<crate::timer::Timing>,
+    /// The timer's scene set (`define_corners`, `read_liberty -corner`) and a `read_sdc`'s
+    /// constraints; default one scene under [`crate::timer::Timing`]'s own.
+    pub scenes: crate::timer::Scenes,
     /// Where to write every computed read (`<P|U> <call> <net> <f32 bits>`), if anywhere.
     pub timer_trace: Option<String>,
     /// `estimate_parasitics -placement` ran: a timer read with no route estimate of its own sees
@@ -107,6 +110,7 @@ impl RouteOptions {
             captured_slacks: None,
             captured_update_slacks: None,
             timing: None,
+            scenes: crate::timer::Scenes::default(),
             timer_trace: None,
             placement_parasitics: false,
             placement_networks: None,
@@ -1987,7 +1991,7 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
                 par.insert(n.name.clone(), planar_net_network(n, tree, &timer_rc, &layer_dir, origin, t.min_routing_layer).2);
             }
         }
-        let by_name = crate::timer::net_slacks(timing, nl, &par)?;
+        let by_name = crate::timer::net_slacks(timing, &opts.scenes, nl, &par)?;
         if opts.timer_trace.is_some() {
             let tag = if read == crate::congestion_loop::SlackRead::Partial { "P" } else { "U" };
             let mut tr = timer_trace.borrow_mut();
