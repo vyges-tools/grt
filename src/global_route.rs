@@ -1971,8 +1971,11 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     let origin = crate::routes::GridOrigin { tile_size: t.core.tile_size, x_corner: t.core.area.x_min, y_corner: t.core.area.y_min };
     let timer_rc = layer_rc(db);
     let timer_netlist = opts.timing.as_ref().map(|_| crate::timer::netlist(db));
-    // `timer_trace`: every computed read, as `<P|U> <call> <net> <f32 bits>` (a capture's format).
-    let timer_trace = std::cell::RefCell::new(String::new());
+    // `timer_trace`: every computed read, as `<P|U> <call> <net> <f32 bits>` (a capture's format),
+    // appended as each read completes, so a run stopped part way keeps the reads it finished.
+    if let Some(path) = &opts.timer_trace {
+        std::fs::write(path, "")?;
+    }
     let compute = |read: crate::congestion_loop::SlackRead, k: usize, st: &[NetState]| -> Result<Vec<f32>, String> {
         let (Some(timing), Some(nl)) = (&opts.timing, &timer_netlist) else { return Err("no timer".into()) };
         let mut par = std::collections::BTreeMap::new();
@@ -1992,14 +1995,17 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
             }
         }
         let by_name = crate::timer::net_slacks(timing, &opts.scenes, nl, &par)?;
-        if opts.timer_trace.is_some() {
+        if let Some(path) = &opts.timer_trace {
+            use std::io::Write;
             let tag = if read == crate::congestion_loop::SlackRead::Partial { "P" } else { "U" };
-            let mut tr = timer_trace.borrow_mut();
+            let mut tr = String::new();
             for &id in &net_ids {
                 if let Some(v) = by_name.get(&nets[id].name) {
                     tr.push_str(&format!("{tag} {k} {} {:08x}\n", nets[id].name, v.to_bits()));
                 }
             }
+            let mut f = std::fs::OpenOptions::new().append(true).open(path).map_err(|e| format!("{path}: {e}"))?;
+            f.write_all(tr.as_bytes()).map_err(|e| format!("{path}: {e}"))?;
         }
         (0..nets.len())
             .map(|k| match by_name.get(&nets[k].name) {
@@ -2120,9 +2126,6 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     let mut ov = Observer { overflow: 0, cnp: t.config.critical_nets_percentage, res_aware: opts.resistance_aware, trees: None, g3: None, g2d: None, lines: crate::run_log::RunLines::new(opts.verbose, opts.congestion_iterations) };
     let run = fastroute_run(&inp, &mut state, &mut ov);
     ov.lines.write(&mut log);
-    if let Some(path) = &opts.timer_trace {
-        std::fs::write(path, timer_trace.borrow().as_str())?;
-    }
     let routes = match run? {
         RunEnd::Routed(r) => r,
         RunEnd::Stopped => return Err("run() stopped".into()),
