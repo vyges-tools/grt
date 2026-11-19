@@ -464,24 +464,64 @@ fn net_slacks_timed(timing: &Timing, scenes: &Scenes, nl: &Netlist, par: &HashMa
 
 /// A read with no timer kept across reads (FastRoute's: every net's parasitics re-estimated, so
 /// the reference's next slack query recomputes every delay, arrival and required): each scene
-/// timed in full, no incremental state kept. On a first read the per-scene incremental timer does
-/// exactly this (a full `find_delays` / `find_arrivals` / `find_requireds` per scene), so the
-/// slacks are its slacks; what it adds, a name-keyed copy of every vertex's paths per scene for
-/// the next read, is what a read like this never uses. Rule (`Sta::slack(net, max)`): over the
-/// net's LOAD pins in pin-id order ([`pin_order`]), each load's slack the fuzzily least over every scene's max paths,
-/// scene by scene, each in its path order; the net's the fuzzily least over its loads in that
-/// order. Fuzzy least is order-sensitive, so the order is the reference's, not a per-scene minimum
-/// taken first.
+/// timed in full, no incremental state kept. Rule (`Sta::slack(net, max)`): over the net's LOAD
+/// pins in pin-id order ([`pin_order`]), each load's slack ONE fuzzy-least fold over every
+/// scene's max paths, scene by scene, each in its path order (the vertex's one path array, scene
+/// major); the net's the fuzzily least over its loads in that order. Fuzzy least is not
+/// transitive, so the fold is carried: a load's running value goes from one scene into the next,
+/// never a per-scene minimum combined afterwards.
+///
+/// The scenes are timed one at a time, each search dropped once its paths are folded into the
+/// loads' running values: one scene's paths are held at a time, not every scene's. The scenes do
+/// not read each other (each graph its own delays, each search its own paths), so the order of
+/// the timing passes does not move a value.
 fn full_scene_slacks(t: &mut SceneTimers<'_>, par: &HashMap<String, NetParasitics>, pin_ids: &[Vec<u64>]) -> Result<HashMap<String, f32>, String> {
-    for g in t.graphs.iter_mut() {
-        g.find_delays(par, None)?;
-    }
-    let mut searches: Vec<Search<'_, '_>> = t.graphs.iter().map(|g| Search::in_graph_order(g, &t.sdc)).collect();
-    for s in searches.iter_mut() {
+    let loads = net_loads(&t.graphs[0], pin_ids)?;
+    let mut running = vec![vyges_sta::search::INF_SLACK; t.graphs[0].vertices.len()];
+    for k in 0..t.graphs.len() {
+        t.graphs[k].find_delays(par, None)?;
+        let mut s = Search::in_graph_order(&t.graphs[k], &t.sdc);
         s.find_arrivals()?;
         s.find_requireds()?;
+        fold_scene(&mut running, &loads, &s.paths);
     }
-    let g = &t.graphs[0];
+    Ok(t.graphs[0]
+        .netlist
+        .nets
+        .iter()
+        .zip(&loads)
+        .map(|(n, vs)| {
+            let mut slack = vyges_sta::search::INF_SLACK;
+            for &v in vs {
+                fold_least(&mut slack, running[v]);
+            }
+            (n.name.clone(), slack)
+        })
+        .collect())
+}
+
+/// One scene's max paths folded into each load's running value, in the vertex's path order,
+/// CARRYING the value the earlier scenes left (never this scene's own minimum combined after).
+fn fold_scene(running: &mut [f32], loads: &[Vec<usize>], paths: &[Vec<vyges_sta::search::Path>]) {
+    for &v in loads.iter().flatten() {
+        for p in &paths[v] {
+            if p.tag.mm == vyges_sta::liberty::MAX {
+                fold_least(&mut running[v], p.required - p.arrival);
+            }
+        }
+    }
+}
+
+/// One step of `Sta::slack`'s fold: `delayLess(x, running)` replaces it.
+fn fold_least(running: &mut f32, x: f32) {
+    if vyges_sta::fuzzy::less(x, *running) {
+        *running = x;
+    }
+}
+
+/// Each net's load vertices in the order [`full_scene_slacks`] folds them: its pins in pin-id
+/// order ([`pin_order`]), a driver or a pin with no vertex left out.
+fn net_loads(g: &vyges_sta::graph::Graph<'_>, pin_ids: &[Vec<u64>]) -> Result<Vec<Vec<usize>>, String> {
     if pin_ids.len() != g.netlist.nets.len() || g.netlist.nets.iter().zip(pin_ids).any(|(n, ids)| n.pins.len() != ids.len()) {
         return Err("pin ids not aligned with the netlist's nets".into());
     }
@@ -492,29 +532,14 @@ fn full_scene_slacks(t: &mut SceneTimers<'_>, par: &HashMap<String, NetParasitic
         .iter()
         .zip(pin_ids)
         .map(|(n, ids)| {
-            let mut slack = vyges_sta::search::INF_SLACK;
-            for c in pin_order(ids).into_iter().map(|k| &n.pins[k]) {
-                name.clear();
-                let Some(&v) = index.get(g.netlist.pin_name_into(c, &mut name)) else { continue };
-                if g.vertices[v].is_driver {
-                    continue;
-                }
-                let mut load = vyges_sta::search::INF_SLACK;
-                for s in &searches {
-                    for p in &s.paths[v] {
-                        if p.tag.mm == vyges_sta::liberty::MAX {
-                            let x = p.required - p.arrival;
-                            if vyges_sta::fuzzy::less(x, load) {
-                                load = x;
-                            }
-                        }
-                    }
-                }
-                if vyges_sta::fuzzy::less(load, slack) {
-                    slack = load;
-                }
-            }
-            (n.name.clone(), slack)
+            pin_order(ids)
+                .into_iter()
+                .filter_map(|k| {
+                    name.clear();
+                    let &v = index.get(g.netlist.pin_name_into(&n.pins[k], &mut name))?;
+                    (!g.vertices[v].is_driver).then_some(v)
+                })
+                .collect()
         })
         .collect())
 }
@@ -570,6 +595,46 @@ mod tests {
         let fold = |vals: &[f32], ids: &[u64]| pin_order(ids).into_iter().map(|k| vals[k]).fold(vyges_sta::search::INF_SLACK, |s, x| if vyges_sta::fuzzy::less(x, s) { x } else { s });
         assert_eq!(fold(&[a, b], &[4, 3]).to_bits(), b.to_bits(), "pin id 3 is reached first");
         assert_eq!(fold(&[a, b], &[2, 3]).to_bits(), a.to_bits());
+    }
+
+    /// Rule (`Sta::slack(vertex)`: ONE `delayLess` fold over the vertex's path array, every scene's
+    /// paths in it, from the min init value): the running value is carried from one scene into
+    /// the next. Fuzzy least is not transitive, so per-scene minima combined afterwards differ:
+    /// with a ~ b and b ~ c fuzzily equal but a and c not, the carried fold over a | b, c reaches
+    /// c, the per-scene minima a and b combine to a.
+    #[test]
+    fn a_load_s_fold_is_carried_across_scenes() {
+        let (a, b, c) = (1.0_f32, 1.0 - 0.7e-6, 1.0 - 1.4e-6);
+        assert!(vyges_sta::fuzzy::equal(a, b) && vyges_sta::fuzzy::equal(b, c) && !vyges_sta::fuzzy::equal(a, c));
+        let scenes: [&[f32]; 2] = [&[a], &[b, c]];
+        let mut carried = vyges_sta::search::INF_SLACK;
+        for xs in scenes {
+            for &x in xs {
+                fold_least(&mut carried, x);
+            }
+        }
+        assert_eq!(carried, c);
+        let mut combined = vyges_sta::search::INF_SLACK;
+        for xs in scenes {
+            let mut m = vyges_sta::search::INF_SLACK;
+            for &x in xs {
+                fold_least(&mut m, x);
+            }
+            fold_least(&mut combined, m);
+        }
+        assert_eq!(combined, a, "the association the fold must not use");
+        // the same through the scene fold the read uses: load 0's max paths, scene 0 then scene 1
+        let path = |slack: f32, mm: usize| vyges_sta::search::Path {
+            tag: vyges_sta::search::Tag { rf: 0, mm, clk_edge: None, is_clock: false, crpr: None, states: Default::default(), latency: 0, segment_start: false },
+            arrival: 0.0,
+            required: slack,
+            prev: None,
+        };
+        let loads = vec![vec![0]];
+        let mut running = vec![vyges_sta::search::INF_SLACK];
+        fold_scene(&mut running, &loads, &[vec![path(a, vyges_sta::liberty::MAX), path(0.0, vyges_sta::liberty::MIN)]]);
+        fold_scene(&mut running, &loads, &[vec![path(b, vyges_sta::liberty::MAX), path(c, vyges_sta::liberty::MAX)]]);
+        assert_eq!(running[0], c, "carried across the scenes; a min path is not folded");
     }
 
     /// Ports a, b into x1 (xor2); x1/Y to port y; a clock port clk on no net.
