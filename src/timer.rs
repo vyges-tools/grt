@@ -398,6 +398,10 @@ fn net_slacks_timed(timing: &Timing, scenes: &Scenes, nl: &Netlist, par: &HashMa
     };
     let libs = scenes.slices(timing);
     let mut t = SceneTimers::for_design(&libs, scenes.link, NetlistRef::Borrowed(nl), None, c)?;
+    // As sta's `load` and rsz do: what the search does not model is refused before any timing,
+    // never timed without. Every scene shares the constraints and the netlist (so its latches),
+    // so the link scene's graph decides.
+    Search::in_graph_order(&t.graphs[0], &t.sdc).constraints_modelled()?;
     let Some(held) = held else {
         return full_scene_slacks(&mut t, par);
     };
@@ -590,6 +594,24 @@ mod tests {
         for (net, s) in &unheld {
             assert_eq!(s.to_bits(), first[net].to_bits(), "{net}");
         }
+    }
+
+    /// Rule (sta's `load::design_constraints` and rsz's timer: `Search::constraints_modelled` before
+    /// any timing): a read whose constraints the search does not model is refused with the reason,
+    /// held or not, rather than timed without them — here a `set_max_delay` measured from the
+    /// clock edge on a clocked design.
+    #[test]
+    fn a_read_on_constraints_the_search_does_not_model_is_refused() {
+        let (nl, sc) = (netlist(), Scenes::default());
+        let mut t = timing(vec![lib("ss", true, 1.5)]);
+        let mut s = sdc(&t.constraints, &nl, t.libs[0].time_scale).unwrap().expect("a clock");
+        assert!(net_slacks_on(&Timing { sdc: Some(s.clone()), ..timing(vec![lib("ss", true, 1.5)]) }, &sc, &nl, &HashMap::new()).is_ok(), "modelled as it stands");
+        s.path_delays.push(vyges_sta::sdc::PathDelay { from_pins: vec!["a".into()], from_clock: false, to_pins: vec!["y".into()], to_clock: false, min_max: vyges_sta::liberty::MAX, ignore_clk_latency: false, break_path: false, delay: 1.0e-9, false_path: false, multicycle: None, thrus: Vec::new(), group: None });
+        t.sdc = Some(s);
+        let unheld = net_slacks_on(&t, &sc, &nl, &HashMap::new());
+        assert!(unheld.as_ref().is_err_and(|e| e.contains("not modelled")), "{unheld:?}");
+        let held = net_slacks_timed(&t, &sc, &nl, &HashMap::new(), Some(&mut HeldTimers::default()));
+        assert!(held.is_err_and(|e| e.contains("not modelled")));
     }
 
     /// Rule (`Sim::evalInstance` does nothing for an instance with no liberty cell): the view the
