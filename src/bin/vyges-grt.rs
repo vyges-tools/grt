@@ -2374,7 +2374,8 @@ fn run(job: &Value) -> Result<Value, Fail> {
 /// Bazel build links (`malloc = @tcmalloc`); see Cargo.toml for the pin.
 /// Not when this file is built into the library as `cli_main` (feature `suite`): the suite
 /// binary that links the library defines the allocator itself.
-#[cfg(not(feature = "suite"))]
+/// Not without feature `mimalloc` either (`cli-core` alone: the system allocator, for profiling).
+#[cfg(all(feature = "mimalloc", not(feature = "suite")))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

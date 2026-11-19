@@ -5,7 +5,7 @@
 //!
 //! ⚠️ The routed output below is a REGRESSION pin (this engine's own answer on this design), not a
 //! correlation claim; correlation against the reference router runs outside this repository.
-#![cfg(feature = "cli")]
+#![cfg(feature = "cli-core")]
 
 use std::path::PathBuf;
 use std::process::{Command, Output};

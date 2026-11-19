@@ -26,7 +26,13 @@ odb = ["dep:vyges-opendb", "vyges-opendb/gen-write", "vyges-est/odb", "dep:vyges
 # `repair_antennas` legalizes the diodes it inserts with the detailed placer, as the reference's
 # `legalizePlacedCells` calls `opendp_->detailedPlacement`.
 # `read_sdc` reads the constraints through loom into the timer (`vyges-sta/loom`).
-cli = ["odb", "dep:vyges-stt", "dep:serde_json", "dep:flate2", "dep:vyges-dpl", "dep:vyges-events", "dep:vyges-loom", "vyges-sta/loom", "dep:mimalloc", "dep:libmimalloc-sys"]
+#
+# `cli` = `cli-core` + `mimalloc`, the build that ships. `cli-core` alone is the same command on the
+# system allocator, for heap profilers that cannot see an overriding allocator (heaptrack); peak
+# sizes under it differ from mimalloc's, the allocation sites do not.
+cli = ["cli-core", "mimalloc"]
+cli-core = ["odb", "dep:vyges-stt", "dep:serde_json", "dep:flate2", "dep:vyges-dpl", "dep:vyges-events", "dep:vyges-loom", "vyges-sta/loom"]
+mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 
 [dev-dependencies]
 # Test-only: the end-to-end corpus is JSON. The library itself stays dependency-free.
@@ -93,7 +99,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "vyges-grt"
 path = "src/bin/vyges-grt.rs"
-required-features = ["cli"]
+required-features = ["cli-core"]
 
 # Guide, route and result maps are spelled out where they are used; naming each would hide them.
 [lints.clippy]
