@@ -1971,13 +1971,14 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     let origin = crate::routes::GridOrigin { tile_size: t.core.tile_size, x_corner: t.core.area.x_min, y_corner: t.core.area.y_min };
     let timer_rc = layer_rc(db);
     let timer_netlist = opts.timing.as_ref().map(|_| crate::timer::netlist(db));
+    let timer_pin_ids = timer_netlist.as_ref().map(|nl| crate::timer::pin_ids(db, nl)).transpose()?;
     // `timer_trace`: every computed read, as `<P|U> <call> <net> <f32 bits>` (a capture's format),
     // appended as each read completes, so a run stopped part way keeps the reads it finished.
     if let Some(path) = &opts.timer_trace {
         std::fs::write(path, "")?;
     }
     let compute = |read: crate::congestion_loop::SlackRead, k: usize, st: &[NetState]| -> Result<Vec<f32>, String> {
-        let (Some(timing), Some(nl)) = (&opts.timing, &timer_netlist) else { return Err("no timer".into()) };
+        let (Some(timing), Some(nl), Some(pin_ids)) = (&opts.timing, &timer_netlist, &timer_pin_ids) else { return Err("no timer".into()) };
         let mut par = std::collections::BTreeMap::new();
         // getPlanarRoutes: the planar routes before layer assignment, the 3D routes (estimated
         // with the pins attached by their real layers) in a 3D pass.
@@ -1994,7 +1995,7 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
                 par.insert(n.name.clone(), planar_net_network(n, tree, &timer_rc, &layer_dir, origin, t.min_routing_layer).2);
             }
         }
-        let by_name = crate::timer::net_slacks(timing, &opts.scenes, nl, &par)?;
+        let by_name = crate::timer::net_slacks(timing, &opts.scenes, nl, pin_ids, &par)?;
         if let Some(path) = &opts.timer_trace {
             use std::io::Write;
             let tag = if read == crate::congestion_loop::SlackRead::Partial { "P" } else { "U" };

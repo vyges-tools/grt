@@ -286,6 +286,34 @@ pub fn netlist(db: &Db) -> Netlist {
     nl
 }
 
+/// Every net's pins as the reference's timer orders them, aligned with `nl.nets[k].pins`: the
+/// `PinIdLess` key of each pin, an instance terminal's database id doubled, a block terminal's
+/// doubled plus one (`dbNetwork::id(Pin)` on a flat block).
+pub fn pin_ids(db: &Db, nl: &Netlist) -> Result<Vec<Vec<u64>>, String> {
+    nl.nets
+        .iter()
+        .map(|n| {
+            n.pins
+                .iter()
+                .map(|c| match c {
+                    Conn::Inst(i, pin) => db.iterm_id(&nl.insts[*i].0, pin).map(|id| u64::from(id) << 1).map_err(|e| e.to_string()),
+                    Conn::Port(p) => db.bterm_id(&nl.ports[*p].0).map(|id| (u64::from(id) << 1) | 1).map_err(|e| e.to_string()),
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// The order `Sta::slack(net)` walks a net's pins in: `Network::connectedPinIterator` gathers them
+/// into a `PinSet`, a set ordered by `PinIdLess`, and iterates the set. So ascending pin id, ports
+/// and instance terminals interleaved by id, not the database's own terminal lists (instance
+/// terminals, then block terminals). `ids`: [`pin_ids`] for one net.
+fn pin_order(ids: &[u64]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..ids.len()).collect();
+    order.sort_by_key(|&k| ids[k]);
+    order
+}
+
 /// The constraints in seconds, the ports resolved against the netlist. `None` without a clock.
 pub fn sdc(c: &Constraints, nl: &Netlist, scale: f32) -> Result<Option<Sdc>, String> {
     let Some((name, period, sources, waveform)) = &c.clock else { return Ok(None) };
@@ -353,14 +381,15 @@ pub fn placement_network(net: &str, g: &vyges_est::network::Parasitic) -> NetPar
 /// `getNetSlack` for every net of the netlist on route estimates: the worst max slack over its
 /// load pins and every scene. Each scene reads the same networks: the estimator's per-corner wire
 /// RC is one table here (a `set_layer_rc -corner` is not modelled).
-pub fn net_slacks(timing: &Timing, scenes: &Scenes, nl: &Netlist, parasitics: &BTreeMap<String, crate::parasitics::Network>) -> Result<HashMap<String, f32>, String> {
+pub fn net_slacks(timing: &Timing, scenes: &Scenes, nl: &Netlist, pin_ids: &[Vec<u64>], parasitics: &BTreeMap<String, crate::parasitics::Network>) -> Result<HashMap<String, f32>, String> {
     let par: HashMap<String, NetParasitics> = parasitics.iter().map(|(net, n)| (net.clone(), timer_network(net, n))).collect();
-    net_slacks_on(timing, scenes, nl, &par)
+    net_slacks_on(timing, scenes, nl, pin_ids, &par)
 }
 
 /// The same, on networks already in the timer's form.
-pub fn net_slacks_on(timing: &Timing, scenes: &Scenes, nl: &Netlist, par: &HashMap<String, NetParasitics>) -> Result<HashMap<String, f32>, String> {
-    net_slacks_timed(timing, scenes, nl, par, None)
+/// `pin_ids`: [`pin_ids`], the order each net's loads are folded in.
+pub fn net_slacks_on(timing: &Timing, scenes: &Scenes, nl: &Netlist, pin_ids: &[Vec<u64>], par: &HashMap<String, NetParasitics>) -> Result<HashMap<String, f32>, String> {
+    net_slacks_timed(timing, scenes, nl, par, Read::Full(pin_ids))
 }
 
 /// [`net_slacks`] through a timer kept across reads (`held`), as the reference's one `dbSta` is.
@@ -370,7 +399,14 @@ pub fn net_slacks_on(timing: &Timing, scenes: &Scenes, nl: &Netlist, par: &HashM
 /// does not re-time its fanout, so a value it does not reach stays as it was.
 pub fn net_slacks_incremental(timing: &Timing, scenes: &Scenes, nl: &Netlist, parasitics: &BTreeMap<String, crate::parasitics::Network>, held: &mut HeldTimers) -> Result<HashMap<String, f32>, String> {
     let par: HashMap<String, NetParasitics> = parasitics.iter().map(|(net, n)| (net.clone(), timer_network(net, n))).collect();
-    net_slacks_timed(timing, scenes, nl, &par, Some(held))
+    net_slacks_timed(timing, scenes, nl, &par, Read::Held(held))
+}
+
+/// How a read is timed: in full, folding each net's loads in its pins' [`pin_ids`] order; or on
+/// timers kept across reads, folded by `vyges_sta::scenes::net_slacks`.
+enum Read<'r> {
+    Full(&'r [Vec<u64>]),
+    Held(&'r mut HeldTimers),
 }
 
 /// The constraints of a read: `read_sdc`'s, else [`Timing`]'s own in every scene (no SDC
@@ -392,7 +428,7 @@ fn read_constraints(timing: &Timing, scenes: &Scenes, nl: &Netlist) -> Result<Op
 
 /// Every net's worst load slack over the scenes, timed in full or (with `held`) incrementally:
 /// `vyges_sta::scenes::net_slacks` on the scene set's timers, the graphs built for this read.
-fn net_slacks_timed(timing: &Timing, scenes: &Scenes, nl: &Netlist, par: &HashMap<String, NetParasitics>, held: Option<&mut HeldTimers>) -> Result<HashMap<String, f32>, String> {
+fn net_slacks_timed(timing: &Timing, scenes: &Scenes, nl: &Netlist, par: &HashMap<String, NetParasitics>, read: Read<'_>) -> Result<HashMap<String, f32>, String> {
     let Some(c) = read_constraints(timing, scenes, nl)? else {
         return Ok(nl.nets.iter().map(|n| (n.name.clone(), 1e30)).collect());
     };
@@ -402,8 +438,9 @@ fn net_slacks_timed(timing: &Timing, scenes: &Scenes, nl: &Netlist, par: &HashMa
     // never timed without. Every scene shares the constraints and the netlist (so its latches),
     // so the link scene's graph decides.
     Search::in_graph_order(&t.graphs[0], &t.sdc).constraints_modelled()?;
-    let Some(held) = held else {
-        return full_scene_slacks(&mut t, par);
+    let held = match read {
+        Read::Full(pin_ids) => return full_scene_slacks(&mut t, par, pin_ids),
+        Read::Held(h) => h,
     };
     // `Sta::slack` → `findRequireds` → `findArrivals` → `findDelays`, each from the state the
     // last read left (`vyges_sta::incr`, the resizer's timer).
@@ -431,11 +468,11 @@ fn net_slacks_timed(timing: &Timing, scenes: &Scenes, nl: &Netlist, par: &HashMa
 /// exactly this (a full `find_delays` / `find_arrivals` / `find_requireds` per scene), so the
 /// slacks are its slacks; what it adds, a name-keyed copy of every vertex's paths per scene for
 /// the next read, is what a read like this never uses. Rule (`Sta::slack(net, max)`): over the
-/// net's LOAD pins in pin order, each load's slack the fuzzily least over every scene's max paths,
+/// net's LOAD pins in pin-id order ([`pin_order`]), each load's slack the fuzzily least over every scene's max paths,
 /// scene by scene, each in its path order; the net's the fuzzily least over its loads in that
 /// order. Fuzzy least is order-sensitive, so the order is the reference's, not a per-scene minimum
 /// taken first.
-fn full_scene_slacks(t: &mut SceneTimers<'_>, par: &HashMap<String, NetParasitics>) -> Result<HashMap<String, f32>, String> {
+fn full_scene_slacks(t: &mut SceneTimers<'_>, par: &HashMap<String, NetParasitics>, pin_ids: &[Vec<u64>]) -> Result<HashMap<String, f32>, String> {
     for g in t.graphs.iter_mut() {
         g.find_delays(par, None)?;
     }
@@ -445,14 +482,18 @@ fn full_scene_slacks(t: &mut SceneTimers<'_>, par: &HashMap<String, NetParasitic
         s.find_requireds()?;
     }
     let g = &t.graphs[0];
+    if pin_ids.len() != g.netlist.nets.len() || g.netlist.nets.iter().zip(pin_ids).any(|(n, ids)| n.pins.len() != ids.len()) {
+        return Err("pin ids not aligned with the netlist's nets".into());
+    }
     let index = g.pin_index();
     let mut name = String::new();
     Ok(g.netlist
         .nets
         .iter()
-        .map(|n| {
+        .zip(pin_ids)
+        .map(|(n, ids)| {
             let mut slack = vyges_sta::search::INF_SLACK;
-            for c in &n.pins {
+            for c in pin_order(ids).into_iter().map(|k| &n.pins[k]) {
                 name.clear();
                 let Some(&v) = index.get(g.netlist.pin_name_into(c, &mut name)) else { continue };
                 if g.vertices[v].is_driver {
@@ -505,6 +546,32 @@ mod tests {
         Library::read(&vyges_sta::liberty_parse::parse(&text).unwrap()).unwrap()
     }
 
+    /// Pin ids that keep each net's pins in netlist order.
+    fn in_netlist_order(nl: &Netlist) -> Vec<Vec<u64>> {
+        nl.nets.iter().map(|n| (0..n.pins.len() as u64).collect()).collect()
+    }
+
+    /// Rule (`Network::connectedPinIterator(net)` gathers the pins into a `PinSet`, ordered by
+    /// `PinIdLess`, and `Sta::slack(net)` folds the loads in that order): ascending pin id, an
+    /// instance terminal's id doubled, a block terminal's doubled plus one, so a port interleaves
+    /// with the instance pins by id. Witness: on the reference's 2-corner resistance-aware probe
+    /// every one of its 416 nets iterates in this order, and none in the database's list order
+    /// (instance terminals, then block terminals).
+    #[test]
+    fn a_net_s_pins_are_folded_in_pin_id_order() {
+        // instance terminal 1721, block terminal 1, instance terminal 5: keys 3442, 3, 10
+        assert_eq!(pin_order(&[1721 << 1, (1 << 1) | 1, 5 << 1]), vec![1, 2, 0]);
+        // a port and an instance terminal of the same id: the instance terminal first
+        assert_eq!(pin_order(&[(7 << 1) | 1, 7 << 1]), vec![1, 0]);
+        // Fuzzy least is order-sensitive: two loads fuzzily equal but not equal keep the one the
+        // order reaches first, so the order decides the bits.
+        let (a, b) = (3.360_896e-9_f32, 3.360_899e-9_f32);
+        assert!(vyges_sta::fuzzy::equal(a, b) && a != b);
+        let fold = |vals: &[f32], ids: &[u64]| pin_order(ids).into_iter().map(|k| vals[k]).fold(vyges_sta::search::INF_SLACK, |s, x| if vyges_sta::fuzzy::less(x, s) { x } else { s });
+        assert_eq!(fold(&[a, b], &[4, 3]).to_bits(), b.to_bits(), "pin id 3 is reached first");
+        assert_eq!(fold(&[a, b], &[2, 3]).to_bits(), a.to_bits());
+    }
+
     /// Ports a, b into x1 (xor2); x1/Y to port y; a clock port clk on no net.
     fn netlist() -> Netlist {
         let pin = |p: &str| Conn::Inst(0, p.into());
@@ -547,15 +614,15 @@ mod tests {
     fn a_net_slack_is_the_worst_over_every_scene() {
         let (slow, fast) = (|| lib("ss", true, 1.5), || lib("ff", false, 0.5));
         let nl = netlist();
-        let all = net_slacks_on(&timing(vec![slow(), fast()]), &scenes(vec![vec![slow()], vec![fast()]]), &nl, &HashMap::new()).unwrap();
-        let each: Vec<HashMap<String, f32>> = [slow(), fast()].into_iter().map(|l| net_slacks_on(&timing(vec![l]), &Scenes::default(), &nl, &HashMap::new()).unwrap()).collect();
+        let all = net_slacks_on(&timing(vec![slow(), fast()]), &scenes(vec![vec![slow()], vec![fast()]]), &nl, &in_netlist_order(&nl), &HashMap::new()).unwrap();
+        let each: Vec<HashMap<String, f32>> = [slow(), fast()].into_iter().map(|l| net_slacks_on(&timing(vec![l]), &Scenes::default(), &nl, &in_netlist_order(&nl), &HashMap::new()).unwrap()).collect();
         for (net, s) in &all {
             assert_eq!(*s, each[0][net].min(each[1][net]), "{net}");
         }
         assert!(all["y"] < 1.0, "net y is timed: {all:?}");
         assert_ne!(all["y"], each[1]["y"], "the slow scene decides, not the first-read fast one");
         // the same scenes with the fast one first: the fold does not depend on the scene order
-        let swapped = net_slacks_on(&timing(vec![fast(), slow()]), &scenes(vec![vec![fast()], vec![slow()]]), &nl, &HashMap::new()).unwrap();
+        let swapped = net_slacks_on(&timing(vec![fast(), slow()]), &scenes(vec![vec![fast()], vec![slow()]]), &nl, &in_netlist_order(&nl), &HashMap::new()).unwrap();
         assert_eq!(swapped, all);
     }
 
@@ -566,17 +633,17 @@ mod tests {
         let (slow, fast) = (|| lib("ss", true, 1.5), || lib("ff", false, 0.5));
         let (nl, t, sc) = (netlist(), timing(vec![slow(), fast()]), scenes(vec![vec![slow()], vec![fast()]]));
         let par = wire(0.5e-12);
-        let full = net_slacks_on(&t, &sc, &nl, &par).unwrap();
+        let full = net_slacks_on(&t, &sc, &nl, &in_netlist_order(&nl), &par).unwrap();
         let mut held = HeldTimers::default();
-        net_slacks_timed(&t, &sc, &nl, &HashMap::new(), Some(&mut held)).unwrap();
+        net_slacks_timed(&t, &sc, &nl, &HashMap::new(), Read::Held(&mut held)).unwrap();
         assert_eq!(held.incs.len(), 2, "one timer per scene, held");
         let mut stale = HeldTimers::default();
-        net_slacks_timed(&t, &sc, &nl, &HashMap::new(), Some(&mut stale)).unwrap();
+        net_slacks_timed(&t, &sc, &nl, &HashMap::new(), Read::Held(&mut stale)).unwrap();
         for pin in ["x1/Y", "y"] {
             held.delays_invalid_from(pin);
         }
-        assert_eq!(net_slacks_timed(&t, &sc, &nl, &par, Some(&mut held)).unwrap(), full);
-        let not_invalidated = net_slacks_timed(&t, &sc, &nl, &par, Some(&mut stale)).unwrap();
+        assert_eq!(net_slacks_timed(&t, &sc, &nl, &par, Read::Held(&mut held)).unwrap(), full);
+        let not_invalidated = net_slacks_timed(&t, &sc, &nl, &par, Read::Held(&mut stale)).unwrap();
         assert_ne!(not_invalidated["y"], full["y"], "without the invalidation the read is stale (the test can fail)");
     }
 
@@ -588,8 +655,8 @@ mod tests {
         let (slow, fast) = (|| lib("ss", true, 1.5), || lib("ff", false, 0.5));
         let (nl, t, sc) = (netlist(), timing(vec![slow(), fast()]), scenes(vec![vec![slow()], vec![fast()]]));
         let par = wire(0.5e-12);
-        let unheld = net_slacks_on(&t, &sc, &nl, &par).unwrap();
-        let first = net_slacks_timed(&t, &sc, &nl, &par, Some(&mut HeldTimers::default())).unwrap();
+        let unheld = net_slacks_on(&t, &sc, &nl, &in_netlist_order(&nl), &par).unwrap();
+        let first = net_slacks_timed(&t, &sc, &nl, &par, Read::Held(&mut HeldTimers::default())).unwrap();
         assert_eq!(unheld.len(), first.len());
         for (net, s) in &unheld {
             assert_eq!(s.to_bits(), first[net].to_bits(), "{net}");
@@ -605,12 +672,12 @@ mod tests {
         let (nl, sc) = (netlist(), Scenes::default());
         let mut t = timing(vec![lib("ss", true, 1.5)]);
         let mut s = sdc(&t.constraints, &nl, t.libs[0].time_scale).unwrap().expect("a clock");
-        assert!(net_slacks_on(&Timing { sdc: Some(s.clone()), ..timing(vec![lib("ss", true, 1.5)]) }, &sc, &nl, &HashMap::new()).is_ok(), "modelled as it stands");
+        assert!(net_slacks_on(&Timing { sdc: Some(s.clone()), ..timing(vec![lib("ss", true, 1.5)]) }, &sc, &nl, &in_netlist_order(&nl), &HashMap::new()).is_ok(), "modelled as it stands");
         s.path_delays.push(vyges_sta::sdc::PathDelay { from_pins: vec!["a".into()], from_clock: false, to_pins: vec!["y".into()], to_clock: false, min_max: vyges_sta::liberty::MAX, ignore_clk_latency: false, break_path: false, delay: 1.0e-9, false_path: false, multicycle: None, thrus: Vec::new(), group: None });
         t.sdc = Some(s);
-        let unheld = net_slacks_on(&t, &sc, &nl, &HashMap::new());
+        let unheld = net_slacks_on(&t, &sc, &nl, &in_netlist_order(&nl), &HashMap::new());
         assert!(unheld.as_ref().is_err_and(|e| e.contains("not modelled")), "{unheld:?}");
-        let held = net_slacks_timed(&t, &sc, &nl, &HashMap::new(), Some(&mut HeldTimers::default()));
+        let held = net_slacks_timed(&t, &sc, &nl, &HashMap::new(), Read::Held(&mut HeldTimers::default()));
         assert!(held.is_err_and(|e| e.contains("not modelled")));
     }
 

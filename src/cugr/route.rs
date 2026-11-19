@@ -290,7 +290,8 @@ pub fn route_cugr(db: &mut Db, opts: &RouteOptions, call: usize, stt: SteinerBui
                 Some(nets) if opts.placement_parasitics => nets.iter().map(|(n, g)| (n.clone(), crate::timer::placement_network(n, g))).collect(),
                 _ => std::collections::HashMap::new(),
             };
-            let by_name = crate::timer::net_slacks_on(timing, &opts.scenes, &nl, &par)?;
+            let pin_ids = crate::timer::pin_ids(db, &nl)?;
+            let by_name = crate::timer::net_slacks_on(timing, &opts.scenes, &nl, &pin_ids, &par)?;
             let m: std::collections::BTreeMap<String, f32> = by_name.into_iter().collect();
             if let Some(path) = &opts.timer_trace {
                 // `C <call> <sort> <net> <bits>`, as the CUGR capture writes its reads.
