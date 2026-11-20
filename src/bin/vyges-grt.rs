@@ -1394,6 +1394,10 @@ fn run(job: &Value) -> Result<Value, Fail> {
     // read and which are not modelled — refused wherever they would be read, but only when present.
     let has_access_points = from_db && db.block_access_point_count().map_err(err)? > 0;
     let mut opts = RouteOptions::new();
+    // The router's parasitics are read only by a write_parasitics or write_spef step; with none
+    // in the job they are not estimated (the reference's global_route estimates nothing after
+    // the run).
+    opts.keep_parasitics = job["steps"].as_array().is_some_and(|s| s.iter().any(|st| matches!(st["cmd"].as_str(), Some("write_parasitics" | "write_spef"))));
     // The libraries' texts, for the timer — parsed only once a clock with a period is defined.
     let mut liberty_texts: Vec<(String, String, Option<usize>)> = Vec::new();
     // read_sdc — the file and the constraint commands applied after it, as read so far.

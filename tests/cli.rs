@@ -319,3 +319,36 @@ fn debug_flags_print_stages_and_change_no_result() {
     }
     assert!(e_old.contains("VYGES_GRT_STAGE_TIMES is deprecated"), "{e_old}");
 }
+
+/// The router's parasitics are estimated only when a step reads them: the reference's
+/// `global_route` estimates nothing after the run (`estimate_parasitics -global_routing` is its
+/// own command). With a `write_parasitics` step the routed estimate runs and the file has the
+/// nets; without one it does not run (no stage line), and the guides are the same.
+#[test]
+fn the_parasitics_are_estimated_only_when_a_step_reads_them() {
+    let run = |tag: &str, write: bool| {
+        let guides = tmp(&format!("lazy-{tag}.guide"));
+        let pars = tmp(&format!("lazy-{tag}.par"));
+        let mut steps = vec![serde_json::json!({ "cmd": "global_route" }), serde_json::json!({ "cmd": "write_guides", "path": guides.to_str().unwrap() })];
+        if write {
+            steps.push(serde_json::json!({ "cmd": "write_parasitics", "path": pars.to_str().unwrap(), "source": "routed" }));
+        }
+        let job = serde_json::json!({ "lefs": [data("tiny.lef")], "def": data("tiny.def"), "steps": steps });
+        let path = tmp(&format!("lazy-{tag}.json"));
+        std::fs::write(&path, job.to_string()).unwrap();
+        let mut c = bin();
+        c.env_remove("VYGES_DEBUG").env_remove("VYGES_GRT_STAGE_TIMES");
+        let o = c.env("VYGES_STAGE_TIMES", "1").env("VYGES_LOG_FORMAT", "json").arg("route").arg(&path).output().unwrap();
+        assert_eq!(o.status.code(), Some(0), "{}", String::from_utf8_lossy(&o.stderr));
+        let par = std::fs::read_to_string(&pars).unwrap_or_default();
+        (std::fs::read(&guides).unwrap(), String::from_utf8_lossy(&o.stderr).into_owned(), par)
+    };
+    let (g_with, e_with, par) = run("with", true);
+    let (g_without, e_without, _) = run("without", false);
+    assert_eq!(g_with, g_without);
+    let stage = "\"estimateAllGlobalRouteParasitics (routed)\"";
+    assert!(e_with.contains(stage), "{e_with}");
+    assert!(!e_without.contains(stage), "{e_without}");
+    assert!(par.lines().any(|l| l.contains("|res|") || l.contains("|node|")), "no networks written:\n{par}");
+    assert!(vyges_grt::global_route::RouteOptions::new().keep_parasitics, "library callers keep them by default");
+}

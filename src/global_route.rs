@@ -50,6 +50,12 @@ pub struct RouteOptions {
     pub scenes: crate::timer::Scenes,
     /// Where to write every computed read (`<P|U> <call> <net> <f32 bits>`), if anywhere.
     pub timer_trace: Option<String>,
+    /// Keep the parasitic networks in the result ([`RouteResult::parasitics`] at the first read,
+    /// [`RouteResult::routed_parasitics`] over the saved routes). The reference's `global_route`
+    /// estimates nothing after the run (`estimate_parasitics -global_routing` is its own
+    /// command), so a caller that reads neither turns this off and skips both estimates and the
+    /// tree snapshot. Default on.
+    pub keep_parasitics: bool,
     /// `estimate_parasitics -placement` ran: a timer read with no route estimate of its own sees
     /// those parasitics.
     pub placement_parasitics: bool,
@@ -112,6 +118,7 @@ impl RouteOptions {
             timing: None,
             scenes: crate::timer::Scenes::default(),
             timer_trace: None,
+            keep_parasitics: true,
             placement_parasitics: false,
             placement_networks: None,
             resistance_aware: false,
@@ -2102,6 +2109,8 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         overflow: i32,
         cnp: f32,
         res_aware: bool,
+        /// The tree snapshot is only for the kept parasitics.
+        snapshot: bool,
         trees: Option<Vec<Option<crate::brk_rsmt::StTree>>>,
         /// The 3D edges at R19 — nothing after it changes them, so they are what antenna repair's
         /// jumper pass reads (`hasAvailableResources`) and charges.
@@ -2120,10 +2129,10 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
                     self.g3 = g3.cloned();
                     self.g2d = Some(g2d.clone());
                 }
-                Stage::Loop(crate::congestion_loop::LoopEvent::Before { params, .. }) if params.ordering && self.cnp != 0.0 && self.trees.is_none() => {
+                Stage::Loop(crate::congestion_loop::LoopEvent::Before { params, .. }) if self.snapshot && params.ordering && self.cnp != 0.0 && self.trees.is_none() => {
                     self.trees = Some(st.iter().map(|n| n.tree.clone()).collect());
                 }
-                Stage::Scan { tag: "B15", .. } if self.res_aware && self.trees.is_none() => {
+                Stage::Scan { tag: "B15", .. } if self.snapshot && self.res_aware && self.trees.is_none() => {
                     self.trees = Some(st.iter().map(|n| n.tree.clone()).collect());
                 }
                 _ => {}
@@ -2132,7 +2141,7 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         }
     }
     let mut state = vec![NetState::default(); nets.len()];
-    let mut ov = Observer { overflow: 0, cnp: t.config.critical_nets_percentage, res_aware: opts.resistance_aware, trees: None, g3: None, g2d: None, lines: crate::run_log::RunLines::new(opts.verbose, opts.congestion_iterations) };
+    let mut ov = Observer { overflow: 0, cnp: t.config.critical_nets_percentage, res_aware: opts.resistance_aware, snapshot: opts.keep_parasitics, trees: None, g3: None, g2d: None, lines: crate::run_log::RunLines::new(opts.verbose, opts.congestion_iterations) };
     let run = {
         let _s = crate::dbg::stage("FastRouteCore::run");
         fastroute_run(&inp, &mut state, &mut ov)
@@ -2192,7 +2201,7 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     // congestion loop (no partial-slack read) still has routes to estimate.
     drop(tail_stage);
     let mut routed_parasitics = std::collections::BTreeMap::new();
-    {
+    if opts.keep_parasitics {
         let _s = crate::dbg::stage("estimateAllGlobalRouteParasitics (routed)");
         let rc = layer_rc(db);
         for n in &nets {
