@@ -1837,6 +1837,38 @@ fn net_network(
     (pins, network)
 }
 
+/// `f(0..n)` on `threads` threads, results in index order: each worker claims 64 indices at a time
+/// (the reference's `schedule(dynamic, 64)`). One thread, or fewer than two chunks, runs serially.
+fn par_map<T: Send>(n: usize, threads: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    const CHUNK: usize = 64;
+    if threads <= 1 || n < 2 * CHUNK {
+        return (0..n).map(f).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let parts: Vec<Vec<(usize, T)>> = std::thread::scope(|s| {
+        let workers: Vec<_> = (0..threads.min(n.div_ceil(CHUNK)))
+            .map(|_| {
+                s.spawn(|| {
+                    let mut out = Vec::new();
+                    loop {
+                        let start = next.fetch_add(CHUNK, std::sync::atomic::Ordering::Relaxed);
+                        if start >= n {
+                            return out;
+                        }
+                        out.extend((start..(start + CHUNK).min(n)).map(|i| (i, f(i))));
+                    }
+                })
+            })
+            .collect();
+        workers.into_iter().map(|w| w.join().unwrap_or_else(|e| std::panic::resume_unwind(e))).collect()
+    });
+    let mut slots: Vec<Option<T>> = std::iter::repeat_with(|| None).take(n).collect();
+    for (i, x) in parts.into_iter().flatten() {
+        slots[i] = Some(x);
+    }
+    slots.into_iter().map(|x| x.expect("every index claimed once")).collect()
+}
+
 pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, flutes: crate::brk_rsmt::Flutes<'_>) -> Res<RouteResult> {
     use crate::brk_rsmt::{CapLayer, Caps3D, NetState, RsmtNet};
     use crate::run::{fastroute_run, RunEnd, RunInputs, RunObserver, Stage};
@@ -1994,16 +2026,27 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         // getPlanarRoutes: the planar routes before layer assignment, the 3D routes (estimated
         // with the pins attached by their real layers) in a 3D pass.
         let is_3d = read == (crate::congestion_loop::SlackRead::Update { is_3d_step: true });
-        for &id in &net_ids {
+        // `estimateRoutesInParallel`: each net estimated on its own on the timer's threads (the
+        // reference's one thread count), stored afterwards in net order — the result does not
+        // depend on the thread count.
+        let one = |j: usize| -> Result<Option<_>, String> {
+            let id = net_ids[j];
             let n = &nets[id];
             if is_3d {
                 let tree = st[id].tree3d.as_ref().ok_or_else(|| format!("net {}: no 3D tree in a 3D pass", n.name))?;
                 let (px, py): (Vec<i32>, Vec<i32>) = n.pins.iter().map(|p| (p.0, p.1)).unzip();
                 let pl: Vec<i16> = n.pins.iter().map(|p| (p.2 - 1) as i16).collect();
                 let route = crate::planar_route::route_3d(tree, crate::planar_route::NetPinsGrid { x: &px, y: &py, layer: &pl }, origin);
-                par.insert(n.name.clone(), net_network(n, &route, &timer_rc, t.min_routing_layer, crate::parasitics::PinAttach::Routed).1);
+                Ok(Some(net_network(n, &route, &timer_rc, t.min_routing_layer, crate::parasitics::PinAttach::Routed).1))
             } else if let Some(tree) = st[id].tree.as_ref() {
-                par.insert(n.name.clone(), planar_net_network(n, tree, &timer_rc, &layer_dir, origin, t.min_routing_layer).2);
+                Ok(Some(planar_net_network(n, tree, &timer_rc, &layer_dir, origin, t.min_routing_layer).2))
+            } else {
+                Ok(None)
+            }
+        };
+        for (j, network) in par_map(net_ids.len(), vyges_sta::par::default_thread_count(), one).into_iter().enumerate() {
+            if let Some(network) = network? {
+                par.insert(nets[net_ids[j]].name.clone(), network);
             }
         }
         drop(est_stage);
@@ -3230,6 +3273,23 @@ fn merge_results(a: &mut AfterRoute, routes: std::collections::BTreeMap<String, 
         if let Some(n) = a.router_nets.iter().find(|n| n.name == r.name) {
             r.set_pins(n.net_pins.iter().map(|p| crate::Pin { connection_layer: p.connection_layer, on_grid_x: p.on_grid.0, on_grid_y: p.on_grid.1 }).collect());
         }
+    }
+}
+
+#[cfg(test)]
+mod par_map_tests {
+    /// Rule (`estimateRoutesInParallel`): each net is estimated on its own and stored by net, so
+    /// the result does not depend on the thread count or the order the threads run in. Ours: the
+    /// results come back in index order at any thread count, every index exactly once.
+    #[test]
+    fn the_results_are_in_index_order_at_any_thread_count() {
+        let f = |i: usize| (i, i.wrapping_mul(2_654_435_761) % 1_000_003);
+        let serial: Vec<_> = (0..10_007).map(f).collect();
+        for threads in [1, 2, 7, 16] {
+            assert_eq!(super::par_map(10_007, threads, f), serial, "threads {threads}");
+        }
+        assert_eq!(super::par_map(100, 16, f), (0..100).map(f).collect::<Vec<_>>(), "fewer than two chunks");
+        assert!(super::par_map(0, 16, f).is_empty());
     }
 }
 
