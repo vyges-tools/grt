@@ -19,6 +19,9 @@ pub const TIMER_STATS: &str = "vy_timer_stats";
 pub const INCR_PINS: &str = "vy_incr_pins";
 /// Turns `VYGES_STAGE_TIMES` on; the target of the old `VYGES_GRT_STAGE_TIMES`.
 pub const STAGE_TIMES: &str = "vy_stage_times";
+/// CUGR's model, each stage and each restore, as the CUGR instruments compare them; the target of
+/// the old `VYGC_OUT` (which still names the file).
+pub const CUGR_TRACE: &str = "vy_cugr_trace";
 
 /// grt's debug groups. None mirrors a reference group: the reference's GRT `incr` (level 2) lists
 /// the dirty nets' names only; ours prints their pins as compared.
@@ -26,6 +29,7 @@ pub const DEBUG_GROUPS: &[DebugGroup] = &[
     DebugGroup { group: TIMER_STATS, max_level: 1, what: "per slack read and scene: graph sizes, path count, capacity and bytes", reference: None },
     DebugGroup { group: INCR_PINS, max_level: 1, what: "incremental routing: each dirty net's pins as compared (file: VYGES_GRT_INCR_TRACE, else VYGES_DEBUG_DIR/grt/incr-pins.txt)", reference: None },
     DebugGroup { group: STAGE_TIMES, max_level: 1, what: "turns VYGES_STAGE_TIMES on (alias target of VYGES_GRT_STAGE_TIMES)", reference: None },
+    DebugGroup { group: CUGR_TRACE, max_level: 1, what: "CUGR: its model, every stage and each restore, appended (file: VYGC_OUT, else VYGES_DEBUG_DIR/grt/cugr.vygc)", reference: None },
 ];
 
 /// The old variables, mapped onto groups. Call once at the start of `main`, before any `Logger`
@@ -34,6 +38,7 @@ pub fn register_aliases() {
     vyges_events::debug::register_alias("VYGES_GRT_STAGE_TIMES", TOOL, STAGE_TIMES, 1);
     vyges_events::debug::register_alias("VYGES_GRT_INCR_TRACE", TOOL, INCR_PINS, 1);
     vyges_events::debug::register_alias("VYGES_GRT_TIMER_STATS", TOOL, TIMER_STATS, 1);
+    vyges_events::debug::register_alias("VYGC_OUT", TOOL, CUGR_TRACE, 1);
     if debug_enabled(TOOL, STAGE_TIMES, 1) && std::env::var_os("VYGES_STAGE_TIMES").is_none() {
         // Single-threaded here (start of main), and before the stage switch is first read.
         std::env::set_var("VYGES_STAGE_TIMES", "1");
@@ -49,6 +54,16 @@ pub fn stage(name: &str) -> vyges_events::stage::Stage {
 /// Whether a grt group is on. Check once, outside a hot loop.
 pub fn on(group: &str) -> bool {
     debug_enabled(TOOL, group, 1)
+}
+
+/// Where the CUGR trace goes: the old variable's path (`VYGC_OUT`, as before), else with
+/// `vy_cugr_trace` on the debug directory's `cugr.vygc`; `None` when neither. Read it once per write.
+pub fn cugr_out() -> Option<String> {
+    cugr_out_from(std::env::var("VYGC_OUT").ok(), on(CUGR_TRACE), || vyges_events::debug_dir(TOOL))
+}
+
+fn cugr_out_from(old: Option<String>, on: bool, dir: impl FnOnce() -> Option<std::path::PathBuf>) -> Option<String> {
+    old.or_else(|| if on { dir().map(|d| d.join("cugr.vygc").to_string_lossy().into_owned()) } else { None })
 }
 
 /// One debug line of a group that is on (the caller checked [`on`]).
@@ -67,6 +82,20 @@ mod tests {
         let w = vyges_events::debug::check_debug_groups(TOOL, DEBUG_GROUPS, &spec.specs);
         assert_eq!(w.len(), 1, "{w:?}");
         assert!(w[0].contains("grt:incr") && w[0].contains(TIMER_STATS), "{}", w[0]);
+    }
+
+    /// `VYGC_OUT` keeps naming the file; the group alone writes into the debug directory; off and
+    /// unset, nothing is written (and the directory is not asked for).
+    #[test]
+    fn the_cugr_trace_goes_to_the_old_path_else_the_debug_directory() {
+        let dir = || Some(std::path::PathBuf::from("/d/grt"));
+        assert_eq!(cugr_out_from(Some("/x.vygc".into()), true, dir), Some("/x.vygc".into()));
+        assert_eq!(cugr_out_from(Some("/x.vygc".into()), false, dir), Some("/x.vygc".into()));
+        assert_eq!(cugr_out_from(None, true, dir), Some("/d/grt/cugr.vygc".into()));
+        assert_eq!(cugr_out_from(None, true, || None), None);
+        assert_eq!(cugr_out_from(None, false, || panic!("not asked when off")), None);
+        let (spec, _) = vyges_events::debug::alias_spec("VYGC_OUT", Some("/x.vygc"), TOOL, CUGR_TRACE, 1).expect("a path turns it on");
+        assert_eq!(spec.group, CUGR_TRACE);
     }
 
     #[test]

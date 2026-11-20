@@ -320,6 +320,49 @@ fn debug_flags_print_stages_and_change_no_result() {
     assert!(e_old.contains("VYGES_GRT_STAGE_TIMES is deprecated"), "{e_old}");
 }
 
+/// The CUGR tracer behind `grt:vy_cugr_trace`: with the group on it writes `cugr.vygc` under
+/// `VYGES_DEBUG_DIR/grt/`, with the old `VYGC_OUT` the file it names (the same lines); either way
+/// the guides and the report equal a run with neither, which writes no trace.
+#[test]
+fn the_cugr_trace_group_writes_the_trace_and_changes_no_result() {
+    // tiny.def on a die a CUGR gcell fits in, as the jumper-pass test makes it
+    let def = std::fs::read_to_string(data("tiny.def")).unwrap()
+        .replace("DIEAREA ( 0 0 ) ( 4000 2400 )", "DIEAREA ( 0 0 ) ( 8000 8000 )")
+        .replace("DO 12 STEP 200", "DO 40 STEP 200").replace("DO 20 STEP 200 LAYER", "DO 40 STEP 200 LAYER");
+    let big = tmp("cugrtrace.def");
+    std::fs::write(&big, def).unwrap();
+    let run = |tag: &str, env: &[(&str, &str)]| {
+        let guides = tmp(&format!("cugrtrace-{tag}.guide"));
+        let job = serde_json::json!({
+            "lefs": [data("tiny.lef")],
+            "def": big.to_str().unwrap(),
+            "steps": [{ "cmd": "global_route", "use_cugr": true }, { "cmd": "write_guides", "path": guides.to_str().unwrap() }]
+        });
+        let path = tmp(&format!("cugrtrace-{tag}.json"));
+        std::fs::write(&path, job.to_string()).unwrap();
+        let mut c = bin();
+        for v in ["VYGES_STAGE_TIMES", "VYGES_DEBUG", "VYGES_DEBUG_DIR", "VYGC_OUT"] {
+            c.env_remove(v);
+        }
+        let o = c.envs(env.iter().copied()).arg("route").arg(&path).output().unwrap();
+        assert_eq!(o.status.code(), Some(0), "{}", String::from_utf8_lossy(&o.stderr));
+        let mut report: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+        report["guides_written"] = serde_json::Value::Null;
+        report["files_written"] = serde_json::Value::Null;
+        (report, std::fs::read(&guides).unwrap())
+    };
+    let dir = tmp("cugrtrace-dbg");
+    let old = tmp("cugrtrace-old.vygc");
+    let off = run("off", &[]);
+    let on = run("on", &[("VYGES_DEBUG", "grt:vy_cugr_trace=1"), ("VYGES_DEBUG_DIR", dir.to_str().unwrap())]);
+    let by_old = run("old", &[("VYGC_OUT", old.to_str().unwrap())]);
+    assert_eq!(on, off, "the group changed a result");
+    assert_eq!(by_old, off, "the old variable changed a result");
+    let traced = std::fs::read_to_string(dir.join("grt").join("cugr.vygc")).expect("the group wrote the trace");
+    assert!(!traced.is_empty());
+    assert_eq!(std::fs::read_to_string(&old).expect("VYGC_OUT still names the file"), traced);
+}
+
 /// The router's parasitics are estimated only when a step reads them: the reference's
 /// `global_route` estimates nothing after the run (`estimate_parasitics -global_routing` is its
 /// own command). With a `write_parasitics` step the routed estimate runs and the file has the

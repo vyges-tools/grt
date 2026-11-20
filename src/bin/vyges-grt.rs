@@ -43,7 +43,8 @@ JOB (JSON):
     { \"cmd\": \"global_route\", \"verbose\": b, \"allow_congestion\": b, \"grid_origin\": [x, y],
       \"skip_large_fanout\": n, \"congestion_iterations\": n, \"critical_nets_percentage\": f,
       \"resistance_aware\": b, \"res_aware_nets_percentage\": f, \"use_cugr\": b }
-      (use_cugr: CUGR — its model and every stage written to the file $VYGC_OUT names)
+      (use_cugr: CUGR — its model and every stage written to the file $VYGC_OUT names, or with
+       VYGES_DEBUG=grt:vy_cugr_trace=1 to VYGES_DEBUG_DIR/grt/cugr.vygc)
     { \"cmd\": \"create_clock\", \"ports\": [..], \"name\": s, \"period\": f, \"waveform\": [r, f] }  (user units: the slacks are timed)
     { \"cmd\": \"set_input_delay\" | \"set_output_delay\", \"value\": f | \"period_times\": f,
       \"ports\": [..] | \"inputs_except_clocks\" | \"outputs\" }      (relative to the clock's rise edge)
@@ -816,9 +817,9 @@ fn repair_antennas(db: &mut Db, opts: &RouteOptions, step: &Value, diode: Option
         if let Some((c, cg)) = cugr.as_mut() {
             // IncrementalGRoute::updateRoutes → updateDirtyRoutesCugr.
             let branches = |x: &[i32], y: &[i32], d: usize, a: f32| stt(x, y, d, a).branch.iter().map(|b| (b.x, b.y, b.n)).collect::<Vec<_>>();
-            let mut trace = std::env::var("VYGC_OUT").ok().map(|_| Vec::new());
+            let mut trace = vyges_grt::dbg::cugr_out().ok_or(()).ok().map(|_| Vec::new());
             let res = vyges_grt::cugr::route::update_dirty_routes_cugr(db, opts, c, cg, &nets_to_repair, &branches, log, trace.as_mut());
-            if let (Ok(path), Some(t)) = (std::env::var("VYGC_OUT"), &trace) {
+            if let (Ok(path), Some(t)) = (vyges_grt::dbg::cugr_out().ok_or(()), &trace) {
                 let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(at(&path))?;
                 std::io::Write::write_all(&mut f, (t.join("\n") + "\n").as_bytes()).map_err(err)?;
             }
@@ -1073,7 +1074,7 @@ fn cugr_jumpers(db: &mut Db, cugr: &mut vyges_grt::cugr::Cugr, cg: &mut vyges_gr
         let mut f = std::fs::OpenOptions::new().create(true).write(true).append(pass > 1).truncate(pass == 1).open(p).map_err(at(p))?;
         std::io::Write::write_all(&mut f, lines.as_bytes()).map_err(at(p))?;
     }
-    if let Ok(path) = std::env::var("VYGC_OUT") {
+    if let Ok(path) = vyges_grt::dbg::cugr_out().ok_or(()) {
         let lines: String = router.restores.iter().map(|(net, r)| vyges_grt::cugr::trace::restore(net, r) + "\n").collect();
         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(at(&path))?;
         std::io::Write::write_all(&mut f, lines.as_bytes()).map_err(err)?;
@@ -1678,9 +1679,9 @@ fn run(job: &Value) -> Result<Value, Fail> {
                         // updateDirtyRoutesCugr over dirty_nets_ (a PtrSet: block order).
                         let list = dirty.in_block_order(&db.net_names());
                         let branches = |x: &[i32], y: &[i32], d: usize, a: f32| stt(x, y, d, a).branch.iter().map(|b| (b.x, b.y, b.n)).collect::<Vec<_>>();
-                        let mut trace = std::env::var("VYGC_OUT").ok().map(|_| Vec::new());
+                        let mut trace = vyges_grt::dbg::cugr_out().ok_or(()).ok().map(|_| Vec::new());
                         let res = vyges_grt::cugr::route::update_dirty_routes_cugr(&mut db, &opts, c, cg, &list, &branches, &mut log, trace.as_mut());
-                        if let (Ok(path), Some(t)) = (std::env::var("VYGC_OUT"), &trace) {
+                        if let (Ok(path), Some(t)) = (vyges_grt::dbg::cugr_out().ok_or(()), &trace) {
                             let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(at(&path))?;
                             std::io::Write::write_all(&mut f, (t.join("\n") + "\n").as_bytes()).map_err(err)?;
                         }
@@ -1721,7 +1722,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
                     cugr_calls += 1;
                     // initCUGR leaves CUGR's member at 0 without a liberty library.
                     critical_nets.after_call(true, opts.liberty.is_some());
-                    if let Ok(path) = std::env::var("VYGC_OUT") {
+                    if let Ok(path) = vyges_grt::dbg::cugr_out().ok_or(()) {
                         let lines = stage;
                         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(at(&path))?;
                         std::io::Write::write_all(&mut f, (lines.join("\n") + "\n").as_bytes()).map_err(err)?;
@@ -2180,9 +2181,9 @@ fn run(job: &Value) -> Result<Value, Fail> {
                 // is the block's `grt_use_cugr` property (`ensureEngineSelected`), and the router is
                 // set up around the database's guides (`loadGuidesFromDB`, `initCUGR`, adoption).
                 if !routed_by_cugr && after.is_none() && from_db && db.block_bool_property("grt_use_cugr").map_err(err)? == Some(true) {
-                    let mut trace = std::env::var("VYGC_OUT").ok().map(|_| Vec::new());
+                    let mut trace = vyges_grt::dbg::cugr_out().ok_or(()).ok().map(|_| Vec::new());
                     let restored = vyges_grt::cugr::route::restore_cugr_for_repair(&mut db, &opts, trace.as_mut());
-                    if let (Ok(path), Some(t)) = (std::env::var("VYGC_OUT"), &trace) {
+                    if let (Ok(path), Some(t)) = (vyges_grt::dbg::cugr_out().ok_or(()), &trace) {
                         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(at(&path))?;
                         std::io::Write::write_all(&mut f, (t.join("\n") + "\n").as_bytes()).map_err(err)?;
                     }
@@ -2355,7 +2356,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
                     other => return Err(Fail::Refused(format!("odb {other} is not modelled"))),
                 }
                 let cb = incremental.as_mut().map(|d| d.take_trace()).unwrap_or_default();
-                if let (Ok(path), false) = (std::env::var("VYGC_OUT"), cb.is_empty()) {
+                if let (Ok(path), false) = (vyges_grt::dbg::cugr_out().ok_or(()), cb.is_empty()) {
                     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(at(&path))?;
                     std::io::Write::write_all(&mut f, (cb.join("\n") + "\n").as_bytes()).map_err(err)?;
                 }

@@ -28,7 +28,8 @@ JOB (JSON):
     { "cmd": "global_route", "verbose": b, "allow_congestion": b, "grid_origin": [x, y],
       "skip_large_fanout": n, "congestion_iterations": n, "critical_nets_percentage": f,
       "resistance_aware": b, "res_aware_nets_percentage": f, "use_cugr": b }
-      (use_cugr: CUGR — its model and every stage written to the file $VYGC_OUT names)
+      (use_cugr: CUGR — its model and every stage written to the file $VYGC_OUT names, or with
+       VYGES_DEBUG=grt:vy_cugr_trace=1 to VYGES_DEBUG_DIR/grt/cugr.vygc)
     { "cmd": "create_clock", "ports": [..], "name": s, "period": f, "waveform": [r, f] }  (user units: the slacks are timed)
     { "cmd": "set_input_delay" | "set_output_delay", "value": f | "period_times": f,
       "ports": [..] | "inputs_except_clocks" | "outputs" }      (relative to the clock's rise edge)
