@@ -1558,6 +1558,9 @@ fn run(job: &Value) -> Result<Value, Fail> {
     for step in job["steps"].as_array().ok_or_else(|| err("steps"))? {
         // One stage per script command (the reference's entry point), the router's own nested in it.
         let _timed = vyges_grt::dbg::stage(step["cmd"].as_str().unwrap_or(""));
+        if !vyges_grt::timer::keeps_timer_netlist(step["cmd"].as_str().unwrap_or("")) {
+            opts.timer_netlist = None;
+        }
         match step["cmd"].as_str().unwrap_or("") {
             "set_routing_layers" => {
                 if let Some([lo, hi]) = step["signal"].as_array().map(Vec::as_slice) {
@@ -2508,7 +2511,7 @@ fn propagated_clock_lines(names: &[String]) -> String {
 /// constant nets. Each clock's source port reaches the clock network.
 fn read_scene_sdc(db: &Db, opts: &mut RouteOptions, path: &str, text: &str) -> Result<(), Fail> {
     let timing = opts.timing.as_ref().ok_or_else(|| Fail::Refused("read_sdc before a liberty library".into()))?;
-    let netlist = vyges_grt::timer::netlist(db);
+    let netlist = vyges_grt::timer::timer_netlist(db, opts);
     let constant_nets = vyges_grt::timer::constant_nets(db).map_err(Fail::Refused)?;
     let read = vyges_loom::sdc::ReadOpts { base_dir: std::path::Path::new(path).parent().map(|p| p.to_path_buf()), ..Default::default() };
     let s = vyges_loom::sdc::Sdc::parse_with_opts(text, &vyges_sta::load::sdc_design(&netlist, &timing.libs), &read).map_err(|e| Fail::Refused(format!("{path}: {}", e.0)))?;
@@ -2521,6 +2524,8 @@ fn read_scene_sdc(db: &Db, opts: &mut RouteOptions, path: &str, text: &str) -> R
         }
     }
     opts.scenes.constraints = Some(c);
+    // the router's reads take this netlist while the design is not edited (one network view)
+    opts.timer_netlist = Some(netlist);
     Ok(())
 }
 

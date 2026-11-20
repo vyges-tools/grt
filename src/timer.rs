@@ -233,8 +233,47 @@ impl HeldTimers {
     }
 }
 
+/// The timer's netlist for a read: the one the job kept ([`crate::global_route::RouteOptions::timer_netlist`],
+/// built for `read_sdc` on the same connectivity), else built now from the database.
+pub fn timer_netlist(db: &Db, opts: &crate::global_route::RouteOptions) -> std::sync::Arc<Netlist> {
+    match &opts.timer_netlist {
+        Some(nl) => std::sync::Arc::clone(nl),
+        None => std::sync::Arc::new(netlist(db)),
+    }
+}
+
+/// Whether a job step leaves the design's connectivity as it was, so the timer netlist kept
+/// across steps stays the database's: the router's own settings, the timer's inputs, the
+/// estimates and the writers. Anything else (an `odb` edit, antenna repair inserting diodes, a
+/// step not listed) drops it, and the next read builds it again.
+pub fn keeps_timer_netlist(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "set_routing_layers"
+            | "layer_adjustment"
+            | "global_adjustment"
+            | "macro_extension"
+            | "region_adjustment"
+            | "routing_alpha"
+            | "nets_to_route"
+            | "global_route"
+            | "set_layer_rc"
+            | "create_clock"
+            | "read_sdc"
+            | "est_rc"
+            | "estimate_parasitics"
+            | "propagated_clock"
+            | "placement_padding"
+            | "write_parasitics"
+            | "write_spef"
+            | "write_guides"
+            | "write_db"
+    )
+}
+
 /// The netlist as the database holds it.
 pub fn netlist(db: &Db) -> Netlist {
+    let _built = crate::dbg::stage("dbNetwork (timer netlist)");
     let mut nl = Netlist::default();
     let mut inst_index = HashMap::new();
     for inst in db.inst_names() {
@@ -633,6 +672,19 @@ mod tests {
     /// Pin ids that keep each net's pins in netlist order.
     fn in_netlist_order(nl: &Netlist) -> Vec<Vec<u64>> {
         nl.nets.iter().map(|n| (0..n.pins.len() as u64).collect()).collect()
+    }
+
+    /// Rule (the reference's timer reads one `dbNetwork` view, which follows every edit): the kept
+    /// netlist survives only steps that cannot change connectivity; an `odb` edit, antenna repair
+    /// (diodes) and any step not known to leave the design alone drop it.
+    #[test]
+    fn the_kept_netlist_survives_only_steps_that_leave_connectivity_alone() {
+        for keep in ["read_sdc", "set_layer_rc", "estimate_parasitics", "global_route", "write_guides", "write_db"] {
+            assert!(keeps_timer_netlist(keep), "{keep}");
+        }
+        for drop in ["odb", "repair_antennas", "antenna_wires", "router_state", "create_ndr", "assign_ndr", "a_step_added_later", ""] {
+            assert!(!keeps_timer_netlist(drop), "{drop}");
+        }
     }
 
     /// Rule (`Network::connectedPinIterator(net)` gathers the pins into a `PinSet`, ordered by

@@ -285,7 +285,7 @@ pub fn route_cugr(db: &mut Db, opts: &RouteOptions, call: usize, stt: SteinerBui
     let computed_stage1 = match (&opts.timing, oracle.is_none() && timed && opts.critical_nets_percentage != 0.0) {
         // After `estimate_parasitics -placement` stage 1 reads THOSE networks; otherwise none.
         (Some(timing), true) => {
-            let nl = crate::timer::netlist(db);
+            let nl = crate::timer::timer_netlist(db, opts);
             let par: std::collections::HashMap<String, vyges_sta::graph::NetParasitics> = match &opts.placement_networks {
                 Some(nets) if opts.placement_parasitics => nets.iter().map(|(n, g)| (n.clone(), crate::timer::placement_network(n, g))).collect(),
                 _ => std::collections::HashMap::new(),
@@ -700,7 +700,7 @@ fn timer_slack_source(db: &mut Db, opts: &RouteOptions) -> Res<super::SlackSourc
         let widths = if ndr.is_empty() { None } else { Some(db.ndr_layer_rules(&ndr)?.iter().map(|(layer, width, _)| (db.layer_get_routing_level(layer), *width)).collect()) };
         nets.insert(n.name.clone(), (pins, widths));
     }
-    let netlist = crate::timer::netlist(db);
+    let netlist = crate::timer::timer_netlist(db, opts);
     // Each net's pin ids, aligned with its pins: every read folds the loads in that order.
     let pin_ids = crate::timer::pin_ids(db, &netlist)?;
     let rc = crate::global_route::layer_rc_for(db, &t, opts);

@@ -59,6 +59,11 @@ pub struct RouteOptions {
     /// `estimate_parasitics -placement` ran: a timer read with no route estimate of its own sees
     /// those parasitics.
     pub placement_parasitics: bool,
+    /// The timer's netlist as built for `read_sdc`, kept for the router's reads while the design's
+    /// connectivity is unchanged: the reference's timer reads one network view of the database,
+    /// built once (`dbNetwork`). The job drops it at any step that may edit the design
+    /// ([`crate::timer::keeps_timer_netlist`]); `None`: built when a read needs it.
+    pub timer_netlist: Option<std::sync::Arc<vyges_sta::netlist::Netlist>>,
     /// Their networks by net (corner 0), when the estimator made any.
     pub placement_networks: Option<std::collections::BTreeMap<String, vyges_est::network::Parasitic>>,
     /// `global_route -resistance_aware`.
@@ -120,6 +125,7 @@ impl RouteOptions {
             timer_trace: None,
             keep_parasitics: true,
             placement_parasitics: false,
+            timer_netlist: None,
             placement_networks: None,
             resistance_aware: false,
             res_aware_nets_percentage: None,
@@ -2011,7 +2017,7 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     // est::estimateAllGlobalRouteParasitics over the planar routes, then vyges-sta.
     let origin = crate::routes::GridOrigin { tile_size: t.core.tile_size, x_corner: t.core.area.x_min, y_corner: t.core.area.y_min };
     let timer_rc = layer_rc(db);
-    let timer_netlist = opts.timing.as_ref().map(|_| crate::timer::netlist(db));
+    let timer_netlist = opts.timing.as_ref().map(|_| crate::timer::timer_netlist(db, opts));
     let timer_pin_ids = timer_netlist.as_ref().map(|nl| crate::timer::pin_ids(db, nl)).transpose()?;
     // `timer_trace`: every computed read, as `<P|U> <call> <net> <f32 bits>` (a capture's format),
     // appended as each read completes, so a run stopped part way keeps the reads it finished.
