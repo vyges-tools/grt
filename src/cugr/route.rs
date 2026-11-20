@@ -701,6 +701,8 @@ fn timer_slack_source(db: &mut Db, opts: &RouteOptions) -> Res<super::SlackSourc
         nets.insert(n.name.clone(), (pins, widths));
     }
     let netlist = crate::timer::netlist(db);
+    // Each net's pin ids, aligned with its pins: every read folds the loads in that order.
+    let pin_ids = crate::timer::pin_ids(db, &netlist)?;
     let rc = crate::global_route::layer_rc_for(db, &t, opts);
     let pin_grid = crate::pins::PinGrid {
         die: t.core.area,
@@ -771,7 +773,7 @@ fn timer_slack_source(db: &mut Db, opts: &RouteOptions) -> Res<super::SlackSourc
                 }
             }
         }
-        let m: std::collections::BTreeMap<String, f32> = crate::timer::net_slacks_incremental(&timing, &scenes, &netlist, &par, &mut timer)?.into_iter().collect();
+        let m: std::collections::BTreeMap<String, f32> = crate::timer::net_slacks_incremental(&timing, &scenes, &netlist, &pin_ids, &par, &mut timer)?.into_iter().collect();
         if let Some(path) = &trace {
             use std::io::Write;
             let mut f = std::fs::OpenOptions::new().append(true).create(true).open(path).map_err(|e| e.to_string())?;
