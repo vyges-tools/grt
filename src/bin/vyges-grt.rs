@@ -2513,7 +2513,7 @@ fn read_scene_sdc(db: &Db, opts: &mut RouteOptions, path: &str, text: &str) -> R
     let s = vyges_loom::sdc::Sdc::parse_with_opts(text, &vyges_sta::load::sdc_design(&netlist, &timing.libs), &read).map_err(|e| Fail::Refused(format!("{path}: {}", e.0)))?;
     let slices = opts.scenes.slices(timing);
     let design = vyges_sta::load::Design { netlist: vyges_grt::timer::linked_view(&netlist, &slices), constant_nets };
-    let c = vyges_sta::scenes::scene_constraints(&s, vyges_sta::scenes::DesignRef::Design(&design), &slices).map_err(|e| Fail::Refused(format!("read_sdc {path}: {e}")))?;
+    let c = vyges_sta::scenes::mode_constraints(&s, vyges_sta::scenes::DesignRef::Design(&design), &slices, opts.scenes.link).map_err(|e| Fail::Refused(format!("read_sdc {path}: {e}")))?;
     for clock in &c.sdc.clocks {
         if !clock.source.is_empty() && !opts.clock_sources.contains(&clock.source) {
             opts.clock_sources.push(clock.source.clone());
