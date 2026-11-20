@@ -87,7 +87,16 @@ const CRATE_PIN: &str = vyges_opendb::OPENROAD_PIN;
 const PIN_TOKEN: &str = "@OPENROAD_PIN@";
 
 fn describe() -> String {
-    DESCRIBE.replace(PIN_TOKEN, CRATE_PIN)
+    let text = DESCRIBE.replace(PIN_TOKEN, CRATE_PIN);
+    // The debug groups (VYGES_DEBUG) and stage times, from the one table the engine reads.
+    match serde_json::from_str::<Value>(&text) {
+        Ok(mut d) => {
+            d["debug"] = vyges_events::debug::describe_debug_groups(vyges_grt::dbg::TOOL, vyges_grt::dbg::DEBUG_GROUPS);
+            d["debug"]["stage_times_env"] = json!("VYGES_STAGE_TIMES");
+            serde_json::to_string_pretty(&d).unwrap_or(text)
+        }
+        Err(_) => text,
+    }
 }
 
 /// ⚠️ **`maturity` is `structured`**: the correlation runs against the reference outside this
@@ -1378,6 +1387,7 @@ fn run(job: &Value) -> Result<Value, Fail> {
     if let Some(def) = job["def"].as_str() {
         db.read_def(def, "default").map_err(at(def))?;
     } else if let Some(odb) = job["db"].as_str() {
+        let _timed = vyges_grt::dbg::stage("read_db");
         db = Db::open(odb).map_err(at(odb))?;
     }
     // ⛔ A database may carry pin access points, which grt's pin positions and the antenna checker
@@ -1541,6 +1551,8 @@ fn run(job: &Value) -> Result<Value, Fail> {
     // set_placement_padding -global: opendp's padding, in sites, left and right.
     let mut padding = (0, 0);
     for step in job["steps"].as_array().ok_or_else(|| err("steps"))? {
+        // One stage per script command (the reference's entry point), the router's own nested in it.
+        let _timed = vyges_grt::dbg::stage(step["cmd"].as_str().unwrap_or(""));
         match step["cmd"].as_str().unwrap_or("") {
             "set_routing_layers" => {
                 if let Some([lo, hi]) = step["signal"].as_array().map(Vec::as_slice) {
@@ -2380,6 +2392,8 @@ fn run(job: &Value) -> Result<Value, Fail> {
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub fn main() -> ExitCode {
+    // ⛔ First: the old variables onto their debug groups, before any Logger or stage exists.
+    vyges_grt::dbg::register_aliases();
     let args: Vec<String> = std::env::args().skip(1).collect();
     // `-o FILE` — the value is consumed here so it never reaches the positional scan.
     let mut out: Option<String> = None;

@@ -31,7 +31,7 @@ odb = ["dep:vyges-opendb", "vyges-opendb/gen-write", "vyges-est/odb", "dep:vyges
 # system allocator, for heap profilers that cannot see an overriding allocator (heaptrack); peak
 # sizes under it differ from mimalloc's, the allocation sites do not.
 cli = ["cli-core", "mimalloc"]
-cli-core = ["odb", "dep:vyges-stt", "dep:serde_json", "dep:flate2", "dep:vyges-dpl", "dep:vyges-events", "dep:vyges-loom", "vyges-sta/loom"]
+cli-core = ["odb", "dep:vyges-stt", "dep:serde_json", "dep:flate2", "dep:vyges-dpl", "dep:vyges-loom", "vyges-sta/loom"]
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 
 [dev-dependencies]
@@ -47,7 +47,8 @@ vyges-stt = { git = "https://github.com/vyges-tools/stt.git", branch = "main" }
 vyges-est = { git = "https://github.com/vyges-tools/est.git", branch = "main" }
 vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "main", optional = true }
 vyges-stt = { git = "https://github.com/vyges-tools/stt.git", branch = "main", optional = true }
-vyges-events = { git = "https://github.com/vyges-tools/events", branch = "main", default-features = false, optional = true }
+# Debug flags and stage times (the engines' debug-flag standard); no allocator, no tracing.
+vyges-events = { git = "https://github.com/vyges-tools/events", branch = "main", default-features = false }
 serde_json = { version = "1", optional = true }
 flate2 = { version = "1", optional = true }
 vyges-dpl = { git = "https://github.com/vyges-tools/dpl.git", branch = "main", optional = true }

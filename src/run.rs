@@ -185,46 +185,62 @@ pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn 
     }
     let no_adj = false;
     // R5
+    let timed = crate::dbg::stage("gen_brk_RSMT");
     let sum = gen_brk_rsmt(BrkFlags { congestion_driven: false, re_route: false, gen_tree: false, no_adj }, ids, &nets_own, state, &mut grid!(), inp.stt, inp.flutes)
         .map_err(|e| format!("R5: {e:?}"))?;
+    drop(timed);
     stop_unless!(Stage::R5(&sum), None);
     // R6
+    let timed = crate::dbg::stage("routeLAll");
     route_l_all(ids, &nets_own, state, &mut grid!());
+    drop(timed);
     stop_unless!(Stage::R6, None);
     // R7
+    let timed = crate::dbg::stage("gen_brk_RSMT (congestion-driven)");
     let sum = gen_brk_rsmt(BrkFlags { congestion_driven: true, re_route: true, gen_tree: true, no_adj }, ids, &nets_own, state, &mut grid!(), inp.stt, inp.flutes)
         .map_err(|e| format!("R7: {e:?}"))?;
+    drop(timed);
     stop_unless!(Stage::R7(&sum), None);
     guard.check(&g2d.est)?; // `getOverflow2D` → `check2DEdgesUsage`
     let scan = g2d.get_overflow_2d();
     stop_unless!(Stage::Scan { tag: "B7", scan: &scan }, None);
     // R8
+    let timed = crate::dbg::stage("newrouteLAll");
     newroute_l_all(false, true, ids, &nets_own, state, &mut grid!());
+    drop(timed);
     guard.check(&g2d.est)?; // `getOverflow2D` → `check2DEdgesUsage`
     let scan = g2d.get_overflow_2d();
     stop_unless!(Stage::Scan { tag: "B8", scan: &scan }, None);
     // R9 — no overflow scan follows it.
     let pin_layer = |id: usize, pin: usize| inp.attrs[id].pin_layers.get(pin).copied().unwrap_or(0);
+    let timed = crate::dbg::stage("spiralRouteAll");
     spiral_route_all(ids, &nets_own, state, &mut grid!(), num_layers as i16, &pin_layer);
+    drop(timed);
     stop_unless!(Stage::Scan { tag: "B9", scan: &scan }, None);
     // R10
+    let timed = crate::dbg::stage("newrouteZAll");
     newroute_z_all(10, ids, &nets_own, state, &mut grid!());
+    drop(timed);
     guard.check(&g2d.est)?; // `getOverflow2D` → `check2DEdgesUsage`
     let scan = g2d.get_overflow_2d();
     stop_unless!(Stage::Scan { tag: "B10", scan: &scan }, None);
     // R11
     // `convertToMazeroute` ends in `check2DEdgesUsage`; the conversion hands back its findings.
+    let timed = crate::dbg::stage("convertToMazeroute");
     let viol = convert_to_mazeroute_all(ids, state, &mut g2d, inp.h_capacity, inp.v_capacity);
+    drop(timed);
     guard.record(&viol)?;
     stop_unless!(Stage::Scan { tag: "B11", scan: &scan }, None);
     // R12
     let pattern_scan = scan;
     let (mut last, mut last_lc) = (scan, 0.0f32);
+    let timed = crate::dbg::stage("routeLVAll rounds");
     lv_rounds(scan.max_overflow, ids, &nets_own, state, &mut grid!(), &guard, &mut |k, round, g, st| {
         flush_edge_usage!(g, st);
         let _ = obs.stage(Stage::Lv { k, round }, g, None, st);
         (last, last_lc) = (round.scan, round.logistic_coef);
     })?;
+    drop(timed);
     // R13
     init_for_congestion_loop(ids, state, &mut g2d);
     stop_unless!(Stage::Scan { tag: "B13", scan: &last }, None);
@@ -237,10 +253,12 @@ pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn 
         critical_nets_percentage: inp.critical_nets_percentage,
         has_ndr: inp.attrs.iter().map(|a| a.has_ndr).collect(),
     };
+    let timed = crate::dbg::stage("mazeRouteMSMD loop");
     let end = congestion_loop(&start, ids, &mut nets_own, state, &mut grid!(), inp.timer_slack, &guard, &mut |ev, g, st| {
         flush_edge_usage!(g, st);
         let _ = obs.stage(Stage::Loop(ev), g, None, st);
     })?;
+    drop(timed);
     let nets = &nets_own[..];
     // A demoted net's `getLayerEdgeCost` is 1 on every layer from here on (`has_ndr`, the rule, stays).
     let attrs_own: Vec<NetLayerAttrs>;
@@ -258,7 +276,9 @@ pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn 
     };
     stop_unless!(Stage::LoopEnd(&end), None);
     // R15 — freeRR drops the loop's own backup; nothing is left here to free.
+    let timed = crate::dbg::stage("removeLoops");
     remove_loops_all(ids, nets, state, &mut g2d);
+    drop(timed);
     guard.check(&g2d.est)?; // `getOverflow2Dmaze` → `check2DEdgesUsage`
     let scan = g2d.get_overflow_2d_maze();
     stop_unless!(Stage::Scan { tag: "B15", scan: &scan }, None);
@@ -280,7 +300,9 @@ pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn 
         })
     });
     let layer = LayerParams { layer_dir: inp.layer_dir, resistance_aware: inp.resistance_aware, liberty: inp.liberty, has_2d_overflow: end.has_2d_overflow, ra: ra.as_ref(), incremental: inp.resume.is_some() };
+    let timed = crate::dbg::stage("layerAssignment");
     let mut order = layer_assignment(ids, nets, attrs, state, &mut g3, &layer)?;
+    drop(timed);
     let overflow = get_overflow_3d_all(&g2d, &g3);
     let mut past_cong = scan.total_overflow;
     stop_unless!(Stage::B16 { past_cong, overflow: &overflow }, Some(&g3));
@@ -342,14 +364,19 @@ pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn 
         let short = if inp.resistance_aware { BIG_INT } else { 12 };
         for (tag, ub) in [("B18a", long), ("B18b", short)] {
             let mp = Maze3dParams { layer: &layer, expand: end.enlarge, ripup_lb: 0, ripup_ub: ub, via_cost: 1 };
+            let timed = crate::dbg::stage("mazeRouteMSMDOrder3D");
             order = maze_route_msmd_order_3d_all(&order, nets, attrs, state, &mut g2d, &mut g3, &mp)?.0;
+            drop(timed);
             stop_unless!(Stage::B18 { tag, expand: end.enlarge, ripup_ub: ub }, Some(&g3));
         }
     }
     // R19
+    let timed = crate::dbg::stage("fillVIA..checkRoute3D");
     let fin = finish_3d(ids, nets, attrs, state, &g2d, &g3)?;
+    drop(timed);
     stop_unless!(Stage::B19(&fin), Some(&g3));
     // R20
+    let _timed = crate::dbg::stage("getRoutes");
     Ok(RunEnd::Routed(get_routes_all(ids, state, inp.db_id, inp.origin)))
 }
 

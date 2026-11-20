@@ -1834,6 +1834,7 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     use crate::brk_rsmt::{CapLayer, Caps3D, NetState, RsmtNet};
     use crate::run::{fastroute_run, RunEnd, RunInputs, RunObserver, Stage};
     let started = std::time::Instant::now();
+    let init_stage = crate::dbg::stage("initFastRoute");
     let t = setup_tech(db, opts)?;
     let mut log = t.log.clone();
     let adj = setup_adjust(db, &t, opts, &mut log)?;
@@ -1849,6 +1850,7 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     }
     crate::init::report_clock_nets(opts.verbose, clock_nets.len(), &mut log);
     let (nets, already_wired) = setup_nets_counted(db, &t, &mut e, adj.has_macros_or_pads, opts, &mut log)?;
+    drop(init_stage);
     let (xg, yg) = (e.x_grid as usize, e.y_grid as usize);
     let layer_name = |l: usize| t.tech.routing_layers.iter().find(|r| r.routing_level == l as i32 + 1).map_or(String::new(), |r| r.name.clone());
     // `initNetlist`'s reportNetDegree (over the nets it made), then `globalRoute`'s
@@ -1979,6 +1981,8 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     }
     let compute = |read: crate::congestion_loop::SlackRead, k: usize, st: &[NetState]| -> Result<Vec<f32>, String> {
         let (Some(timing), Some(nl), Some(pin_ids)) = (&opts.timing, &timer_netlist, &timer_pin_ids) else { return Err("no timer".into()) };
+        let _update = crate::dbg::stage("updateSlacks");
+        let est_stage = crate::dbg::stage("estimateAllGlobalRouteParasitics");
         let mut par = std::collections::BTreeMap::new();
         // getPlanarRoutes: the planar routes before layer assignment, the 3D routes (estimated
         // with the pins attached by their real layers) in a 3D pass.
@@ -1995,7 +1999,11 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
                 par.insert(n.name.clone(), planar_net_network(n, tree, &timer_rc, &layer_dir, origin, t.min_routing_layer).2);
             }
         }
-        let by_name = crate::timer::net_slacks(timing, &opts.scenes, nl, pin_ids, &par)?;
+        drop(est_stage);
+        let by_name = {
+            let _s = crate::dbg::stage("Sta::slack");
+            crate::timer::net_slacks(timing, &opts.scenes, nl, pin_ids, &par)?
+        };
         if let Some(path) = &opts.timer_trace {
             use std::io::Write;
             let tag = if read == crate::congestion_loop::SlackRead::Partial { "P" } else { "U" };
@@ -2125,13 +2133,17 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     }
     let mut state = vec![NetState::default(); nets.len()];
     let mut ov = Observer { overflow: 0, cnp: t.config.critical_nets_percentage, res_aware: opts.resistance_aware, trees: None, g3: None, g2d: None, lines: crate::run_log::RunLines::new(opts.verbose, opts.congestion_iterations) };
-    let run = fastroute_run(&inp, &mut state, &mut ov);
+    let run = {
+        let _s = crate::dbg::stage("FastRouteCore::run");
+        fastroute_run(&inp, &mut state, &mut ov)
+    };
     ov.lines.write(&mut log);
     let routes = match run? {
         RunEnd::Routed(r) => r,
         RunEnd::Stopped => return Err("run() stopped".into()),
     };
     // est::estimateAllGlobalRouteParasitics, on the planar routes the first partial-slack call saw.
+    let snap_stage = crate::dbg::stage("estimateAllGlobalRouteParasitics (first-read snapshot)");
     let mut parasitics = std::collections::BTreeMap::new();
     let mut parasitic_pins: std::collections::BTreeMap<String, Vec<crate::parasitics::PinGridLocation>> = std::collections::BTreeMap::new();
     let mut planar_routes: std::collections::BTreeMap<String, Vec<crate::parasitics::Segment>> = std::collections::BTreeMap::new();
@@ -2156,6 +2168,8 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         }
     }
     // F — findRouting's post-processing: remaining guides, pad pins (inert), then each merge.
+    drop(snap_stage);
+    let tail_stage = crate::dbg::stage("findRouting (addRemainingGuides, connectPadPins, mergeSegments)");
     let raw_routes = routes.clone();
     let mut by_name: std::collections::BTreeMap<String, Vec<crate::GSegment>> =
         routes.into_iter().map(|(id, segs)| (nets[id as usize].name.clone(), segs)).collect();
@@ -2176,8 +2190,10 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     // Upstream rule (`EstimateParasitics::estimateGlobalRouteRC`): every net of `getRoutes()` with a
     // non-empty route gets a network — whether or not the run ever read the timer. A run with no
     // congestion loop (no partial-slack read) still has routes to estimate.
+    drop(tail_stage);
     let mut routed_parasitics = std::collections::BTreeMap::new();
     {
+        let _s = crate::dbg::stage("estimateAllGlobalRouteParasitics (routed)");
         let rc = layer_rc(db);
         for n in &nets {
             let Some(segs) = by_name.get(&n.name) else { continue };
@@ -2207,6 +2223,7 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     }
     // X — finishGlobalRouting's reports, verbose only: reportCongestion on the final 3D usage,
     // computeWirelength over the routes, GRT-14; GRT-303 closes `globalRoute`.
+    let finish_stage = crate::dbg::stage("finishGlobalRouting");
     if opts.verbose {
         if let Some(g3) = &ov.g3 {
             let edges = |cap: &[u16], usage: &[u16], horizontal: bool| -> Vec<(u16, u16)> {
@@ -2250,7 +2267,11 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         .collect();
     let grid = crate::Grid { tile_size: t.core.tile_size, area: t.core.area };
     let save = crate::SaveOptions { guide_is_congested, origin_x: opts.grid_origin.0, origin_y: opts.grid_origin.1, min_routing_layer: t.min_routing_layer };
-    let guides = crate::save_guides(&net_routes, &grid, &save).map_err(|e| format!("{e:?}"))?;
+    drop(finish_stage);
+    let guides = {
+        let _s = crate::dbg::stage("saveGuides");
+        crate::save_guides(&net_routes, &grid, &save).map_err(|e| format!("{e:?}"))?
+    };
     let layer_names = t.tech.routing_layers.iter().map(|l| (l.routing_level, l.name.clone())).collect();
     let jumper_grid = crate::repair_antennas::JumperGrid { grid, x_grids: t.core.x_grids, y_grids: t.core.y_grids };
     // A net the run demoted to soft NDR (`setSoftNDR`) carries edge cost 1 and per-layer cost 1 into
@@ -2773,6 +2794,12 @@ fn pin_key(n: &RouterNet) -> Vec<(i32, i32, i32)> {
 /// with; when they changed and it now has two pins or more, `initNetlist` → `makeFastrouteNet` gives
 /// it the next id (`FastRouteCore::addNet` appends) — assigned here, in the same order.
 fn update_dirty_nets(a: &mut AfterRoute, fresh: &std::collections::BTreeMap<String, RouterNet>, dirty: &[String]) -> Res<Vec<usize>> {
+    // The old variable's path (it still works in any binary linking this library; grt's own maps
+    // it onto the group), else `vy_incr_pins` on: the debug directory's file.
+    let incr_pins_file: Option<std::path::PathBuf> = std::env::var_os("VYGES_GRT_INCR_TRACE")
+        .filter(|v| !v.is_empty() && v != "0")
+        .map(std::path::PathBuf::from)
+        .or_else(|| crate::dbg::on(crate::dbg::INCR_PINS).then(|| vyges_events::debug_dir(crate::dbg::TOOL).map(|d| d.join("incr-pins.txt"))).flatten());
     let mut out = Vec::new();
     for name in dirty {
         let now = fresh.get(name).map(pin_key).unwrap_or_default();
@@ -2835,8 +2862,8 @@ fn update_dirty_nets(a: &mut AfterRoute, fresh: &std::collections::BTreeMap<Stri
                 return Err(format!("[ERROR GRT-0267] Net {name} has disconnected segments.").into());
             }
         }
-        // A diagnostic: each dirty net's pins as compared (`VYGES_GRT_INCR_TRACE`, appended).
-        if let Ok(path) = std::env::var("VYGES_GRT_INCR_TRACE") {
+        // A diagnostic (debug group `vy_incr_pins`): each dirty net's pins as compared, appended.
+        if let Some(path) = &incr_pins_file {
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
                 let _ = std::io::Write::write_all(&mut f, format!("{name}|last={:?}|now={:?}|changed={}\n", key(&a.router_nets[id]), now, i32::from(changed)).as_bytes());
             }

@@ -433,7 +433,12 @@ fn net_slacks_timed(timing: &Timing, scenes: &Scenes, nl: &Netlist, par: &HashMa
         return Ok(nl.nets.iter().map(|n| (n.name.clone(), 1e30)).collect());
     };
     let libs = scenes.slices(timing);
+    let timed = crate::dbg::stage("makeGraph (scene timers)");
     let mut t = SceneTimers::for_design(&libs, scenes.link, NetlistRef::Borrowed(nl), None, c)?;
+    drop(timed);
+    if crate::dbg::on(crate::dbg::TIMER_STATS) {
+        crate::dbg::line(crate::dbg::TIMER_STATS, format!("read: parasitic nets {}; {}", par.len(), stats::graphs(&t.graphs)));
+    }
     // As sta's `load` and rsz do: what the search does not model is refused before any timing,
     // never timed without. Every scene shares the constraints and the netlist (so its latches),
     // so the link scene's graph decides.
@@ -478,11 +483,21 @@ fn net_slacks_timed(timing: &Timing, scenes: &Scenes, nl: &Netlist, par: &HashMa
 fn full_scene_slacks(t: &mut SceneTimers<'_>, par: &HashMap<String, NetParasitics>, pin_ids: &[Vec<u64>]) -> Result<HashMap<String, f32>, String> {
     let loads = net_loads(&t.graphs[0], pin_ids)?;
     let mut running = vec![vyges_sta::search::INF_SLACK; t.graphs[0].vertices.len()];
+    let stats_on = crate::dbg::on(crate::dbg::TIMER_STATS);
     for k in 0..t.graphs.len() {
+        let timed = crate::dbg::stage(&format!("findDelays scene {k}"));
         t.graphs[k].find_delays(par, None)?;
+        drop(timed);
         let mut s = Search::in_graph_order(&t.graphs[k], &t.sdc);
+        let timed = crate::dbg::stage(&format!("findArrivals scene {k}"));
         s.find_arrivals()?;
+        drop(timed);
+        if stats_on {
+            crate::dbg::line(crate::dbg::TIMER_STATS, format!("scene {k} arrivals: {}", stats::paths(&s.paths)));
+        }
+        let timed = crate::dbg::stage(&format!("findRequireds scene {k}"));
         s.find_requireds()?;
+        drop(timed);
         fold_scene(&mut running, &loads, &s.paths);
     }
     Ok(t.graphs[0]
@@ -542,6 +557,50 @@ fn net_loads(g: &vyges_sta::graph::Graph<'_>, pin_ids: &[Vec<u64>]) -> Result<Ve
                 .collect()
         })
         .collect())
+}
+
+/// The `vy_timer_stats` lines' contents: what a read's timer holds (time and memory per stage are
+/// the stage lines').
+pub(crate) mod stats {
+    use vyges_sta::search::Path;
+
+    /// The scene graphs: sizes, and whether their structure is shared.
+    pub fn graphs(gs: &[vyges_sta::graph::Graph<'_>]) -> String {
+        let Some(g) = gs.first() else { return "0 graphs".into() };
+        let delays: usize = g.delay.iter().map(|d| d.capacity()).sum();
+        let ins: usize = g.in_edges.iter().map(|v| v.capacity()).sum::<usize>() + g.out_edges.iter().map(|v| v.capacity()).sum::<usize>();
+        format!(
+            "{} graphs; graph 0: vertices {} edges {} edge-index entries {} delay entries {} (vertex {} B, edge {} B); shared structure: {}",
+            gs.len(),
+            g.vertices.len(),
+            g.edges.len(),
+            ins,
+            delays,
+            std::mem::size_of::<vyges_sta::graph::Vertex>(),
+            std::mem::size_of::<vyges_sta::graph::Edge>(),
+            gs.iter().skip(1).all(|h| std::sync::Arc::ptr_eq(&h.vertices, &g.vertices))
+        )
+    }
+
+    /// A search's paths: count, capacity, bytes, and the paths-per-vertex histogram (0..8+).
+    pub fn paths(p: &[Vec<Path>]) -> String {
+        let (n, cap) = p.iter().fold((0usize, 0usize), |(n, c), v| (n + v.len(), c + v.capacity()));
+        let mut hist = [0usize; 9];
+        for v in p {
+            hist[v.len().min(8)] += 1;
+        }
+        let bytes = cap * std::mem::size_of::<Path>() + std::mem::size_of_val(p);
+        format!(
+            "vertices {} paths {} capacity {} (Path {} B, Tag {} B) => {:.1} GB of paths; paths per vertex 0..8+: {:?}",
+            p.len(),
+            n,
+            cap,
+            std::mem::size_of::<Path>(),
+            std::mem::size_of::<vyges_sta::search::Tag>(),
+            bytes as f64 / 1e9,
+            hist
+        )
+    }
 }
 
 #[cfg(test)]
@@ -635,6 +694,21 @@ mod tests {
         fold_scene(&mut running, &loads, &[vec![path(a, vyges_sta::liberty::MAX), path(0.0, vyges_sta::liberty::MIN)]]);
         fold_scene(&mut running, &loads, &[vec![path(b, vyges_sta::liberty::MAX), path(c, vyges_sta::liberty::MAX)]]);
         assert_eq!(running[0], c, "carried across the scenes; a min path is not folded");
+    }
+
+    /// The `vy_timer_stats` paths line counts what the search holds: paths, capacity and the
+    /// paths-per-vertex histogram (a vertex with none in bucket 0, two in bucket 2).
+    #[test]
+    fn the_timer_stats_line_counts_the_paths() {
+        let path = vyges_sta::search::Path {
+            tag: vyges_sta::search::Tag { rf: 0, mm: vyges_sta::liberty::MAX, clk_edge: None, is_clock: false, crpr: None, states: Default::default(), latency: 0, segment_start: false },
+            arrival: 0.0,
+            required: 1.0,
+            prev: None,
+        };
+        let line = stats::paths(&[Vec::new(), vec![path, path]]);
+        assert!(line.starts_with("vertices 2 paths 2 capacity 2 "), "{line}");
+        assert!(line.ends_with("paths per vertex 0..8+: [1, 0, 1, 0, 0, 0, 0, 0, 0]"), "{line}");
     }
 
     /// Ports a, b into x1 (xor2); x1/Y to port y; a clock port clk on no net.

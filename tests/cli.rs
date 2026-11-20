@@ -281,3 +281,41 @@ fn a_later_cugr_iteration_runs_the_jumper_pass_again() {
     assert_eq!(o.status.code(), Some(0), "{r}");
     assert_eq!(repair_codes(&r), ["GRT-0012", "GRT-0302", "GRT-0012", "GRT-0015", "GRT-0012", "GRT-0302", "GRT-0012"], "{r}");
 }
+
+/// Debug flags change what is printed, never a result: with the stage times and every grt debug
+/// group on, the tiny design's guides and report are the same as with all off; the stage lines
+/// name the router's stages after the reference's functions, and with the flags off none is
+/// printed. The old `VYGES_GRT_STAGE_TIMES` still turns the stage times on.
+#[test]
+fn debug_flags_print_stages_and_change_no_result() {
+    let run = |tag: &str, env: &[(&str, &str)]| {
+        let guides = tmp(&format!("flags-{tag}.guide"));
+        let job = serde_json::json!({
+            "lefs": [data("tiny.lef")],
+            "def": data("tiny.def"),
+            "steps": [{ "cmd": "global_route" }, { "cmd": "write_guides", "path": guides.to_str().unwrap() }]
+        });
+        let path = tmp(&format!("flags-{tag}.json"));
+        std::fs::write(&path, job.to_string()).unwrap();
+        let mut c = bin();
+        for v in ["VYGES_STAGE_TIMES", "VYGES_DEBUG", "VYGES_GRT_STAGE_TIMES", "VYGES_GRT_INCR_TRACE", "VYGES_GRT_TIMER_STATS"] {
+            c.env_remove(v);
+        }
+        let o = c.envs(env.iter().copied()).arg("route").arg(&path).env("VYGES_LOG_FORMAT", "json").output().unwrap();
+        assert_eq!(o.status.code(), Some(0), "{}", String::from_utf8_lossy(&o.stderr));
+        let mut report: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+        report["guides_written"] = serde_json::Value::Null;
+        report["files_written"] = serde_json::Value::Null;
+        (report, std::fs::read(&guides).unwrap(), String::from_utf8_lossy(&o.stderr).into_owned())
+    };
+    let (r_off, g_off, e_off) = run("off", &[]);
+    let (r_on, g_on, e_on) = run("on", &[("VYGES_STAGE_TIMES", "1"), ("VYGES_DEBUG", "grt:*=1")]);
+    let (r_old, g_old, e_old) = run("old", &[("VYGES_GRT_STAGE_TIMES", "1")]);
+    assert_eq!((&r_on, &g_on), (&r_off, &g_off), "a flag changed a result");
+    assert_eq!((&r_old, &g_old), (&r_off, &g_off), "a flag changed a result");
+    assert!(!e_off.contains("VYGES-STAGE"), "{e_off}");
+    for name in ["\"global_route\"", "\"initFastRoute\"", "\"FastRouteCore::run\"", "\"gen_brk_RSMT\"", "\"layerAssignment\"", "\"saveGuides\""] {
+        assert!(e_on.contains(name) && e_old.contains(name), "no stage {name} in:\n{e_on}");
+    }
+    assert!(e_old.contains("VYGES_GRT_STAGE_TIMES is deprecated"), "{e_old}");
+}
