@@ -155,8 +155,10 @@ impl Scenes {
 /// one), in block order, that the timing netlist holds ([`netlist`] leaves a SPECIAL supply net
 /// out: it connects no timing pin). The reference's simulation holds every pin of such a net, so a
 /// signal terminal on a special supply net is refused: it would be held there and is unconnected
-/// here.
-pub fn constant_nets(db: &Db) -> Result<Vec<(String, bool)>, String> {
+/// here. `nl` is the timer netlist of the same database: it gives each instance's master.
+pub fn constant_nets(db: &Db, nl: &Netlist) -> Result<Vec<(String, bool)>, String> {
+    let masters: HashMap<&str, &str> = nl.insts.iter().map(|x| (x.0.as_str(), x.1.as_str())).collect();
+    let mut supply = SupplyTerms::default();
     let mut out = Vec::new();
     for net in db.net_names() {
         let value = match db.net_get_sig_type(&net).as_str() {
@@ -167,7 +169,8 @@ pub fn constant_nets(db: &Db) -> Result<Vec<(String, bool)>, String> {
         if db.net_is_special(&net) {
             for iterm in db.net_iterms(&net) {
                 let (inst, term) = iterm.rsplit_once('/').unwrap_or((&iterm, ""));
-                if !matches!(db.iterm_get_sig_type(inst, term).as_str(), "POWER" | "GROUND") {
+                let is_supply = supply.is_supply(masters.get(inst).copied(), inst, term, |m, t| db.mterm_get_sig_type(m, t), |i, t| db.iterm_get_sig_type(i, t));
+                if !is_supply {
                     return Err(format!("{iterm}: a signal terminal on the special supply net {net} (held constant by the reference) is not modelled"));
                 }
             }
@@ -269,6 +272,32 @@ pub fn keeps_timer_netlist(cmd: &str) -> bool {
             | "write_guides"
             | "write_db"
     )
+}
+
+/// Whether a terminal is a supply terminal, answered once per master terminal. Rule
+/// (`dbITerm::getSigType` returns its MTerm's signal type): every instance of a master gives the
+/// same answer for a terminal, so the reference's per-pin pointer read becomes one name lookup per
+/// (master, terminal) here; an instance whose master is not known is asked directly.
+#[derive(Default)]
+pub struct SupplyTerms {
+    by_master_term: HashMap<(String, String), bool>,
+}
+
+impl SupplyTerms {
+    pub fn is_supply(&mut self, master: Option<&str>, inst: &str, term: &str, mterm_sig: impl Fn(&str, &str) -> String, iterm_sig: impl Fn(&str, &str) -> String) -> bool {
+        let supply = |t: String| matches!(t.as_str(), "POWER" | "GROUND");
+        match master {
+            Some(m) => {
+                if let Some(&s) = self.by_master_term.get(&(m.to_string(), term.to_string())) {
+                    return s;
+                }
+                let s = supply(mterm_sig(m, term));
+                self.by_master_term.insert((m.to_string(), term.to_string()), s);
+                s
+            }
+            None => supply(iterm_sig(inst, term)),
+        }
+    }
 }
 
 /// The netlist as the database holds it.
@@ -672,6 +701,27 @@ mod tests {
     /// Pin ids that keep each net's pins in netlist order.
     fn in_netlist_order(nl: &Netlist) -> Vec<Vec<u64>> {
         nl.nets.iter().map(|n| (0..n.pins.len() as u64).collect()).collect()
+    }
+
+    /// Rule (`dbITerm::getSigType` is its MTerm's signal type): a supply terminal is answered per
+    /// (master, terminal), each asked once; two terminals of one master answer apart, and an
+    /// instance with no known master is asked as the pin itself.
+    #[test]
+    fn a_supply_terminal_is_answered_per_master_terminal() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let mterm = |m: &str, t: &str| {
+            asked.borrow_mut().push(format!("{m}/{t}"));
+            if t == "VDD" { "POWER".to_string() } else { "SIGNAL".to_string() }
+        };
+        let iterm = |_: &str, t: &str| if t == "VSS" { "GROUND".to_string() } else { "SIGNAL".to_string() };
+        let mut s = SupplyTerms::default();
+        assert!(s.is_supply(Some("INV"), "u1", "VDD", mterm, iterm));
+        assert!(!s.is_supply(Some("INV"), "u2", "A", mterm, iterm));
+        assert!(s.is_supply(Some("INV"), "u3", "VDD", mterm, iterm));
+        assert!(!s.is_supply(Some("INV"), "u4", "A", mterm, iterm));
+        assert!(s.is_supply(None, "u5", "VSS", mterm, iterm));
+        assert!(!s.is_supply(None, "u6", "A", mterm, iterm));
+        assert_eq!(*asked.borrow(), vec!["INV/VDD".to_string(), "INV/A".to_string()]);
     }
 
     /// Rule (the reference's timer reads one `dbNetwork` view, which follows every edit): the kept

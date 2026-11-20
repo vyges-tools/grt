@@ -2512,7 +2512,7 @@ fn propagated_clock_lines(names: &[String]) -> String {
 fn read_scene_sdc(db: &Db, opts: &mut RouteOptions, path: &str, text: &str) -> Result<(), Fail> {
     let timing = opts.timing.as_ref().ok_or_else(|| Fail::Refused("read_sdc before a liberty library".into()))?;
     let netlist = vyges_grt::timer::timer_netlist(db, opts);
-    let constant_nets = vyges_grt::timer::constant_nets(db).map_err(Fail::Refused)?;
+    let constant_nets = vyges_grt::timer::constant_nets(db, &netlist).map_err(Fail::Refused)?;
     let read = vyges_loom::sdc::ReadOpts { base_dir: std::path::Path::new(path).parent().map(|p| p.to_path_buf()), ..Default::default() };
     let s = vyges_loom::sdc::Sdc::parse_with_opts(text, &vyges_sta::load::sdc_design(&netlist, &timing.libs), &read).map_err(|e| Fail::Refused(format!("{path}: {}", e.0)))?;
     let slices = opts.scenes.slices(timing);
