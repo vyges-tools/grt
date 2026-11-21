@@ -99,8 +99,15 @@ fn check(e: &RouterEdges, st: &Value, who: &str, step: &str) {
             panic!("{who} after {step}: {name}[{i}] engine {g:?} reference {x:?}");
         }
     }
-    assert_eq!(e.horizontal_blocked, want.hb, "{who} after {step}: horizontal blocked intervals");
-    assert_eq!(e.vertical_blocked, want.vb, "{who} after {step}: vertical blocked intervals");
+    // ⛔ Captured at 4155ac31, which kept the intervals to the end of the run. Since OpenROAD #12371
+    // (f11b4276 pin) `initBlockedIntervals` drops them once applied: from that step on they are
+    // empty, whatever the capture holds.
+    if step == "obstructions" {
+        assert_eq!(e.horizontal_blocked, want.hb, "{who} after {step}: horizontal blocked intervals");
+        assert_eq!(e.vertical_blocked, want.vb, "{who} after {step}: vertical blocked intervals");
+    } else {
+        assert!(e.horizontal_blocked.is_empty() && e.vertical_blocked.is_empty(), "{who} after {step}: the blocked intervals are dropped");
+    }
 }
 
 #[derive(Default)]
