@@ -59,7 +59,8 @@ impl Default for Constants {
         Constants {
             weight_wire_length: 0.5,
             weight_via_number: 4.0,
-            weight_short_area: 500.0,
+            // `Constants::weight_short_area`: 100 since OpenROAD #12296 (f11b4276 pin), 500 before.
+            weight_short_area: 100.0,
             min_routing_layer: 1,
             cost_logistic_slope: 1.0,
             max_detour_ratio: 0.25,

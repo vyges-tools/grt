@@ -599,7 +599,8 @@ mod tests {
     fn unit_costs_read_layer_one_pitch() {
         let d = Design::new(&facts(), &Constants::default(), 2, 3).unwrap();
         assert_eq!(d.unit_length_wire_cost, 0.5 / 380.0);
-        assert_eq!(d.unit_length_short_costs[0], 500.0 / f64::from(380 * 380) * 140.0);
+        // weight_short_area defaults to 100 since OpenROAD #12296 (f11b4276 pin), 500 before.
+        assert_eq!(d.unit_length_short_costs[0], 100.0 / f64::from(380 * 380) * 140.0);
     }
 
     // Upstream rule (Design.cpp `chooseViaForPair`): OR_DEFAULT first, then fewest cuts, then LEF
