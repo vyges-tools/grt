@@ -344,6 +344,9 @@ pub fn adjust_tile_set(e: &mut RouterEdges, tiles: &BTreeSet<(i32, i32)>, layer:
 /// `initBlockedIntervals`: each blocked tile's edge loses the tracks its intervals cover
 /// (clamped at 0) — only edges that still have capacity. Vertical tiles, then horizontal; the
 /// tiles are independent, so the maps' order does not matter.
+///
+/// Then the intervals are dropped (OpenROAD #12371): nothing reads them once applied, and on a
+/// large die they hold an interval set per blocked edge.
 pub fn init_blocked_intervals(e: &mut RouterEdges) {
     for vertical in [true, false] {
         let map = if vertical { &e.vertical_blocked } else { &e.horizontal_blocked };
@@ -365,6 +368,8 @@ pub fn init_blocked_intervals(e: &mut RouterEdges) {
             }
         }
     }
+    e.vertical_blocked = HashMap::new();
+    e.horizontal_blocked = HashMap::new();
 }
 
 /// `saveResourcesBeforeAdjustments`: every REAL edge's capacity becomes its real capacity, 2D and
