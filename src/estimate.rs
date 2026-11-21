@@ -202,7 +202,7 @@ impl EstimateGrid {
 ///
 /// ⛔ **The reference's updaters charge through the NDR-aware cost**, per edge. The plain
 /// [`EstimateGrid`] charges the amount as given, which is what the cost does for a net of edge
-/// cost 1; [`crate::ndr_cost::NdrAwareGrid`] charges an NDR net the way the reference does. A step
+/// cost 1; [`crate::graph2d::NetUsage`] charges an NDR net the way the reference does. A step
 /// written against this trait takes either.
 pub trait Usage2d {
     /// Demand on the horizontal edge leaving cell `(x, y)`.
@@ -217,6 +217,24 @@ pub trait Usage2d {
     fn update_usage_h(&mut self, x: i32, y: i32, amount: f64);
     /// Charge ONE vertical edge's committed usage — `updateUsageV(x, y, net, usage)`.
     fn update_usage_v(&mut self, x: i32, y: i32, amount: f64);
+
+    /// `getUsageNDRAware(net, x, y, direction, usage)` — the usage of an edge as the routing net
+    /// sees it when it prices a route (OpenROAD #11963).
+    ///
+    /// ⛔ A net that would leave the edge short of NDR tracks (`getNDRDeficitIfRouted > 0`) sees
+    /// it as at least `capacity − 1 + 100 × deficit`; every other net, and every grid that has no
+    /// NDR ledger, sees `usage` unchanged.
+    fn ndr_aware(&self, _x: usize, _y: usize, _horizontal: bool, usage: f64) -> f64 {
+        usage
+    }
+    /// `getEstUsageRedH(net, x, y)` — estimate plus reduction, through [`Usage2d::ndr_aware`].
+    fn est_red_h(&self, x: usize, y: usize, red: u16) -> f64 {
+        self.ndr_aware(x, y, true, self.h(x, y) + f64::from(red))
+    }
+    /// `getEstUsageRedV(net, x, y)`.
+    fn est_red_v(&self, x: usize, y: usize, red: u16) -> f64 {
+        self.ndr_aware(x, y, false, self.v(x, y) + f64::from(red))
+    }
 }
 
 /// `uint16_t usage += double amount` — the sum formed in double, then converted back.

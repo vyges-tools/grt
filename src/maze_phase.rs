@@ -91,8 +91,9 @@ pub fn route_monotonic_edge(
         return Err(format!("monotonic routing with an empty cost table (10 x h_capacity = 0): the reference reads past it (net {id}, edge {eid})"));
     }
     let g = &*grid.g;
-    let used_h = |x: i32, y: i32| f64::from(g.usage_red_h(x, y, red_h(x as usize, y as usize)));
-    let used_v = |x: i32, y: i32| f64::from(g.usage_red_v(x, y, red_v(x as usize, y as usize)));
+    // The search prices each edge at `getUsageNDRAware(net, …, getUsageRedH/V)` (#11963).
+    let used_h = |x: i32, y: i32| g.usage_ndr_aware(&nn, x as usize, y as usize, true, f64::from(g.usage_red_h(x, y, red_h(x as usize, y as usize))));
+    let used_v = |x: i32, y: i32| g.usage_ndr_aware(&nn, x as usize, y as usize, false, f64::from(g.usage_red_v(x, y, red_v(x as usize, y as usize))));
     let (px, py, bl1, bl2, _best) = monotonic_search(p1, p2, bx, cost_table, grid.via_cost, &used_h, &used_v);
     let (points, routelen) = walk_monotonic_route(&mut grid.g.for_net(&nn), p1, (px, py), p2, bl1, bl2, nn.edge_cost);
     let r = &mut t.routes[eid];

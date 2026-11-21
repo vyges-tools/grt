@@ -183,3 +183,62 @@ fn an_oversubscribed_layer_counts_as_no_free_track() {
     assert_eq!(l.cap(true, 0, 1, 1).cap_ndr(), -5);
     assert_eq!(l.compute_ndr_deficit(&one(2), 1, 1, true), 5);
 }
+
+/// A 4 × 4 graph: every 2D capacity 10, every layer 5 NDR tracks over two layers.
+fn graph() -> Graph2d {
+    let mut g = Graph2d::new(4, 4, 2);
+    g.cap_h = vec![10; 16];
+    g.cap_v = vec![10; 16];
+    for x in 0..4 {
+        for y in 0..4 {
+            for l in 0..2 {
+                g.ndr.update_cap_3d(x, y, l, true, 5.0);
+                g.ndr.update_cap_3d(x, y, l, false, 5.0);
+            }
+        }
+    }
+    g
+}
+
+/// ⛔ Upstream #11963 `getUsageNDRAware`: a net that would leave the edge short of NDR tracks sees
+/// the edge as at least `capacity − 1 + 100 × deficit`, with the EDGE's own 2D capacity (#11963
+/// 01b0fe5704, `getCapH(x, y)`, not `h_capacity_`); a net that fits, and every regular net, sees
+/// the usage unchanged, and a usage above the floor is kept.
+#[test]
+fn a_net_that_would_miss_tracks_sees_the_edge_as_overflowed() {
+    let mut g = graph();
+    let wide = NdrCostNet { layer_edge_cost: Some(vec![6, 6]), ..ndr(1, 6) };
+    assert_eq!(g.ndr.ndr_deficit_if_routed(&wide, 1, 1, true), 1);
+    assert_eq!(g.usage_ndr_aware(&wide, 1, 1, true, 3.0), 10.0 - 1.0 + 100.0);
+    assert_eq!(g.usage_ndr_aware(&wide, 1, 1, true, 500.0), 500.0, "max, not replace");
+    assert_eq!(g.usage_ndr_aware(&ndr(2, 3), 1, 1, true, 3.0), 3.0, "a net that fits");
+    assert_eq!(g.usage_ndr_aware(&ndr(2, 1), 1, 1, true, 3.0), 3.0, "a regular net");
+    g.cap_h[4 + 1] = 4; // (1, 1)
+    assert_eq!(g.usage_ndr_aware(&wide, 1, 1, true, 3.0), 4.0 - 1.0 + 100.0, "the edge's own capacity");
+    g.cap_v[4 + 2] = 7; // (2, 1)
+    assert_eq!(g.usage_ndr_aware(&wide, 2, 1, false, 0.0), 7.0 - 1.0 + 100.0, "the vertical edge's");
+}
+
+/// ⛔ Upstream #11963: the pattern routes price each edge through `getEstUsageRedH/V(net, …)`, so an
+/// NDR net turns its L away from edges where it would miss tracks; a regular net, seeing the same
+/// empty grid, keeps the tie-break bend (x first).
+#[test]
+fn an_l_route_turns_away_from_where_the_net_would_miss_tracks() {
+    let mut g = graph();
+    // Row 0 (the x-first L's horizontal run for a (0,0)→(2,2) segment) has 2 NDR tracks a layer.
+    for x in 0..2 {
+        for l in 0..2 {
+            g.ndr.update_cap_3d(x, 0, l, true, 2.0);
+        }
+    }
+    let red = |_: usize, _: usize| 0u16;
+    let route = |g: &mut Graph2d, net: &NdrCostNet| {
+        let before = g.clone();
+        let mut seg = RoutedSegment { seg: vyges_grt::rsmt::Segment { x1: 0, y1: 0, x2: 2, y2: 2, edge_cost: net.edge_cost }, x_first: false };
+        route_seg_l_first_time(&mut g.for_net(net), &mut seg, 0.0, 0.0, &red, &red);
+        *g = before;
+        seg.x_first
+    };
+    assert!(route(&mut g, &ndr(1, 1)), "a regular net keeps the tie bend");
+    assert!(!route(&mut g, &NdrCostNet { layer_edge_cost: Some(vec![3, 3]), ..ndr(1, 3) }), "the NDR net goes y first");
+}

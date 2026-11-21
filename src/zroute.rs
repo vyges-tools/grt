@@ -121,12 +121,8 @@ pub fn newroute_z<G: Usage2d + ?Sized>(
         }
     }
 
-    let over_v = |grid: &G, x: usize, y: usize| -> f64 {
-        grid.v(x, y) + f64::from(red_v(x, y)) - f64::from(v_lb)
-    };
-    let over_h = |grid: &G, x: usize, y: usize| -> f64 {
-        grid.h(x, y) + f64::from(red_h(x, y)) - f64::from(h_lb)
-    };
+    let over_v = |grid: &G, x: usize, y: usize| -> f64 { grid.est_red_v(x, y, red_v(x, y)) - f64::from(v_lb) };
+    let over_h = |grid: &G, x: usize, y: usize| -> f64 { grid.est_red_h(x, y, red_h(x, y)) - f64::from(h_lb) };
 
     // The vertical middle segment, per candidate column.
     let mut cost_v = vec![0.0; seg_width];
@@ -167,7 +163,7 @@ pub fn newroute_z<G: Usage2d + ?Sized>(
     for i in ymin..ymax {
         for j in x1..x2 {
             cost_h[(i - ymin) as usize] +=
-                congestion_cost(grid.h(j as usize, i as usize), red_h(j as usize, i as usize), h_lb);
+                congestion_cost(grid.est_red_h(j as usize, i as usize, red_h(j as usize, i as usize)), 0, h_lb);
         }
     }
 
@@ -175,11 +171,11 @@ pub fn newroute_z<G: Usage2d + ?Sized>(
     let mut cost_lr = vec![0.0; seg_height];
     for j in ymin..ymax {
         cost_lr[0] += if y1_smaller {
-            congestion_cost(grid.v(x2 as usize, j as usize), red_v(x2 as usize, j as usize), v_lb)
+            congestion_cost(grid.est_red_v(x2 as usize, j as usize, red_v(x2 as usize, j as usize)), 0, v_lb)
         } else {
             // ⛔ The reference asks for the UNREDUCED usage on this one branch alone — no
             // blockage term — and flags it in its own comment. Transcribed, not levelled out.
-            congestion_cost(grid.v(x1 as usize, j as usize), 0, v_lb)
+            congestion_cost(grid.ndr_aware(x1 as usize, j as usize, false, grid.v(x1 as usize, j as usize)), 0, v_lb)
         };
     }
     let (lr_near, lr_far) = if y1_smaller { (x1, x2) } else { (x2, x1) };
@@ -187,9 +183,9 @@ pub fn newroute_z<G: Usage2d + ?Sized>(
         cost_lr[i] = cost_lr[i - 1];
         let row = (ymin + i as i32 - 1) as usize;
         cost_lr[i] +=
-            congestion_cost(grid.v(lr_near as usize, row), red_v(lr_near as usize, row), v_lb);
+            congestion_cost(grid.est_red_v(lr_near as usize, row, red_v(lr_near as usize, row)), 0, v_lb);
         cost_lr[i] -=
-            congestion_cost(grid.v(lr_far as usize, row), red_v(lr_far as usize, row), v_lb);
+            congestion_cost(grid.est_red_v(lr_far as usize, row, red_v(lr_far as usize, row)), 0, v_lb);
     }
 
     // ⛔ The two families are NOT compared the same way. A horizontal candidate can win a tie on
@@ -322,12 +318,8 @@ pub fn route_z_edge_after_ripup<G: Usage2d + ?Sized>(
     let (ymin, ymax) = (y1.min(y2), y1.max(y2));
     let npts = seg_width + 1;
 
-    let over_v = |grid: &G, x: i32, y: i32| -> f64 {
-        grid.v(x as usize, y as usize) + f64::from(red_v(x as usize, y as usize)) - f64::from(v_lb)
-    };
-    let over_h = |grid: &G, x: i32, y: i32| -> f64 {
-        grid.h(x as usize, y as usize) + f64::from(red_h(x as usize, y as usize)) - f64::from(h_lb)
-    };
+    let over_v = |grid: &G, x: i32, y: i32| -> f64 { grid.est_red_v(x as usize, y as usize, red_v(x as usize, y as usize)) - f64::from(v_lb) };
+    let over_h = |grid: &G, x: i32, y: i32| -> f64 { grid.est_red_h(x as usize, y as usize, red_h(x as usize, y as usize)) - f64::from(h_lb) };
 
     // The vertical middle segment, per candidate column — INCLUDING column x2.
     let (mut cost_v, mut cost_v_test) = (vec![0.0; npts], vec![0.0; npts]);

@@ -11,6 +11,10 @@ use crate::estimate::{Usage2d, EstimateGrid};
 use crate::ndr_cost::{NdrCostNet, NdrLedger};
 use crate::overflow2d::{get_overflow_2d, get_overflow_2d_maze, Overflow2DScan, UsedCell};
 
+/// `kNdrDeficitCost` — the overflow an NDR net is charged, in its routing cost and in the net
+/// ordering, per track it would miss on an edge where it fits no single layer.
+pub const NDR_DEFICIT_COST: i32 = 100;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Graph2d {
     pub est: EstimateGrid,
@@ -124,6 +128,23 @@ impl Graph2d {
         }
     }
 
+    /// `getUsageNDRAware` — `usage` as `net` sees it when pricing a route (OpenROAD #11963).
+    ///
+    /// ⛔ Only a net that would leave the edge short of NDR tracks — `getNDRDeficitIfRouted`, the
+    /// edge's deficit plus what this net would add — sees more: the edge priced as one it would
+    /// overflow by [`NDR_DEFICIT_COST`] tracks per missing track, `max(usage, capacity − 1 +
+    /// 100 × deficit)` (the track less because the cost functions read the usage before the net is
+    /// added). The capacity is the edge's own 2D capacity (`getCapH/V(x, y)`, #11963 01b0fe5704),
+    /// not the grid-wide one.
+    pub fn usage_ndr_aware(&self, net: &NdrCostNet, x: usize, y: usize, horizontal: bool, usage: f64) -> f64 {
+        let deficit = self.ndr.ndr_deficit_if_routed(net, x, y, horizontal);
+        if deficit == 0 {
+            return usage;
+        }
+        let cap = if horizontal { self.cap_h[y * self.est.x_grids + x] } else { self.cap_v[y * self.est.x_grids + x] };
+        usage.max(f64::from(cap) - 1.0 + f64::from(NDR_DEFICIT_COST * deficit))
+    }
+
     /// `getUsageRedH` — committed usage plus the edge's reduction, ⛔ as `uint16_t` (the sum wraps).
     pub fn usage_red_h(&self, x: i32, y: i32, red: u16) -> u16 {
         (u32::from(self.est.usage_h(x as usize, y as usize)) + u32::from(red)) as u16
@@ -183,5 +204,8 @@ impl Usage2d for NetUsage<'_> {
         if amount > 0.0 {
             self.g.used_v.insert((x, y));
         }
+    }
+    fn ndr_aware(&self, x: usize, y: usize, horizontal: bool, usage: f64) -> f64 {
+        self.g.usage_ndr_aware(self.net, x, y, horizontal, usage)
     }
 }

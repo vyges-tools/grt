@@ -158,12 +158,12 @@ pub fn route_edge<G: Usage2d + ?Sized>(
     };
 
     for j in ymin..ymax {
-        cost_l1 += congestion_cost(grid.v(x1 as usize, j as usize), red_v(x1 as usize, j as usize), v_lb);
-        cost_l2 += congestion_cost(grid.v(x2 as usize, j as usize), red_v(x2 as usize, j as usize), v_lb);
+        cost_l1 += congestion_cost(grid.est_red_v(x1 as usize, j as usize, red_v(x1 as usize, j as usize)), 0, v_lb);
+        cost_l2 += congestion_cost(grid.est_red_v(x2 as usize, j as usize, red_v(x2 as usize, j as usize)), 0, v_lb);
     }
     for j in x1..x2 {
-        cost_l1 += congestion_cost(grid.h(j as usize, y2 as usize), red_h(j as usize, y2 as usize), h_lb);
-        cost_l2 += congestion_cost(grid.h(j as usize, y1 as usize), red_h(j as usize, y1 as usize), h_lb);
+        cost_l1 += congestion_cost(grid.est_red_h(j as usize, y2 as usize, red_h(j as usize, y2 as usize)), 0, h_lb);
+        cost_l2 += congestion_cost(grid.est_red_h(j as usize, y1 as usize, red_h(j as usize, y1 as usize)), 0, h_lb);
     }
 
     // ⛔ A tie goes to L2, as everywhere else in this router.

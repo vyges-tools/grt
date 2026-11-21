@@ -32,12 +32,12 @@ pub fn route_seg_l_first_time<G: Usage2d + ?Sized>(
     let (ymin, ymax) = (s.y1.min(s.y2), s.y1.max(s.y2));
     let (mut cost_l1, mut cost_l2) = (0.0, 0.0);
     for i in ymin..ymax {
-        cost_l1 += congestion_cost(grid.v(s.x1 as usize, i as usize), red_v(s.x1 as usize, i as usize), v_lb);
-        cost_l2 += congestion_cost(grid.v(s.x2 as usize, i as usize), red_v(s.x2 as usize, i as usize), v_lb);
+        cost_l1 += congestion_cost(grid.est_red_v(s.x1 as usize, i as usize, red_v(s.x1 as usize, i as usize)), 0, v_lb);
+        cost_l2 += congestion_cost(grid.est_red_v(s.x2 as usize, i as usize, red_v(s.x2 as usize, i as usize)), 0, v_lb);
     }
     for i in s.x1..s.x2 {
-        cost_l1 += congestion_cost(grid.h(i as usize, s.y2 as usize), red_h(i as usize, s.y2 as usize), h_lb);
-        cost_l2 += congestion_cost(grid.h(i as usize, s.y1 as usize), red_h(i as usize, s.y1 as usize), h_lb);
+        cost_l1 += congestion_cost(grid.est_red_h(i as usize, s.y2 as usize, red_h(i as usize, s.y2 as usize)), 0, h_lb);
+        cost_l2 += congestion_cost(grid.est_red_h(i as usize, s.y1 as usize, red_h(i as usize, s.y1 as usize)), 0, h_lb);
     }
     let shape = choose_l_shape(cost_l1, cost_l2);
     commit_l_shape(grid, &s, shape);

@@ -315,15 +315,15 @@ pub fn spiral_route<G: crate::estimate::Usage2d + ?Sized>(
     let (mut cost_l1, mut cost_l2) = via_bias(nodes[n1].status, nodes[n2].status, via_cost);
 
     for j in ymin..ymax {
-        cost_l1 += congestion_cost(grid.v(x1 as usize, j as usize), red_v(x1 as usize, j as usize), v_lb);
-        cost_l2 += congestion_cost(grid.v(x2 as usize, j as usize), red_v(x2 as usize, j as usize), v_lb);
+        cost_l1 += congestion_cost(grid.est_red_v(x1 as usize, j as usize, red_v(x1 as usize, j as usize)), 0, v_lb);
+        cost_l2 += congestion_cost(grid.est_red_v(x2 as usize, j as usize, red_v(x2 as usize, j as usize)), 0, v_lb);
     }
     // ⚠️ Not `min..max` — the reference writes `for (int j = x1; j < x2; j++)` with no ordering,
     // so this loop contributes nothing at all when `x1 > x2`. The vertical loop above DOES order
     // its bounds. The asymmetry is the reference's.
     for j in x1..x2 {
-        cost_l1 += congestion_cost(grid.h(j as usize, y2 as usize), red_h(j as usize, y2 as usize), h_lb);
-        cost_l2 += congestion_cost(grid.h(j as usize, y1 as usize), red_h(j as usize, y1 as usize), h_lb);
+        cost_l1 += congestion_cost(grid.est_red_h(j as usize, y2 as usize, red_h(j as usize, y2 as usize)), 0, h_lb);
+        cost_l2 += congestion_cost(grid.est_red_h(j as usize, y1 as usize, red_h(j as usize, y1 as usize)), 0, h_lb);
     }
 
     if chooses_y_first(cost_l1, cost_l2) {

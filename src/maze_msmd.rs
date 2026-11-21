@@ -182,8 +182,9 @@ pub fn maze_route_msmd_sequential(
             let (maze_nodes, maze_edges) = (maze_nodes_of(t), maze_edges_of(t));
             let outcome = {
                 let g = &*grid.g;
-                let used_h = |x: i32, y: i32| i32::from(g.usage_red_h(x, y, red_h(x as usize, y as usize)));
-                let used_v = |x: i32, y: i32| i32::from(g.usage_red_v(x, y, red_v(x as usize, y as usize)));
+                // `pos = (int) getUsageNDRAware(net, …, getUsageRedH/V) + L × last` (#11963).
+                let used_h = |x: i32, y: i32| g.usage_ndr_aware(&nn, x as usize, y as usize, true, f64::from(g.usage_red_h(x, y, red_h(x as usize, y as usize)))) as i32;
+                let used_v = |x: i32, y: i32| g.usage_ndr_aware(&nn, x as usize, y as usize, false, f64::from(g.usage_red_v(x, y, red_v(x as usize, y as usize)))) as i32;
                 let last_h = |x: i32, y: i32| i32::from(g.est.last_usage_h(x as usize, y as usize));
                 let last_v = |x: i32, y: i32| i32::from(g.est.last_usage_v(x as usize, y as usize));
                 let relax = RelaxInputs {
