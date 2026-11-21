@@ -290,3 +290,19 @@ fn the_l_rip_up_takes_an_ndr_net_off_a_deficit() {
         }
     }
 }
+
+/// ⛔ Upstream #11963 `getOverflow2D` / `getOverflow2Dmaze`: the tracks the NDR nets miss count as
+/// overflow too — added to the total, not to the maximum, and not to the usage.
+#[test]
+fn the_overflow_totals_count_the_ndr_deficit() {
+    // Committed: the 20-track net on two edges of capacity 10 → 10 + 10 over, 15 + 15 missed.
+    let g = graph_with_deficits();
+    let s = g.get_overflow_2d_maze();
+    assert_eq!((s.total_overflow, s.max_overflow, s.total_usage), (10 + 10 + 15 + 15, 10, 40));
+    // Estimated: the same net estimated on one edge.
+    let mut g = graph();
+    let fat = NdrCostNet { layer_edge_cost: Some(vec![20, 20]), ..ndr(9, 20) };
+    g.for_net(&fat).update_h(1, 2, 1, 1.0);
+    let s = g.get_overflow_2d();
+    assert_eq!((s.total_overflow, s.max_overflow), (10 + 15, 10));
+}

@@ -53,21 +53,31 @@ impl Graph2d {
     }
 
     /// `getOverflow2D`'s scan over the used grids, in set order.
+    ///
+    /// ⛔ OpenROAD #11963: the total overflow also counts the tracks the NDR nets miss
+    /// (`getTotalNDRDeficit`), though they are not edge usage; the maximum does not. The running
+    /// total is what the reference's production path (`overflowStatistics`) adds; its full-scan
+    /// cross-check sums the used edges' deficits instead, which agree unless the total drifts.
     pub fn get_overflow_2d(&self) -> Overflow2DScan {
         let xg = self.est.x_grids;
         let cell = |x: i32, y: i32, est: f64, cap: u16| UsedCell { x, y, usage: 0, est_usage: est, cap };
         let h: Vec<UsedCell> = self.used_h.iter().map(|&(x, y)| cell(x, y, self.est.h(x as usize, y as usize), self.cap_h[y as usize * xg + x as usize])).collect();
         let v: Vec<UsedCell> = self.used_v.iter().map(|&(x, y)| cell(x, y, self.est.v(x as usize, y as usize), self.cap_v[y as usize * xg + x as usize])).collect();
-        get_overflow_2d(&h, &v)
+        let mut scan = get_overflow_2d(&h, &v);
+        scan.total_overflow += self.ndr.total_ndr_deficit();
+        scan
     }
 
-    /// `getOverflow2Dmaze`'s scan — COMMITTED usage over the used grids, in set order.
+    /// `getOverflow2Dmaze`'s scan — COMMITTED usage over the used grids, in set order, plus the NDR
+    /// deficit as in [`Graph2d::get_overflow_2d`].
     pub fn get_overflow_2d_maze(&self) -> Overflow2DScan {
         let xg = self.est.x_grids;
         let cell = |x: i32, y: i32, usage: u16, cap: u16| UsedCell { x, y, usage, est_usage: 0.0, cap };
         let h: Vec<UsedCell> = self.used_h.iter().map(|&(x, y)| cell(x, y, self.est.usage_h(x as usize, y as usize), self.cap_h[y as usize * xg + x as usize])).collect();
         let v: Vec<UsedCell> = self.used_v.iter().map(|&(x, y)| cell(x, y, self.est.usage_v(x as usize, y as usize), self.cap_v[y as usize * xg + x as usize])).collect();
-        get_overflow_2d_maze(&h, &v)
+        let mut scan = get_overflow_2d_maze(&h, &v);
+        scan.total_overflow += self.ndr.total_ndr_deficit();
+        scan
     }
 
     /// `updateCongestionHistory(up_type, ahth, stop_decreasing, max_adj)` — over the USED grids, in
