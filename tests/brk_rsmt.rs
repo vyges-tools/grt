@@ -1484,6 +1484,107 @@ fn copy_br_restores_the_saved_routes_and_their_usage() {
     assert_eq!((g2d.est.usage_v(0, 0), g2d.est.usage_v(4, 0)), (0, 0), "the detour's columns given back");
 }
 
+/// ⛔ Upstream #12039 (`restoreInitialRoutes`): the first soft-NDR demotion puts back the routes
+/// saved before the first iteration — the current route given back, the saved one charged at the
+/// net's CURRENT edge cost — clears the net's critical flag and resets the congestion history
+/// (`InitLastUsage(1)`: last usage and congestion counts). No corpus loop is captured at the pin.
+#[test]
+fn restore_initial_routes_puts_back_the_saved_routes_and_clears_the_history() {
+    use vyges_grt::congestion_loop::{has_non_soft_ndr_nets, restore_initial_routes, save_initial_routes};
+    let pins = [(0, 0), (4, 0)];
+    let mut state = vec![st_tree(2, &[(0, 0, 1), (4, 0, 1)], &pins)];
+    let row = |y: i32| -> Vec<(i32, i32)> { let mut v = vec![(0, 0)]; if y > 0 { v.push((0, y)); } v.extend((1..=4).map(|x| (x, y))); if y > 0 { v.push((4, 0)); } v };
+    {
+        let r = &mut state[0].tree.as_mut().expect("tree").routes[0];
+        (r.kind, r.grids, r.routelen) = (RouteKind::MazeRoute, row(0), 4);
+    }
+    let (px, py): (Vec<i32>, Vec<i32>) = pins.iter().copied().unzip();
+    let nets = [RsmtNet { layer_edge_cost: &[1], ..net(&px, &py) }];
+    let mut g2d = Graph2d::new(6, 3, 1);
+    for x in 0..4 {
+        g2d.est.update_usage_h(x, 0, 1.0);
+    }
+    let saved = save_initial_routes(&[0], &state);
+    for x in 0..4 {
+        g2d.est.update_usage_h(x, 0, -1.0);
+        g2d.est.update_usage_h(x, 1, 1.0);
+    }
+    g2d.est.update_usage_v(0, 0, 1.0);
+    g2d.est.update_usage_v(4, 0, 1.0);
+    {
+        let r = &mut state[0].tree.as_mut().expect("tree").routes[0];
+        (r.grids, r.routelen) = (row(1), 6);
+    }
+    state[0].critical = true;
+    {
+        let (last, cnt) = g2d.est.history_mut(true, 1, 0);
+        (*last, *cnt) = (2, 3);
+    }
+    restore_initial_routes(&[0], &nets, &mut state, &mut g2d, saved);
+    assert_eq!(state[0].tree.as_ref().expect("tree").routes[0].grids, row(0), "the saved route is back");
+    let usage: Vec<(u16, u16)> = (0..4).map(|x| (g2d.est.usage_h(x, 0), g2d.est.usage_h(x, 1))).collect();
+    assert_eq!(usage, vec![(1, 0); 4], "row 0 charged again, row 1 given back");
+    assert_eq!((g2d.est.usage_v(0, 0), g2d.est.usage_v(4, 0)), (0, 0), "the detour's columns given back");
+    assert!(!state[0].critical, "the critical flag is cleared");
+    assert_eq!((g2d.est.last_usage_h(1, 0), g2d.est.cong_cnt_h(1, 0)), (0, 0), "InitLastUsage(1)");
+
+    // `hasNonSoftNdrNets`: an NDR net not yet demoted — the save is made only then.
+    assert!(!has_non_soft_ndr_nets(&[0], &[false], &state));
+    assert!(has_non_soft_ndr_nets(&[0], &[true], &state));
+    state[0].soft_ndr = true;
+    assert!(!has_non_soft_ndr_nets(&[0], &[true], &state));
+}
+
+/// ⛔ Upstream #12039 (run()): when an NDR net can be demoted the routes are saved before the first
+/// iteration, and the FIRST demotion restarts from them with every loop parameter put back —
+/// `THRESH_M` among them, so the restarted first pass steps it from its initial 20 again (to 10),
+/// where without the restart it stays 0. A net that never leaves an all-zero-capacity grid keeps
+/// overflowing, so the loop stalls and demotes it after iteration 15; the second stall finds no NDR
+/// net left and nothing restarts.
+#[test]
+fn the_first_soft_ndr_demotion_restarts_the_loop_from_the_initial_routing() {
+    let pins = [(0, 0), (4, 0)];
+    let mut state = vec![st_tree(2, &[(0, 0, 1), (4, 0, 1)], &pins)];
+    {
+        let r = &mut state[0].tree.as_mut().expect("tree").routes[0];
+        (r.kind, r.grids, r.routelen) = (RouteKind::MazeRoute, (0..=4).map(|x| (x, 0)).collect(), 4);
+    }
+    let (px, py): (Vec<i32>, Vec<i32>) = pins.iter().copied().unzip();
+    let mut nets = [RsmtNet { edge_cost: 2, layer_edge_cost: &[2], ..net(&px, &py) }];
+    let mut g2d = Graph2d::new(80, 3, 1);
+    {
+        use vyges_grt::estimate::Usage2d as _;
+        let nn = nets[0].ndr_net(0);
+        let mut g = g2d.for_net(&nn);
+        for x in 0..4 {
+            g.update_usage_h(x, 0, 2.0);
+        }
+    }
+    for x in 0..4 {
+        g2d.used_h.insert((x, 0));
+    }
+    g2d.cap_h.iter_mut().for_each(|c| *c = 0);
+    g2d.cap_v.iter_mut().for_each(|c| *c = 0);
+    let caps = grid_caps(80, 3, 0);
+    let mut grid = BrkGrid { g: &mut g2d, red_h: &no_red, red_v: &no_red, caps: &caps, h_capacity: 10, v_capacity: 10, via_cost: 0.0 };
+    let scan = grid.g.get_overflow_2d_maze();
+    assert!(scan.total_overflow > 0);
+    let start = LoopStart { pattern_max_overflow: 0, logistic_coef: 0.0, scan, overflow_iterations: 20, critical_nets_percentage: 0.0, has_ndr: vec![true] };
+    let guard = vyges_grt::EdgeUsageGuard::new(10, 10, vyges_grt::CongestionPolicy::Allow);
+    let mut before = Vec::new();
+    let end = congestion_loop(&start, &[0], &mut nets, &mut state, &mut grid, vyges_grt::congestion_loop::TimerSlack::None, &guard, &mut |ev, _, _| {
+        if let LoopEvent::Before { params, schedule } = ev {
+            before.push((params.iter, schedule.thresh_m, schedule.up_type));
+        }
+    })
+    .expect("the loop runs");
+    assert_eq!(end.soft_ndr, vec![0], "the net is demoted once");
+    assert_eq!(end.rare.soft_ndr_restart, 1, "the first demotion restarts");
+    let restart = before.iter().skip(1).position(|b| b.0 == 1).expect("the loop restarts at i = 1") + 1;
+    assert_eq!(before[0], (1, 10, 1), "the first pass: THRESH_M 20 stepped to 10");
+    assert_eq!(before[restart], (1, 10, 1), "the restarted first pass steps THRESH_M from 20 again, upType 1");
+}
+
 /// R15, constructed — no corpus run leaves a loop (asserted in the replay), so this is the driver's
 /// only witness. `removeLoops` walks every positive-length edge of every net, cuts the stretch
 /// between two visits of one point, gives back what that stretch was charged through the net's

@@ -8,8 +8,11 @@
 //! ⚠️ Not transcribed, refused rather than guessed: the snapshot-batched convergence (the sequential
 //! kernel keeps `snapshot_cleanup_active_` false).
 //!
-//! Soft-NDR demotion IS transcribed ([`soft_ndr_demotion`]): witnessed by `soft_ndr_4w_6s` (2 nets
-//! demoted at iteration 16) and `soft_ndr_escalation` (6 at iteration 12), each firing once.
+//! Soft-NDR demotion IS transcribed ([`soft_ndr_demotion`]): witnessed at the 4155ac31 pin by
+//! `soft_ndr_4w_6s` (2 nets demoted at iteration 16) and `soft_ndr_escalation` (6 at iteration 12),
+//! each firing once. Since OpenROAD #12039 (f11b4276 pin) the FIRST demotion restarts the loop from
+//! the routing saved before iteration 1 ([`restore_initial_routes`]); those goldens moved upstream
+//! and are re-captured in the heavy window.
 
 use crate::brk_rsmt::{BrkGrid, NetState, RouteKind, RsmtNet, StTree};
 use crate::estimate::Usage2d;
@@ -150,6 +153,8 @@ pub struct RareBranches {
     pub late_accu: u32,
     /// The `mazeRound` (500) cap.
     pub maze_round: u32,
+    /// The first soft-NDR demotion's restart from the initial routing.
+    pub soft_ndr_restart: u32,
 }
 
 /// run()'s congestion loop, from `i = 1` to its break, then `copyBR` when any round beat nothing.
@@ -209,6 +214,14 @@ pub fn congestion_loop(
     let mut backup: Option<Vec<Option<StTree>>> = None;
     let (xg, yg) = (grid.g.est.x_grids as i32, grid.g.est.y_grids as i32);
     let mut rare = RareBranches::default();
+    // The loop parameters the first soft-NDR demotion puts back (OpenROAD #12039).
+    let (initial_thresh_m, initial_via, initial_logistic_coef) = (thresh_m, via, logistic_coef);
+    // The routes the first soft-NDR demotion restores, saved only when an NDR net can be demoted.
+    let mut initial_trees = if has_non_soft_ndr_nets(net_ids, &start.has_ndr, state) && total_overflow > 0 && start.overflow_iterations > 0 {
+        save_initial_routes(net_ids, state)
+    } else {
+        Vec::new()
+    };
 
     // ⛔ The pass computes an `enlarge_` per edge, but into the router's MEMBER; run()'s loop uses a
     // LOCAL `int enlarge_` that shadows it, so the pass never changes the schedule's value.
@@ -416,17 +429,41 @@ pub fn congestion_loop(
             let demoted = soft_ndr_demotion(net_ids, nets, &start.has_ndr, state, grid)?;
             if !demoted.is_empty() {
                 soft_ndr.extend(demoted);
-                overflow_increases = 0;
                 minofl_stagnant = 0;
                 i = 1;
                 costheight = COSHEIGHT;
                 enlarge = ENLARGE;
                 ripup_threshold = RIPVALUE;
-                minofl = total_overflow;
-                bmfl = minofl;
                 stop_dec = false;
                 slope = 20;
                 l = 1;
+                // Upstream rule (run(), OpenROAD #12039): ONLY the first demotion restarts from the
+                // routing saved before the first iteration — the moved-from save is empty after —
+                // and puts every loop parameter back; later ones keep the routing in place.
+                if !initial_trees.is_empty() {
+                    restore_initial_routes(net_ids, nets, state, grid.g, std::mem::take(&mut initial_trees));
+                    guard.check(&grid.g.est)?; // `getOverflow2Dmaze` → `check2DEdgesUsage`
+                    scan = grid.g.get_overflow_2d_maze();
+                    (past_cong, max_overflow, total_overflow) = (scan.total_overflow, scan.max_overflow, scan.total_overflow);
+                    rare.soft_ndr_restart += 1;
+                    // freeRR: the best routing copyRS saved predates the restart.
+                    backup = None;
+                    thresh_m = initial_thresh_m;
+                    via = initial_via;
+                    logistic_coef = initial_logistic_coef;
+                    up_type = 1;
+                    minofl = total_overflow;
+                    minoflrnd = 0;
+                    bmfl = BIG_INT;
+                    bwcnt = 0;
+                    slack_th.set(f32::MIN);
+                    overflow_increases = -1;
+                    last_total_overflow = 0;
+                } else {
+                    overflow_increases = 0;
+                    minofl = total_overflow;
+                    bmfl = minofl;
+                }
             }
         }
     }
@@ -541,6 +578,37 @@ fn update_planar_net_usage(g: &mut crate::graph2d::Graph2d, net: &RsmtNet<'_>, i
             }
         }
     }
+}
+
+/// `hasNonSoftNdrNets` (run()'s `has_non_soft_ndr_nets_`): some net in `net_ids_` has a
+/// non-default rule and is not yet demoted to soft-NDR.
+pub fn has_non_soft_ndr_nets(net_ids: &[usize], has_ndr: &[bool], state: &[NetState]) -> bool {
+    net_ids.iter().any(|&id| has_ndr.get(id).copied().unwrap_or(false) && !state[id].soft_ndr)
+}
+
+/// `saveInitialRoutes`: every net's tree, in `net_ids_` order.
+pub fn save_initial_routes(net_ids: &[usize], state: &[NetState]) -> Vec<Option<StTree>> {
+    net_ids.iter().map(|&id| state[id].tree.clone()).collect()
+}
+
+/// `restoreInitialRoutes` (OpenROAD #12039): the usage of EVERY net given back first, so the NDR
+/// nets reserve capacity against the restored routes only; then, net by net, the saved tree put
+/// back and charged at the net's CURRENT edge cost (a net demoted since is charged at 1) and its
+/// critical flag cleared; then `InitLastUsage(1)` clears the congestion history.
+pub fn restore_initial_routes(net_ids: &[usize], nets: &[RsmtNet<'_>], state: &mut [NetState], g: &mut crate::graph2d::Graph2d, saved: Vec<Option<StTree>>) {
+    for &id in net_ids {
+        if let Some(t) = &state[id].tree {
+            update_planar_net_usage(g, &nets[id], id, t, -f64::from(nets[id].edge_cost));
+        }
+    }
+    for (&id, tree) in net_ids.iter().zip(saved) {
+        state[id].tree = tree;
+        if let Some(t) = &state[id].tree {
+            update_planar_net_usage(g, &nets[id], id, t, f64::from(nets[id].edge_cost));
+        }
+        state[id].critical = false;
+    }
+    g.est.init_last_usage(1);
 }
 
 /// `copyRS` — save every net's tree (topology and routes) as the best so far.

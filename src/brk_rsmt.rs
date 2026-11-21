@@ -233,7 +233,8 @@ pub struct NetState {
     /// `FrNet::slack_` — ⛔ MUTATED by the maze phase: the congestion ordering stamps de-prioritised
     /// nets with `f32::MAX`. Starts at the sentinel `ceil(lowest float)`.
     pub slack: f32,
-    /// `FrNet::is_critical_` — set by the rip-up gate's critical arm, never cleared.
+    /// `FrNet::is_critical_` — set by the rip-up gate's critical arm; cleared only by the first
+    /// soft-NDR demotion's restart (`restoreInitialRoutes`).
     pub critical: bool,
     /// The net's layer range as `assignEdge` leaves it (`setMinLayer`/`setMaxLayer`), or `None`
     /// while it is still the net's own. ⛔ The widening PERSISTS: later edges, and the 3D passes,
