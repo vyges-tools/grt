@@ -1158,9 +1158,9 @@ pub enum InitError {
 ///
 /// `driver_terms[k]` is the first driver terminal of `facts.nets[k]` (see
 /// [`grnet::GrNet::new`]). NDR costs are not modelled yet.
-pub fn init(facts: &DesignFacts, driver_terms: &[String], min_routing_layer: i32, max_routing_layer: i32) -> Result<Cugr, InitError> {
+pub fn init(facts: &DesignFacts, driver_terms: &[String], min_routing_layer: i32, max_routing_layer: i32, selection: &design::NetSelection) -> Result<Cugr, InitError> {
     let constants = Constants { min_routing_layer: min_routing_layer - 1, ..Constants::default() };
-    let design = Design::new(facts, &constants, min_routing_layer, max_routing_layer).map_err(InitError::Design)?;
+    let design = Design::new(facts, &constants, min_routing_layer, max_routing_layer, selection).map_err(InitError::Design)?;
     let grid = GridGraph::new(&design, constants.min_routing_layer as usize).map_err(InitError::Grid)?;
     let nets = design
         .nets
@@ -1362,7 +1362,7 @@ mod tests {
             min_layer_for_clock: 0,
             max_layer_for_clock: 0,
         };
-        init(&f, &[], 2, 3).unwrap()
+        init(&f, &[], 2, 3, &Default::default()).unwrap()
     }
 
     fn net_with(tree: GrTree, aps: &[(usize, Point)]) -> GrNet {

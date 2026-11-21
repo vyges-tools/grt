@@ -1067,7 +1067,7 @@ mod tests {
     }
 
     fn graph(f: &DesignFacts) -> GridGraph {
-        let d = Design::new(f, &Constants::default(), 2, 3).unwrap();
+        let d = Design::new(f, &Constants::default(), 2, 3, &crate::cugr::design::NetSelection::default()).unwrap();
         GridGraph::new(&d, 1).unwrap()
     }
 
@@ -1211,7 +1211,7 @@ mod tests {
         // charging ONE pad per layer from low to high: max(the via below's upper length, the via
         // above's lower length), spread over the layer's flanking edges.
         let f = facts();
-        let mut d = Design::new(&f, &Constants::default(), 2, 3).unwrap();
+        let mut d = Design::new(&f, &Constants::default(), 2, 3, &crate::cugr::design::NetSelection::default()).unwrap();
         d.via_demand_length_lower = vec![10.0, 20.0, 0.0];
         d.via_demand_length_upper = vec![30.0, 40.0, 0.0];
         let g = GridGraph::new(&d, 1).unwrap();
@@ -1261,7 +1261,7 @@ mod tests {
         f.layers[1].metal.as_mut().unwrap().resistance = 2.0;
         f.layers[2].metal.as_mut().unwrap().resistance = 4.0;
         f.layers[1].metal.as_mut().unwrap().via_resistance = 3.0;
-        let d = Design::new(&f, &Constants::default(), 2, 3).unwrap();
+        let d = Design::new(&f, &Constants::default(), 2, 3, &crate::cugr::design::NetSelection::default()).unwrap();
         let g = GridGraph::new(&d, 1).unwrap();
         let c = Constants::default();
         assert_eq!(GridGraph::ref_resistances(&d), (2.0, 3.0));

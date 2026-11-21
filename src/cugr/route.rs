@@ -77,7 +77,9 @@ impl InitCugrStages for InitCugrDb<'_> {
             }
         }
         crate::init::report_clock_nets(self.opts.verbose, found, &mut self.log);
-        self.db_nets = read_nets(self.db);
+        // findNets: the block's nets, or set_nets_to_route's.
+        let all = read_nets(self.db);
+        self.db_nets = crate::global_route::find_nets_list(&all, self.opts.nets_to_route.as_deref())?.into_iter().cloned().collect();
         let candidates: Vec<NetCandidate> = self
             .db_nets
             .iter()
@@ -132,7 +134,12 @@ impl InitCugrStages for InitCugrDb<'_> {
 
     fn cugr_init(&mut self) -> Res<()> {
         let (facts, drivers) = read_design_facts(self.db, &self.clock_nets)?;
-        self.cugr = Some(init(&facts, &drivers, self.min, self.max).map_err(|e| format!("{e:?}"))?);
+        // initCUGR: setSkipLargeFanoutNets(skip_large_fanout_), setSelectedNets(nets_to_route_).
+        let selection = super::design::NetSelection {
+            selected: self.opts.nets_to_route.iter().flatten().cloned().collect(),
+            skip_large_fanout: self.opts.skip_large_fanout,
+        };
+        self.cugr = Some(init(&facts, &drivers, self.min, self.max, &selection).map_err(|e| format!("{e:?}"))?);
         Ok(())
     }
 }
@@ -416,14 +423,11 @@ pub struct CugrGuides {
 /// marked congested. `isLocal` is asked of the pins AFTER they moved.
 pub fn cugr_guides(db: &mut Db, opts: &RouteOptions, cugr: &Cugr, clock_nets: &BTreeSet<String>, alphas: &[f32], slack: f32, log: &mut dyn crate::log::Sink) -> Res<CugrGuides> {
     use crate::findrouting::{add_remaining_guides, RemainingNet};
-    if opts.nets_to_route.is_some() {
-        return Err("cugr: set_nets_to_route (incremental routing) is not modelled".into());
-    }
     // initRoutingGrid: layers, tracks and the core grid the guide boxes are cut on.
     let t = crate::global_route::setup_tech(db, opts)?;
     let db: &Db = db;
     let all = read_nets(db);
-    let db_nets: Vec<&crate::read::NetFacts> = all.iter().collect();
+    let db_nets = crate::global_route::find_nets_list(&all, opts.nets_to_route.as_deref())?; // findNets
     let candidates: Vec<NetCandidate> = db_nets
         .iter()
         .map(|n| NetCandidate {
@@ -679,7 +683,7 @@ fn timer_slack_source(db: &mut Db, opts: &RouteOptions) -> Res<super::SlackSourc
     let t = crate::global_route::setup_tech(db, opts)?;
     let db: &Db = db;
     let all = read_nets(db);
-    let db_nets: Vec<&crate::read::NetFacts> = all.iter().collect();
+    let db_nets = crate::global_route::find_nets_list(&all, opts.nets_to_route.as_deref())?; // findNets
     let candidates: Vec<NetCandidate> = db_nets
         .iter()
         .map(|n| NetCandidate {

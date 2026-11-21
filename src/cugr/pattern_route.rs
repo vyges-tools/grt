@@ -898,7 +898,7 @@ pub(crate) mod tests {
             min_layer_for_clock: 0,
             max_layer_for_clock: 0,
         };
-        init(&f, &[], 2, 3).unwrap()
+        init(&f, &[], 2, 3, &Default::default()).unwrap()
     }
 
     pub(crate) fn net(grid: &GridGraph, pins: &[&[(i32, i32, i32)]]) -> GrNet {
@@ -989,7 +989,7 @@ pub(crate) mod tests {
             min_layer_for_clock: 0,
             max_layer_for_clock: 0,
         };
-        let c = init(&f, &[], 2, 4).unwrap();
+        let c = init(&f, &[], 2, 4, &Default::default()).unwrap();
         let mut n = net(&c.grid, &[&[(1, 2, 2)]]);
         n.layer_range.max_layer = 3;
         let mut dag = Dag::default();
@@ -1030,7 +1030,7 @@ pub(crate) mod tests {
             min_layer_for_clock: 0,
             max_layer_for_clock: 0,
         };
-        let mut r = init(&f, &[], 2, 4).unwrap();
+        let mut r = init(&f, &[], 2, 4, &Default::default()).unwrap();
         r.design.via_demand_length_lower = vec![100.0, 300.0, 50.0, 0.0];
         r.design.via_demand_length_upper = vec![200.0, 120.0, 400.0, 0.0];
         let n = net(&r.grid, &[&[(1, 2, 2)]]);

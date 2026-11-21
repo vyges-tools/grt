@@ -87,6 +87,8 @@ pub struct NetFacts {
     /// `!getSWires().empty()`.
     pub has_swires: bool,
     pub connected_by_abutment: bool,
+    /// `dbNet::getTermCount()`: instance terminals plus block terminals.
+    pub term_count: i32,
     /// In GlobalRouter's clock-net set (`findClockNets`).
     pub is_clock: bool,
     /// Block terminals first, then instance terminals, each in the net's order.
@@ -188,16 +190,41 @@ pub enum DesignError {
     DieSmallerThanGcell,
 }
 
+/// The nets `Design` may read: `CUGR::setSelectedNets` (from `set_nets_to_route`) and
+/// `CUGR::setSkipLargeFanoutNets` (from `-skip_large_fanout_nets`), both read at the next `init`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetSelection {
+    /// Empty keeps every net.
+    pub selected: std::collections::BTreeSet<String>,
+    pub skip_large_fanout: i32,
+}
+
+impl Default for NetSelection {
+    fn default() -> Self {
+        NetSelection { selected: std::collections::BTreeSet::new(), skip_large_fanout: i32::MAX }
+    }
+}
+
+impl NetSelection {
+    /// Upstream rule (`Design::readNetlist`, since OpenROAD #12367): the same selection as
+    /// `GlobalRouter::findNets` — a net outside a NON-EMPTY selected set, or with more terminals
+    /// than the skip threshold, stays out of the netlist (the timing update estimates parasitics
+    /// for every net CUGR routed, so a net the global router dropped must not be routed here).
+    pub fn leaves_out(&self, name: &str, term_count: i32) -> bool {
+        (!self.selected.is_empty() && !self.selected.contains(name)) || term_count > self.skip_large_fanout
+    }
+}
+
 impl Design {
     /// The constructor: `read()`, then `setUnitCosts()`.
-    pub fn new(f: &DesignFacts, c: &Constants, min_routing_layer: i32, max_routing_layer: i32) -> Result<Design, DesignError> {
-        let mut d = Design::read(f, c, min_routing_layer, max_routing_layer)?;
+    pub fn new(f: &DesignFacts, c: &Constants, min_routing_layer: i32, max_routing_layer: i32, sel: &NetSelection) -> Result<Design, DesignError> {
+        let mut d = Design::read(f, c, min_routing_layer, max_routing_layer, sel)?;
         d.set_unit_costs(c)?;
         Ok(d)
     }
 
     /// `Design::read()`.
-    fn read(f: &DesignFacts, c: &Constants, min_routing_layer: i32, max_routing_layer: i32) -> Result<Design, DesignError> {
+    fn read(f: &DesignFacts, c: &Constants, min_routing_layer: i32, max_routing_layer: i32, sel: &NetSelection) -> Result<Design, DesignError> {
         let mut d = Design {
             dbu_per_micron: f.dbu_per_micron,
             die: box_of(f.die),
@@ -216,7 +243,7 @@ impl Design {
             unit_length_short_costs: Vec::new(),
         };
         d.read_layers(f, max_routing_layer);
-        d.read_netlist(f, min_routing_layer, max_routing_layer);
+        d.read_netlist(f, min_routing_layer, max_routing_layer, sel);
         d.read_instance_obstructions(f, max_routing_layer);
         d.num_special_nets = d.read_special_net_obstructions(f, max_routing_layer)?;
         d.read_design_obstructions(f, max_routing_layer);
@@ -276,10 +303,13 @@ impl Design {
     ///
     /// Upstream rule: a special, supply, special-wired or abutment-connected net is not routed; nor
     /// is one with fewer than two terminals. A clock net takes the CLOCK layer range only when
-    /// both clock bounds are set (> 0).
-    fn read_netlist(&mut self, f: &DesignFacts, min_routing_layer: i32, max_routing_layer: i32) {
+    /// both clock bounds are set (> 0). Between the two, [`NetSelection::leaves_out`].
+    fn read_netlist(&mut self, f: &DesignFacts, min_routing_layer: i32, max_routing_layer: i32, sel: &NetSelection) {
         for (k, n) in f.nets.iter().enumerate() {
             if n.is_special || n.is_supply || n.has_swires || n.connected_by_abutment {
+                continue;
+            }
+            if sel.leaves_out(&n.name, n.term_count) {
                 continue;
             }
             let pins = self.make_net_pins(n);
@@ -588,7 +618,7 @@ mod tests {
     // gives 0, 5000, 11000.
     #[test]
     fn last_gcell_absorbs_the_remainder() {
-        let d = Design::new(&facts(), &Constants::default(), 2, 3).unwrap();
+        let d = Design::new(&facts(), &Constants::default(), 2, 3, &NetSelection::default()).unwrap();
         assert_eq!(d.gridlines[0], vec![0, 5000, 10000, 20000]);
         assert_eq!(d.gridlines[1], vec![0, 5000, 11000]);
     }
@@ -597,7 +627,7 @@ mod tests {
     // per unit length is weight_short_area / pitch² × the layer's width.
     #[test]
     fn unit_costs_read_layer_one_pitch() {
-        let d = Design::new(&facts(), &Constants::default(), 2, 3).unwrap();
+        let d = Design::new(&facts(), &Constants::default(), 2, 3, &NetSelection::default()).unwrap();
         assert_eq!(d.unit_length_wire_cost, 0.5 / 380.0);
         // weight_short_area defaults to 100 since OpenROAD #12296 (f11b4276 pin), 500 before.
         assert_eq!(d.unit_length_short_costs[0], 100.0 / f64::from(380 * 380) * 140.0);
@@ -626,7 +656,7 @@ mod tests {
     // tracks = ceil((140 + 280) / 380) = 2.
     #[test]
     fn via_demand_length_blocks_whole_tracks() {
-        let d = Design::new(&facts(), &Constants::default(), 2, 3).unwrap();
+        let d = Design::new(&facts(), &Constants::default(), 2, 3, &NetSelection::default()).unwrap();
         assert_eq!(Design::via_demand_length(&d.layers[1], 140, 280), 560.0);
         // horizontal m1 (pitch 280): along = 140, ceil((280 + 280) / 280) = 2
         assert_eq!(Design::via_demand_length(&d.layers[0], 140, 280), 280.0);
@@ -643,7 +673,7 @@ mod tests {
         m.spacing = 0;
         m.v55_widths_and_lengths = Some((vec![0], vec![0]));
         m.v55_table = Some(vec![vec![200]]);
-        let d = Design::new(&f, &Constants::default(), 2, 3).unwrap();
+        let d = Design::new(&f, &Constants::default(), 2, 3, &NetSelection::default()).unwrap();
         assert_eq!(d.layers[1].default_spacing, 200);
         assert_eq!(Design::via_demand_length(&d.layers[1], 140, 280), 560.0);
     }
@@ -654,11 +684,11 @@ mod tests {
     fn via_demand_unions_boxes_and_falls_back() {
         let mut f = facts();
         f.layers[0].metal.as_mut().unwrap().area = 140 * 400; // min_length 400 - 140 = 260
-        let d = Design::new(&f, &Constants::default(), 2, 3).unwrap();
+        let d = Design::new(&f, &Constants::default(), 2, 3, &NetSelection::default()).unwrap();
         assert_eq!(d.pair_vias[0], None);
         assert_eq!(d.via_demand_length_lower[0], 260.0 * 2.0);
         f.vias = vec![via("v", &[("m1", (0, 0, 100, 140)), ("m1", (50, 0, 300, 140)), ("m2", (0, 0, 140, 140))], false, false)];
-        let d = Design::new(&f, &Constants::default(), 2, 3).unwrap();
+        let d = Design::new(&f, &Constants::default(), 2, 3, &NetSelection::default()).unwrap();
         // union 300×140 on horizontal m1: along 300, ceil((140 + 280) / 280) = 2
         assert_eq!(d.via_demand_length_lower[0], 600.0);
         assert_eq!(d.via_demand_length_lower[2], 0.0, "the top layer has no pair");
@@ -669,7 +699,7 @@ mod tests {
     }
 
     fn net(name: &str, pins: Vec<PinFacts>) -> NetFacts {
-        NetFacts { name: name.into(), is_special: false, is_supply: false, has_swires: false, connected_by_abutment: false, is_clock: false, pins, wire_count: 0, swire_boxes: Vec::new() }
+        NetFacts { name: name.into(), is_special: false, is_supply: false, has_swires: false, connected_by_abutment: false, term_count: pins.len() as i32, is_clock: false, pins, wire_count: 0, swire_boxes: Vec::new() }
     }
 
     const M1: Option<ShapeLayer> = Some(ShapeLayer { is_routing: true, routing_level: 1 });
@@ -686,13 +716,30 @@ mod tests {
             net("a", vec![pin("p", true, false, &[(M1, (0, 0, 1, 1))]), pin("u1/A", false, true, &[(M9, (0, 0, 1, 1)), (CUT, (0, 0, 1, 1))])]),
             net("single", vec![pin("u2/A", false, true, &[(M1, (0, 0, 1, 1))])]),
         ];
-        let d = Design::new(&f, &Constants::default(), 2, 3).unwrap();
+        let d = Design::new(&f, &Constants::default(), 2, 3, &NetSelection::default()).unwrap();
         assert_eq!(d.nets.len(), 1, "a one-terminal net is not routed");
         let n = &d.nets[0];
         assert!(n.pins[0].shapes.is_empty(), "no pin location: no shapes");
         assert_eq!(n.pins[1].shapes.len(), 1, "the cut box is dropped");
         assert_eq!(n.pins[1].shapes[0].layer, 2, "level 9 clamps to the top layer, index 2");
         assert_eq!(n.layer_range, LayerRange { min_layer: 1, max_layer: 2 });
+    }
+
+    // Upstream rule (Design.cpp `readNetlist`, OpenROAD #12367): the selection GlobalRouter's
+    // `findNets` made — a net outside a NON-EMPTY `set_nets_to_route` set, or with more terminals
+    // (`getTermCount`) than `-skip_large_fanout_nets`, is left out; an empty set keeps every net.
+    // The filter sits AFTER the special/supply test and BEFORE the two-pin minimum.
+    #[test]
+    fn the_selected_nets_and_the_fanout_skip_leave_nets_out() {
+        let mut f = facts();
+        let pins = |k: usize| (0..k).map(|i| pin(&format!("u{i}/A"), false, true, &[(M1, (0, 0, 1, 1))])).collect::<Vec<_>>();
+        f.nets = vec![net("a", pins(2)), net("b", pins(3)), net("c", pins(2))];
+        let names = |sel: &NetSelection| Design::new(&f, &Constants::default(), 2, 3, sel).unwrap().nets.iter().map(|n| n.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&NetSelection::default()), ["a", "b", "c"]);
+        let picked = NetSelection { selected: ["c".to_string(), "b".to_string()].into(), ..NetSelection::default() };
+        assert_eq!(names(&picked), ["b", "c"], "the netlist keeps the block's order");
+        assert_eq!(names(&NetSelection { skip_large_fanout: 2, ..NetSelection::default() }), ["a", "c"], "3 > 2 is skipped, 2 is not");
+        assert_eq!(names(&NetSelection { skip_large_fanout: 2, ..picked }), ["c"]);
     }
 
     // Upstream rule (Design.cpp `readNetlist`): a clock net takes the clock range only when BOTH
@@ -705,9 +752,9 @@ mod tests {
         clk.is_clock = true;
         f.nets = vec![clk];
         f.min_layer_for_clock = 3;
-        assert_eq!(Design::new(&f, &Constants::default(), 2, 3).unwrap().nets[0].layer_range.min_layer, 1);
+        assert_eq!(Design::new(&f, &Constants::default(), 2, 3, &NetSelection::default()).unwrap().nets[0].layer_range.min_layer, 1);
         f.max_layer_for_clock = 3;
-        assert_eq!(Design::new(&f, &Constants::default(), 2, 3).unwrap().nets[0].layer_range, LayerRange { min_layer: 2, max_layer: 2 });
+        assert_eq!(Design::new(&f, &Constants::default(), 2, 3, &NetSelection::default()).unwrap().nets[0].layer_range, LayerRange { min_layer: 2, max_layer: 2 });
     }
 
     // Upstream rule (Design.cpp `readSpecialNetObstructions`): special OR supply, non-zero wire
@@ -729,7 +776,7 @@ mod tests {
         unwired.is_supply = true;
         unwired.swire_boxes = vec![(Shape { layer: M1, rect: (0, 0, 1, 1) }, false)];
         f.nets = vec![vdd, unwired];
-        let d = Design::new(&f, &Constants::default(), 2, 3).unwrap();
+        let d = Design::new(&f, &Constants::default(), 2, 3, &NetSelection::default()).unwrap();
         assert_eq!(d.num_special_nets, 1, "a zero wire count skips the net");
         assert_eq!(d.obstacles.len(), 2);
         assert_eq!(d.obstacles[1].b, BoxT::new(0, 0, 99, 10));

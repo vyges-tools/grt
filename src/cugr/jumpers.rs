@@ -206,7 +206,7 @@ mod tests {
             min_layer_for_clock: 0,
             max_layer_for_clock: 0,
         };
-        let mut c = init(&f, &[], 1, 3).unwrap();
+        let mut c = init(&f, &[], 1, 3, &Default::default()).unwrap();
         let n = crate::cugr::pattern_route::tests_support::net(&c.grid, &[&[(0, 1, 1)], &[(0, 3, 1)]]);
         c.nets.push(n);
         c

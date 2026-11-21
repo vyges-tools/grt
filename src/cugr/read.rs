@@ -161,6 +161,7 @@ fn read_nets(db: &Db, clock_nets: &BTreeSet<String>, masters: &mut BTreeMap<Stri
             is_supply: sig == "POWER" || sig == "GROUND",
             has_swires: db.num_net_get_s_wires(&name) > 0,
             connected_by_abutment: db.net_is_connected_by_abutment(&name),
+            term_count: db.net_get_term_count(&name) as i32,
             is_clock: clock_nets.contains(&name),
             pins,
             wire_count: db.net_get_wire_count_wire_cnt(&name),

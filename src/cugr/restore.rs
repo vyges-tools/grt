@@ -193,7 +193,7 @@ mod tests {
             min_layer_for_clock: 0,
             max_layer_for_clock: 0,
         };
-        init(&f, &[], 2, 3).unwrap()
+        init(&f, &[], 2, 3, &Default::default()).unwrap()
     }
 
     fn seg(a: (i32, i32, i32), b: (i32, i32, i32)) -> GSegment {
