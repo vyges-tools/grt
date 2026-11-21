@@ -7,34 +7,43 @@
 //!
 //! | call | net already on the edge | net not on the edge |
 //! | --- | --- | --- |
-//! | add (`amount >= 0`) | 0 | `+edgeCost`, or `+100 × edgeCost` in NDR overflow |
-//! | remove (`amount < 0`) | `-edgeCost`, or `-100 × edgeCost` while the edge is in overflow | 0 |
+//! | add (`amount >= 0`) | 0 | `+edgeCost` |
+//! | remove (`amount < 0`) | `-edgeCost` | 0 |
 //!
 //! ⚠️ **So a net is counted once per edge however many times it is added.** The first L-routing
 //! pass adds half the cost twice; only the first half counts, as the full edge cost.
 //!
-//! ⛔ **Overflow is decided per call, by the edge's overflow count or the layers' NDR capacity.**
-//! Each layer in the net's range keeps a `cap_ndr` that NDR nets draw down by their layer edge cost;
-//! when no layer has room the edge enters overflow and every NDR net added to it costs 100×.
+//! 🔑 **NDR deficits (OpenROAD #11963 / #12148, f11b4276 pin) replace the 100× overflow charge.**
+//! Each layer in a net's range has an NDR capacity — its capacity less what NDR nets reserved
+//! there (`ndr_debit_`). An NDR net reserves its layer edge cost on the FIRST layer with room; where
+//! none has room it reserves on its lowest layer anyway and records the tracks it misses on its best
+//! layer as its DEFICIT on the edge. The shared usage always gets the true edge cost; the deficits
+//! are kept per edge and in a running total, which only NDR nets price
+//! ([`NdrLedger::ndr_deficit_if_routed`]) and which the 2D overflow counts. When a net leaves an edge
+//! that still has a deficit, the remaining deficit nets are re-reserved in database-id order
+//! ([`NdrLedger::refit_ndr_deficit_nets`]).
 //!
 //! Stages in the reference's order: [`NdrLedger::init_cap_3d`], [`NdrLedger::update_cap_3d`],
-//! [`NdrLedger::has_ndr_capacity`], [`NdrLedger::get_cost_ndr_aware`],
-//! [`NdrLedger::update_ndr_cap_layer`]; the lifecycle: [`NdrLedger::copy_routing_state_from`],
+//! [`NdrLedger::compute_ndr_deficit`], [`NdrLedger::get_cost_ndr_aware`],
+//! [`NdrLedger::reserve_ndr_cap_layer`], [`NdrLedger::release_ndr_cap_layer`],
+//! [`NdrLedger::refit_ndr_deficit_nets`]; the lifecycle: [`NdrLedger::copy_routing_state_from`],
 //! [`NdrLedger::clear_ndr_nets`].
 
 use std::collections::BTreeMap;
 
-/// The reference's `OVERFLOW_COST_MULTIPLIER`.
-pub const OVERFLOW_COST_MULTIPLIER: f64 = 100.0;
-
-/// One layer's capacity on one edge (`Graph2D::Cap3D`).
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+/// One layer's capacity on one edge: `h_cap_3D_`/`v_cap_3D_` (`uint16_t`) and what NDR nets
+/// reserved there (`ndr_debit_`, an `int`; absent = 0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct NdrCap {
-    /// ⛔ `uint16_t` — the reference narrows the capacity it is given.
     pub cap: u16,
-    /// The capacity left for NDR nets. `double`, and it can go negative (see
-    /// [`NdrLedger::update_ndr_cap_layer`]).
-    pub cap_ndr: f64,
+    pub debit: i32,
+}
+
+impl NdrCap {
+    /// `getCapNDR`: the capacity less the debit — negative when NDR nets oversubscribe the layer.
+    pub fn cap_ndr(&self) -> i32 {
+        i32::from(self.cap) - self.debit
+    }
 }
 
 /// What the cost reads from a net.
@@ -62,18 +71,20 @@ impl NdrCostNet {
 }
 
 /// `Graph2D::NDRUsage` — what one NDR net took on one edge: the layer whose NDR capacity was
-/// debited (-1 none), by how much, and whether it was charged the overflow cost.
+/// debited (-1 none), by how much, and the tracks it misses on its best layer (0 = it fits).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NdrUsage {
     pub layer: i16,
     pub amount: i8,
-    pub charged_overflow: bool,
+    pub deficit: i8,
 }
 
-/// The NDR half of `Graph2D`: the per-layer capacities (`h_cap_3D_` / `v_cap_3D_`), the NDR nets
-/// on each edge (`h_ndr_nets_` / `v_ndr_nets_`), and each edge's overflow count (`Edge::ndr_overflow`).
+/// The NDR half of `Graph2D`: the per-layer capacities and their NDR debits, the NDR nets on each
+/// edge (`ndr_nets_`), each edge's NDR deficit (`Edge::ndr_deficit`) and their total.
 ///
-/// ⚠️ The reference indexes all of these `[x][y]` (caps `[layer][x][y]`); held flat here the same way.
+/// ⚠️ The reference indexes the capacities `[layer][x][y]` and keys the sparse maps by edge; held
+/// dense here, which no reader can tell apart (the maps are only ever looked up, never walked).
+/// Each record keeps the net it belongs to, so a refit can reserve for it again.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NdrLedger {
     pub x_grid: usize,
@@ -81,17 +92,20 @@ pub struct NdrLedger {
     pub num_layers: usize,
     h_cap: Vec<NdrCap>,
     v_cap: Vec<NdrCap>,
-    /// `h_ndr_nets_` / `v_ndr_nets_`: per edge, each NDR net on it and what it took
-    /// ([`NdrUsage`]), so a rip-up gives back exactly that.
-    h_nets: Vec<BTreeMap<usize, NdrUsage>>,
-    v_nets: Vec<BTreeMap<usize, NdrUsage>>,
+    h_nets: Vec<BTreeMap<usize, (NdrUsage, NdrCostNet)>>,
+    v_nets: Vec<BTreeMap<usize, (NdrUsage, NdrCostNet)>>,
     /// ⛔ `uint16_t`, and sized like the EDGES — `(x-1) × y` and `x × (y-1)` — not the cells.
-    h_overflow: Vec<u16>,
-    v_overflow: Vec<u16>,
+    h_deficit: Vec<u16>,
+    v_deficit: Vec<u16>,
+    /// `ndr_deficit_total_`.
+    deficit_total: i32,
+    /// Each net's database id by net id (`getDbNet()->getId()`), the refit's order; a net id past
+    /// the end orders by itself.
+    db_ids: Vec<u32>,
 }
 
 impl NdrLedger {
-    /// `Graph2D::init` then `initCap3D`: every overflow count 0, every set empty, every capacity 0.
+    /// `Graph2D::init` then `initCap3D`: no record, no deficit, every capacity 0.
     pub fn new(x_grid: usize, y_grid: usize, num_layers: usize) -> Self {
         let cells = x_grid * y_grid;
         NdrLedger {
@@ -102,9 +116,18 @@ impl NdrLedger {
             v_cap: vec![NdrCap::default(); num_layers * cells],
             h_nets: vec![BTreeMap::new(); cells],
             v_nets: vec![BTreeMap::new(); cells],
-            h_overflow: vec![0; x_grid.saturating_sub(1) * y_grid],
-            v_overflow: vec![0; x_grid * y_grid.saturating_sub(1)],
+            h_deficit: vec![0; x_grid.saturating_sub(1) * y_grid],
+            v_deficit: vec![0; x_grid * y_grid.saturating_sub(1)],
+            deficit_total: 0,
+            db_ids: Vec::new(),
         }
+    }
+
+    /// The database id of each net, by net id: the order [`refit_ndr_deficit_nets`] re-reserves in.
+    ///
+    /// [`refit_ndr_deficit_nets`]: Self::refit_ndr_deficit_nets
+    pub fn set_db_ids(&mut self, db_ids: Vec<u32>) {
+        self.db_ids = db_ids;
     }
 
     fn cell(&self, x: usize, y: usize) -> usize {
@@ -116,6 +139,22 @@ impl NdrLedger {
     fn edge_at(&self, horizontal: bool, x: usize, y: usize) -> usize {
         if horizontal { x * self.y_grid + y } else { x * (self.y_grid - 1) + y }
     }
+    fn nets(&self, horizontal: bool, x: usize, y: usize) -> &BTreeMap<usize, (NdrUsage, NdrCostNet)> {
+        let i = self.cell(x, y);
+        if horizontal { &self.h_nets[i] } else { &self.v_nets[i] }
+    }
+    fn nets_mut(&mut self, horizontal: bool, x: usize, y: usize) -> &mut BTreeMap<usize, (NdrUsage, NdrCostNet)> {
+        let i = self.cell(x, y);
+        if horizontal { &mut self.h_nets[i] } else { &mut self.v_nets[i] }
+    }
+    fn cap_mut(&mut self, horizontal: bool, layer: usize, x: usize, y: usize) -> &mut NdrCap {
+        let i = self.cap_at(layer, x, y);
+        if horizontal { &mut self.h_cap[i] } else { &mut self.v_cap[i] }
+    }
+    fn deficit_mut(&mut self, horizontal: bool, x: usize, y: usize) -> &mut u16 {
+        let e = self.edge_at(horizontal, x, y);
+        if horizontal { &mut self.h_deficit[e] } else { &mut self.v_deficit[e] }
+    }
 
     /// One layer's capacity on an edge.
     pub fn cap(&self, horizontal: bool, layer: usize, x: usize, y: usize) -> NdrCap {
@@ -124,131 +163,148 @@ impl NdrLedger {
     }
     /// Whether the net is recorded on the edge.
     pub fn has_net(&self, horizontal: bool, x: usize, y: usize, net: usize) -> bool {
-        let i = self.cell(x, y);
-        if horizontal { self.h_nets[i].contains_key(&net) } else { self.v_nets[i].contains_key(&net) }
+        self.nets(horizontal, x, y).contains_key(&net)
     }
-    /// The edge's NDR overflow count.
-    pub fn overflow(&self, horizontal: bool, x: usize, y: usize) -> u16 {
-        let i = self.edge_at(horizontal, x, y);
-        if horizontal { self.h_overflow[i] } else { self.v_overflow[i] }
+    /// The record a net left on an edge.
+    pub fn usage(&self, horizontal: bool, x: usize, y: usize, net: usize) -> Option<NdrUsage> {
+        self.nets(horizontal, x, y).get(&net).map(|(u, _)| *u)
+    }
+    /// `getEdgeNDRDeficit`: the deficit of all the NDR nets using the edge.
+    pub fn edge_ndr_deficit(&self, horizontal: bool, x: usize, y: usize) -> i32 {
+        let e = self.edge_at(horizontal, x, y);
+        i32::from(if horizontal { self.h_deficit[e] } else { self.v_deficit[e] })
+    }
+    /// `hasNDRDeficit`: an NDR net using the edge fits no single layer there.
+    pub fn has_ndr_deficit(&self, horizontal: bool, x: usize, y: usize) -> bool {
+        self.edge_ndr_deficit(horizontal, x, y) > 0
+    }
+    /// `getTotalNDRDeficit` — the running total.
+    pub fn total_ndr_deficit(&self) -> i32 {
+        self.deficit_total
     }
 
-    /// `initCap3D` — ⛔ a RESIZE, not a reset: boost's `multi_array::resize` keeps every element where
-    /// the old and new extents overlap. On a grid of the same size the capacities and the NDR sets of
-    /// the previous run survive; only [`update_cap_3d`](Self::update_cap_3d) then overwrites the
-    /// capacities. (The overflow counts are reset by `Graph2D::init`, which runs first.)
+    /// `initCap3D`: the capacities RESIZED (boost's `resize` keeps the elements where the old and
+    /// new extents overlap), then `initNDRnets` — every record, deficit and debit dropped.
+    ///
+    /// Upstream rule (#11963): the records of a previous run must go — its nets are deleted by
+    /// then, and a new net at the same address would be taken for one already on the edge.
     pub fn init_cap_3d(&mut self, x_grid: usize, y_grid: usize, num_layers: usize) {
         let mut next = NdrLedger::new(x_grid, y_grid, num_layers);
         for l in 0..num_layers.min(self.num_layers) {
             for x in 0..x_grid.min(self.x_grid) {
                 for y in 0..y_grid.min(self.y_grid) {
                     let (a, b) = (next.cap_at(l, x, y), self.cap_at(l, x, y));
-                    next.h_cap[a] = self.h_cap[b];
-                    next.v_cap[a] = self.v_cap[b];
+                    next.h_cap[a].cap = self.h_cap[b].cap;
+                    next.v_cap[a].cap = self.v_cap[b].cap;
                 }
             }
         }
-        for x in 0..x_grid.min(self.x_grid) {
-            for y in 0..y_grid.min(self.y_grid) {
-                let (a, b) = (next.cell(x, y), self.cell(x, y));
-                next.h_nets[a] = std::mem::take(&mut self.h_nets[b]);
-                next.v_nets[a] = std::mem::take(&mut self.v_nets[b]);
-            }
-        }
+        next.db_ids = std::mem::take(&mut self.db_ids);
         *self = next;
     }
 
-    /// `updateCap3D` — set a layer's capacity and its NDR capacity to the same value.
-    /// ⛔ The capacity arrives as `double` and is narrowed to `uint16_t`; `cap_ndr` keeps the double.
+    /// `updateCap3D` — set a layer's capacity (the double narrowed to `uint16_t`) and drop its
+    /// NDR debit.
     pub fn update_cap_3d(&mut self, x: usize, y: usize, layer: usize, horizontal: bool, cap: f64) {
-        let i = self.cap_at(layer, x, y);
-        let c = if horizontal { &mut self.h_cap[i] } else { &mut self.v_cap[i] };
+        let c = self.cap_mut(horizontal, layer, x, y);
         c.cap = cap as u16;
-        c.cap_ndr = cap;
+        c.debit = 0;
     }
 
-    /// `addCap3D` — add to a layer's capacity, keeping the NDR capacity reserved on it: both move
-    /// by `delta`. ⛔ `cap` is `uint16_t`: `cap += delta` wraps as the reference's does.
+    /// `addCap3D` — add to a layer's capacity; what NDR nets reserved stays reserved (the debit is
+    /// unchanged). ⛔ `cap` is `uint16_t`: `cap += delta` wraps as the reference's does.
     pub fn add_cap_3d(&mut self, x: usize, y: usize, layer: usize, horizontal: bool, delta: i32) {
-        let i = self.cap_at(layer, x, y);
-        let c = if horizontal { &mut self.h_cap[i] } else { &mut self.v_cap[i] };
+        let c = self.cap_mut(horizontal, layer, x, y);
         c.cap = (i32::from(c.cap) + delta) as u16;
-        c.cap_ndr += f64::from(delta);
     }
 
-    /// `hasNDRCapacity` — whether ANY single layer in the net's range still has room for its layer
-    /// edge cost. A net with edge cost 1 always has room.
-    pub fn has_ndr_capacity(&self, net: &NdrCostNet, x: usize, y: usize, horizontal: bool) -> bool {
-        if net.edge_cost == 1 {
-            return true;
+    /// `computeNDRDeficit` — the tracks the net would miss on its best layer if it used the edge
+    /// now: per layer in range `max(0, layer edge cost − max(0, NDR capacity))`, the minimum,
+    /// stopping at the first 0; with no layer in range, the net's whole edge cost.
+    pub fn compute_ndr_deficit(&self, net: &NdrCostNet, x: usize, y: usize, horizontal: bool) -> i32 {
+        let mut deficit = i32::MAX;
+        let mut l = net.min_layer;
+        while l <= net.max_layer && deficit > 0 {
+            let free = self.cap(horizontal, l, x, y).cap_ndr().max(0);
+            deficit = deficit.min((i32::from(net.layer_edge_cost(l)) - free).max(0));
+            l += 1;
         }
-        (net.min_layer..=net.max_layer).any(|l| self.cap(horizontal, l, x, y).cap_ndr >= net.layer_edge_cost(l) as f64)
+        if deficit == i32::MAX { i32::from(net.edge_cost) } else { deficit }
+    }
+
+    /// `getNDRDeficit` — the net's own deficit on the edge; 0 for an edge-cost-1 net or one not on
+    /// the edge.
+    pub fn ndr_deficit(&self, net: &NdrCostNet, x: usize, y: usize, horizontal: bool) -> i32 {
+        if net.edge_cost == 1 {
+            return 0;
+        }
+        self.nets(horizontal, x, y).get(&net.id).map_or(0, |(u, _)| i32::from(u.deficit))
+    }
+
+    /// `getNDRDeficitIfRouted` — the edge's deficit once the net uses it: the edge's own, plus
+    /// what the net would miss when it is not on the edge yet. 0 for an edge-cost-1 net.
+    pub fn ndr_deficit_if_routed(&self, net: &NdrCostNet, x: usize, y: usize, horizontal: bool) -> i32 {
+        if net.edge_cost == 1 {
+            return 0;
+        }
+        let edge = self.edge_ndr_deficit(horizontal, x, y);
+        if self.has_net(horizontal, x, y, net.id) {
+            return edge;
+        }
+        edge + self.compute_ndr_deficit(net, x, y, horizontal)
     }
 
     /// `getCostNDRAware` — the usage an update actually charges, and the bookkeeping behind it.
     ///
     /// ⛔ `amount` is read for its SIGN only once the net is an NDR net, and `0` counts as an add.
-    ///
-    /// 🔑 Since the incremental-overflow rework (27288f5) each net's record says what it TOOK:
-    /// a rip-up refunds the overflow cost only if THIS net was charged it, and releases the layer
-    /// capacity it reserved — not whatever the edge's state suggests now. Nets are not ripped up in
-    /// the order they were routed, so reading the edge's current overflow (as before) refunds the
-    /// wrong cost and lets the NDR capacity drift.
+    /// A rip-up gives back exactly what the net's record says it took (the nets are not ripped up
+    /// in the order they were routed), then refits the edge's deficit nets while a deficit is left.
     pub fn get_cost_ndr_aware(&mut self, net: &NdrCostNet, x: usize, y: usize, amount: f64, horizontal: bool) -> f64 {
         let ec = net.edge_cost;
         if ec == 1 {
             return amount;
         }
-        let (cell, e) = (self.cell(x, y), self.edge_at(horizontal, x, y));
-        let present = if horizontal { self.h_nets[cell].contains_key(&net.id) } else { self.v_nets[cell].contains_key(&net.id) };
-        let mut cost = 0.0;
+        let present = self.has_net(horizontal, x, y, net.id);
         if amount < 0.0 {
-            if present {
-                let usage = if horizontal { self.h_nets[cell].remove(&net.id) } else { self.v_nets[cell].remove(&net.id) }
-                    .expect("present");
-                if usage.charged_overflow {
-                    let ov = if horizontal { &mut self.h_overflow[e] } else { &mut self.v_overflow[e] };
-                    *ov = ov.wrapping_sub(1);
-                    cost = -OVERFLOW_COST_MULTIPLIER * ec as f64;
-                } else {
-                    cost = -(ec as f64);
-                }
-                self.release_ndr_cap_layer(x, y, horizontal, usage);
+            if !present {
+                return 0.0;
             }
+            let (usage, _) = self.nets_mut(horizontal, x, y).remove(&net.id).expect("present");
+            let d = self.deficit_mut(horizontal, x, y);
+            *d = d.wrapping_sub(usage.deficit as u16);
+            self.deficit_total -= i32::from(usage.deficit);
+            self.release_ndr_cap_layer(x, y, horizontal, usage);
+            if self.has_ndr_deficit(horizontal, x, y) {
+                self.refit_ndr_deficit_nets(x, y, horizontal);
+            }
+            -f64::from(ec)
         } else if !present {
-            let charge_overflow = self.overflow(horizontal, x, y) > 0 || !self.has_ndr_capacity(net, x, y, horizontal);
-            if charge_overflow {
-                let ov = if horizontal { &mut self.h_overflow[e] } else { &mut self.v_overflow[e] };
-                *ov = ov.wrapping_add(1);
-                cost = OVERFLOW_COST_MULTIPLIER * ec as f64;
-            } else {
-                cost = ec as f64;
-            }
-            let mut usage = self.reserve_ndr_cap_layer(x, y, net, horizontal);
-            usage.charged_overflow = charge_overflow;
-            if horizontal { self.h_nets[cell].insert(net.id, usage) } else { self.v_nets[cell].insert(net.id, usage) };
+            let usage = self.reserve_ndr_cap_layer(x, y, net, horizontal);
+            let d = self.deficit_mut(horizontal, x, y);
+            *d = d.wrapping_add(usage.deficit as u16);
+            self.deficit_total += i32::from(usage.deficit);
+            self.nets_mut(horizontal, x, y).insert(net.id, (usage, net.clone()));
+            f64::from(ec)
+        } else {
+            0.0
         }
-        cost
     }
 
-    /// `reserveNDRCapLayer` — draw the net's layer edge cost from the FIRST layer in its range with
-    /// room; with none, from its lowest layer anyway (`cap_ndr` goes negative: the oversubscription,
-    /// restored by the rip-up). Returns what was taken.
+    /// `reserveNDRCapLayer` — debit the net's layer edge cost from the FIRST layer in its range
+    /// with room (deficit 0); with none, compute the deficit and debit its lowest layer anyway (the
+    /// NDR capacity goes negative: the oversubscription, restored by the rip-up).
     pub fn reserve_ndr_cap_layer(&mut self, x: usize, y: usize, net: &NdrCostNet, horizontal: bool) -> NdrUsage {
         for l in net.min_layer..=net.max_layer {
-            let i = self.cap_at(l, x, y);
-            let c = if horizontal { &mut self.h_cap[i] } else { &mut self.v_cap[i] };
             let lec = net.layer_edge_cost(l);
-            if c.cap_ndr >= lec as f64 {
-                c.cap_ndr -= lec as f64;
-                return NdrUsage { layer: l as i16, amount: lec, charged_overflow: false };
+            if self.cap(horizontal, l, x, y).cap_ndr() >= i32::from(lec) {
+                self.cap_mut(horizontal, l, x, y).debit += i32::from(lec);
+                return NdrUsage { layer: l as i16, amount: lec, deficit: 0 };
             }
         }
         let lec = net.layer_edge_cost(net.min_layer);
-        let i = self.cap_at(net.min_layer, x, y);
-        let c = if horizontal { &mut self.h_cap[i] } else { &mut self.v_cap[i] };
-        c.cap_ndr -= lec as f64;
-        NdrUsage { layer: net.min_layer as i16, amount: lec, charged_overflow: false }
+        let deficit = self.compute_ndr_deficit(net, x, y, horizontal) as i8;
+        self.cap_mut(horizontal, net.min_layer, x, y).debit += i32::from(lec);
+        NdrUsage { layer: net.min_layer as i16, amount: lec, deficit }
     }
 
     /// `releaseNDRCapLayer` — give back exactly what [`reserve_ndr_cap_layer`](Self::reserve_ndr_cap_layer)
@@ -257,36 +313,56 @@ impl NdrLedger {
         if usage.layer < 0 {
             return;
         }
-        let i = self.cap_at(usage.layer as usize, x, y);
-        let c = if horizontal { &mut self.h_cap[i] } else { &mut self.v_cap[i] };
-        c.cap_ndr += f64::from(usage.amount);
+        self.cap_mut(horizontal, usage.layer as usize, x, y).debit -= i32::from(usage.amount);
     }
 
-    /// `resetNDRCap` — every layer's NDR capacity back to its full capacity.
-    pub fn reset_ndr_cap(&mut self) {
-        for c in self.h_cap.iter_mut().chain(self.v_cap.iter_mut()) {
-            c.cap_ndr = f64::from(c.cap);
+    /// `refitNDRDeficitNets` (#11963 74d34bd075) — the tracks a leaving net freed may host the NDR
+    /// nets that miss tracks on the edge: each net with a deficit is released and reserved again,
+    /// in DATABASE-ID order (the reference's map is ordered by address), its deficit and the
+    /// totals moved by the difference.
+    pub fn refit_ndr_deficit_nets(&mut self, x: usize, y: usize, horizontal: bool) {
+        let mut deficit_nets: Vec<usize> = self.nets(horizontal, x, y).iter().filter(|(_, (u, _))| u.deficit > 0).map(|(&id, _)| id).collect();
+        let key = |id: usize| self.db_ids.get(id).copied().unwrap_or(id as u32);
+        deficit_nets.sort_by_key(|&id| key(id));
+        for id in deficit_nets {
+            let (old, net) = self.nets(horizontal, x, y)[&id].clone();
+            self.release_ndr_cap_layer(x, y, horizontal, old);
+            let refit = self.reserve_ndr_cap_layer(x, y, &net, horizontal);
+            let delta = i32::from(refit.deficit) - i32::from(old.deficit);
+            let d = self.deficit_mut(horizontal, x, y);
+            *d = (i32::from(*d) + delta) as u16;
+            self.deficit_total += delta;
+            self.nets_mut(horizontal, x, y).insert(id, (refit, net));
         }
     }
 
-    /// `copyRoutingStateFrom` — take another graph's capacities and overflow counts (they travel
-    /// with the edges), and its NDR sets only when asked; otherwise the sets are CLEARED.
-    ///
-    /// ⛔ Without the NDR state, the records, the NDR capacity they reserved and the edges' NDR
-    /// overflow counts are ONE piece of bookkeeping (27288f5): all three are reset, or the
-    /// reservations could never be released and the counts never return to zero.
+    /// `resetNDRCap` — every NDR debit dropped: the NDR capacity is the full capacity again.
+    pub fn reset_ndr_cap(&mut self) {
+        for c in self.h_cap.iter_mut().chain(self.v_cap.iter_mut()) {
+            c.debit = 0;
+        }
+    }
+
+    /// `copyRoutingStateFrom` — take another graph's capacities with the edges, and its NDR state
+    /// (records, debits, deficits) only when asked; otherwise the records, the debits and the
+    /// deficits are ONE piece of bookkeeping and all three are dropped.
     pub fn copy_routing_state_from(&mut self, other: &NdrLedger, include_ndr_state: bool) {
+        let db_ids = std::mem::take(&mut self.db_ids);
         *self = other.clone();
+        if self.db_ids.is_empty() {
+            self.db_ids = db_ids;
+        }
         if !include_ndr_state {
             self.clear_ndr_nets();
             self.reset_ndr_cap();
-            self.h_overflow.iter_mut().chain(self.v_overflow.iter_mut()).for_each(|o| *o = 0);
         }
     }
 
-    /// `clearNDRnets` — empty every edge's NDR set. Capacities and overflow counts are left alone.
+    /// `clearNDRnets` — every record dropped, with the per-edge deficits (the sums of the records)
+    /// and their total (#11963 1fe08158b2). The debits are left alone.
     pub fn clear_ndr_nets(&mut self) {
         self.h_nets.iter_mut().chain(self.v_nets.iter_mut()).for_each(BTreeMap::clear);
+        self.h_deficit.iter_mut().chain(self.v_deficit.iter_mut()).for_each(|d| *d = 0);
+        self.deficit_total = 0;
     }
 }
-

@@ -1,197 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The NDR-aware usage cost (`getCostNDRAware`), replayed call by call against the reference.
+//! The NDR-aware usage cost (`Graph2D::getCostNDRAware`) and its ledger, at the f11b4276 pin.
 //!
-//! Golden `ndr_cost.json`: every call an NDR net makes, in order, with the lifecycle events of the
-//! state (init / copy / clear) per graph instance. The replay THREADS the state through the calls:
-//! before each call the engine's capacities, the net's presence on the edge and the edge's overflow
-//! count must equal the reference's; then the returned cost and the state after must too.
-//!
-//! ⚠️ Capacities are set by `updateCap3D` at init, which the capture does not log; each layer's is
-//! taken from the first call that touches it, and that call must see it UNTOUCHED (`cap_ndr == cap`).
+//! ⚠️ The call-by-call replay of `examples/grt_gate/ndr_cost.json` was captured at 4155ac31, under
+//! the 100× overflow charge that OpenROAD #11963 removed (NDR deficits replace it). It is retired
+//! here; a capture of the deficit ledger at the pin is on the heavy-run plan. Until then the rules
+//! below are constructed, each from the reference's code.
 
-use serde_json::Value;
-use std::collections::{HashMap, HashSet};
 use vyges_grt::*;
-
-fn read(path: &str) -> Value {
-    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"));
-    serde_json::from_str(&text).expect("golden parses")
-}
-
-fn int(v: &Value) -> i64 {
-    v.as_i64().expect("integer")
-}
-
-fn num(v: &Value) -> f64 {
-    v.as_f64().expect("number")
-}
-
-fn arr(v: &Value) -> &Vec<Value> {
-    v.as_array().expect("array")
-}
-
-struct Inst {
-    ledger: NdrLedger,
-    known: HashSet<(bool, usize, usize, usize)>,
-}
-
-#[derive(Default, Debug)]
-struct Seen {
-    runs: usize,
-    calls: usize,
-    est_calls: usize,
-    usage_calls: usize,
-    adds: usize,
-    removes: usize,
-    overflow_adds: usize,
-    overflow_removes: usize,
-    no_charge: usize,
-    cap_below_zero: usize,
-    inits: usize,
-    reinits: usize,
-    copies: usize,
-    clears: usize,
-    instances: usize,
-}
-
-fn replay(g: &Value) -> Seen {
-    let mut seen = Seen::default();
-    for r in arr(&g["runs"]) {
-        let who = r["design"].as_str().expect("design");
-        let events = arr(&r["events"]);
-        let calls = || events.iter().filter(|e| e["ev"] == "call");
-        let xg = calls().map(|e| int(&e["x"])).max().unwrap_or(0) as usize + 2;
-        let yg = calls().map(|e| int(&e["y"])).max().unwrap_or(0) as usize + 2;
-        let nl = calls().map(|e| int(&e["max"])).max().unwrap_or(0) as usize + 1;
-        let mut names: HashMap<String, usize> = HashMap::new();
-        let mut inst: HashMap<i64, Inst> = HashMap::new();
-        let fresh = || Inst { ledger: NdrLedger::new(xg, yg, nl), known: HashSet::new() };
-
-        for (i, e) in events.iter().enumerate() {
-            let at = format!("{who} event {i}");
-            let gi = int(&e["g"]);
-            match e["ev"].as_str() {
-                Some("init") => {
-                    // A repeated init on the same instance is the resize, not a reset.
-                    match inst.get_mut(&gi) {
-                        Some(s) => {
-                            s.ledger.init_cap_3d(xg, yg, nl);
-                            s.known.clear();
-                            seen.reinits += 1;
-                        }
-                        None => {
-                            inst.insert(gi, fresh());
-                        }
-                    }
-                    seen.inits += 1;
-                }
-                Some("copy") => {
-                    let from = int(&e["from"]);
-                    let (l, k) = inst.get(&from).map(|s| (s.ledger.clone(), s.known.clone())).unwrap_or_else(|| {
-                        let f = fresh();
-                        (f.ledger, f.known)
-                    });
-                    let s = inst.entry(gi).or_insert_with(fresh);
-                    s.ledger.copy_routing_state_from(&l, e["include"].as_bool().expect("include"));
-                    s.known = k;
-                    seen.copies += 1;
-                }
-                Some("clear") => {
-                    inst.entry(gi).or_insert_with(fresh).ledger.clear_ndr_nets();
-                    seen.clears += 1;
-                }
-                Some("call") => {
-                    let s = inst.entry(gi).or_insert_with(fresh);
-                    let (h, x, y) = (e["h"].as_bool().expect("h"), int(&e["x"]) as usize, int(&e["y"]) as usize);
-                    let (lo, hi) = (int(&e["min"]) as usize, int(&e["max"]) as usize);
-                    let n = names.len();
-                    let id = *names.entry(e["net"].as_str().expect("net").to_string()).or_insert(n);
-                    let net = NdrCostNet {
-                        id,
-                        edge_cost: int(&e["ec"]) as i8,
-                        min_layer: lo,
-                        max_layer: hi,
-                        layer_edge_cost: Some(arr(&e["lec"]).iter().map(|v| int(v) as i8).collect()),
-                        soft_ndr: e["soft"].as_bool().expect("soft"),
-                    };
-                    let caps = arr(&e["caps"]);
-                    for (k, l) in (lo..=hi).enumerate() {
-                        let (cap, cap_ndr) = (int(&caps[k][0]), num(&caps[k][1]));
-                        if s.known.insert((h, l, x, y)) {
-                            assert_eq!(cap_ndr, cap as f64, "{at}: layer {l} first touched with cap_ndr already drawn");
-                            s.ledger.update_cap_3d(x, y, l, h, cap as f64);
-                        }
-                        let c = s.ledger.cap(h, l, x, y);
-                        assert_eq!((c.cap as i64, c.cap_ndr), (cap, cap_ndr), "{at}: layer {l} capacity before the call");
-                    }
-                    assert_eq!(s.ledger.has_net(h, x, y, id), e["present"].as_bool().expect("present"), "{at}: presence before");
-                    assert_eq!(s.ledger.overflow(h, x, y) as i64, int(&e["overflow"]), "{at}: overflow before");
-
-                    let amount = num(&e["amount"]);
-                    let cost = s.ledger.get_cost_ndr_aware(&net, x, y, amount, h);
-                    let out = &e["out"];
-                    assert_eq!(cost, num(&out["cost"]), "{at}: cost of {amount} for {} on {}{x},{y}", net.id, if h { "H" } else { "V" });
-                    assert_eq!(s.ledger.has_net(h, x, y, id), out["present"].as_bool().expect("present"), "{at}: presence after");
-                    assert_eq!(s.ledger.overflow(h, x, y) as i64, int(&out["overflow"]), "{at}: overflow after");
-                    let after: Vec<f64> = arr(&out["cap_ndr"]).iter().map(num).collect();
-                    let ours: Vec<f64> = (lo..=hi).map(|l| s.ledger.cap(h, l, x, y).cap_ndr).collect();
-                    assert_eq!(ours, after, "{at}: cap_ndr after");
-
-                    seen.calls += 1;
-                    match e["kind"].as_str() {
-                        Some("E") => seen.est_calls += 1,
-                        Some("U") => seen.usage_calls += 1,
-                        k => panic!("{at}: caller kind {k:?}"),
-                    }
-                    if amount < 0.0 { seen.removes += 1 } else { seen.adds += 1 }
-                    seen.overflow_adds += (cost > OVERFLOW_COST_MULTIPLIER) as usize;
-                    seen.overflow_removes += (cost < -OVERFLOW_COST_MULTIPLIER) as usize;
-                    seen.no_charge += (cost == 0.0) as usize;
-                    seen.cap_below_zero += ours.iter().any(|&c| c < 0.0) as usize;
-                }
-                k => panic!("{at}: event {k:?}"),
-            }
-        }
-        seen.instances += inst.len();
-        seen.runs += 1;
-    }
-    seen
-}
-
-#[test]
-fn the_ndr_aware_cost_matches_the_reference() {
-    let s = replay(&read(&format!("{}/examples/grt_gate/ndr_cost.json", env!("CARGO_MANIFEST_DIR"))));
-    eprintln!("{s:?}");
-    assert!(s.calls > 0 && s.overflow_adds > 0 && s.overflow_removes > 0 && s.no_charge > 0 && s.est_calls > 0 && s.usage_calls > 0, "{s:?}");
-}
-
-/// GRT_NDR_COST_FULL=/path/to/nc-all.json cargo test --release --test ndr_cost -- --ignored
-#[test]
-#[ignore = "needs the uncapped dump; the committed sample is what CI runs"]
-fn the_ndr_aware_cost_matches_the_reference_exhaustively() {
-    let path = std::env::var("GRT_NDR_COST_FULL").expect("set GRT_NDR_COST_FULL");
-    eprintln!("exhaustive: {:?}", replay(&read(&path)));
-}
-
-// ─── Constructed cases: branches the corpus never reaches ───────────────────────────────────
 
 fn ndr(id: usize, ec: i8) -> NdrCostNet {
     NdrCostNet { id, edge_cost: ec, min_layer: 0, max_layer: 1, layer_edge_cost: Some(vec![ec, ec]), soft_ndr: false }
 }
 
-fn ledger() -> NdrLedger {
+fn ledger_with(cap: f64) -> NdrLedger {
     let mut l = NdrLedger::new(4, 4, 2);
     for x in 0..3 {
         for y in 0..4 {
-            l.update_cap_3d(x, y, 0, true, 10.0);
-            l.update_cap_3d(x, y, 1, true, 10.0);
+            l.update_cap_3d(x, y, 0, true, cap);
+            l.update_cap_3d(x, y, 1, true, cap);
         }
     }
     l
 }
 
-/// An edge-cost-1 net's amount passes unchanged and leaves no trace — the corpus capture logs only
-/// NDR nets, so this is the one branch it cannot see.
+fn ledger() -> NdrLedger {
+    ledger_with(10.0)
+}
+
+/// An edge-cost-1 net's amount passes unchanged and leaves no trace.
 #[test]
 fn an_edge_cost_1_net_passes_through() {
     let mut l = ledger();
@@ -200,40 +36,97 @@ fn an_edge_cost_1_net_passes_through() {
     assert_eq!(l, before);
 }
 
-/// ⛔ Only a NEGATIVE amount removes: zero is an add, and charges the full edge cost.
+/// ⛔ Only a NEGATIVE amount removes: zero is an add, charges the full edge cost, and debits the
+/// first layer with room.
 #[test]
 fn a_zero_amount_is_an_add() {
     let mut l = ledger();
     assert_eq!(l.get_cost_ndr_aware(&ndr(0, 3), 1, 1, 0.0, true), 3.0);
     assert!(l.has_net(true, 1, 1, 0));
-    // …and draws no layer down: `updateNDRCapLayer` draws only for `amount >= 0` inside the loop,
-    // so the first layer with room still pays. (The below-zero fallback needs `amount > 0`.)
-    assert_eq!(l.cap(true, 0, 1, 1).cap_ndr, 7.0);
+    assert_eq!(l.cap(true, 0, 1, 1).cap_ndr(), 7);
+    assert_eq!(l.get_cost_ndr_aware(&ndr(0, 3), 1, 1, 1.0, true), 0.0, "a second add counts nothing");
 }
 
-/// ⛔ A re-init is a RESIZE: on a grid of the same size the NDR sets and the capacities survive
-/// (until `updateCap3D` rewrites the capacities); the overflow counts do not.
+/// ⛔ Upstream #11963: where no layer has room the net is charged its TRUE edge cost (no 100×), its
+/// lowest layer is debited anyway, and the tracks it misses on its best layer —
+/// `min over layers of max(0, cost − max(0, NDR capacity))` — are its deficit on the edge and in
+/// the total. The rip-up gives the deficit back with the record.
 #[test]
-fn a_reinit_keeps_the_sets_and_capacities_but_not_the_overflow() {
+fn a_net_that_fits_no_layer_records_its_deficit_not_an_overflow_charge() {
+    let mut l = ledger();
+    let big = NdrCostNet { layer_edge_cost: Some(vec![12, 14]), ..ndr(1, 14) };
+    assert_eq!(l.get_cost_ndr_aware(&ndr(0, 3), 1, 1, 1.0, true), 3.0);
+    // Layer 0 has 7 left, layer 1 10: the net misses 12 − 7 = 5 there, 14 − 10 = 4 here.
+    assert_eq!(l.compute_ndr_deficit(&big, 1, 1, true), 4);
+    assert_eq!(l.ndr_deficit_if_routed(&big, 1, 1, true), 4, "the edge's 0, plus the net's own");
+    assert_eq!(l.get_cost_ndr_aware(&big, 1, 1, 1.0, true), 14.0);
+    assert_eq!(l.usage(true, 1, 1, 1), Some(NdrUsage { layer: 0, amount: 12, deficit: 4 }));
+    assert_eq!((l.edge_ndr_deficit(true, 1, 1), l.total_ndr_deficit()), (4, 4));
+    assert!(l.has_ndr_deficit(true, 1, 1));
+    assert_eq!(l.cap(true, 0, 1, 1).cap_ndr(), -5, "the lowest layer is debited anyway");
+    assert_eq!(l.ndr_deficit(&big, 1, 1, true), 4);
+    assert_eq!(l.ndr_deficit_if_routed(&big, 1, 1, true), 4, "a net on the edge sees the edge's deficit only");
+    assert_eq!(l.ndr_deficit_if_routed(&ndr(2, 3), 1, 1, true), 4, "another net that fits still sees it");
+    assert_eq!(l.ndr_deficit_if_routed(&ndr(2, 1), 1, 1, true), 0, "a regular net never does");
+    assert_eq!(l.get_cost_ndr_aware(&big, 1, 1, -1.0, true), -14.0);
+    assert_eq!((l.edge_ndr_deficit(true, 1, 1), l.total_ndr_deficit(), l.cap(true, 0, 1, 1).cap_ndr()), (0, 0, 7));
+}
+
+/// `computeNDRDeficit` with no layer in the net's range: nothing can host it, the deficit is its
+/// whole edge cost.
+#[test]
+fn no_layer_in_range_misses_the_whole_edge_cost() {
+    let l = ledger();
+    let empty = NdrCostNet { min_layer: 1, max_layer: 0, ..ndr(0, 6) };
+    assert_eq!(l.compute_ndr_deficit(&empty, 1, 1, true), 6);
+}
+
+/// ⛔ Upstream #11963 (74d34bd075 `refitNDRDeficitNets`): when a net leaves an edge that still has a
+/// deficit, every deficit net there is released and reserved again in DATABASE-ID order, so the
+/// freed tracks go to the lowest database id — not the lowest router id.
+#[test]
+fn a_leaving_net_frees_its_layer_for_the_deficit_nets_in_database_id_order() {
+    let mut l = ledger_with(5.0);
+    // Router ids 0..4; database ids: net 2 is 9, net 3 is 1.
+    l.set_db_ids(vec![0, 1, 9, 1]);
+    let n = |id| ndr(id, 5);
+    for id in 0..4 {
+        l.get_cost_ndr_aware(&n(id), 1, 1, 1.0, true);
+    }
+    // 0 on layer 0, 1 on layer 1; 2 and 3 fit nowhere.
+    assert_eq!(l.usage(true, 1, 1, 2).map(|u| u.deficit), Some(5));
+    assert_eq!(l.usage(true, 1, 1, 3).map(|u| u.deficit), Some(5));
+    assert_eq!(l.total_ndr_deficit(), 10);
+    l.get_cost_ndr_aware(&n(1), 1, 1, -1.0, true);
+    assert_eq!(l.usage(true, 1, 1, 3), Some(NdrUsage { layer: 1, amount: 5, deficit: 0 }), "database id 1 refits first");
+    assert_eq!(l.usage(true, 1, 1, 2).map(|u| u.deficit), Some(5));
+    assert_eq!((l.edge_ndr_deficit(true, 1, 1), l.total_ndr_deficit()), (5, 5));
+}
+
+/// Upstream #11963: `initCap3D` resizes the capacities (kept where the extents overlap) and then
+/// `initNDRnets` drops every record, deficit and debit — a new run's net must not be taken for
+/// one of the last run's.
+#[test]
+fn a_reinit_drops_the_records_deficits_and_debits_but_keeps_the_capacities() {
     let mut l = ledger();
     let big = NdrCostNet { layer_edge_cost: Some(vec![20, 20]), ..ndr(1, 20) };
     l.get_cost_ndr_aware(&ndr(0, 3), 1, 1, 1.0, true);
-    assert_eq!(l.get_cost_ndr_aware(&big, 1, 1, 1.0, true), 2000.0, "no layer has room for 20: overflow");
-    assert_eq!(l.overflow(true, 1, 1), 1);
+    l.get_cost_ndr_aware(&big, 1, 1, 1.0, true);
+    assert!(l.total_ndr_deficit() > 0);
     l.init_cap_3d(4, 4, 2);
-    assert!(l.has_net(true, 1, 1, 0) && l.has_net(true, 1, 1, 1), "sets survive");
-    assert_eq!(l.cap(true, 0, 1, 1).cap_ndr, 10.0 - 3.0 - 20.0, "capacities survive until updateCap3D");
-    assert_eq!(l.overflow(true, 1, 1), 0, "Graph2D::init reset the overflow");
-    assert_eq!(l.get_cost_ndr_aware(&ndr(0, 3), 1, 1, 1.0, true), 0.0, "net 0 is still counted as present");
+    assert!(!l.has_net(true, 1, 1, 0) && !l.has_net(true, 1, 1, 1));
+    assert_eq!((l.edge_ndr_deficit(true, 1, 1), l.total_ndr_deficit()), (0, 0));
+    assert_eq!((l.cap(true, 0, 1, 1).cap, l.cap(true, 0, 1, 1).cap_ndr()), (10, 10));
+    assert_eq!(l.get_cost_ndr_aware(&ndr(0, 3), 1, 1, 1.0, true), 3.0, "net 0 is new on the edge");
 }
 
-/// `copyRoutingStateFrom` takes capacities and overflow counts with the edges; the NDR records only
-/// when asked. Without them (since 27288f5) the records, the NDR capacity they reserved and the NDR
-/// overflow counts are reset together — a reservation with no record could never be released.
+/// `copyRoutingStateFrom` takes the capacities with the edges, and the NDR state (records, debits,
+/// deficits) only when asked; without it the three are dropped together.
 #[test]
-fn a_copy_takes_the_sets_only_when_asked() {
+fn a_copy_takes_the_ndr_state_only_when_asked() {
     let mut src = ledger();
     src.get_cost_ndr_aware(&ndr(0, 3), 1, 1, 1.0, true);
+    src.get_cost_ndr_aware(&NdrCostNet { layer_edge_cost: Some(vec![20, 20]), ..ndr(1, 20) }, 1, 1, 1.0, true);
     let mut with = ledger();
     with.get_cost_ndr_aware(&ndr(5, 3), 2, 2, 1.0, true);
     let mut without = with.clone();
@@ -241,28 +134,52 @@ fn a_copy_takes_the_sets_only_when_asked() {
     without.copy_routing_state_from(&src, false);
     assert!(with.has_net(true, 1, 1, 0) && !with.has_net(true, 2, 2, 5));
     assert!(!without.has_net(true, 1, 1, 0) && !without.has_net(true, 2, 2, 5));
-    assert_eq!(with.cap(true, 0, 1, 1).cap_ndr, 7.0, "with the records, the reservation comes across");
-    assert_eq!(without.cap(true, 0, 1, 1).cap_ndr, 10.0, "without them, the NDR capacity is reset to the capacity");
-    assert_eq!(without.overflow(true, 1, 1), 0);
+    assert_eq!(with.cap(true, 0, 1, 1).cap_ndr(), -13, "with the records, the debits come across");
+    assert_eq!(without.cap(true, 0, 1, 1).cap_ndr(), 10, "without them, the NDR capacity is the capacity");
+    assert_eq!((with.total_ndr_deficit() > 0, without.total_ndr_deficit(), without.edge_ndr_deficit(true, 1, 1)), (true, 0, 0));
 }
 
-/// `clearNDRnets` empties the sets and nothing else.
+/// `clearNDRnets` drops the records, the per-edge deficits and their total (#11963 1fe08158b2);
+/// the debits stay.
 #[test]
-fn clearing_keeps_capacities_and_overflow() {
+fn clearing_drops_records_and_deficits_but_keeps_the_debits() {
     let mut l = ledger();
     let big = NdrCostNet { layer_edge_cost: Some(vec![20, 20]), ..ndr(1, 20) };
     l.get_cost_ndr_aware(&big, 1, 1, 1.0, true);
     l.clear_ndr_nets();
     assert!(!l.has_net(true, 1, 1, 1));
-    assert_eq!((l.overflow(true, 1, 1), l.cap(true, 0, 1, 1).cap_ndr), (1, -10.0));
+    assert_eq!((l.edge_ndr_deficit(true, 1, 1), l.total_ndr_deficit(), l.cap(true, 0, 1, 1).cap_ndr()), (0, 0, -10));
+}
+
+/// `addCap3D` moves the capacity; what NDR nets reserved stays reserved.
+#[test]
+fn an_adjustment_keeps_the_debit() {
+    let mut l = ledger();
+    l.get_cost_ndr_aware(&ndr(0, 3), 1, 1, 1.0, true);
+    l.add_cap_3d(1, 1, 0, true, -4);
+    assert_eq!((l.cap(true, 0, 1, 1).cap, l.cap(true, 0, 1, 1).cap_ndr()), (6, 3));
+    l.update_cap_3d(1, 1, 0, true, 8.0);
+    assert_eq!(l.cap(true, 0, 1, 1).cap_ndr(), 8, "updateCap3D drops the debit");
 }
 
 /// ⛔ Removing a net that is not on the edge charges nothing and changes nothing — the reference's
-/// comment: the second half-cost removal of the first routing pass. No corpus call does it.
+/// comment: the second half-cost removal of the first routing pass.
 #[test]
 fn removing_an_absent_net_charges_nothing() {
     let mut l = ledger();
     let before = l.clone();
     assert_eq!(l.get_cost_ndr_aware(&ndr(0, 3), 1, 1, -1.5, true), 0.0);
     assert_eq!(l, before);
+}
+
+/// `computeNDRDeficit`: a layer other NDR nets already oversubscribed has NO free track — the net
+/// misses its whole width there, not more.
+#[test]
+fn an_oversubscribed_layer_counts_as_no_free_track() {
+    let mut l = ledger_with(5.0);
+    let one = |id| NdrCostNet { max_layer: 0, layer_edge_cost: Some(vec![5]), ..ndr(id, 5) };
+    l.get_cost_ndr_aware(&one(0), 1, 1, 1.0, true);
+    l.get_cost_ndr_aware(&one(1), 1, 1, 1.0, true);
+    assert_eq!(l.cap(true, 0, 1, 1).cap_ndr(), -5);
+    assert_eq!(l.compute_ndr_deficit(&one(2), 1, 1, true), 5);
 }

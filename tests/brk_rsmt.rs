@@ -96,6 +96,7 @@ struct Seen {
     usage_errors: usize,
     loop_iterations: usize,
     snapshot_batched: usize,
+    ndr_pre_pin: usize,
     loops_removed: usize,
     r15_checked: usize,
     r16_checked: usize,
@@ -131,6 +132,12 @@ const INCREMENTAL: [&str; 4] =
 /// Those runs must diverge at their first loop iteration's result, and every other run must match.
 const SNAPSHOT_BATCHED: [&str; 2] = ["snapshot_batched_smoke-", "snapshot_batched_single_thread_smoke-"];
 
+/// ⛔ Captured at 4155ac31, when an NDR net on an edge no layer could host was charged 100× its edge
+/// cost in the shared usage. OpenROAD #11963 (f11b4276 pin) charges the true edge cost and keeps
+/// the missing tracks as an NDR deficit, so these runs must diverge at the first usage they check
+/// (R6's exit) until the corpus is re-captured at the pin (heavy-run plan).
+const NDR_PRE_PIN: [&str; 2] = ["ndr_1w_3s-", "ndr_2w_3s-"];
+
 /// Replay every run; list every run that diverges rather than stopping at the first. `bounds` is
 /// the boundary golden: each run's router state after R7, R8, R9, R10, per `global_route`.
 fn replay(g: &Value, bounds: &Value) -> Seen {
@@ -146,6 +153,8 @@ fn replay(g: &Value, bounds: &Value) -> Seen {
             (true, "B7: committed usage")
         } else if SNAPSHOT_BATCHED.iter().any(|p| who.starts_with(p)) {
             (true, "B14_1: getOverflow2D")
+        } else if NDR_PRE_PIN.iter().any(|p| who.starts_with(p)) {
+            (true, "R6 exit usage")
         } else {
             (false, "")
         };
@@ -154,7 +163,13 @@ fn replay(g: &Value, bounds: &Value) -> Seen {
             (Err(e), true) => {
                 let msg = e.downcast_ref::<String>().cloned().unwrap_or_default();
                 if msg.contains(expect) {
-                    if expect.starts_with("B7") { seen.incremental += 1 } else { seen.snapshot_batched += 1 }
+                    if expect.starts_with("B7") {
+                        seen.incremental += 1
+                    } else if expect.starts_with("R6") {
+                        seen.ndr_pre_pin += 1
+                    } else {
+                        seen.snapshot_batched += 1
+                    }
                 } else {
                     failed.push(format!("{who}: diverges, but not where expected ({expect}): {msg}"));
                 }
@@ -657,6 +672,7 @@ fn replay_chain(who: &str, pass: usize, c5: &Value, c7: &Value, group: &[&Value]
         res_aware: None,
         origin,
         db_id: &db_id,
+        net_db_ids: &[],
         resume: None,
         allow_congestion: false,
     };
@@ -886,7 +902,7 @@ fn gen_brk_rsmt_matches_the_reference() {
     let s = replay(&read(&format!("{dir}/brk_rsmt.json")), &read(&format!("{dir}/boundaries.json")));
     eprintln!("{s:?}");
     assert!(s.runs >= 40 && s.flute_nets >= 990 && s.shifted >= 70 && s.shifts > 0 && s.copied >= 900
-            && s.routed_edges >= 1000 && s.usage_checked >= 60 && s.ndr_checked >= 2 && s.r6_checked >= 40 && s.boundaries >= 160 && s.gate_hvh > 0 && s.gate_vhv > 0 && s.maze_passes >= 18 && s.loop_iterations >= 50 && s.htree > 0,
+            && s.routed_edges >= 1000 && s.usage_checked >= 60 && s.ndr_pre_pin == NDR_PRE_PIN.len() && s.r6_checked >= 40 && s.boundaries >= 160 && s.gate_hvh > 0 && s.gate_vhv > 0 && s.maze_passes >= 18 && s.loop_iterations >= 50 && s.htree > 0,
             "{s:?}");
 }
 
@@ -904,7 +920,7 @@ fn add(a: Seen, b: Seen) -> Seen {
         runs: a.runs + b.runs, calls: a.calls + b.calls, nets: a.nets + b.nets, flute_nets: a.flute_nets + b.flute_nets,
         shifted: a.shifted + b.shifted, shifts: a.shifts + b.shifts, copied: a.copied + b.copied,
         routed_edges: a.routed_edges + b.routed_edges, usage_checked: a.usage_checked + b.usage_checked,
-        ndr_checked: a.ndr_checked + b.ndr_checked, r6_checked: a.r6_checked + b.r6_checked, r6_segs: a.r6_segs + b.r6_segs, boundaries: a.boundaries + b.boundaries, boundary_nets: a.boundary_nets + b.boundary_nets, incremental: a.incremental + b.incremental, gate_hvh: a.gate_hvh + b.gate_hvh, gate_vhv: a.gate_vhv + b.gate_vhv, maze_routes: a.maze_routes + b.maze_routes, maze_passes: a.maze_passes + b.maze_passes, usage_errors: a.usage_errors + b.usage_errors, loop_iterations: a.loop_iterations + b.loop_iterations, snapshot_batched: a.snapshot_batched + b.snapshot_batched, loops_removed: a.loops_removed + b.loops_removed, r15_checked: a.r15_checked + b.r15_checked, r16_checked: a.r16_checked + b.r16_checked, r16_widened: a.r16_widened + b.r16_widened, r16_res_aware: a.r16_res_aware + b.r16_res_aware, r18_passes: a.r18_passes + b.r18_passes, r18_ra_skipped: a.r18_ra_skipped + b.r18_ra_skipped, emptied_routes: a.emptied_routes + b.emptied_routes, r19_checked: a.r19_checked + b.r19_checked, r19_defects: a.r19_defects + b.r19_defects, r19_pin_stacks: a.r19_pin_stacks + b.r19_pin_stacks, r20_checked: a.r20_checked + b.r20_checked, r20_segments: a.r20_segments + b.r20_segments, thinned: a.thinned + b.thinned, loop_partial_slack: a.loop_partial_slack + b.loop_partial_slack, loop_extra_stops: a.loop_extra_stops + b.loop_extra_stops, stacked_pins: a.stacked_pins + b.stacked_pins, htree: a.htree + b.htree,
+        ndr_checked: a.ndr_checked + b.ndr_checked, r6_checked: a.r6_checked + b.r6_checked, r6_segs: a.r6_segs + b.r6_segs, boundaries: a.boundaries + b.boundaries, boundary_nets: a.boundary_nets + b.boundary_nets, incremental: a.incremental + b.incremental, gate_hvh: a.gate_hvh + b.gate_hvh, gate_vhv: a.gate_vhv + b.gate_vhv, maze_routes: a.maze_routes + b.maze_routes, maze_passes: a.maze_passes + b.maze_passes, usage_errors: a.usage_errors + b.usage_errors, loop_iterations: a.loop_iterations + b.loop_iterations, snapshot_batched: a.snapshot_batched + b.snapshot_batched, ndr_pre_pin: a.ndr_pre_pin + b.ndr_pre_pin, loops_removed: a.loops_removed + b.loops_removed, r15_checked: a.r15_checked + b.r15_checked, r16_checked: a.r16_checked + b.r16_checked, r16_widened: a.r16_widened + b.r16_widened, r16_res_aware: a.r16_res_aware + b.r16_res_aware, r18_passes: a.r18_passes + b.r18_passes, r18_ra_skipped: a.r18_ra_skipped + b.r18_ra_skipped, emptied_routes: a.emptied_routes + b.emptied_routes, r19_checked: a.r19_checked + b.r19_checked, r19_defects: a.r19_defects + b.r19_defects, r19_pin_stacks: a.r19_pin_stacks + b.r19_pin_stacks, r20_checked: a.r20_checked + b.r20_checked, r20_segments: a.r20_segments + b.r20_segments, thinned: a.thinned + b.thinned, loop_partial_slack: a.loop_partial_slack + b.loop_partial_slack, loop_extra_stops: a.loop_extra_stops + b.loop_extra_stops, stacked_pins: a.stacked_pins + b.stacked_pins, htree: a.htree + b.htree,
     }
 }
 
@@ -1632,10 +1648,11 @@ fn remove_loops_all_cuts_the_detour_and_gives_back_its_usage() {
     assert_eq!(grids, straight, "the straight path is left");
     assert_eq!(row0, vec![2; 4], "row 0 keeps one step each per net; (1,0) was crossed twice and loses one");
     assert_eq!(detour, (0, 0, 0), "the detour given back");
-    // NDR: no capacity here, so every first charge is an overflow charge (100 x edge cost).
+    // NDR: no capacity here, so every charge leaves a deficit — the usage still takes the edge cost.
     let (removed, routelen, grids, row0, detour) = run(2);
     assert_eq!((removed, routelen, grids), (2, 4, straight), "the same cut");
-    assert_eq!(row0, vec![400, 0, 400, 400], "(1,0) charged once per net, given back whole though the path still crosses it");
+    // Since OpenROAD #11963 the shared usage gets the true edge cost (no 100× overflow charge).
+    assert_eq!(row0, vec![4, 0, 4, 4], "(1,0) charged once per net, given back whole though the path still crosses it");
     assert_eq!(detour, (0, 0, 0), "the detour given back");
 }
 

@@ -2129,6 +2129,7 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
     };
     let stt_net = |id: usize| stt(&pins[id].0, &pins[id].1, nets[id].root, steiner_alpha(opts, &nets[id], hpwl.get(id).copied().flatten()));
     let db_id: Vec<u32> = (0..nets.len() as u32).collect();
+    let net_db_ids: Vec<u32> = nets.iter().map(|n| db.net_id(&n.name)).collect::<Result<_, _>>()?;
     let inp = RunInputs {
         x_grid: xg,
         y_grid: yg,
@@ -2155,6 +2156,7 @@ pub fn route_design(db: &mut Db, opts: &RouteOptions, stt: SteinerBuilder<'_>, f
         res_aware,
         origin: crate::routes::GridOrigin { tile_size: t.core.tile_size, x_corner: t.core.area.x_min, y_corner: t.core.area.y_min },
         db_id: &db_id,
+        net_db_ids: &net_db_ids,
         resume: None,
         allow_congestion: opts.allow_congestion,
     };
@@ -2587,6 +2589,7 @@ pub fn restore_for_repair(db: &mut Db, opts: &RouteOptions) -> Res<AfterRoute> {
     let num_layers = e.num_layers as usize;
     let max_layer = nets.iter().filter(|n| !n.is_local).map(|n| (n.max_layer - 1) as usize).max().unwrap_or(0);
     let mut g2 = crate::run::initial_graph_2d(xg, yg, &caps, &cap_h, &cap_v, num_layers.max(max_layer + 1));
+    g2.ndr.set_db_ids(nets.iter().map(|n| db.net_id(&n.name)).collect::<Result<_, _>>()?);
     let mut g3 = crate::run::graph_3d(&caps, xg, yg);
 
     // 1. loadGuidesFromDB — routes_ per net, in block order.
@@ -3198,6 +3201,7 @@ fn find_routing(db: &Db, opts: &RouteOptions, a: &mut AfterRoute, dirty_nets: &[
     let stt_net = |id: usize| stt(&pins[id].0, &pins[id].1, nets[id].root, steiner_alpha(opts, &nets[id], hpwl.get(id).copied().flatten()));
     let layer_dir = a.layer_dir.clone();
     let db_id: Vec<u32> = (0..nets.len() as u32).collect();
+    let net_db_ids: Vec<u32> = nets.iter().map(|n| db.net_id(&n.name)).collect::<Result<_, _>>()?;
     let (g2, g3) = (a.final_2d.clone().ok_or("no 2D graph to resume")?, a.final_3d.clone().ok_or("no 3D graph to resume")?);
     let net_ids = a.net_ids.clone();
     let inp = RunInputs {
@@ -3227,6 +3231,7 @@ fn find_routing(db: &Db, opts: &RouteOptions, a: &mut AfterRoute, dirty_nets: &[
         res_aware: ra_inputs,
         origin: crate::routes::GridOrigin { tile_size: a.jumper_grid.grid.tile_size, x_corner: a.jumper_grid.grid.area.x_min, y_corner: a.jumper_grid.grid.area.y_min },
         db_id: &db_id,
+        net_db_ids: &net_db_ids,
         resume: Some((&g2, &g3)),
         allow_congestion: opts.allow_congestion,
     };
@@ -3414,7 +3419,7 @@ mod restore_capacities_tests {
         assert_eq!((e.h3[4].cap, e.h3[4].red, e.h2[3].cap, e.h2[3].red), (4, 4, 4, 4));
         assert_eq!((e.h3[1].cap, e.h3[3].cap, e.h3[2].cap), (5, 5, 5));
         let (a, b) = (ndr.cap(true, 0, 0, 0), ndr.cap(true, 0, 1, 1));
-        assert_eq!((a.cap, a.cap_ndr, b.cap, b.cap_ndr), (6, 6.0, 4, 4.0));
+        assert_eq!((a.cap, a.cap_ndr(), b.cap, b.cap_ndr()), (6, 6, 4, 4));
         assert_eq!(ndr.cap(true, 0, 1, 0).cap, 5);
     }
 

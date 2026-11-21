@@ -71,6 +71,9 @@ pub struct RunInputs<'a> {
     pub origin: GridOrigin,
     /// Each net's database id, indexed by net id (R20's key).
     pub db_id: &'a [u32],
+    /// `getDbNet()->getId()` per net id — the order `refitNDRDeficitNets` re-reserves in. Empty:
+    /// each net orders by its net id.
+    pub net_db_ids: &'a [u32],
     /// An incremental run (`is_incremental_grt_`): the 2D and 3D graphs the last run, the jumpers
     /// and the rip-ups left. ⛔ The only incremental branch outside resistance-aware routing is
     /// `rebuildUsedGrids`: the used sets are cleared and refilled from COMMITTED usage (`> 0`), not
@@ -151,6 +154,7 @@ pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn 
         Some((g, _)) => resumed_graph_2d(g),
         None => graph_2d(inp, num_layers),
     };
+    g2d.ndr.set_db_ids(inp.net_db_ids.to_vec());
     for &id in ids {
         state[id].seglist.clear();
         (state[id].slack, state[id].critical) = inp.slack[id];
