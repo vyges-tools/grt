@@ -1120,6 +1120,30 @@ pub(crate) mod tests {
         assert_eq!(order, vec![2, 1, 3, 0]);
     }
 
+    // Upstream rule (CUGR `sortForReroute` / `sortRerouteIndices`, OpenROAD #12090): stages 3 and 4
+    // sort STABLY by (slack < kDemotedSlack, -slack, -bbox hp) — demoted (non-critical) nets first,
+    // largest bounding box first; critical nets last, worst slack last. With the res-aware order on,
+    // or during an incremental route, they keep `sortNetIndices`' (slack, hp) order instead.
+    #[test]
+    fn the_reroute_order_puts_large_demoted_nets_first_and_the_worst_slack_last() {
+        let mut c = router();
+        let d = super::super::DEMOTED_SLACK;
+        // 0: demoted hp 1; 1: critical -1 hp 9; 2: demoted hp 3; 3: critical -2 hp 1; 4: demoted hp 3.
+        for (k, (slack, hp)) in [(d, 1), (-1.0f32, 9), (d, 3), (-2.0, 1), (d, 3)].into_iter().enumerate() {
+            let mut n = net(&c.grid, &[&[(1, 0, 0)], &[(1, hp, 0)]]);
+            n.index = k;
+            n.slack = slack;
+            c.nets.push(n);
+        }
+        let mut order: Vec<usize> = (0..5).collect();
+        c.sort_for_reroute(&mut order, 3, None).unwrap();
+        assert_eq!(order, vec![2, 4, 0, 1, 3]);
+        c.incremental_candidates = Some((0..5).collect());
+        let mut order: Vec<usize> = (0..5).collect();
+        c.sort_for_reroute(&mut order, 3, None).unwrap();
+        assert_eq!(order, vec![3, 1, 0, 2, 4], "an incremental route keeps the slack-then-size order");
+    }
+
     // Upstream rule (PatternRoute `calculateRoutingCosts` / `getRoutingTree`): the wire runs on the
     // only horizontal layer at or above the min (m3, index 2); the top-down fill gives layers 0-2
     // the SAME root cost, and the root takes the FIRST minimum — layer 0, the pin's own. So the

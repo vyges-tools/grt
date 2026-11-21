@@ -240,6 +240,21 @@ impl RerouteOptions {
     }
 }
 
+/// `std::tuple<bool, float, int>::operator<`: lexicographic, each element by `a < b` then
+/// `b < a`, so an unordered (NaN) pair falls through to the next element.
+fn reroute_key_less(a: (bool, f32, i32), b: (bool, f32, i32)) -> bool {
+    if a.0 != b.0 {
+        return !a.0 & b.0;
+    }
+    if a.1 < b.1 {
+        return true;
+    }
+    if b.1 < a.1 {
+        return false;
+    }
+    a.2 < b.2
+}
+
 /// `mazeRoute`'s accept test: a relief neighbour (a finite length limit) keeps its reroute only if
 /// the touched edges' overflow DROPS beyond the tolerance and the new route's planar length is
 /// within the limit; any other net keeps it unless it adds overflow beyond the tolerance.
@@ -271,16 +286,7 @@ impl Cugr {
     /// With the timer's raw slacks captured, only the first sort takes the per-sort capture: later
     /// sorts read the slacks the engine refreshed and demoted itself.
     pub fn sort_net_indices(&mut self, indices: &mut [usize], res_aware_order: bool, stage: i32, trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
-        if let Some(sorts) = &self.sort_slacks {
-            // Later sorts read what the refresh left — captured raw slacks, or the timer's own.
-            if (self.raw_slacks.is_none() && self.slack_source.0.is_none()) || self.sorts_done == 0 {
-                let m = sorts.get(self.sorts_done).ok_or_else(|| StageError::Slacks(format!("no captured slacks for sort {}", self.sorts_done)))?;
-                for &k in indices.iter() {
-                    self.nets[k].slack = *m.get(&self.nets[k].name).ok_or_else(|| StageError::Slacks(format!("net {} has no captured slack in sort {}", self.nets[k].name, self.sorts_done)))?;
-                }
-            }
-        }
-        self.sorts_done += 1;
+        self.take_sort_slacks(indices)?;
         if res_aware_order {
             let scores: Vec<f32> = (0..self.nets.len()).map(|k| self.res_aware_score(k)).collect();
             indices.sort_by(|&a, &b| scores[a].partial_cmp(&scores[b]).unwrap_or(std::cmp::Ordering::Equal));
@@ -292,6 +298,60 @@ impl Cugr {
         } else {
             self.sort_by_slack_then_hp(indices);
         }
+        Ok(())
+    }
+
+    /// `sortForReroute` (stages 3 and 4, OpenROAD #12090): [`Self::sort_net_indices`] when the
+    /// res-aware order is on or the route is incremental, else [`Self::sort_reroute_indices`].
+    ///
+    /// Upstream rule: incremental reroutes follow netlist edits, not congestion, and skip the
+    /// demotion, so they keep the slack-then-size order. Either way the sort takes this sort's
+    /// captured slacks first, as `sort_net_indices` does.
+    pub fn sort_for_reroute(&mut self, indices: &mut [usize], stage: i32, trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
+        let res_aware_order = self.res_aware_order();
+        if res_aware_order || self.incremental_candidates.is_some() {
+            return self.sort_net_indices(indices, res_aware_order, stage, trace);
+        }
+        self.take_sort_slacks(indices)?;
+        self.sort_reroute_indices(indices);
+        Ok(())
+    }
+
+    /// `sortRerouteIndices` (OpenROAD #12090): a STABLE sort by the tuple
+    /// `(slack < kDemotedSlack, -slack, -bbox half perimeter)` under C++'s lexicographic `<`.
+    ///
+    /// Upstream rule: each reroute sees every other net in place, so non-critical (demoted) nets
+    /// go first, largest bounding box first; critical nets go last, worst slack last.
+    fn sort_reroute_indices(&self, indices: &mut [usize]) {
+        let key = |k: usize| {
+            let n = &self.nets[k];
+            (n.slack < DEMOTED_SLACK, -n.slack, -n.bounding_box.hp())
+        };
+        indices.sort_by(|&a, &b| {
+            let (ka, kb) = (key(a), key(b));
+            if reroute_key_less(ka, kb) {
+                std::cmp::Ordering::Less
+            } else if reroute_key_less(kb, ka) {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        });
+    }
+
+    /// The slacks a sort reads: where captured slacks are set, each listed net first takes this
+    /// sort's; every sort counts.
+    fn take_sort_slacks(&mut self, indices: &[usize]) -> Result<(), StageError> {
+        if let Some(sorts) = &self.sort_slacks {
+            // Later sorts read what the refresh left — captured raw slacks, or the timer's own.
+            if (self.raw_slacks.is_none() && self.slack_source.0.is_none()) || self.sorts_done == 0 {
+                let m = sorts.get(self.sorts_done).ok_or_else(|| StageError::Slacks(format!("no captured slacks for sort {}", self.sorts_done)))?;
+                for &k in indices.iter() {
+                    self.nets[k].slack = *m.get(&self.nets[k].name).ok_or_else(|| StageError::Slacks(format!("net {} has no captured slack in sort {}", self.nets[k].name, self.sorts_done)))?;
+                }
+            }
+        }
+        self.sorts_done += 1;
         Ok(())
     }
 
@@ -579,8 +639,7 @@ impl Cugr {
         if let Some(t) = trace.as_deref_mut() {
             trace::congestion_view(t, &view);
         }
-        let res_aware = self.res_aware_order();
-        self.sort_net_indices(nets, res_aware, 3, trace.as_deref_mut())?;
+        self.sort_for_reroute(nets, 3, trace.as_deref_mut())?;
         if let Some(t) = trace.as_deref_mut() {
             trace::order(t, self, nets, 3);
         }
@@ -629,8 +688,7 @@ impl Cugr {
         }
         let mut view: grid_graph::View<f64> = Vec::new();
         self.grid.extract_wire_cost_view(&mut view, &[], &self.constants, self.cost_multiplier);
-        let res_aware = self.res_aware_order();
-        self.sort_maze_net_indices(nets, res_aware, stage, trace.as_deref_mut())?;
+        self.sort_maze_net_indices(nets, stage, trace.as_deref_mut())?;
         if let Some(t) = trace.as_deref_mut() {
             trace::wire_cost_view(t, &view, stage);
         }
@@ -708,11 +766,11 @@ impl Cugr {
         Ok(overflow_change)
     }
 
-    /// `mazeRoute`'s `sortNetIndices` call and its trace (the sorted order, then the `order`
-    /// records). Behind its own function: post-pin #12090 changes this sort upstream.
-    fn sort_maze_net_indices(&mut self, nets: &mut [usize], res_aware: bool, stage: i32, trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
+    /// `mazeRoute`'s `sortForReroute` call and its trace (the sorted order, then the `order`
+    /// records).
+    fn sort_maze_net_indices(&mut self, nets: &mut [usize], stage: i32, trace: Option<&mut Vec<String>>) -> Result<(), StageError> {
         let mut sorted_trace = Vec::new();
-        self.sort_net_indices(nets, res_aware, stage, Some(&mut sorted_trace))?;
+        self.sort_for_reroute(nets, stage, Some(&mut sorted_trace))?;
         if let Some(t) = trace {
             t.extend(sorted_trace);
             trace::order(t, self, nets, stage);
