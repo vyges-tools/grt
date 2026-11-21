@@ -251,7 +251,9 @@ pub struct FastRouteGrid {
     pub x_grid: i32,
     pub y_grid: i32,
     pub num_layers: i32,
-    /// `x_range_ = y_range_`: the larger grid dimension, but never below 1000 (`setGridsAndLayers`).
+    /// `x_range_`, `y_range_` — since OpenROAD #12369 the grid itself (`setGridsAndLayers`); at
+    /// 4155ac31 both were the larger grid dimension, never below 1000. Only the maze's row stride
+    /// and array sizes read them, so no route depends on the change.
     pub x_range: i32,
     pub y_range: i32,
     pub regular_x: bool,
@@ -270,7 +272,6 @@ pub struct FastRouteGrid {
 /// I8 — `mirrorGridToFastRoute(max_routing_layer)`: copy the grid into the router's own fields,
 /// and each routing level's direction into router layer `level - 1`.
 pub fn mirror_grid_to_fast_route(grid: &CoreGrid, directions: &[Option<Direction>]) -> FastRouteGrid {
-    let range = grid.x_grids.max(grid.y_grids).max(1000);
     let mut dirs = vec![None; grid.num_layers as usize];
     for (l, d) in directions.iter().enumerate().take(grid.num_layers as usize) {
         dirs[l] = *d;
@@ -279,8 +280,8 @@ pub fn mirror_grid_to_fast_route(grid: &CoreGrid, directions: &[Option<Direction
         x_grid: grid.x_grids,
         y_grid: grid.y_grids,
         num_layers: grid.num_layers,
-        x_range: range,
-        y_range: range,
+        x_range: grid.x_grids,
+        y_range: grid.y_grids,
         regular_x: grid.perfect_regular_x,
         regular_y: grid.perfect_regular_y,
         x_corner: grid.area.x_min,

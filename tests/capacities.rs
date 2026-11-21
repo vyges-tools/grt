@@ -81,7 +81,11 @@ fn replay(g: &Value) -> Seen {
 
             // I8
             let fr = mirror_grid_to_fast_route(&core, &dirs);
-            let st: Vec<i32> = arr(&s["state"]).iter().map(int).collect();
+            let mut st: Vec<i32> = arr(&s["state"]).iter().map(int).collect();
+            // ⛔ Captured at 4155ac31, where x_range_ = y_range_ = max(x_grid, y_grid, 1000). Since
+            // OpenROAD #12369 (f11b4276 pin) they are the grid itself.
+            assert_eq!((st[3], st[4]), (st[0].max(st[1]).max(1000), st[0].max(st[1]).max(1000)), "{who}: the old pin's range");
+            (st[3], st[4]) = (st[0], st[1]);
             assert_eq!(
                 vec![fr.x_grid, fr.y_grid, fr.num_layers, fr.x_range, fr.y_range, fr.regular_x as i32, fr.regular_y as i32,
                      fr.x_corner, fr.y_corner, fr.tile_size, fr.x_grid_max, fr.y_grid_max],

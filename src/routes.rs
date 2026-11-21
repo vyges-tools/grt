@@ -124,7 +124,10 @@ pub fn get_routes(nets: &[NetForRoutes], origin: GridOrigin) -> BTreeMap<u32, Ve
 /// timings are this engine's own and cannot match; they are not modelled here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunReport {
-    /// The `global_route__vias` metric, always written.
+    /// FastRoute's via count, as GRT-0111 reports it. ⚠️ At 4155ac31 it was also the
+    /// `global_route__vias` metric; since OpenROAD #12263 that metric is GlobalRouter's — the cut
+    /// layers crossed by the via segments of `routes_`, written with the wirelength and not for an
+    /// incremental reroute. This engine writes no metrics file.
     pub vias_metric: i32,
     /// GRT-0111 and GRT-0112, only in verbose mode.
     pub verbose_lines: Vec<String>,
