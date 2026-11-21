@@ -6,6 +6,7 @@
 //! here; a capture of the deficit ledger at the pin is on the heavy-run plan. Until then the rules
 //! below are constructed, each from the reference's code.
 
+use vyges_grt::estimate::Usage2d as _;
 use vyges_grt::*;
 
 fn ndr(id: usize, ec: i8) -> NdrCostNet {
@@ -241,4 +242,51 @@ fn an_l_route_turns_away_from_where_the_net_would_miss_tracks() {
     };
     assert!(route(&mut g, &ndr(1, 1)), "a regular net keeps the tie bend");
     assert!(!route(&mut g, &NdrCostNet { layer_edge_cost: Some(vec![3, 3]), ..ndr(1, 3) }), "the NDR net goes y first");
+}
+
+/// A graph with an NDR deficit on horizontal edge (1, 1) and vertical edge (2, 0): a net of 20
+/// NDR tracks fits neither layer of 5 there.
+fn graph_with_deficits() -> Graph2d {
+    let mut g = graph();
+    let fat = NdrCostNet { layer_edge_cost: Some(vec![20, 20]), ..ndr(9, 20) };
+    g.for_net(&fat).update_usage_h(1, 1, 1.0);
+    g.for_net(&fat).update_usage_v(2, 0, 1.0);
+    assert!(g.ndr.has_ndr_deficit(true, 1, 1) && g.ndr.has_ndr_deficit(false, 2, 0));
+    g
+}
+
+/// ⛔ Upstream #11963 `newRipupCheck`: an NDR net (edge cost above 1) is torn up off an edge where
+/// the NDR nets fit no single layer, even with the usage far under the threshold; a regular net
+/// on the same route is not. Both directions are read at the walk's lower coordinate.
+#[test]
+fn the_maze_gate_tears_an_ndr_net_off_an_edge_with_a_deficit() {
+    let g = graph_with_deficits();
+    let zero = |_: i32, _: i32| 0.0;
+    let mut regular = g.clone();
+    let mut wide = g.clone();
+    // (2,1) → (1,1) → (1,2): horizontal (1,1) walked right to left.
+    let h_route = [(2, 1), (1, 1), (1, 2)];
+    // (2,1) → (2,0): vertical (2,0) walked downwards.
+    let v_route = [(3, 1), (2, 1), (2, 0)];
+    for route in [&h_route[..], &v_route[..]] {
+        assert_eq!(new_ripup_check(&mut regular.for_net(&ndr(3, 1)), route, 2, 0, (10, 10), 1, None, &zero, &zero), None);
+        assert_eq!(new_ripup_check(&mut wide.for_net(&ndr(3, 3)), route, 2, 0, (10, 10), 3, None, &zero, &zero), Some(RipupReason::Congested));
+    }
+}
+
+/// ⛔ Upstream #11963 `newRipupCongestedL`: the same for the L rip-up — an NDR net leaves an L whose
+/// checked column or row has an NDR deficit, though no edge is over capacity.
+#[test]
+fn the_l_rip_up_takes_an_ndr_net_off_a_deficit() {
+    let cap = |_: i32, _: i32, _: bool| 10;
+    // (0,0) → (2,1) y first checks column 0, then row 1: the deficit at (1,1).
+    // (1,0) → (2,1) x first checks column 2: the deficit at (2,0).
+    for (p1, p2, x_first) in [((0, 0), (2, 1), false), ((1, 0), (2, 1), true)] {
+        for (ec, rips) in [(1, false), (3, true)] {
+            let mut g = graph_with_deficits();
+            let mut statuses = vec![2i16, 2];
+            let got = new_ripup_congested_l(&mut g.for_net(&ndr(3, ec)), &mut statuses, (0, 1), p1, p2, x_first, 2, ec, &cap);
+            assert_eq!(got, rips, "{p1:?}→{p2:?} x_first {x_first} edge cost {ec}");
+        }
+    }
 }

@@ -227,6 +227,11 @@ pub trait Usage2d {
     fn ndr_aware(&self, _x: usize, _y: usize, _horizontal: bool, usage: f64) -> f64 {
         usage
     }
+    /// `hasNDRDeficit(x, y, direction)` — whether some NDR net on the edge fits no layer there.
+    /// A grid without an NDR ledger has none.
+    fn has_ndr_deficit(&self, _x: usize, _y: usize, _horizontal: bool) -> bool {
+        false
+    }
     /// `getEstUsageRedH(net, x, y)` — estimate plus reduction, through [`Usage2d::ndr_aware`].
     fn est_red_h(&self, x: usize, y: usize, red: u16) -> f64 {
         self.ndr_aware(x, y, true, self.h(x, y) + f64::from(red))

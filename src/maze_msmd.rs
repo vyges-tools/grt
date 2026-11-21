@@ -168,7 +168,8 @@ pub fn maze_route_msmd_sequential(
                     critical_slack: slack_th,
                     slack: st.slack,
                 });
-                needs_ripup_check(&r.grids, r.routelen as usize, p.ripup_threshold, (grid.h_capacity, grid.v_capacity), critical, &used_h, &used_v)
+                let deficit = |x: i32, y: i32, horizontal: bool| g.ndr.has_ndr_deficit(horizontal, x as usize, y as usize);
+                needs_ripup_check(&r.grids, r.routelen as usize, p.ripup_threshold, (grid.h_capacity, grid.v_capacity), critical, &used_h, &used_v, (nn.edge_cost > 1).then_some(&deficit))
             };
             let Some(reason) = reason else { continue };
             if reason == RipupReason::CriticalDetour {

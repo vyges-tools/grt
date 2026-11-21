@@ -208,4 +208,7 @@ impl Usage2d for NetUsage<'_> {
     fn ndr_aware(&self, x: usize, y: usize, horizontal: bool, usage: f64) -> f64 {
         self.g.usage_ndr_aware(self.net, x, y, horizontal, usage)
     }
+    fn has_ndr_deficit(&self, x: usize, y: usize, horizontal: bool) -> bool {
+        self.g.ndr.has_ndr_deficit(horizontal, x, y)
+    }
 }

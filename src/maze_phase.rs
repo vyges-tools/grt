@@ -72,10 +72,11 @@ pub fn route_monotonic_edge(
     let caps = (grid.h_capacity, grid.v_capacity);
     let r = &t.routes[eid];
     assert_eq!(r.kind, RouteKind::MazeRoute, "GRT-500: route type is not maze");
-    if needs_ripup_check(&r.grids, r.routelen as usize, threshold, caps, None, &used_h, &used_v).is_none() {
+    let nn = net.ndr_net(id);
+    let deficit = |x: i32, y: i32, horizontal: bool| g.ndr.has_ndr_deficit(horizontal, x as usize, y as usize);
+    if needs_ripup_check(&r.grids, r.routelen as usize, threshold, caps, None, &used_h, &used_v, (nn.edge_cost > 1).then_some(&deficit)).is_none() {
         return Ok(());
     }
-    let nn = net.ndr_net(id);
     give_back_committed(&mut grid.g.for_net(&nn), &r.grids, r.routelen as usize, nn.edge_cost);
 
     let (p1, p2) = ((t.nodes[e.n1].x as i32, t.nodes[e.n1].y as i32), (t.nodes[e.n2].x as i32, t.nodes[e.n2].y as i32));

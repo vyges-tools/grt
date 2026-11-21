@@ -175,16 +175,24 @@ pub fn new_ripup_congested_l<G: Usage2d + ?Sized>(
     let x_check = if x_first { x2 } else { x1 };
     let y_check = if x_first { y1 } else { y2 };
 
+    // ⛔ OpenROAD #11963: an NDR net also leaves the edges where the NDR nets fit no single layer,
+    // even below capacity.
+    let check_ndr = edge_cost > 1;
+
     let mut need = false;
     for i in ymin..ymax {
-        if grid.v(x_check as usize, i as usize) > f64::from(capacity(x_check, i, false)) {
+        if grid.v(x_check as usize, i as usize) > f64::from(capacity(x_check, i, false))
+            || (check_ndr && grid.has_ndr_deficit(x_check as usize, i as usize, false))
+        {
             need = true;
             break;
         }
     }
     if !need {
         for i in x1..x2 {
-            if grid.h(i as usize, y_check as usize) > f64::from(capacity(i, y_check, true)) {
+            if grid.h(i as usize, y_check as usize) > f64::from(capacity(i, y_check, true))
+                || (check_ndr && grid.has_ndr_deficit(i as usize, y_check as usize, true))
+            {
                 need = true;
                 break;
             }
@@ -247,7 +255,10 @@ pub fn new_ripup_check<G: Usage2d + ?Sized>(
     used_h: &dyn Fn(i32, i32) -> f64,
     used_v: &dyn Fn(i32, i32) -> f64,
 ) -> Option<RipupReason> {
-    let reason = needs_ripup_check(grids, routelen, ripup_threshold, caps, critical, used_h, used_v);
+    let reason = {
+        let deficit = |x: i32, y: i32, horizontal: bool| grid.has_ndr_deficit(x as usize, y as usize, horizontal);
+        needs_ripup_check(grids, routelen, ripup_threshold, caps, critical, used_h, used_v, (edge_cost > 1).then_some(&deficit))
+    };
     if reason.is_some() {
         give_back_walked(grid, grids, routelen, f64::from(edge_cost), Layer::Committed);
     }
@@ -258,6 +269,11 @@ pub fn new_ripup_check<G: Usage2d + ?Sized>(
 ///
 /// ⚠️ Split out so a caller whose demand reads and writes go to the same grid can decide first and
 /// then give back through its own charge.
+///
+/// ⛔ OpenROAD #11963: `ndr_deficit` is `hasNDRDeficit(x, y, direction)`, given only for an NDR net
+/// (edge cost above 1). Such a net is also rerouted out of an edge where the NDR nets fit no
+/// single layer, even below the threshold — the same reason, in the same walk.
+#[allow(clippy::too_many_arguments)]
 pub fn needs_ripup_check(
     grids: &[(i32, i32)],
     routelen: usize,
@@ -266,17 +282,20 @@ pub fn needs_ripup_check(
     critical: Option<CriticalCheck>,
     used_h: &dyn Fn(i32, i32) -> f64,
     used_v: &dyn Fn(i32, i32) -> f64,
+    ndr_deficit: Option<&dyn Fn(i32, i32, bool) -> bool>,
 ) -> Option<RipupReason> {
+    let deficit = |x: i32, y: i32, horizontal: bool| ndr_deficit.is_some_and(|f| f(x, y, horizontal));
     let mut reason = None;
     for i in 0..routelen {
         let (ax, ay) = grids[i];
         let (bx, by) = grids[i + 1];
         if ax == bx {
-            if used_v(ax, ay.min(by)) >= f64::from(v_capacity - ripup_threshold) {
+            let min_y = ay.min(by);
+            if used_v(ax, min_y) >= f64::from(v_capacity - ripup_threshold) || deficit(ax, min_y, false) {
                 reason = Some(RipupReason::Congested);
                 break;
             }
-        } else if ay == by && used_h(ax.min(bx), ay) >= f64::from(h_capacity - ripup_threshold) {
+        } else if ay == by && (used_h(ax.min(bx), ay) >= f64::from(h_capacity - ripup_threshold) || deficit(ax.min(bx), ay, true)) {
             reason = Some(RipupReason::Congested);
             break;
         }
