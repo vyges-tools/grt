@@ -306,3 +306,17 @@ fn the_overflow_totals_count_the_ndr_deficit() {
     let s = g.get_overflow_2d();
     assert_eq!((s.total_overflow, s.max_overflow), (10 + 15, 10));
 }
+
+/// ⛔ Upstream #11963 run(): R17 (demote the congested NDR nets) also fires when an NDR deficit is
+/// left though the 2D and 3D totals match; the 3D maze passes run when the 2D overflow is ALL NDR
+/// deficit (`canRunMaze3D`: `overflow_2d == getTotalNDRDeficit()`), not only at zero.
+#[test]
+fn run_demotes_on_a_left_deficit_and_runs_3d_maze_past_one() {
+    use vyges_grt::run::{can_run_maze_3d, ndr_mismatch};
+    assert!(!ndr_mismatch(7, 7, 0));
+    assert!(ndr_mismatch(7, 7, 1), "the totals match, a deficit is left");
+    assert!(ndr_mismatch(7, 6, 0));
+    assert!(can_run_maze_3d(0, 0));
+    assert!(can_run_maze_3d(5, 5), "all of it is deficit");
+    assert!(!can_run_maze_3d(6, 5), "one track of usage overflow");
+}

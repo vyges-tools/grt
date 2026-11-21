@@ -310,9 +310,10 @@ pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn 
     let overflow = get_overflow_3d_all(&g2d, &g3);
     let mut past_cong = scan.total_overflow;
     stop_unless!(Stage::B16 { past_cong, overflow: &overflow }, Some(&g3));
-    // R17 — 2D and 3D overflow disagree: `disableNDRForCongestedNets(net_ids_)`, then
-    // `long_edge_len = BIG_INT` and both overflows read again.
-    let r17 = past_cong != overflow.total;
+    // R17 — 2D and 3D overflow disagree, or an NDR deficit is left in 2D:
+    // `disableNDRForCongestedNets(net_ids_)`, then `long_edge_len = BIG_INT` and both overflows
+    // read again.
+    let r17 = ndr_mismatch(past_cong, overflow.total, g2d.ndr.total_ndr_deficit());
     let mut r17_demoted = Vec::new();
     if r17 {
         // The scan skips a net with no rule and a net already soft. With none left it returns
@@ -359,11 +360,11 @@ pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn 
         &attrs_r17
     };
     // R18 — costheight_ 3, via_cost_ 1; run()'s local enlarge_ as the loop left it.
-    if past_cong == 0 {
+    if can_run_maze_3d(past_cong, g2d.ndr.total_ndr_deficit()) {
         // long_edge_len: 40, raised to BIG_INT by a soft-NDR demotion in R14 (and, with short_edge_len,
         // by resistance awareness).
         // ⚠️ The soft-NDR half is UNWITNESSED: both scripts that demote end congested, so this pass
-        // (`past_cong == 0`) never runs after a demotion — a mutant leaving 40 survives them.
+        // (`canRunMaze3D`) never runs after a demotion — a mutant leaving 40 survives them.
         let long = if inp.resistance_aware || !end.soft_ndr.is_empty() || r17 { BIG_INT } else { 40 };
         let short = if inp.resistance_aware { BIG_INT } else { 12 };
         for (tag, ub) in [("B18a", long), ("B18b", short)] {
@@ -460,6 +461,23 @@ impl crate::softndr::CongestionView for R17View<'_> {
 /// The 2D graph at entry: the estimated usage, the capacities, and the NDR ledger's per-layer
 /// capacities as `initEdgesCapacityPerLayer` leaves them (horizontal edges to `x < xg-1`, vertical
 /// to `y < yg-1`, no NDR net anywhere).
+/// run()'s R17 test — the 2D and 3D congestion disagree.
+///
+/// ⛔ OpenROAD #11963: an NDR deficit left in 2D triggers it even when the totals match, since layer
+/// assignment may or may not fit the nets the first-fit 2D reservations could not.
+pub fn ndr_mismatch(past_cong: i32, overflow_3d: i32, ndr_deficit_total: i32) -> bool {
+    past_cong != overflow_3d || ndr_deficit_total > 0
+}
+
+/// `canRunMaze3D(overflow_2d)` — the 3D maze passes run on a 2D routing with no USAGE overflow.
+///
+/// ⛔ OpenROAD #11963 (74d34bd075): the 2D overflow now includes the NDR deficit, which does not
+/// count here — it comes from first-fit layer reservations, and the NDR nets it leaves
+/// overflowing in 3D are demoted. So the gate is `overflow_2d == getTotalNDRDeficit()`, not `== 0`.
+pub fn can_run_maze_3d(overflow_2d: i32, ndr_deficit_total: i32) -> bool {
+    overflow_2d == ndr_deficit_total
+}
+
 fn graph_2d(inp: &RunInputs<'_>, num_layers: usize) -> Graph2d {
     let mut g = initial_graph_2d(inp.x_grid, inp.y_grid, inp.caps, inp.cap_h, inp.cap_v, num_layers);
     g.est = inp.entry.clone();
