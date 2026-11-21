@@ -12,6 +12,7 @@
 //! (`reInitTree`, which no corpus pass reaches). The snapshot-batched variant is a separate mode.
 //! The partial-slack pass needs the timer's per-net slack, and is refused without one.
 
+use crate::graph2d::NDR_DEFICIT_COST;
 use crate::brk_rsmt::{BrkGrid, NetState, RouteKind, RsmtNet, StTree};
 use crate::lroute::TreeNode;
 use crate::maze::{
@@ -52,6 +53,11 @@ pub struct MsmdResult {
 
 /// `StNetOrder` — order the nets by their routes' congestion, then by slack, and write the stamped
 /// slacks back onto the nets.
+///
+/// ⛔ OpenROAD #11963: per route edge the congestion is `max(0, usage − capacity)` PLUS
+/// `100 × getNDRDeficit(net, edge)` — the tracks an NDR net misses there count as its overflow.
+/// The sum is formed in `int` and stored clamped to `int16_t`'s maximum (the order key is that
+/// narrow); a net's own deficit only, not the edge's.
 pub fn st_net_order(net_ids: &[usize], nets: &[RsmtNet<'_>], state: &mut [NetState], grid: &BrkGrid<'_>) -> Vec<usize> {
     let g = &*grid.g;
     let trees: Vec<OrderTree> = net_ids
@@ -59,21 +65,24 @@ pub fn st_net_order(net_ids: &[usize], nets: &[RsmtNet<'_>], state: &mut [NetSta
         .map(|&id| {
             let net = &nets[id];
             let cap = |x: i32, y: i32, h: bool| grid.caps.edge_capacity(net.min_layer, net.max_layer, x, y, h);
-            let mut xmin = 0i32;
+            let nn = net.ndr_net(id);
+            let deficit = |x: i32, y: i32, h: bool| NDR_DEFICIT_COST * g.ndr.ndr_deficit(&nn, x as usize, y as usize, h);
+            let mut overflow = 0i32;
             if let Some(t) = state[id].tree.as_ref() {
                 for r in &t.routes {
                     for k in 0..r.routelen.max(0) as usize {
                         let ((ax, ay), (bx, by)) = (r.grids[k], r.grids[k + 1]);
                         if ax == bx {
                             let y = ay.min(by);
-                            xmin += (i32::from(g.est.usage_v(ax as usize, y as usize)) - cap(ax, y, false)).max(0);
+                            overflow += (i32::from(g.est.usage_v(ax as usize, y as usize)) - cap(ax, y, false)).max(0) + deficit(ax, y, false);
                         } else {
                             let x = ax.min(bx);
-                            xmin += (i32::from(g.est.usage_h(x as usize, ay as usize)) - cap(x, ay, true)).max(0);
+                            overflow += (i32::from(g.est.usage_h(x as usize, ay as usize)) - cap(x, ay, true)).max(0) + deficit(x, ay, true);
                         }
                     }
                 }
             }
+            let xmin = overflow.min(i32::from(i16::MAX));
             OrderTree { net: id.to_string(), xmin, slack: state[id].slack }
         })
         .collect();

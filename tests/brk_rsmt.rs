@@ -1820,3 +1820,55 @@ fn ensure_pin_coverage_appends_a_default_edge_per_unreached_pin() {
     assert_eq!((e.n1, e.n2, e.n1a, e.n2a, e.len, e.route_type, e.routelen), (0, 0, 0, 0, 0, RouteType::MazeRoute, 2));
     assert_eq!(e.grids.iter().map(|q| (q.x, q.y, q.layer)).collect::<Vec<_>>(), vec![(3, 0, 0), (3, 0, 1), (3, 0, 2)]);
 }
+
+/// ⛔ Upstream #11963 `StNetOrder`: an NDR net's congestion key adds `100 ×` its own NDR deficit per
+/// route edge, and the key, summed in `int`, is stored clamped at `int16_t`'s maximum — two nets
+/// past it tie, and the stable sort keeps them in net order.
+#[test]
+fn st_net_order_counts_the_ndr_deficit_and_clamps_the_key() {
+    use vyges_grt::estimate::Usage2d as _;
+    // Net k < 4 runs along row k from x 0 to 4; net 4 up column 5 from y 0 to 1.
+    let mut pins: Vec<[(i32, i32); 2]> = (0..4).map(|k| [(0, k), (4, k)]).collect();
+    pins.push([(5, 0), (5, 1)]);
+    let xy: Vec<(Vec<i32>, Vec<i32>)> = pins.iter().map(|p| p.iter().copied().unzip()).collect();
+    let mut state: Vec<NetState> = (0..5)
+        .map(|k| {
+            let p = pins[k];
+            let mut st = st_tree(2, &[(p[0].0, p[0].1, 1), (p[1].0, p[1].1, 1)], &p);
+            let r = &mut st.tree.as_mut().expect("tree").routes[0];
+            let grids: Vec<(i32, i32)> = if k < 4 { (0..=4).map(|x| (x, k as i32)).collect() } else { vec![(5, 0), (5, 1)] };
+            (r.kind, r.routelen) = (RouteKind::MazeRoute, grids.len() as i32 - 1);
+            r.grids = grids;
+            st
+        })
+        .collect();
+    let (one, three, wide) = ([1i8], [3i8], [127i8]);
+    let nets: Vec<RsmtNet<'_>> = vec![
+        RsmtNet { layer_edge_cost: &one, ..net(&xy[0].0, &xy[0].1) },
+        RsmtNet { edge_cost: 3, layer_edge_cost: &three, ..net(&xy[1].0, &xy[1].1) },
+        RsmtNet { edge_cost: 127, layer_edge_cost: &wide, ..net(&xy[2].0, &xy[2].1) },
+        RsmtNet { layer_edge_cost: &one, ..net(&xy[3].0, &xy[3].1) },
+        RsmtNet { edge_cost: 3, layer_edge_cost: &three, ..net(&xy[4].0, &xy[4].1) },
+    ];
+    let mut g2d = Graph2d::new(6, 4, 1);
+    for x in 0..6 {
+        for y in 0..4 {
+            g2d.ndr.update_cap_3d(x, y, 0, true, 2.0);
+            g2d.ndr.update_cap_3d(x, y, 0, false, 2.0);
+        }
+    }
+    // Net 0: one edge 1 over capacity 10. Net 1: 3 tracks on a 2-track layer, one edge — deficit
+    // 1, key 100. Net 2: 127 tracks on four edges — 4 × (117 over + 100 × 125) past 32767.
+    // Net 3: 20000 over on four edges — 80000, also past it. Net 4: net 1's deficit, vertical.
+    g2d.est.update_usage_h(0, 0, 11.0);
+    g2d.for_net(&nets[1].ndr_net(1)).update_usage_h(0, 1, 1.0);
+    g2d.for_net(&nets[4].ndr_net(4)).update_usage_v(5, 0, 1.0);
+    for x in 0..4 {
+        g2d.for_net(&nets[2].ndr_net(2)).update_usage_h(x, 2, 1.0);
+        g2d.est.update_usage_h(x, 3, 20_010.0);
+    }
+    assert_eq!(g2d.ndr.ndr_deficit(&nets[1].ndr_net(1), 0, 1, true), 1);
+    let caps = grid_caps(6, 4, 10);
+    let grid = BrkGrid { g: &mut g2d, red_h: &no_red, red_v: &no_red, caps: &caps, h_capacity: 10, v_capacity: 10, via_cost: 0.0 };
+    assert_eq!(st_net_order(&[0, 1, 2, 3, 4], &nets, &mut state, &grid), vec![2, 3, 1, 4, 0]);
+}
