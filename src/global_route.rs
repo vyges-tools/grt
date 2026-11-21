@@ -812,6 +812,18 @@ fn first_index_by_name<'a>(names: impl IntoIterator<Item = &'a str>) -> std::col
 }
 
 /// [`setup_nets`], and how many routable nets it left out because they already have wiring.
+/// `findNets`' net list: the block's nets in `getNets()` order, or the nets `set_nets_to_route`
+/// added, in the order added.
+///
+/// Upstream rule (`GlobalRouter::findNets`): the test is `nets_to_route_.empty()`, so a
+/// `set_nets_to_route` whose patterns matched no net leaves the list empty and EVERY net is routed.
+pub(crate) fn find_nets_list<'a>(all: &'a [NetFacts], nets_to_route: Option<&[String]>) -> Res<Vec<&'a NetFacts>> {
+    match nets_to_route {
+        None | Some([]) => Ok(all.iter().collect()),
+        Some(names) => names.iter().map(|n| all.iter().find(|f| &f.name == n).ok_or_else(|| format!("net {n} not found").into())).collect(),
+    }
+}
+
 pub fn setup_nets_counted(db: &Db, t: &TechSetup, e: &mut RouterEdges, has_macros_or_pads: bool, opts: &RouteOptions, log: &mut dyn crate::log::Sink) -> Res<(Vec<RouterNet>, usize)> {
     let (min, max) = (t.min_routing_layer, t.max_routing_layer);
     let (clk_min, clk_max) = (t.tech.min_layer_for_clock, t.tech.max_layer_for_clock);
@@ -821,10 +833,7 @@ pub fn setup_nets_counted(db: &Db, t: &TechSetup, e: &mut RouterEdges, has_macro
     // findNets — initClockNets: with a liberty library the timer retypes its clock network's nets
     // to CLOCK; ⛔ with no clock defined (the only case the caller lets through) it finds none.
     let all = read_nets(db);
-    let db_nets: Vec<&NetFacts> = match &opts.nets_to_route {
-        None => all.iter().collect(),
-        Some(names) => names.iter().map(|n| all.iter().find(|f| &f.name == n).ok_or_else(|| format!("net {n} not found"))).collect::<Result<_, _>>()?,
-    };
+    let db_nets = find_nets_list(&all, opts.nets_to_route.as_deref())?;
     let candidates: Vec<NetCandidate> = db_nets
         .iter()
         .map(|n| NetCandidate {
@@ -3481,5 +3490,26 @@ mod iterm_ap_source_tests {
     fn placed_points_are_offset_by_the_location_in_input_order() {
         let stored = vec![(110, 92400, 3), (70, 92400, 3), (5, 6, 2)];
         assert_eq!(placed_access_points(stored, (120200, 100100)), vec![(3, 120310, 192500), (3, 120270, 192500), (2, 120205, 100106)]);
+    }
+}
+
+#[cfg(test)]
+mod find_nets_list_tests {
+    use crate::read::NetFacts;
+
+    fn net(name: &str) -> NetFacts {
+        NetFacts { name: name.into(), sig_type: "SIGNAL".into(), is_special: false, term_count: 2, has_special_wires: false, connected_by_abutment: false, has_wire: false, iterms: Vec::new(), bterms: Vec::new() }
+    }
+
+    /// Rule (`GlobalRouter::findNets`): `nets_to_route_.empty()` picks the block's nets in
+    /// `getNets()` order, so `set_nets_to_route` patterns that matched nothing route EVERY net;
+    /// otherwise the added nets, in the order added.
+    #[test]
+    fn an_empty_selection_routes_every_net() {
+        let all = vec![net("a"), net("b"), net("c")];
+        let names = |v: Vec<&NetFacts>| v.into_iter().map(|n| n.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(super::find_nets_list(&all, None).unwrap()), ["a", "b", "c"]);
+        assert_eq!(names(super::find_nets_list(&all, Some(&[])).unwrap()), ["a", "b", "c"]);
+        assert_eq!(names(super::find_nets_list(&all, Some(&["c".to_string(), "a".to_string()])).unwrap()), ["c", "a"]);
     }
 }
