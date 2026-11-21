@@ -397,3 +397,34 @@ fn no_captured_count_comes_near_the_counter_width() {
     // ⚠️ And the counter must be doing real work, or "it never wraps" is vacuous.
     assert!(worst >= 10, "the largest count is only {worst}");
 }
+
+/// ⛔ Upstream #11963 `computeCongestedNDRnets`: a step counts as congested when its edge
+/// overflows OR the net itself misses NDR tracks there (`getNDRDeficit > 0`) — vertical and
+/// horizontal alike; a step with neither does not.
+#[test]
+fn a_step_where_the_net_misses_ndr_tracks_counts_as_congested() {
+    struct Deficits(Vec<(i16, i16, bool)>);
+    impl Overflow2D for Deficits {
+        fn overflow_v(&self, _x: i16, _y: i16) -> i32 { 0 }
+        fn overflow_h(&self, _x: i16, _y: i16) -> i32 { 0 }
+        fn ndr_deficit(&self, _net: &NdrNet, x: i16, y: i16, horizontal: bool) -> i32 {
+            i32::from(self.0.contains(&(x, y, horizontal)))
+        }
+    }
+    let p = |x, y| Point3D { x, y, layer: 0 };
+    // (0,0) → (1,0) → (1,1) → (1,2): horizontal (0,0), vertical (1,0) and (1,1), walked downwards
+    // on the way back from (1,2) to (1,1) so the lower coordinate is read.
+    let net = NdrNet {
+        net_id: 5,
+        has_ndr: true,
+        is_soft_ndr: false,
+        edge_cost: 3,
+        layer_edge_cost: None,
+        edges: vec![NdrEdge { len: 3, routelen: 3, grids: vec![p(0, 0), p(1, 0), p(1, 2), p(1, 1)] }],
+    };
+    let count = |d: Vec<(i16, i16, bool)>| compute_congested_ndr_nets(std::slice::from_ref(&net), &Deficits(d)).first().map_or(0, |c| c.num_edges);
+    assert_eq!(count(vec![]), 0);
+    assert_eq!(count(vec![(0, 0, true)]), 1, "the horizontal step");
+    assert_eq!(count(vec![(1, 1, false)]), 1, "the vertical step (1,2)→(1,1), read at (1,1)");
+    assert_eq!(count(vec![(0, 0, true), (1, 1, false), (1, 0, false)]), 3);
+}

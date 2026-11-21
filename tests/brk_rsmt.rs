@@ -1872,3 +1872,37 @@ fn st_net_order_counts_the_ndr_deficit_and_clamps_the_key() {
     let grid = BrkGrid { g: &mut g2d, red_h: &no_red, red_v: &no_red, caps: &caps, h_capacity: 10, v_capacity: 10, via_cost: 0.0 };
     assert_eq!(st_net_order(&[0, 1, 2, 3, 4], &nets, &mut state, &grid), vec![2, 3, 1, 4, 0]);
 }
+
+/// ⛔ Upstream #11963, through the loop's own view of the graph: an NDR net on edges well under
+/// capacity is still demoted when it misses NDR tracks on them (its record's deficit); with room
+/// for it on a layer, it is not.
+#[test]
+fn the_loop_demotes_an_ndr_net_that_misses_tracks_below_capacity() {
+    use vyges_grt::estimate::Usage2d as _;
+    let pins = [(0, 0), (4, 0)];
+    let (px, py): (Vec<i32>, Vec<i32>) = pins.iter().copied().unzip();
+    let demoted = |ndr_tracks: f64| {
+        let mut state = vec![st_tree(2, &[(0, 0, 1), (4, 0, 1)], &pins)];
+        {
+            let r = &mut state[0].tree.as_mut().expect("tree").routes[0];
+            (r.kind, r.grids, r.routelen) = (RouteKind::MazeRoute, (0..=4).map(|x| (x, 0)).collect(), 4);
+        }
+        let mut nets = [RsmtNet { edge_cost: 2, layer_edge_cost: &[2], ..net(&px, &py) }];
+        let mut g2d = Graph2d::new(6, 2, 1);
+        g2d.cap_h.iter_mut().for_each(|c| *c = 10);
+        g2d.cap_v.iter_mut().for_each(|c| *c = 10);
+        for x in 0..6 {
+            g2d.ndr.update_cap_3d(x, 0, 0, true, ndr_tracks);
+        }
+        let nn = nets[0].ndr_net(0);
+        for x in 0..4 {
+            g2d.for_net(&nn).update_usage_h(x, 0, 2.0);
+        }
+        let caps = grid_caps(6, 2, 10);
+        let mut grid = BrkGrid { g: &mut g2d, red_h: &no_red, red_v: &no_red, caps: &caps, h_capacity: 10, v_capacity: 10, via_cost: 0.0 };
+        assert_eq!(grid.g.get_overflow_2d_maze().max_overflow, 0, "no edge over capacity");
+        vyges_grt::congestion_loop::soft_ndr_demotion(&[0], &mut nets, &[true], &mut state, &mut grid).expect("demotion")
+    };
+    assert_eq!(demoted(1.0), vec![0], "1 NDR track for a 2-track net: deficit, demoted");
+    assert_eq!(demoted(2.0), Vec::<usize>::new(), "room on the layer: kept");
+}

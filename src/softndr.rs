@@ -261,6 +261,11 @@ pub struct CongestedNdr {
 pub trait Overflow2D {
     fn overflow_v(&self, x: i16, y: i16) -> i32;
     fn overflow_h(&self, x: i16, y: i16) -> i32;
+    /// `getNDRDeficit(net, x, y, direction)` — the tracks `net` itself misses on the edge (0 for an
+    /// edge-cost-1 net). A view with no NDR ledger has none.
+    fn ndr_deficit(&self, _net: &NdrNet, _x: i16, _y: i16, _horizontal: bool) -> i32 {
+        0
+    }
 }
 
 /// Count each NDR net's congested steps.
@@ -286,10 +291,13 @@ pub fn compute_congested_ndr_nets(
             }
             for i in 0..edge.routelen.max(0) as usize {
                 let (a, b) = (edge.grids[i], edge.grids[i + 1]);
+                // ⛔ OpenROAD #11963: or the net fits no single layer there (its own NDR deficit).
                 let congested = if a.x == b.x {
-                    view.overflow_v(a.x, a.y.min(b.y)) > 0
+                    let y = a.y.min(b.y);
+                    view.overflow_v(a.x, y) > 0 || view.ndr_deficit(net, a.x, y, false) > 0
                 } else {
-                    view.overflow_h(a.x.min(b.x), a.y) > 0
+                    let x = a.x.min(b.x);
+                    view.overflow_h(x, a.y) > 0 || view.ndr_deficit(net, x, a.y, true) > 0
                 };
                 if congested {
                     // ⚠️ Wrapping, because the reference's counter is 16 bits wide.

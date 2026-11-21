@@ -509,6 +509,12 @@ pub fn soft_ndr_demotion(
             let (x, y) = (x as usize, y as usize);
             i32::from(self.0.est.usage_h(x, y)) - i32::from(self.0.cap_h[y * self.0.est.x_grids + x])
         }
+        fn ndr_deficit(&self, net: &NdrNet, x: i16, y: i16, horizontal: bool) -> i32 {
+            if net.edge_cost == 1 {
+                return 0;
+            }
+            self.0.ndr.usage(horizontal, x as usize, y as usize, net.net_id).map_or(0, |u| i32::from(u.deficit))
+        }
     }
     // computeCongestedNDRnets over net_ids_, in order: the 2D trees as they stand.
     let scan_nets: Vec<NdrNet> = net_ids
