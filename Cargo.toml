@@ -44,18 +44,18 @@ vyges-stt = { git = "https://github.com/vyges-tools/stt.git", branch = "main" }
 [dependencies]
 # The parasitic estimator (`est`): the router builds its partial-slack networks with it, as the
 # reference's grt links est. Itself dependency-free.
-vyges-est = { git = "https://github.com/vyges-tools/est.git", branch = "main" }
-vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "main", optional = true }
+vyges-est = { git = "https://github.com/vyges-tools/est.git", branch = "repin-f11b4276" }
+vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "repin-f11b4276", optional = true }
 vyges-stt = { git = "https://github.com/vyges-tools/stt.git", branch = "main", optional = true }
 # Debug flags and stage times (the engines' debug-flag standard); no allocator, no tracing.
 vyges-events = { git = "https://github.com/vyges-tools/events", branch = "main", default-features = false }
 serde_json = { version = "1", optional = true }
 flate2 = { version = "1", optional = true }
-vyges-dpl = { git = "https://github.com/vyges-tools/dpl.git", branch = "main", optional = true }
+vyges-dpl = { git = "https://github.com/vyges-tools/dpl.git", branch = "repin-f11b4276", optional = true }
 # The timer the router reads its net slacks from (a clock defined, no captured slacks).
-vyges-sta = { git = "https://github.com/vyges-tools/sta.git", branch = "main", optional = true }
+vyges-sta = { git = "https://github.com/vyges-tools/sta.git", branch = "repin-f11b4276", optional = true }
 # The constraints reader `read_sdc` takes (the command line only).
-vyges-loom = { git = "https://github.com/vyges-tools/loom.git", branch = "main", optional = true }
+vyges-loom = { git = "https://github.com/vyges-tools/loom.git", branch = "repin-f11b4276", optional = true }
 
 # The binary's global allocator. The reference build links tcmalloc for all of its code
 # (BUILD.bazel `malloc = @tcmalloc`), not the system allocator; mimalloc measured fastest and
