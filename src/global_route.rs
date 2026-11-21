@@ -2819,6 +2819,9 @@ pub fn update_dirty_routes_fast_route_logged(db: &mut Db, opts: &RouteOptions, a
     if a.total_overflow > 0 && !opts.allow_congestion {
         return Err("the incremental re-route left overflow: its congestion loop is not modelled".into());
     }
+    // saveGuides over every net rerouted (OpenROAD #12280: `dirty_nets` as it stands after the
+    // congestion recovery, not the list taken before it). The recovery is refused above, so the
+    // set is the dirty nets either way.
     if save_guides {
         let names: Vec<String> = dirty_nets.iter().map(|&id| a.router_nets[id].name.clone()).collect();
         for name in names {
