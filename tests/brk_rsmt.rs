@@ -24,6 +24,24 @@ fn read(path: &str) -> Value {
     serde_json::from_str(&text).expect("golden parses")
 }
 
+/// A golden split into parts (it is over the repo's file-size limit whole): `name` is the manifest —
+/// the part files IN ORDER and the run count — and each part carries its `part` / `of`. The runs are
+/// joined in manifest order; a missing, extra or reordered part, or a lost run, is a panic.
+fn read_parts(dir: &str, name: &str) -> Value {
+    let mut m = read(&format!("{dir}/{name}"));
+    let names: Vec<String> = m["parts"].as_array().expect("manifest lists its parts").iter().map(|n| n.as_str().expect("part name").to_string()).collect();
+    assert!(!names.is_empty(), "{name}: a manifest with no parts");
+    let mut runs = Vec::new();
+    for (i, part) in names.iter().enumerate() {
+        let p = read(&format!("{dir}/{part}"));
+        assert_eq!((p["part"].as_u64(), p["of"].as_u64()), (Some(i as u64 + 1), Some(names.len() as u64)), "{part}: out of order or from another split");
+        runs.extend(p["runs"].as_array().expect("part runs").iter().cloned());
+    }
+    assert_eq!(Some(runs.len() as u64), m["run_count"].as_u64(), "{name}: the parts do not hold every run");
+    m["runs"] = Value::Array(runs);
+    m
+}
+
 fn int(v: &Value) -> i32 {
     v.as_i64().expect("integer") as i32
 }
@@ -96,7 +114,6 @@ struct Seen {
     usage_errors: usize,
     loop_iterations: usize,
     snapshot_batched: usize,
-    ndr_pre_pin: usize,
     loops_removed: usize,
     r15_checked: usize,
     r16_checked: usize,
@@ -123,20 +140,23 @@ struct Seen {
 /// and estimated usage at B7 and diverge on the COMMITTED usage — the other nets' routes — which is
 /// what the used grids are rebuilt from. They must diverge exactly there, and every
 /// other run must match — so this list fails the day the incremental setup lands.
-const INCREMENTAL: [&str; 4] =
-    ["repair_antennas_adjacent_jumpers-", "repair_antennas_allow_congestion-", "repair_antennas_from_odb-", "repair_antennas_only_diodes-"];
+/// `remove_buffers8` / `remove_buffers9` (NDR nets merged by `remove_buffers` between
+/// `-start_incremental` and `-end_incremental`) entered the corpus at the f11b4276 capture as its
+/// smallest NDR runs.
+const INCREMENTAL: [&str; 6] = [
+    "repair_antennas_adjacent_jumpers-",
+    "repair_antennas_allow_congestion-",
+    "repair_antennas_from_odb-",
+    "repair_antennas_only_diodes-",
+    "remove_buffers8-",
+    "remove_buffers9-",
+];
 
 /// ⛔ Known limitation — the SNAPSHOT-BATCHED maze router. With a batch width configured and enough
 /// nets, `mazeRouteMSMD` routes early iterations in parallel snapshot batches ("intentionally not
 /// exact-preserving", per its own comment) instead of the sequential kernel this engine transcribes.
 /// Those runs must diverge at their first loop iteration's result, and every other run must match.
 const SNAPSHOT_BATCHED: [&str; 2] = ["snapshot_batched_smoke-", "snapshot_batched_single_thread_smoke-"];
-
-/// ⛔ Captured at 4155ac31, when an NDR net on an edge no layer could host was charged 100× its edge
-/// cost in the shared usage. OpenROAD #11963 (f11b4276 pin) charges the true edge cost and keeps
-/// the missing tracks as an NDR deficit, so these runs must diverge at the first usage they check
-/// (R6's exit) until the corpus is re-captured at the pin (heavy-run plan).
-const NDR_PRE_PIN: [&str; 2] = ["ndr_1w_3s-", "ndr_2w_3s-"];
 
 /// Replay every run; list every run that diverges rather than stopping at the first. `bounds` is
 /// the boundary golden: each run's router state after R7, R8, R9, R10, per `global_route`.
@@ -153,8 +173,6 @@ fn replay(g: &Value, bounds: &Value) -> Seen {
             (true, "B7: committed usage")
         } else if SNAPSHOT_BATCHED.iter().any(|p| who.starts_with(p)) {
             (true, "B14_1: getOverflow2D")
-        } else if NDR_PRE_PIN.iter().any(|p| who.starts_with(p)) {
-            (true, "R6 exit usage")
         } else {
             (false, "")
         };
@@ -165,8 +183,6 @@ fn replay(g: &Value, bounds: &Value) -> Seen {
                 if msg.contains(expect) {
                     if expect.starts_with("B7") {
                         seen.incremental += 1
-                    } else if expect.starts_with("R6") {
-                        seen.ndr_pre_pin += 1
                     } else {
                         seen.snapshot_batched += 1
                     }
@@ -896,13 +912,26 @@ impl RunObserver for ChainCheck<'_, '_> {
     }
 }
 
+/// The boundary golden is a manifest and ordered parts: every part is there, in order, and together
+/// they hold every run the manifest counts — including the NDR runs the deficit port replays.
+#[test]
+fn the_boundary_golden_has_every_part() {
+    let dir = format!("{}/examples/grt_gate", env!("CARGO_MANIFEST_DIR"));
+    let b = read_parts(&dir, "boundaries.json");
+    let runs = b["runs"].as_array().expect("runs");
+    assert!(b["parts"].as_array().expect("parts").len() >= 2, "a split golden");
+    for d in ["ndr_1w_3s-plain", "ndr_2w_3s-plain"] {
+        assert!(runs.iter().any(|r| r["design"] == d), "{d} is in the boundary golden");
+    }
+}
+
 #[test]
 fn gen_brk_rsmt_matches_the_reference() {
     let dir = format!("{}/examples/grt_gate", env!("CARGO_MANIFEST_DIR"));
-    let s = replay(&read(&format!("{dir}/brk_rsmt.json")), &read(&format!("{dir}/boundaries.json")));
+    let s = replay(&read(&format!("{dir}/brk_rsmt.json")), &read_parts(&dir, "boundaries.json"));
     eprintln!("{s:?}");
     assert!(s.runs >= 40 && s.flute_nets >= 990 && s.shifted >= 70 && s.shifts > 0 && s.copied >= 900
-            && s.routed_edges >= 1000 && s.usage_checked >= 60 && s.ndr_pre_pin == NDR_PRE_PIN.len() && s.r6_checked >= 40 && s.boundaries >= 160 && s.gate_hvh > 0 && s.gate_vhv > 0 && s.maze_passes >= 18 && s.loop_iterations >= 50 && s.htree > 0,
+            && s.routed_edges >= 1000 && s.usage_checked >= 60 && s.r6_checked >= 40 && s.boundaries >= 160 && s.gate_hvh > 0 && s.gate_vhv > 0 && s.maze_passes >= 18 && s.loop_iterations >= 50 && s.htree > 0,
             "{s:?}");
 }
 
@@ -920,7 +949,7 @@ fn add(a: Seen, b: Seen) -> Seen {
         runs: a.runs + b.runs, calls: a.calls + b.calls, nets: a.nets + b.nets, flute_nets: a.flute_nets + b.flute_nets,
         shifted: a.shifted + b.shifted, shifts: a.shifts + b.shifts, copied: a.copied + b.copied,
         routed_edges: a.routed_edges + b.routed_edges, usage_checked: a.usage_checked + b.usage_checked,
-        ndr_checked: a.ndr_checked + b.ndr_checked, r6_checked: a.r6_checked + b.r6_checked, r6_segs: a.r6_segs + b.r6_segs, boundaries: a.boundaries + b.boundaries, boundary_nets: a.boundary_nets + b.boundary_nets, incremental: a.incremental + b.incremental, gate_hvh: a.gate_hvh + b.gate_hvh, gate_vhv: a.gate_vhv + b.gate_vhv, maze_routes: a.maze_routes + b.maze_routes, maze_passes: a.maze_passes + b.maze_passes, usage_errors: a.usage_errors + b.usage_errors, loop_iterations: a.loop_iterations + b.loop_iterations, snapshot_batched: a.snapshot_batched + b.snapshot_batched, ndr_pre_pin: a.ndr_pre_pin + b.ndr_pre_pin, loops_removed: a.loops_removed + b.loops_removed, r15_checked: a.r15_checked + b.r15_checked, r16_checked: a.r16_checked + b.r16_checked, r16_widened: a.r16_widened + b.r16_widened, r16_res_aware: a.r16_res_aware + b.r16_res_aware, r18_passes: a.r18_passes + b.r18_passes, r18_ra_skipped: a.r18_ra_skipped + b.r18_ra_skipped, emptied_routes: a.emptied_routes + b.emptied_routes, r19_checked: a.r19_checked + b.r19_checked, r19_defects: a.r19_defects + b.r19_defects, r19_pin_stacks: a.r19_pin_stacks + b.r19_pin_stacks, r20_checked: a.r20_checked + b.r20_checked, r20_segments: a.r20_segments + b.r20_segments, thinned: a.thinned + b.thinned, loop_partial_slack: a.loop_partial_slack + b.loop_partial_slack, loop_extra_stops: a.loop_extra_stops + b.loop_extra_stops, stacked_pins: a.stacked_pins + b.stacked_pins, htree: a.htree + b.htree,
+        ndr_checked: a.ndr_checked + b.ndr_checked, r6_checked: a.r6_checked + b.r6_checked, r6_segs: a.r6_segs + b.r6_segs, boundaries: a.boundaries + b.boundaries, boundary_nets: a.boundary_nets + b.boundary_nets, incremental: a.incremental + b.incremental, gate_hvh: a.gate_hvh + b.gate_hvh, gate_vhv: a.gate_vhv + b.gate_vhv, maze_routes: a.maze_routes + b.maze_routes, maze_passes: a.maze_passes + b.maze_passes, usage_errors: a.usage_errors + b.usage_errors, loop_iterations: a.loop_iterations + b.loop_iterations, snapshot_batched: a.snapshot_batched + b.snapshot_batched, loops_removed: a.loops_removed + b.loops_removed, r15_checked: a.r15_checked + b.r15_checked, r16_checked: a.r16_checked + b.r16_checked, r16_widened: a.r16_widened + b.r16_widened, r16_res_aware: a.r16_res_aware + b.r16_res_aware, r18_passes: a.r18_passes + b.r18_passes, r18_ra_skipped: a.r18_ra_skipped + b.r18_ra_skipped, emptied_routes: a.emptied_routes + b.emptied_routes, r19_checked: a.r19_checked + b.r19_checked, r19_defects: a.r19_defects + b.r19_defects, r19_pin_stacks: a.r19_pin_stacks + b.r19_pin_stacks, r20_checked: a.r20_checked + b.r20_checked, r20_segments: a.r20_segments + b.r20_segments, thinned: a.thinned + b.thinned, loop_partial_slack: a.loop_partial_slack + b.loop_partial_slack, loop_extra_stops: a.loop_extra_stops + b.loop_extra_stops, stacked_pins: a.stacked_pins + b.stacked_pins, htree: a.htree + b.htree,
     }
 }
 
