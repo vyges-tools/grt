@@ -314,6 +314,10 @@ pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn 
     // `disableNDRForCongestedNets(net_ids_)`, then `long_edge_len = BIG_INT` and both overflows
     // read again.
     let r17 = ndr_mismatch(past_cong, overflow.total, g2d.ndr.total_ndr_deficit());
+    let ndr_passes = crate::dbg::on(crate::dbg::NDR_PASSES);
+    if ndr_passes {
+        crate::dbg::line(crate::dbg::NDR_PASSES, format!("VYGN|r17|past={past_cong}|ofl3d={}|deficit={}|fired={}", overflow.total, g2d.ndr.total_ndr_deficit(), u8::from(r17)));
+    }
     let mut r17_demoted = Vec::new();
     if r17 {
         // The scan skips a net with no rule and a net already soft. With none left it returns
@@ -360,7 +364,11 @@ pub fn fastroute_run(inp: &RunInputs<'_>, state: &mut [NetState], obs: &mut dyn 
         &attrs_r17
     };
     // R18 — costheight_ 3, via_cost_ 1; run()'s local enlarge_ as the loop left it.
-    if can_run_maze_3d(past_cong, g2d.ndr.total_ndr_deficit()) {
+    let maze3d = can_run_maze_3d(past_cong, g2d.ndr.total_ndr_deficit());
+    if ndr_passes {
+        crate::dbg::line(crate::dbg::NDR_PASSES, format!("VYGN|maze3d|past={past_cong}|deficit={}|run={}", g2d.ndr.total_ndr_deficit(), u8::from(maze3d)));
+    }
+    if maze3d {
         // long_edge_len: 40, raised to BIG_INT by a soft-NDR demotion in R14 (and, with short_edge_len,
         // by resistance awareness).
         // ⚠️ The soft-NDR half is UNWITNESSED: both scripts that demote end congested, so this pass

@@ -211,6 +211,7 @@ pub fn congestion_loop(
     let mut overflow_increases = -1;
     let mut last_total_overflow = 0;
     let mut minofl_stagnant = 0;
+    let ndr_passes = crate::dbg::on(crate::dbg::NDR_PASSES);
     let mut backup: Option<Vec<Option<StTree>>> = None;
     let (xg, yg) = (grid.g.est.x_grids as i32, grid.g.est.y_grids as i32);
     let mut rare = RareBranches::default();
@@ -421,6 +422,10 @@ pub fn congestion_loop(
             overflow_increases += 1;
         }
         last_total_overflow = total_overflow;
+        if ndr_passes {
+            // where the reference prints its `congestionIterations` line
+            crate::dbg::line(crate::dbg::NDR_PASSES, format!("VYGN|pass|i={i}|ofl={total_overflow}|deficit={}", grid.g.ndr.total_ndr_deficit()));
+        }
 
         // Soft-NDR demotion when the loop stops making progress: every congested NDR net, then the
         // loop restarts. Only NDR nets can be demoted, so a design without them computes an empty

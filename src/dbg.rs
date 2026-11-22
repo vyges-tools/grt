@@ -23,12 +23,18 @@ pub const STAGE_TIMES: &str = "vy_stage_times";
 /// the old `VYGC_OUT` (which still names the file).
 pub const CUGR_TRACE: &str = "vy_cugr_trace";
 
+/// Per congestion pass and at finalization, the NDR-deficit values that gate R17 and the 3D maze:
+/// `pass|i|ofl|deficit`, `r17|past|ofl3d|deficit|fired`, `maze3d|past|deficit|run`, in the words
+/// the reference instrument (`grt-ndrpass-trace.py`) prints at the same points.
+pub const NDR_PASSES: &str = "vy_ndr_passes";
+
 /// grt's debug groups. None mirrors a reference group: the reference's GRT `incr` (level 2) lists
 /// the dirty nets' names only; ours prints their pins as compared.
 pub const DEBUG_GROUPS: &[DebugGroup] = &[
     DebugGroup { group: TIMER_STATS, max_level: 1, what: "per slack read and scene: graph sizes, path count, capacity and bytes", reference: None },
     DebugGroup { group: INCR_PINS, max_level: 1, what: "incremental routing: each dirty net's pins as compared (file: VYGES_GRT_INCR_TRACE, else VYGES_DEBUG_DIR/grt/incr-pins.txt)", reference: None },
     DebugGroup { group: STAGE_TIMES, max_level: 1, what: "turns VYGES_STAGE_TIMES on (alias target of VYGES_GRT_STAGE_TIMES)", reference: None },
+    DebugGroup { group: NDR_PASSES, max_level: 1, what: "per congestion pass: total overflow and NDR deficit; at finalization R17's and the 3D maze's inputs and verdicts", reference: None },
     DebugGroup { group: CUGR_TRACE, max_level: 1, what: "CUGR: its model, every stage and each restore, appended (file: VYGC_OUT, else VYGES_DEBUG_DIR/grt/cugr.vygc)", reference: None },
 ];
 
