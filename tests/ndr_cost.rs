@@ -1,13 +1,215 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The NDR-aware usage cost (`Graph2D::getCostNDRAware`) and its ledger, at the f11b4276 pin.
+//! The NDR-aware usage cost (`Graph2D::getCostNDRAware`) and its deficit ledger, at the f11b4276 pin.
 //!
-//! ⚠️ The call-by-call replay of `examples/grt_gate/ndr_cost.json` was captured at 4155ac31, under
-//! the 100× overflow charge that OpenROAD #11963 removed (NDR deficits replace it). It is retired
-//! here; a capture of the deficit ledger at the pin is on the heavy-run plan. Until then the rules
-//! below are constructed, each from the reference's code.
+//! Golden `examples/grt_gate/ndr_cost.json` (captured at the pin): every call an NDR net makes, in
+//! order, with the lifecycle events of the state (init / copy / clear) per graph instance. The
+//! replay THREADS the ledger through the calls: before each call the engine's layer capacities and
+//! NDR capacities, the net's presence and record on the edge, the edge's deficit and the total must
+//! equal the reference's; then the returned cost, the same state after, and the edge's whole ledger
+//! (every NDR net's record, in database-id order — what a rip-up's refit leaves) must too.
+//!
+//! ⚠️ Capacities are set by `updateCap3D` / `addCap3D`, which the capture does not log: each layer's
+//! is taken from the first call that touches it (with no NDR debit yet), and a later change of the
+//! raw capacity is applied as `addCap3D` (the debit kept) — the NDR capacity must still match.
+//! The constructed cases below take branches the corpus does not reach.
 
+use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use vyges_grt::estimate::Usage2d as _;
 use vyges_grt::*;
+
+fn read(path: &str) -> Value {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    serde_json::from_str(&text).expect("golden parses")
+}
+fn int(v: &Value) -> i64 {
+    v.as_i64().unwrap_or_else(|| panic!("int: {v}"))
+}
+fn num(v: &Value) -> f64 {
+    v.as_f64().unwrap_or_else(|| panic!("num: {v}"))
+}
+fn arr(v: &Value) -> &Vec<Value> {
+    v.as_array().expect("array")
+}
+
+struct Inst {
+    ledger: NdrLedger,
+    known: HashSet<(bool, usize, usize, usize)>,
+}
+
+#[derive(Default, Debug)]
+struct Seen {
+    runs: usize,
+    calls: usize,
+    est_calls: usize,
+    usage_calls: usize,
+    adds: usize,
+    removes: usize,
+    no_charge: usize,
+    deficit_adds: usize,
+    deficit_removes: usize,
+    refits: usize,
+    shared_edges: usize,
+    cap_adjusts: usize,
+    inits: usize,
+    reinits: usize,
+    copies: usize,
+    clears: usize,
+    instances: usize,
+}
+
+/// The net's record on the edge as the capture prints it: `[layer, amount, deficit]`.
+fn record(u: NdrUsage) -> Vec<i64> {
+    vec![i64::from(u.layer), i64::from(u.amount), i64::from(u.deficit)]
+}
+
+fn replay(g: &Value) -> Seen {
+    let mut seen = Seen::default();
+    for r in arr(&g["runs"]) {
+        let who = r["design"].as_str().expect("design");
+        let events = arr(&r["events"]);
+        let calls = || events.iter().filter(|e| e["ev"] == "call");
+        let xg = calls().map(|e| int(&e["x"])).max().unwrap_or(0) as usize + 2;
+        let yg = calls().map(|e| int(&e["y"])).max().unwrap_or(0) as usize + 2;
+        let nl = calls().map(|e| int(&e["max"])).max().unwrap_or(0) as usize + 1;
+        // Net ids in order of appearance; each one's database id (the refit's order).
+        let mut names: HashMap<String, usize> = HashMap::new();
+        let mut db_ids: Vec<u32> = Vec::new();
+        let mut inst: HashMap<i64, Inst> = HashMap::new();
+        let fresh = || Inst { ledger: NdrLedger::new(xg, yg, nl), known: HashSet::new() };
+
+        for (i, e) in events.iter().enumerate() {
+            let at = format!("{who} event {i}");
+            let gi = int(&e["g"]);
+            match e["ev"].as_str() {
+                Some("init") => {
+                    // A repeated init on the same instance is the resize (records, deficits and
+                    // debits dropped, capacities kept), not a new graph.
+                    match inst.get_mut(&gi) {
+                        Some(s) => {
+                            s.ledger.init_cap_3d(xg, yg, nl);
+                            s.known.clear();
+                            seen.reinits += 1;
+                        }
+                        None => {
+                            inst.insert(gi, fresh());
+                        }
+                    }
+                    seen.inits += 1;
+                }
+                Some("copy") => {
+                    let from = int(&e["from"]);
+                    let (l, k) = inst.get(&from).map(|s| (s.ledger.clone(), s.known.clone())).unwrap_or_else(|| {
+                        let f = fresh();
+                        (f.ledger, f.known)
+                    });
+                    let s = inst.entry(gi).or_insert_with(fresh);
+                    s.ledger.copy_routing_state_from(&l, e["include"].as_bool().expect("include"));
+                    s.known = k;
+                    seen.copies += 1;
+                }
+                Some("clear") => {
+                    inst.entry(gi).or_insert_with(fresh).ledger.clear_ndr_nets();
+                    seen.clears += 1;
+                }
+                Some("call") => {
+                    let (h, x, y) = (e["h"].as_bool().expect("h"), int(&e["x"]) as usize, int(&e["y"]) as usize);
+                    let (lo, hi) = (int(&e["min"]) as usize, int(&e["max"]) as usize);
+                    let n = names.len();
+                    let id = *names.entry(e["net"].as_str().expect("net").to_string()).or_insert(n);
+                    let db = int(&e["db_id"]) as u32;
+                    if id == db_ids.len() {
+                        db_ids.push(db);
+                    }
+                    assert_eq!(db_ids[id], db, "{at}: one net, one database id");
+                    let s = inst.entry(gi).or_insert_with(fresh);
+                    s.ledger.set_db_ids(db_ids.clone());
+                    let net = NdrCostNet {
+                        id,
+                        edge_cost: int(&e["ec"]) as i8,
+                        min_layer: lo,
+                        max_layer: hi,
+                        layer_edge_cost: Some(arr(&e["lec"]).iter().map(|v| int(v) as i8).collect()),
+                        soft_ndr: e["soft"].as_bool().expect("soft"),
+                    };
+                    let caps = arr(&e["caps"]);
+                    for (k, l) in (lo..=hi).enumerate() {
+                        let (cap, cap_ndr) = (int(&caps[k][0]), int(&caps[k][1]));
+                        if s.known.insert((h, l, x, y)) {
+                            assert_eq!(cap_ndr, cap, "{at}: layer {l} first touched with an NDR debit already taken");
+                            s.ledger.update_cap_3d(x, y, l, h, cap as f64);
+                        } else if i64::from(s.ledger.cap(h, l, x, y).cap) != cap {
+                            let delta = cap as i32 - i32::from(s.ledger.cap(h, l, x, y).cap);
+                            s.ledger.add_cap_3d(x, y, l, h, delta);
+                            seen.cap_adjusts += 1;
+                        }
+                        let c = s.ledger.cap(h, l, x, y);
+                        assert_eq!((i64::from(c.cap), i64::from(c.cap_ndr())), (cap, cap_ndr), "{at}: layer {l} capacity before the call");
+                    }
+                    let state = |l: &NdrLedger| (l.has_net(h, x, y, id), i64::from(l.edge_ndr_deficit(h, x, y)), i64::from(l.total_ndr_deficit()));
+                    let want = |v: &Value| (v["present"].as_bool().expect("present"), int(&v["edge_deficit"]), int(&v["total_deficit"]));
+                    assert_eq!(state(&s.ledger), want(e), "{at}: (present, edge deficit, total) before");
+                    let rec_want = e.get("usage").map(|u| arr(u).iter().map(int).collect::<Vec<_>>());
+                    assert_eq!(s.ledger.usage(h, x, y, id).map(record), rec_want, "{at}: the net's record before");
+
+                    let amount = num(&e["amount"]);
+                    let others_before: Vec<(usize, NdrUsage)> =
+                        (0..names.len()).filter(|&o| o != id).filter_map(|o| s.ledger.usage(h, x, y, o).map(|u| (o, u))).collect();
+                    let cost = s.ledger.get_cost_ndr_aware(&net, x, y, amount, h);
+                    let out = &e["out"];
+                    assert_eq!(cost, num(&out["cost"]), "{at}: cost of {amount} for {} on {}{x},{y}", net.id, if h { "H" } else { "V" });
+                    assert_eq!(state(&s.ledger), want(out), "{at}: (present, edge deficit, total) after");
+                    let after: Vec<i64> = arr(&out["cap_ndr"]).iter().map(int).collect();
+                    let ours: Vec<i64> = (lo..=hi).map(|l| i64::from(s.ledger.cap(h, l, x, y).cap_ndr())).collect();
+                    assert_eq!(ours, after, "{at}: NDR capacity after");
+                    let mut ledger: Vec<Vec<i64>> = (0..names.len())
+                        .filter_map(|o| s.ledger.usage(h, x, y, o).map(|u| [vec![i64::from(db_ids[o])], record(u)].concat()))
+                        .collect();
+                    ledger.sort();
+                    let want_ledger: Vec<Vec<i64>> = arr(&out["ledger"]).iter().map(|row| arr(row).iter().map(int).collect()).collect();
+                    assert_eq!(ledger, want_ledger, "{at}: the edge's ledger after (database id, layer, amount, deficit)");
+
+                    seen.calls += 1;
+                    match e["kind"].as_str() {
+                        Some("E") => seen.est_calls += 1,
+                        Some("U") => seen.usage_calls += 1,
+                        k => panic!("{at}: caller kind {k:?}"),
+                    }
+                    if amount < 0.0 { seen.removes += 1 } else { seen.adds += 1 }
+                    seen.no_charge += (cost == 0.0) as usize;
+                    let (d0, d1) = (int(&e["edge_deficit"]), int(&out["edge_deficit"]));
+                    seen.deficit_adds += (amount >= 0.0 && d1 > d0) as usize;
+                    seen.deficit_removes += (amount < 0.0 && d1 < d0) as usize;
+                    seen.refits += others_before.iter().any(|&(o, u)| s.ledger.usage(h, x, y, o) != Some(u)) as usize;
+                    seen.shared_edges += (want_ledger.len() >= 2) as usize;
+                }
+                k => panic!("{at}: event {k:?}"),
+            }
+        }
+        seen.instances += inst.len();
+        seen.runs += 1;
+    }
+    seen
+}
+
+#[test]
+fn the_ndr_aware_cost_and_its_ledger_match_the_reference() {
+    let s = replay(&read(&format!("{}/examples/grt_gate/ndr_cost.json", env!("CARGO_MANIFEST_DIR"))));
+    eprintln!("{s:?}");
+    // Every ledger rule witnessed: a deficit recorded and returned, a refit, two NDR nets on an edge.
+    assert!(s.calls > 0 && s.est_calls > 0 && s.usage_calls > 0 && s.adds > 0 && s.removes > 0 && s.no_charge > 0
+            && s.deficit_adds > 0 && s.deficit_removes > 0 && s.refits > 0 && s.shared_edges > 0, "{s:?}");
+}
+
+/// GRT_NDR_COST_FULL=/path/to/nc-all.json cargo test --release --test ndr_cost -- --ignored
+#[test]
+#[ignore = "needs the uncapped dump; the committed sample is what CI runs"]
+fn the_ndr_aware_cost_and_its_ledger_match_the_reference_exhaustively() {
+    let path = std::env::var("GRT_NDR_COST_FULL").expect("set GRT_NDR_COST_FULL");
+    eprintln!("exhaustive: {:?}", replay(&read(&path)));
+}
+
+// ─── Constructed cases: branches the corpus never reaches ───────────────────────────────────
 
 fn ndr(id: usize, ec: i8) -> NdrCostNet {
     NdrCostNet { id, edge_cost: ec, min_layer: 0, max_layer: 1, layer_edge_cost: Some(vec![ec, ec]), soft_ndr: false }
